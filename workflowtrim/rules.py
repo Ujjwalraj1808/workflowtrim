@@ -6,7 +6,10 @@ INSTALL_CMDS = ("npm ci", "npm install", "yarn install", "pip install", "mvn ", 
 
 
 def parse(text):
-    wf = yaml.safe_load(text)
+    try:
+        wf = yaml.safe_load(text)
+    except yaml.YAMLError:
+        return None  # malformed YAML (e.g. tab characters) -> skip this file
     if not isinstance(wf, dict):
         return None
     # PyYAML (YAML 1.1) parses the bare key `on:` as boolean True
@@ -126,7 +129,12 @@ def s8_artifact_retention(wf):
                 days = (s.get("with") or {}).get("retention-days")
                 if days is None:
                     out.append(("S8", job, "upload-artifact without retention-days (default 90)"))
-                elif int(days) > 30:
+                    continue
+                try:
+                    days = int(days)
+                except (TypeError, ValueError):
+                    continue  # expression like ${{ ... }} -> cannot judge, skip
+                if days > 30:
                     out.append(("S8", job, f"upload-artifact retention-days={days} (>30)"))
     return out
 
