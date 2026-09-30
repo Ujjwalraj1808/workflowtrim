@@ -8,6 +8,7 @@ import streamlit as st
 from workflowtrim.fetch import API, _headers, fetch_workflows
 from workflowtrim.repair import check, diff, repair
 from workflowtrim.rules import detect
+from workflowtrim.savings import estimate
 
 SMELL_NAMES = {
     "S1": "Missing job timeout",
@@ -51,11 +52,18 @@ if st.button("Analyze", type="primary") and repo.strip():
         st.warning("No workflow files found in .github/workflows/")
         st.stop()
 
+    smells_by_file = df.groupby("file")["smell"].apply(set).to_dict()
+    bar = st.progress(0, text="Reading run history...")
+    savings = estimate(repo.strip(), smells_by_file, days=90,
+                       progress=lambda i, n: bar.progress(i / n, text=f"Reading jobs of run {i}/{n}..."))
+    bar.empty()
+
     repairable = sum(len(applied) for _, applied, _ in repairs.values())
-    c1, c2, c3 = st.columns(3)
+    c1, c2, c3, c4 = st.columns(4)
     c1.metric("Workflow files", len(files))
     c2.metric("Smells found", len(df))
     c3.metric("Auto-repairable", repairable)
+    c4.metric(f"Est. waste ({savings['runs']} runs)", f"${savings['cost_usd']}", f"{savings['minutes']:.0f} min")
 
     left, right = st.columns([1, 2])
     with left:
@@ -78,3 +86,12 @@ if st.button("Analyze", type="primary") and repo.strip():
             st.write(" · ".join(f"{'✓' if v else '✗'} {k.replace('_', ' ')}" for k, v in checks.items()))
             st.code(diff(text, fixed, name), language="diff")
             st.download_button("Download fixed YAML", fixed, file_name=name, mime="text/yaml", key=name)
+
+    st.subheader("Savings (estimated)")
+    st.caption(f"From {savings['runs']} completed runs ({savings['from']} to {savings['to']}), job-level timing. "
+               "Only S1 and S2 are estimated from run history; cost uses GitHub-hosted runner rates by OS.")
+    s1, s2 = savings["S1"], savings["S2"]
+    st.dataframe(pd.DataFrame([
+        ("S2", "Job-minutes cancel-in-progress would have stopped", s2["overlaps"], s2["minutes"], s2["cost_usd"]),
+        ("S1", "Failed/cancelled jobs longer than 30 min", s1["jobs"], s1["minutes"], s1["cost_usd"]),
+    ], columns=["smell", "what", "count", "minutes wasted", "cost (USD)"]), width="stretch", hide_index=True)
