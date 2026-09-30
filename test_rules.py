@@ -82,3 +82,18 @@ def test_schedule_with_guard_is_clean():
 def test_reusable_workflow_job_is_skipped():
     text = "on: push\njobs:\n  call:\n    uses: org/repo/.github/workflows/x.yml@main\n"
     assert "S1" not in ids(text)
+
+
+def test_retention_days_expression_is_skipped():
+    text = """
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/upload-artifact@v4
+        with:
+          retention-days: ${{ matrix.deep_profile == 'true' && 14 || 30 }}
+"""
+    assert "S8" not in ids(text)
