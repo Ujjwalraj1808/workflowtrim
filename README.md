@@ -4,7 +4,7 @@ Automated detection and repair of resource-waste smells in GitHub Actions CI/CD 
 
 WorkflowTrim downloads the `.github/workflows/*.yml` files of a GitHub repository and checks them against a catalogue of eight resource-waste smells: configuration patterns that are valid and functional but cause compute minutes to be consumed without contributing to the workflow's purpose.
 
-**Status:** v0.2 — detector, 500-repository dataset, automated repair with safety checks, and a web UI. Savings estimation from run history is in progress.
+**Status:** v0.3 — detector, 500-repository dataset, automated repair with safety checks, savings estimation from run history (S1 and S2), and a web UI.
 
 ## Smell catalogue
 
@@ -65,7 +65,20 @@ S4  pre-commit.yaml              on.push              no paths / paths-ignore fi
 streamlit run app.py
 ```
 
-Enter a repository, click **Analyze**: summary metrics, a smell distribution chart, the findings table, and per-file repairs shown as a unified diff with three safety checks (repaired YAML parses, the reported smells are gone, jobs and steps are unchanged). Each fixed file can be downloaded.
+Enter a repository, click **Analyze**: summary metrics, a smell distribution chart, the findings table, per-file repairs shown as a unified diff with three safety checks (repaired YAML parses, the reported smells are gone, jobs and steps are unchanged), and the estimated waste from the repository's run history (see below). Each fixed file can be downloaded.
+
+## Savings estimation
+
+`workflowtrim/savings.py` estimates the compute minutes and cost that the detected smells caused, from the repository's real GitHub Actions run history:
+
+- **Data:** the most recent 300 completed runs from the last 90 days (`GET /actions/runs`), and the jobs of each run (`GET /actions/runs/{id}/jobs`). Job-level `started_at` / `completed_at` are used because the run-level `updated_at` is not a completion time (it changes, for example, when a pull request is closed).
+- **S2:** for consecutive `push` / `pull_request` runs of the same workflow file on the same branch, the job-minutes of the earlier run that were still executing after the next run started, i.e. what `cancel-in-progress: true` would have stopped.
+- **S1:** for failed, cancelled or timed-out jobs longer than 30 minutes, the minutes beyond 30 (the same default the S1 repair adds).
+- Only workflow files in which the smell was detected are counted.
+- **Cost:** minutes × GitHub-hosted runner rate by OS, taken from the job labels (Linux $0.008, Windows $0.016, macOS $0.08 per minute).
+- S3, S4 and S5 are not estimated: they need data the run history does not provide (per-run changed files, fork runs, install-step timings).
+
+Jobs are fetched with 8 parallel requests. In the web UI, results are cached on disk per repository per day, so analysing the same repository again on the same day is instant, also after a Streamlit restart (clear with **⋮ → Clear cache**).
 
 ## Building a dataset
 
@@ -91,11 +104,13 @@ workflowtrim/
   fetch.py      downloads workflow files via the GitHub REST API
   rules.py      one detection function per smell (S1-S8)
   repair.py     one repair function per repairable smell; ruamel.yaml round-trip keeps comments and formatting
-app.py          Streamlit web UI (analyze + repair)
+  savings.py    waste estimation (S1, S2) from run history
+app.py          Streamlit web UI (analyze + repair + savings)
 collect.py      dataset collection
 summarize.py    prevalence tables from the CSVs
 test_rules.py   detector tests
 test_repair.py  repairer tests
+test_savings.py savings estimator tests
 ```
 
 ## Authors
