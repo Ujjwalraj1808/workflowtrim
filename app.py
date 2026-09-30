@@ -2,6 +2,8 @@
 
 Run:  set GITHUB_TOKEN=ghp_...   then   streamlit run app.py
 """
+from datetime import date
+
 import pandas as pd
 import requests
 import streamlit as st
@@ -39,6 +41,18 @@ def analyze(repo):
     return files, df, repairs
 
 
+@st.cache_data(persist="disk", show_spinner=False)
+def cached_estimate(repo, smells_by_file, day):
+    """day = today's date, so the same repo on the same day is read from the disk cache
+    (survives a Streamlit restart). The progress bar lives inside: Streamlit's cache
+    cannot update an element created outside the cached function."""
+    bar = st.progress(0, text="Reading run history...")
+    savings = estimate(repo, smells_by_file, days=90,
+                       progress=lambda i, n: bar.progress(i / n, text=f"Reading jobs of run {i}/{n}..."))
+    bar.empty()
+    return savings
+
+
 st.set_page_config(page_title="WorkflowTrim", layout="wide")
 st.title("WorkflowTrim")
 st.caption("Find resource-waste smells in a repository's GitHub Actions workflows")
@@ -52,11 +66,9 @@ if st.button("Analyze", type="primary") and repo.strip():
         st.warning("No workflow files found in .github/workflows/")
         st.stop()
 
-    smells_by_file = df.groupby("file")["smell"].apply(set).to_dict()
-    bar = st.progress(0, text="Reading run history...")
-    savings = estimate(repo.strip(), smells_by_file, days=90,
-                       progress=lambda i, n: bar.progress(i / n, text=f"Reading jobs of run {i}/{n}..."))
-    bar.empty()
+    # sorted lists, not sets: set order changes between Python processes and would break the disk-cache key
+    smells_by_file = df.groupby("file")["smell"].apply(lambda s: sorted(set(s))).to_dict()
+    savings = cached_estimate(repo.strip(), smells_by_file, date.today().isoformat())
 
     repairable = sum(len(applied) for _, applied, _ in repairs.values())
     c1, c2, c3, c4 = st.columns(4)
