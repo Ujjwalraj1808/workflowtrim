@@ -115,6 +115,6 @@ test_savings.py savings estimator tests
 
 ## Authors
 
-Ujjwal Raj, Vaibhav Mishra, Rishav Raj  
+Ujjwal Raj 
 Guide: Dr. Arvind Kumar  
 School of Computer Application and Technology, Galgotias University
