@@ -14,6 +14,7 @@ closed), so jobs are required for correct durations.
 S3, S4, S5 need extra data (commit file lists, fork runs, install-step times)
 and are not estimated here.
 """
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 
 from .fetch import API, _get_with_backoff, _headers
@@ -21,6 +22,7 @@ from .fetch import API, _get_with_backoff, _headers
 TIMEOUT_MIN = 30          # same default as the S1 repair
 RATES = {"linux": 0.008, "windows": 0.016, "macos": 0.08}   # USD per minute, GitHub-hosted
 MAX_RUNS = 300            # one extra API call per run (jobs)
+WORKERS = 8               # parallel jobs requests
 
 
 def _ts(s):
@@ -129,8 +131,10 @@ def estimate(repo, smells_by_file, days=90, max_runs=MAX_RUNS, progress=None):
     """progress: optional callback(done, total) called after each run's jobs are fetched."""
     runs = [r for r in fetch_runs(repo, days, max_runs) if r["conclusion"] != "skipped"]
     jobs_by_run = {}
-    for i, run in enumerate(runs, 1):
-        jobs_by_run[run["id"]] = fetch_jobs(repo, run["id"])
-        if progress:
-            progress(i, len(runs))
+    with ThreadPoolExecutor(max_workers=WORKERS) as pool:
+        futures = {pool.submit(fetch_jobs, repo, run["id"]): run["id"] for run in runs}
+        for i, fut in enumerate(as_completed(futures), 1):   # progress runs in the caller's thread
+            jobs_by_run[futures[fut]] = fut.result()
+            if progress:
+                progress(i, len(runs))
     return estimate_from_runs(runs, jobs_by_run, smells_by_file)
