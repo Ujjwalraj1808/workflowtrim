@@ -1,0 +1,140 @@
+repo,excluded,note
+public-apis/public-apis,content_only,your review
+EbookFoundation/free-programming-books,content_only,your review
+donnemartin/system-design-primer,content_only,your review
+vinta/awesome-python,content_only,your review
+practical-tutorials/project-based-learning,content_only,your review
+Vann-Dev/proxy-list,content_only,your review
+ProxyScrape/free-proxy-list,content_only,your review
+watchttvv/free-proxy-list,content_only,your review
+LeCoupa/awesome-cheatsheets,content_only,your review
+sudheerj/reactjs-interview-questions,content_only,your review
+yangshun/front-end-interview-handbook,content_only,your review
+PatrickJS/awesome-cursorrules,content_only,your review
+github/awesome-copilot,content_only,your review
+OWASP/CheatSheetSeries,content_only,your review
+lassekongo83/Frellwits-filter-lists,content_only,your review
+nilbuild/developer-roadmap,content_only,your review
+yangshun/tech-interview-handbook,content_only,your review
+typescript-cheatsheets/react,content_only,your review
+neverbiasu/awesome-gemini-prompts,content_only,your review
+avelino/awesome-go,content_only,your review
+gfpcom/free-proxy-list,content_only,your review
+ashishps1/awesome-system-design-resources,content_only,your review
+ashishps1/awesome-low-level-design,content_only,your review
+ashishps1/awesome-leetcode-resources,content_only,your review
+microsoft/markitdown,,build manifest in a subfolder (monorepo)
+Significant-Gravitas/AutoGPT,,build manifest in a subfolder (monorepo)
+langchain-ai/langchain,,build manifest in a subfolder (monorepo)
+bytedance/deer-flow,,build manifest in a subfolder (monorepo)
+tensorflow/models,,build manifest in a subfolder (monorepo)
+python/cpython,,build manifest in a subfolder (monorepo)
+666ghj/MiroFish,,build manifest in a subfolder (monorepo)
+openbq-org/OpenBB,,build manifest in a subfolder (monorepo)
+microsoft/autogen,,build manifest in a subfolder (monorepo)
+cloudflare/workers-py,,build manifest in a subfolder (monorepo)
+Azure/azure-cli-extensions,,build manifest in a subfolder (monorepo)
+nodejs/node,,build manifest in a subfolder (monorepo)
+songquanpeng/one-api,,build manifest in a subfolder (monorepo)
+slow-stack/mneme,,build manifest in a subfolder (monorepo)
+tt-a1i/archify,,build manifest in a subfolder (monorepo)
+firecrawl/firecrawl,,build manifest in a subfolder (monorepo)
+OpenCut-app/OpenCut,,build manifest in a subfolder (monorepo)
+siyuan-note/siyuan,,build manifest in a subfolder (monorepo)
+timoncool/YuE2-Studio,,build manifest in a subfolder (monorepo)
+ctrliq/ascender,,build manifest in a subfolder (monorepo)
+proactive-agent/langgraphics,,build manifest in a subfolder (monorepo)
+finos/jupyterlab_templates,,build manifest in a subfolder (monorepo)
+netdata/netdata,,build manifest in a subfolder (monorepo)
+multica-ai/multica,,build manifest in a subfolder (monorepo)
+Wei-Shaw/sub2api,,build manifest in a subfolder (monorepo)
+1Panel-dev/1Panel,,build manifest in a subfolder (monorepo)
+wailsapp/wails,,build manifest in a subfolder (monorepo)
+goharbor/harbor,,build manifest in a subfolder (monorepo)
+thunder-id/thunderid,,build manifest in a subfolder (monorepo)
+Calcium-Ion/AstrLink,,build manifest in a subfolder (monorepo)
+omacom/try-omarchy-windows,,build manifest in a subfolder (monorepo)
+konflux-ci/konflux-ci,,build manifest in a subfolder (monorepo)
+kazeyukiro/3m-ui,,build manifest in a subfolder (monorepo)
+isc-projects/stork,,build manifest in a subfolder (monorepo)
+NVIDIA/NVSentinel,,build manifest in a subfolder (monorepo)
+dropbox/dropbox-sdk-go-unofficial,,build manifest in a subfolder (monorepo)
+TokenFlux/TokenRouter,,build manifest in a subfolder (monorepo)
+fe-spark/EcoHub,,build manifest in a subfolder (monorepo)
+gen2brain/iup-go,,build manifest in a subfolder (monorepo)
+openbkn-ai/bkn-foundry,,build manifest in a subfolder (monorepo)
+golang-app/ecommerce,,build manifest in a subfolder (monorepo)
+naiba/bonds,,build manifest in a subfolder (monorepo)
+opendataloader-project/opendataloader-pdf,,build manifest in a subfolder (monorepo)
+OtterMind/Chat2DB,,build manifest in a subfolder (monorepo)
+openjdk/jdk,,build manifest in a subfolder (monorepo)
+oracle/graal,,build manifest in a subfolder (monorepo)
+apache/doris,,build manifest in a subfolder (monorepo)
+gchq/sleeper,,build manifest in a subfolder (monorepo)
+uyuni-project/uyuni,,build manifest in a subfolder (monorepo)
+JanssenProject/jans,,build manifest in a subfolder (monorepo)
+binance/binance-connector-java,,build manifest in a subfolder (monorepo)
+Aletheore/Aletheore,,"CHECK: build manifest in a subfolder, purpose unclear"
+oliver-zehentleitner/keep-the-why,,"CHECK: build manifest in a subfolder, purpose unclear"
+LukePrior/nbn-upgrade-map,,"CHECK: build manifest in a subfolder, purpose unclear"
+hackforla/website,,"CHECK: build manifest in a subfolder, purpose unclear"
+antongulin/opencode-skill-creator,,"CHECK: build manifest in a subfolder, purpose unclear"
+maboloshi/github-chinese,,"CHECK: build manifest in a subfolder, purpose unclear"
+Endless1936/cut-motion,,"CHECK: build manifest in a subfolder, purpose unclear"
+MONZikWasTaken/Framegen,,"CHECK: build manifest in a subfolder, purpose unclear"
+nomadicmehul/CloudCaptain,,"CHECK: build manifest in a subfolder, purpose unclear"
+yennanliu/CS_basics,,"CHECK: build manifest in a subfolder, purpose unclear"
+adoptium/jdk,duplicate,same file tree and workflows as openjdk/jdk
+openjdk/leyden,duplicate,same file tree and workflows as openjdk/jdk
+openjdk/wakefield,duplicate,same file tree and workflows as openjdk/jdk
+abi/screenshot-to-code,no_workflows,"build manifest in a subfolder, but no workflows"
+lipengdong/hei-rebot-lift,no_workflows,"build manifest in a subfolder, but no workflows"
+FortAwesome/Font-Awesome,no_workflows,"build manifest in a subfolder, but no workflows"
+NaiboWang/EasySpider,no_workflows,"build manifest in a subfolder, but no workflows"
+nwjs/nw.js,no_workflows,"build manifest in a subfolder, but no workflows"
+sengchor/kokraf,no_workflows,"build manifest in a subfolder, but no workflows"
+Horace-Maxwell/Horosa-Web-App-comprehensively-improved-Windows,no_workflows,"build manifest in a subfolder, but no workflows"
+golang/go,no_workflows,"build manifest in a subfolder, but no workflows"
+jeecgboot/JeecgBoot,no_workflows,"build manifest in a subfolder, but no workflows"
+didi/DoKit,no_workflows,"build manifest in a subfolder, but no workflows"
+calcom/sans-ui,no_workflows,"build manifest in a subfolder, but no workflows"
+521xueweihan/HelloGitHub,content_only,manifest only for helper scripts; list/docs/tutorial/skills/data
+anthropics/skills,content_only,manifest only for helper scripts; list/docs/tutorial/skills/data
+Shubhamsaboo/awesome-llm-apps,content_only,manifest only for helper scripts; list/docs/tutorial/skills/data
+nextlevelbuilder/ui-ux-pro-max-skill,content_only,manifest only for helper scripts; list/docs/tutorial/skills/data
+datawhalechina/hello-agents,content_only,manifest only for helper scripts; list/docs/tutorial/skills/data
+ComposioHQ/awesome-claude-skills,content_only,manifest only for helper scripts; list/docs/tutorial/skills/data
+Asabeneh/30-Days-Of-Python,content_only,manifest only for helper scripts; list/docs/tutorial/skills/data
+josephmisiti/awesome-machine-learning,content_only,manifest only for helper scripts; list/docs/tutorial/skills/data
+datasets/s-and-p-500,content_only,manifest only for helper scripts; list/docs/tutorial/skills/data
+nthack/Shadowrocket-ADBlock-Rules-Easy,content_only,manifest only for helper scripts; list/docs/tutorial/skills/data
+NiceVPN123/NiceVPN,content_only,manifest only for helper scripts; list/docs/tutorial/skills/data
+HotKids/Rules,content_only,manifest only for helper scripts; list/docs/tutorial/skills/data
+Hao0321/claude-skill-social-post,content_only,manifest only for helper scripts; list/docs/tutorial/skills/data
+AI-in-Transportation-Lab/awesome-jepa,content_only,manifest only for helper scripts; list/docs/tutorial/skills/data
+AI-in-Transportation-Lab/awesome-pinns,content_only,manifest only for helper scripts; list/docs/tutorial/skills/data
+AI-in-Transportation-Lab/awesome-tinyml,content_only,manifest only for helper scripts; list/docs/tutorial/skills/data
+DataDog/documentation,content_only,manifest only for helper scripts; list/docs/tutorial/skills/data
+Alchemyst-ai/awesome-saas,content_only,manifest only for helper scripts; list/docs/tutorial/skills/data
+swyxio/skills,content_only,manifest only for helper scripts; list/docs/tutorial/skills/data
+DereC4/internships-and-newgrad,content_only,manifest only for helper scripts; list/docs/tutorial/skills/data
+poteto/hiring-without-whiteboards,content_only,was included: list/guide/course/notes/docs site/data
+denysdovhan/wtfjs,content_only,was included: list/guide/course/notes/docs site/data
+Snailclimb/JavaGuide,content_only,was included: list/guide/course/notes/docs site/data
+liusida/top-100-comfyui,content_only,was included: list/guide/course/notes/docs site/data
+nh-server/switch-guide,content_only,was included: list/guide/course/notes/docs site/data
+microsoft/Web-Dev-For-Beginners,content_only,was included: list/guide/course/notes/docs site/data
+remoteintech/remote-jobs,content_only,was included: list/guide/course/notes/docs site/data
+ImChong/Robotics_Notebooks,content_only,was included: list/guide/course/notes/docs site/data
+Jianqiuer/Awesome6DPoseEstimation,content_only,was included: list/guide/course/notes/docs site/data
+open-webui/docs,content_only,was included: list/guide/course/notes/docs site/data
+layer5io/docs,content_only,was included: list/guide/course/notes/docs site/data
+treeverse/dvc.org,content_only,was included: list/guide/course/notes/docs site/data
+open-telemetry/opentelemetry.io,content_only,was included: list/guide/course/notes/docs site/data
+bryanthaboi/gen1recomp-mod-index,content_only,was included: list/guide/course/notes/docs site/data
+Ringmast4r/OUI-Master-Database,content_only,was included: list/guide/course/notes/docs site/data
+AdguardTeam/HostlistsRegistry,content_only,was included: list/guide/course/notes/docs site/data
+sefinek/Sefinek-Blocklist-Collection,content_only,was included: list/guide/course/notes/docs site/data
+shareAI-lab/learn-claude-code,content_only,"CHECK: was included, looks like tutorial/notes/rules"
+Myyura/the_kai_project,content_only,"CHECK: was included, looks like tutorial/notes/rules"
+Agent-Threat-Rule/agent-threat-rules,content_only,"CHECK: was included, looks like tutorial/notes/rules"
