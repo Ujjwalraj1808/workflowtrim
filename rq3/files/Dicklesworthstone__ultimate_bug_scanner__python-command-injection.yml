@@ -1,0 +1,140 @@
+name: Python Command Injection
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - modules/helpers/ubs_core/py_detectors/command_injection.py
+      - test-suite/quality/test_python_command_injection_dataflow.py
+      - test-suite/quality/test_command_*.py
+      - test-suite/python/security/command_injection_*.py
+      - .github/workflows/python-command-injection.yml
+      - ubs
+      - SHA256SUMS
+  pull_request:
+    paths:
+      - modules/helpers/ubs_core/py_detectors/command_injection.py
+      - test-suite/quality/test_python_command_injection_dataflow.py
+      - test-suite/quality/test_command_*.py
+      - test-suite/python/security/command_injection_*.py
+      - .github/workflows/python-command-injection.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  command-regressions:
+    runs-on: ubuntu-26.04-arm
+    timeout-minutes: 20
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+      UBS_NO_AUTO_UPDATE: "1"
+      UBS_ENABLE_AUTO_UPDATE: "0"
+      UBS_SKIP_RUST_BUILD: "1"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install integration dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y jq ripgrep rsync shellcheck
+      - name: Test the committed command-analysis implementation
+        run: |
+          echo "COMMAND_VALIDATION_BASE $(git rev-parse HEAD)"
+          python3 -m unittest discover -s test-suite/quality -p 'test_*command*.py' -v
+      - name: Compare original detector and existing fixtures
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PYTHONPATH: modules/helpers
+        run: |
+          gh api -H 'User-Agent: OpenAI File Downloader, XaiImageApiFetch/1.0' "repos/$GH_REPO/git/blobs/17c626e0c86ec411d08f4e5a2186208cb634cd62" --jq .content | base64 --decode > "$RUNNER_TEMP/original-command-injection.py"
+          python3 - <<'PY'
+          import ast
+          import importlib.util
+          import os
+          from pathlib import Path
+          from ubs_core.py_detectors import command_injection as current
+          spec = importlib.util.spec_from_file_location('original_command_injection', Path(os.environ['RUNNER_TEMP']) / 'original-command-injection.py')
+          original = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(original)
+          samples = [
+              'import os, shlex\nx=input()\ny=shlex.quote(x) if flag else x\nos.system(y)',
+              'import os, shlex\nx=choose(input(), shlex.quote("fixed"))\nos.system(x)',
+              'import os, shlex\nx=shlex.quote(input())\nos.execvp(x, [x])',
+              'import subprocess\nsubprocess.run(args=input(), shell=True)',
+              'import subprocess\nsubprocess.run(["fixed"], executable=input())',
+          ]
+          for source in samples:
+              results = []
+              for module in (original, current):
+                  analyzer = module.CommandInjectionAnalyzer(source, source.splitlines())
+                  analyzer.visit(ast.parse(source))
+                  results.append(analyzer.issues)
+              assert results[0] == [] and len(results[1]) == 1, (source, results)
+          clean = Path('test-suite/python/security/command_injection_clean.py')
+          buggy = Path('test-suite/python/security/command_injection_buggy.py')
+          assert list(current.find([clean])) == [], 'existing clean fixture regressed'
+          before = {r[:3] for r in original.find([buggy])}
+          after = {r[:3] for r in current.find([buggy])}
+          assert before and before <= after, (before, after)
+          print('COMMAND_BASELINE 5 reproduced misses corrected; existing clean/buggy fixtures preserved')
+          PY
+      - name: Verify committed installation integrity and deterministic regeneration
+        run: |
+          ./scripts/verify_checksums.sh
+          ./scripts/verify_sha256sums.sh
+          python3 scripts/update_checksums.py > "$RUNNER_TEMP/command-checksums.log"
+          git diff --exit-code
+          ./scripts/verify_checksums.sh
+          ./scripts/verify_sha256sums.sh
+          for script in ubs modules/lib/ubs-common.sh modules/ubs-*.sh scripts/new-module.sh; do bash -n "$script"; done
+          git diff --check
+      - name: Test real scanner command detection and clean controls
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+          import tempfile
+          from pathlib import Path
+          root = Path.cwd()
+          with tempfile.TemporaryDirectory(prefix='ubs-command-integration-') as scratch:
+              scratch = Path(scratch)
+              cases = {
+                  'buggy': ('import subprocess\nsubprocess.run(args=input(), shell=True)\n', True),
+                  'shell-alias': ('import subprocess\nargv = [\"sh\", \"-c\", input()]\nsubprocess.run(argv)\n', True),
+                  'shell-exec': ('import os\nos.execve(\"/bin/sh\", [\"sh\", \"-c\", input()], {})\n', True),
+                  'branch': ('import os\ncmd = input()\nif flag:\n cmd = \"echo\"\nos.system(cmd)\n', True),
+                  'loop': ('import os\ncmd = \"echo\"\nwhile flag:\n os.system(cmd)\n cmd = input()\n', True),
+                  'scope-clean': ('import os\ndef first():\n cmd = input()\ndef second(cmd):\n os.system(cmd)\n', False),
+                  'clean': ('import subprocess\nsubprocess.run(args=["echo", input()], executable="/bin/echo", shell=False, check=True, timeout=5)\n', False),
+              }
+              for name, (source, expected) in cases.items():
+                  project = scratch / name
+                  project.mkdir()
+                  (project / 'sample.py').write_text(source, encoding='utf-8')
+                  result = subprocess.run([str(root / 'ubs'), str(project), '--only=python', '--ci', '--format=json'],
+                      cwd=scratch, env={**os.environ, 'HOME': str(scratch), 'XDG_CACHE_HOME': str(scratch / 'cache')},
+                      text=True, capture_output=True, timeout=180)
+                  assert result.returncode in (0, 1), (name, result.returncode, result.stdout, result.stderr)
+                  payload = json.loads(result.stdout)
+                  assert payload.get('status') == 'ok' and not payload.get('failed_modules'), (name, payload)
+                  def rules(value):
+                      if isinstance(value, dict):
+                          yield value.get('rule_id', value.get('ruleId'))
+                          for child in value.values():
+                              yield from rules(child)
+                      elif isinstance(value, list):
+                          for child in value:
+                              yield from rules(child)
+                  found = 'py.security.command-injection' in set(rules(payload))
+                  assert found == expected, (name, payload, result.stderr)
+                  print('COMMAND_REAL_SCAN', name, 'PASS')
+          PY
+      - name: Test existing checksum generation and installed contract
+        run: |
+          python3 test-suite/shareable/test_contract_checksums.py -v
+          python3 test-suite/shareable/test_installed_contract.py -v

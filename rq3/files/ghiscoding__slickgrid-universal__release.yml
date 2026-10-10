@@ -1,0 +1,187 @@
+name: 🏷️ Release to NPM
+
+on:
+  workflow_dispatch:
+    inputs:
+      dryrun:
+        type: boolean
+        description: Dry-Run
+      tag:
+        type: choice
+        default: latest
+        description: NPM tag (defaults to 'latest')
+        options:
+          - latest
+          - alpha
+          - beta
+          - next
+      graduate:
+        type: boolean
+        description: Force Conventional Graduate
+      version:
+        description: 'Fixed Version'
+        required: false
+        type: string
+      skip_version_retry_publish:
+        type: boolean
+        description: 'Skip running `lerna version` and run publish-only retry (useful to retry failed publish)'
+
+permissions:
+  contents: write # to be able to publish a GitHub release
+  id-token: write # to enable use of OIDC for npm provenance
+  issues: write # to be able to comment on released issues
+  pull-requests: write # to be able to comment on released pull requests
+
+jobs:
+  deploy-npm-latest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Retrieve current Date Time in EST
+        shell: bash
+        run: echo "START_TIME=$(TZ=":America/New_York" date -R|sed 's/.....$//')" >> $GITHUB_ENV
+
+      - name: Current datetime - ${{ env.START_TIME }}
+        run: echo ${{ env.START_TIME }}
+
+      - name: Clone repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - if: ${{ github.event.pull_request.merged != true && contains('["ghiscoding"]', github.actor) != true }}
+        name: Exit early when current actor is not allowed to push new release
+        run: |
+          echo "Error: Your GitHub username (${{ github.actor }}) is not on the allowed list of Admins that can run this workflow"
+          exit 1
+
+      - name: Install pnpm
+        uses: pnpm/setup@fbda4c85fc2e1e08721cd8763afea8f48d60f024 # v3
+        with:
+          install: false
+
+      - name: Set NodeJS
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          registry-url: 'https://registry.npmjs.org/'
+          node-version: 24
+
+      - run: node --version
+      - run: npm --version
+
+      - name: Run pnpm install dependencies
+        run: pnpm install
+
+      - name: Build Everything
+        run: pnpm build
+
+      - name: Lerna Version (build query)
+        if: ${{ inputs.skip_version_retry_publish != true }}
+        shell: bash
+        run: |
+          if [ "${{ inputs.dryrun }}" = "true" ] && [ "${{ inputs.graduate }}" = "true" ]; then
+            echo "LERNA_VERSION_TYPE=Dry-Run 🧪 - Prod Version w/Graduate" >> $GITHUB_ENV
+            echo "LERNA_VERSION_QUERY=lerna version --yes --conventional-graduate --dry-run" >> $GITHUB_ENV
+          elif [ "${{ inputs.dryrun }}" = "true" ] && [ -n "${{ inputs.version }}" ]; then
+            echo "LERNA_VERSION_TYPE=Dry-Run 🧪 - Fixed Version" >> $GITHUB_ENV
+            echo "LERNA_VERSION_QUERY=lerna version ${{ inputs.version }} --yes --dry-run" >> $GITHUB_ENV
+          elif [ "${{ inputs.dryrun }}" = "true" ] && { [ "${{ inputs.tag }}" = "alpha" ] || [ "${{ inputs.tag }}" = "beta" ] || [ "${{ inputs.tag }}" = "next" ]; }; then
+            echo "LERNA_VERSION_TYPE=Dry-Run 🧪 - Pre-Release" >> $GITHUB_ENV
+            echo "LERNA_VERSION_QUERY=lerna version --yes --conventional-prerelease --preid ${{ inputs.tag }} --dry-run" >> $GITHUB_ENV
+          elif [ "${{ inputs.dryrun }}" = "true" ]; then
+            echo "LERNA_VERSION_TYPE=Dry-Run 🧪" >> $GITHUB_ENV
+            echo "LERNA_VERSION_QUERY=lerna version --yes --dry-run" >> $GITHUB_ENV
+          elif [ "${{inputs.dryrun }}" != "true" ] && [ "${{ inputs.graduate }}" = "true" ]; then
+            echo "LERNA_VERSION_TYPE=Prod Version 🚀 - w/Graduate" >> $GITHUB_ENV
+            echo "LERNA_VERSION_QUERY=lerna version --yes --conventional-graduate" >> $GITHUB_ENV
+          elif [ -n "${{ inputs.version }}" ]; then
+            echo "LERNA_VERSION_TYPE=Prod Version 🚀 - Fixed Version" >> $GITHUB_ENV
+            echo "LERNA_VERSION_QUERY=lerna version ${{ inputs.version }} --yes" >> $GITHUB_ENV
+          elif [ "${{ inputs.tag }}" = "alpha" ] || [ "${{ inputs.tag }}" = "beta" ] || [ "${{ inputs.tag }}" = "next" ]; then
+            echo "LERNA_VERSION_TYPE=Prod Version 🚀 - Pre-Release" >> $GITHUB_ENV
+            echo "LERNA_VERSION_QUERY=lerna version --yes --conventional-prerelease --preid ${{ inputs.tag }}" >> $GITHUB_ENV
+          else
+            echo "LERNA_VERSION_TYPE=Prod Version 🚀" >> $GITHUB_ENV
+            echo "LERNA_VERSION_QUERY=lerna version --yes" >> $GITHUB_ENV
+          fi
+
+      - name: Final version type ➜ ${{ env.LERNA_VERSION_TYPE }}
+        shell: bash
+        run: echo "${{ env.LERNA_VERSION_QUERY }}"
+
+      - name: Lerna Version 🏷️
+        if: ${{ inputs.skip_version_retry_publish != true }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          git config --global user.name "${{ github.actor }}"
+          git config --global user.email "${{ github.actor }}@users.noreply.github.com"
+          pnpm exec ${{ env.LERNA_VERSION_QUERY }}
+
+      - name: Skip Lerna Version Notice
+        if: ${{ inputs.skip_version_retry_publish == true }}
+        run: |
+          echo "skip_version_retry_publish=true — lerna version is skipped; proceeding to publish-only run."
+
+      - name: Replace Angular workspace dependencies for publish retry
+        if: ${{ inputs.skip_version_retry_publish == true }}
+        run: pnpm angular:replace-workspace
+
+      - name: Lerna Publish (build query)
+        shell: bash
+        run: |
+          if [ "${{ inputs.dryrun }}" = "true" ] && { [ "${{ inputs.tag }}" = "alpha" ] || [ "${{ inputs.tag }}" = "beta" ] || [ "${{ inputs.tag }}" = "next" ]; }; then
+            echo "LERNA_PUBLISH_TYPE=Dry-Run 🧪 - Pre-Release" >> $GITHUB_ENV
+            echo "LERNA_PUBLISH_QUERY=lerna publish from-package --force-publish --yes --pre-dist-tag ${{ inputs.tag }} --dry-run" >> $GITHUB_ENV
+          elif [ "${{ inputs.dryrun }}" = "true" ]; then
+            echo "LERNA_PUBLISH_TYPE=Dry-Run 🧪" >> $GITHUB_ENV
+            echo "LERNA_PUBLISH_QUERY=lerna publish from-package --force-publish --yes --dist-tag latest --dry-run" >> $GITHUB_ENV
+          elif [ "${{ inputs.tag }}" = "alpha" ] || [ "${{ inputs.tag }}" = "beta" ] || [ "${{ inputs.tag }}" = "next" ]; then
+            echo "LERNA_PUBLISH_TYPE=📦 Publish - Pre-Release" >> $GITHUB_ENV
+            echo "LERNA_PUBLISH_QUERY=lerna publish from-package --force-publish --yes --pre-dist-tag ${{ inputs.tag }}" >> $GITHUB_ENV
+          else
+            echo "LERNA_PUBLISH_TYPE=📦 Publish Latest" >> $GITHUB_ENV
+            echo "LERNA_PUBLISH_QUERY=lerna publish from-package --force-publish --yes --dist-tag latest" >> $GITHUB_ENV
+          fi
+
+      - name: Final publish type ➜ ${{ env.LERNA_PUBLISH_TYPE }}
+        shell: bash
+        run: echo "${{ env.LERNA_PUBLISH_QUERY }}"
+
+      - name: Lerna Publish 📦
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        id: lerna-publish
+        run: |
+          for attempt in 1 2 3; do
+            if output=$(pnpm exec ${{ env.LERNA_PUBLISH_QUERY }} 2>&1); then
+              printf '%s\n' "$output"
+              exit 0
+            fi
+
+            printf '%s\n' "$output"
+            if ! grep -q 'TLOG_CREATE_ENTRY_ERROR' <<< "$output"; then
+              exit 1
+            fi
+
+            if [ "$attempt" -lt 3 ]; then
+              echo "Sigstore transparency-log conflict on attempt $attempt; retrying in 20 seconds."
+              sleep 20
+            fi
+          done
+
+          echo "Lerna publish failed after 3 Sigstore transparency-log retries." >&2
+          exit 1
+
+      - name: Website Dev Build
+        run: pnpm build:dev
+
+      - name: Deploy to gh-pages
+        if: github.ref == 'refs/heads/master'
+        uses: peaceiris/actions-gh-pages@84c30a85c19949d7eee79c4ff27748b70285e453 # v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./website

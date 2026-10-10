@@ -1,0 +1,78 @@
+name: Deploy Documentation
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'docs-site/**'
+      - '.github/workflows/docs.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'docs-site/**'
+      - '.github/workflows/docs.yml'
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+# Publishing is gated on the repository actually having a Pages site.
+#
+# A fork inherits this workflow but not the upstream Pages configuration, so
+# actions/deploy-pages fails there with a 404 that has nothing to do with the
+# change being pushed:
+#
+#   Failed to create deployment (status: 404) ... Ensure GitHub Pages has been
+#   enabled: https://github.com/<owner>/mxcli/settings/pages
+#
+# Every push to a fork's main therefore left a permanent red X, which is how a
+# real failure gets missed. The book is still BUILT on forks (and on pull
+# requests) — only the upload and deploy are skipped, so a docs change is still
+# proven to compile wherever it is pushed.
+#
+# A fork that wants to publish its own copy: enable Pages (Settings → Pages →
+# Source: GitHub Actions), then set the repository variable DEPLOY_DOCS=true
+# (Settings → Secrets and variables → Actions → Variables).
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install mdBook
+        run: |
+          MDBOOK_VERSION="0.5.2"
+          curl -sSL "https://github.com/rust-lang/mdBook/releases/download/v${MDBOOK_VERSION}/mdbook-v${MDBOOK_VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
+            | tar -xz -C /usr/local/bin
+
+      - name: Build book
+        run: mdbook build docs-site
+
+      - name: Upload artifact
+        if: >-
+          github.ref == 'refs/heads/main' && github.event_name == 'push'
+          && (github.event.repository.fork != true || vars.DEPLOY_DOCS == 'true')
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: docs-site/book
+
+  deploy:
+    # Same condition as the upload above: with no artifact there is nothing to
+    # deploy, and deploy-pages fails rather than no-ops when Pages is absent.
+    if: >-
+      github.ref == 'refs/heads/main' && github.event_name == 'push'
+      && (github.event.repository.fork != true || vars.DEPLOY_DOCS == 'true')
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v5

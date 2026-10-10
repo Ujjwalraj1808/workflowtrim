@@ -1,0 +1,46 @@
+on: push
+permissions:
+  pages: write
+  id-token: write
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+# Build the WASMs and check everything is working.
+
+      - uses: denoland/setup-deno@v2
+      - run: deno task test
+
+# Publish the website.
+
+      - run: cp -R site _site
+
+# Publish the libs.
+
+      - run: cp -R test _site/test
+      - run: cp -R fpga/ucode _site/ucode
+      - run: cp -R lib _site/lib
+      - run: cp -R vm/js _site/js
+      - run: mkdir _site/wasm
+      - run: cp vm/wasm/*.wasm _site/wasm/
+
+# Publish the apps.
+
+      - run: cp -R apps/debugger _site/debugger
+      - run: cp -R apps/playground _site/playground
+      - run: cp -R apps/ucode_dbg _site/ucode_dbg
+      - run: cp -R apps/udbg _site/udbg
+
+# Apply some optimizations and deploy.
+
+      - run: find _site -name '*.js' -exec deno run -A tools/demain.js {} \+
+      - run: deno run -A apps/playground/optimize.js _site/playground/index.html
+      - uses: actions/upload-pages-artifact@v3
+      - uses: actions/deploy-pages@v4

@@ -1,0 +1,258 @@
+---
+# Runs various linter checks against PR with suggested changes to improve quality
+name: Review
+on:
+  pull_request:
+    types: [opened, reopened, labeled, synchronize]
+env:
+  DISABLE_TELEMETRY: 1
+concurrency:
+  group: review-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  prep-review:
+    name: Prepare Review Jobs
+    runs-on: ubuntu-latest
+    outputs:
+      actionlint: ${{ steps.actionlint.outputs.run }}
+      # clangformat: ${{ steps.clangformat.outputs.run }}
+      flake8: ${{ steps.flake8.outputs.run }}
+      golangci-lint: ${{ steps.golangci-lint.outputs.run }}
+      hadolint: ${{ steps.hadolint.outputs.run }}
+      shellcheck: ${{ steps.shellcheck.outputs.run }}
+      yamllint: ${{ steps.yamllint.outputs.run }}
+    steps:
+      - name: Clone repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+          fetch-depth: 0
+      - name: Check files for actionlint
+        id: actionlint
+        run: |
+          if [ "${{ contains(github.event.pull_request.labels.*.name, 'run-ci/actionlint') }}" = "true" ]; then
+            echo "run=true" >> "${GITHUB_OUTPUT}"
+          elif git diff --name-only origin/${{ github.base_ref }} HEAD | grep -Eq '^\.github/workflows/|^\.github/scripts/test-ci-workflow-file-selection\.py$' ; then
+            echo "run=true" >> "${GITHUB_OUTPUT}"
+            echo 'GitHub Actions workflows have changed, need to run actionlint.'
+          else
+            echo "run=false" >> "${GITHUB_OUTPUT}"
+          fi
+      # - name: Check files for clang-format
+      #   id: clangformat
+      #   run: |
+      #     if [ "${{ contains(github.event.pull_request.labels.*.name, 'run-ci/clang-format') }}" = "true" ]; then
+      #       echo "run=true" >> "${GITHUB_OUTPUT}"
+      #     elif git diff --name-only origin/${{ github.base_ref }} HEAD | grep -Eq '\.cpp$|\.cxx$|\.c$|\.hpp$|\.hxx$|\.h$' ; then
+      #       echo "run=true" >> "${GITHUB_OUTPUT}"
+      #       echo 'C/C++ code has changed, need to run clang-format.'
+      #     else
+      #       echo "run=false" >> "${GITHUB_OUTPUT}"
+      #     fi
+      - name: Check files for flake8
+        id: flake8
+        run: |
+          if [ "${{ contains(github.event.pull_request.labels.*.name, 'run-ci/flake8') }}" = "true" ]; then
+            echo "run=true" >> "${GITHUB_OUTPUT}"
+          elif git diff --name-only origin/${{ github.base_ref }} HEAD | grep -Eq '.*\.py' ; then
+            echo "run=true" >> "${GITHUB_OUTPUT}"
+            echo 'Python files have changed, need to run flake8.'
+          else
+            echo "run=false" >> "${GITHUB_OUTPUT}"
+          fi
+      - name: Check files for golangci-lint
+        id: golangci-lint
+        run: |
+          if [ "${{ contains(github.event.pull_request.labels.*.name, 'run-ci/golangci-lint') }}" = "true" ]; then
+            echo "run=true" >> "${GITHUB_OUTPUT}"
+          elif git diff --name-only origin/"${{ github.base_ref }}" HEAD -- | grep -Eq '.*\.go'; then
+            echo "run=true" >> "${GITHUB_OUTPUT}"
+            echo 'Go code has changed, need to run golangci-lint.'
+          else
+            echo "run=false" >> "${GITHUB_OUTPUT}"
+          fi
+      - name: Check files for hadolint
+        id: hadolint
+        run: |
+          if [ "${{ contains(github.event.pull_request.labels.*.name, 'run-ci/hadolint') }}" = "true" ]; then
+            echo "run=true" >> "${GITHUB_OUTPUT}"
+          elif git diff --name-only origin/${{ github.base_ref }} HEAD | grep -Eq '.*Dockerfile.*' ; then
+            echo "run=true" >> "${GITHUB_OUTPUT}"
+            echo 'Dockerfiles have changed, need to run Hadolint.'
+          else
+            echo "run=false" >> "${GITHUB_OUTPUT}"
+          fi
+      - name: Check files for shellcheck
+        id: shellcheck
+        run: |
+          if [ "${{ contains(github.event.pull_request.labels.*.name, 'run-ci/shellcheck') }}" = "true" ]; then
+            echo "run=true" >> "${GITHUB_OUTPUT}"
+          elif git diff --name-only origin/${{ github.base_ref }} HEAD | grep -Eq '\.sh(\.in)?$' ; then
+            echo "run=true" >> "${GITHUB_OUTPUT}"
+            echo 'Shell scripts have changed, need to run shellcheck.'
+          else
+            echo "run=false" >> "${GITHUB_OUTPUT}"
+          fi
+      - name: Check files for yamllint
+        id: yamllint
+        run: |
+          if [ "${{ contains(github.event.pull_request.labels.*.name, 'run-ci/yamllint') }}" = "true" ]; then
+            echo "run=true" >> "${GITHUB_OUTPUT}"
+          elif git diff --name-only origin/${{ github.base_ref }} HEAD | grep -Eq '.*\.ya?ml|python\.d/.*\.conf' ; then
+            echo "run=true" >> "${GITHUB_OUTPUT}"
+            echo 'YAML files have changed, need to run yamllint.'
+          else
+            echo "run=false" >> "${GITHUB_OUTPUT}"
+          fi
+
+  actionlint:
+    name: actionlint
+    needs: prep-review
+    if: needs.prep-review.outputs.actionlint == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Git clone repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+          fetch-depth: 0
+      - name: Run actionlint
+        uses: reviewdog/action-actionlint@1758727be30241166609dad4c97588b6ad411f32 # v1.79.1
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          reporter: github-pr-check
+      - name: Test CI workflow file selection
+        run: python3 .github/scripts/test-ci-workflow-file-selection.py
+
+#  clang-format:
+#    name: clang-format
+#    needs: prep-review
+#    if: needs.prep-review.outputs.clangformat == 'true'
+#    runs-on: ubuntu-latest
+#    steps:
+#      - name: Git clone repository
+#        uses: actions/checkout@v7
+#        with:
+#          submodules: false
+#          fetch-depth: 0
+#      - name: Check for label
+#        id: label
+#        run: |
+#          if [ "${{ contains(github.event.pull_request.labels.*.name, 'run-ci/clang-format') }}" = "true" ]; then
+#            echo 'check-all=true' >> "${GITHUB_OUTPUT}"
+#          else
+#            echo 'check-all=false' >> "${GITHUB_OUTPUT}"
+#          fi
+#      - name: Run clang-format
+#        run: |
+#          if [ "${{ steps.label.outputs.check-all }}" == 'true' ]; then
+#            find . -regex '.*\.\(c\|cpp\|cxx\|h\|hpp\|hxx\)$' -exec clang-format -i --style=file '{}' \;
+#          else
+#            git diff --name-only origin/${{ github.base_ref }} HEAD | grep -E '\.cpp$|\.cxx$|\.c$|\.hpp$|\.hxx$|\.h$' | \
+#            xargs -n 1 -r clang-format -i --style=file
+#          fi
+#          git status --porcelain=v1 > /tmp/porcelain
+#          if [ -s /tmp/porcelain ]; then
+#            cat /tmp/porcelain
+#            exit 1
+#          fi
+
+  flake8:
+    name: flake8
+    needs: prep-review
+    if: needs.prep-review.outputs.flake8 == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Git clone repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+          fetch-depth: 0
+      - name: Setup Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.10"
+      - name: Run flake8
+        uses: reviewdog/action-flake8@b65981e158319f08cb7d0132f28bc0081e110adc # v3.15.2
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          reporter: github-pr-check
+
+  golangci-lint:
+    name: golangci-lint
+    needs: prep-review
+    if: needs.prep-review.outputs.golangci-lint == 'true'
+    strategy:
+      matrix:
+        tree:
+          - src/go
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Run golangci-lint
+        uses: reviewdog/action-golangci-lint@284129a3ac23bc5d8ac1522e0b6511df74a8836d # v2.10.2
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          reporter: github-pr-check
+          golangci_lint_flags: '--timeout=10m'
+          workdir: ${{ matrix.tree }}
+
+  hadolint:
+    name: hadolint
+    needs: prep-review
+    if: needs.prep-review.outputs.hadolint == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Git clone repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Run hadolint
+        uses: reviewdog/action-hadolint@1df92335c6c70880e301926d46148aeb27de1912 # v1.55.0
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          reporter: github-pr-check
+
+  shellcheck:
+    name: shellcheck
+    needs: prep-review
+    if: needs.prep-review.outputs.shellcheck == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Git clone repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+          fetch-depth: 0
+      - name: Run shellcheck
+        uses: reviewdog/action-shellcheck@d0b8d5fd7fad6afdb6e1b6ce1778892be4d1f427 # v1.34.1
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          reporter: github-pr-check
+          path: "."
+          pattern: |
+            *.sh
+            *.sh.in
+          exclude: |
+            ./.git/*
+            packaging/makeself/makeself.sh
+            packaging/makeself/makeself-header.sh
+            ./fluent-bit/*
+
+  yamllint:
+    name: yamllint
+    needs: prep-review
+    if: needs.prep-review.outputs.yamllint == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Git clone repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+          fetch-depth: 0
+      - name: Run yamllint
+        uses: reviewdog/action-yamllint@5dd4640db975e4cac6f4e775a401695bafc28068 # v1.25.1
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          reporter: github-pr-check

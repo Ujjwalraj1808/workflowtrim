@@ -1,0 +1,24 @@
+name: govulncheck
+on:
+  push:
+    paths:
+      - go.sum
+  schedule:
+    - cron: "0 0 * * *"
+  workflow_dispatch: {}
+
+permissions: read-all
+
+jobs:
+  govulncheck:
+    name: govulncheck
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Install Go
+        uses: ./.github/actions/setup-go
+      - name: Install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
+      - name: Run govulncheck
+        run: govulncheck -format=text ./...

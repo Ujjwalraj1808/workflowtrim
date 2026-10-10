@@ -1,0 +1,50 @@
+name: Test Suite Lint & Test
+
+on:
+  workflow_dispatch: {}
+  push:
+    branches: [main]
+    paths:
+      - apps/test-suite/**
+  pull_request:
+    paths:
+      - apps/test-suite/**
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: 👀 Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: 🔨 Install pnpm
+        uses: pnpm/setup@703c52620218391530e48b9e8870d5c0082e1b9b # v2.1.0
+        with:
+          install: false
+      - name: ⬢ Setup Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: 'pnpm'
+      - name: 📦 Install dependencies
+        run: pnpm install --ignore-scripts --frozen-lockfile
+      - name: 🛠 Build app dependencies
+        run: pnpm turbo build --filter test-suite...
+        env:
+          TURBO_TOKEN: ${{ secrets.TURBO_TOKEN }}
+          TURBO_TEAM: expo
+      - name: 🚨 Lint test-suite files
+        run: pnpm lint --max-warnings 0
+        working-directory: apps/test-suite
+      - name: 💅 Check formatting
+        run: pnpm format --check
+        working-directory: apps/test-suite
+      - name: 🔍 Type check test-suite files
+        run: pnpm tsc
+        working-directory: apps/test-suite
+      - name: 🧪 Run unit tests
+        run: pnpm test
+        working-directory: apps/test-suite

@@ -1,0 +1,41 @@
+---
+name: Cleans all preview pages for gh-pages
+
+permissions:
+  contents: write
+
+on:
+  schedule:
+    - cron: "0 0 * * *"
+
+jobs:
+  clean:
+    name: Clean
+    runs-on: ubuntu-26.04
+    steps:
+      - name: ⏬ Checkout repo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: 📥 Get gh-pages tar
+        run: wget --quiet https://github.com/db-ux-design-system/core-web/tarball/gh-pages
+
+      - name: ➕ Create public dir
+        run: mkdir public
+
+      - name: 📦 Unpack Tar
+        run: tar --gzip --extract --file gh-pages --directory public --strip-components 1
+
+      - name: 🗑️ Clean all preview pages
+        id: cleanup
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          result-encoding: json
+          script: |
+            const { default: cleanUpPages } = await import('${{ github.workspace }}/scripts/github/cleanup-gh-pages.js');
+            return await cleanUpPages({github, context});
+
+      - name: 🥅 Deploy to GH-Pages
+        uses: peaceiris/actions-gh-pages@84c30a85c19949d7eee79c4ff27748b70285e453 # v4.1.0
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./public

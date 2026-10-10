@@ -1,0 +1,26 @@
+name: Build
+
+on:
+  push:
+    branches: "**"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Setup java
+        uses: actions/setup-java@v6
+        with:
+          java-version: 17
+          distribution: temurin
+      - name: Build with SonarCloud
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        run: |
+          mvn -B clean
+          mvn -B jacoco:prepare-agent install jacoco:report
+          mvn -B -Dsonar.host.url=https://sonarcloud.io -Dsonar.organization=porscheinformatik org.sonarsource.scanner.maven:sonar-maven-plugin:sonar

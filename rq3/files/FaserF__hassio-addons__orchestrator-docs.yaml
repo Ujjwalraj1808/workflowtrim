@@ -1,0 +1,56 @@
+name: Orchestrator Docs & Standards
+
+permissions:
+  contents: write
+  pull-requests: write
+
+on:
+  schedule:
+    - cron: "0 0 * * 1" # Weekly check
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - "apache2/Dockerfile"
+      - "apache2-minimal-mariadb/Dockerfile"
+      - "nginx/Dockerfile"
+      - ".scripts/update_php_info.py"
+  workflow_dispatch:
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  doc-audit:
+    name: 📚 Documentation Audit
+    runs-on: ubuntu-latest
+    steps:
+      - name: ⤵️ Check out code
+        uses: actions/checkout@v7
+      - name: 📝 Update Templates
+        run: |
+          python3 .scripts/sync_templates.py
+
+      - name: 📄 Standardize READMEs & Configs (Auto-Fix)
+        run: |
+          python3 .scripts/standardize_readmes.py
+
+      - name: 📖 Badge & Style Audit (Auto-Fix)
+        run: |
+          python3 .scripts/check_docs.py --fix
+
+      - name: 🐘 Update PHP Info
+        run: |
+          python3 .scripts/update_php_info.py
+
+      - name: 🔄 Pull latest changes (Handle non-fast-forward)
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git pull --rebase --autostash origin master
+
+      - name: 💾 Commit Changes
+        uses: stefanzweifel/git-auto-commit-action@v7
+        with:
+          commit_message: "docs: auto-update documentation standards"

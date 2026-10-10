@@ -1,0 +1,76 @@
+name: CI
+on:
+    push:
+        branches: [master]
+    pull_request:
+        branches: [master]
+jobs:
+    test:
+        runs-on: ubuntu-latest
+        strategy:
+            matrix:
+                node-version: [22, 24]
+        steps:
+            - uses: actions/checkout@v4
+            - uses: actions/setup-node@v4
+              with:
+                  node-version: ${{ matrix.node-version }}
+                  cache: npm
+            - run: npm ci
+            - run: npm run typecheck
+            - run: npm test
+    build:
+        runs-on: ubuntu-latest
+        needs: test
+        steps:
+            - uses: actions/checkout@v4
+            - uses: actions/setup-node@v4
+              with:
+                  node-version: 22
+                  cache: npm
+            - run: npm ci
+            - run: npm run build
+    e2e:
+        runs-on: ubuntu-latest
+        needs: build
+        steps:
+            - uses: actions/checkout@v4
+            - uses: actions/setup-node@v4
+              with:
+                  node-version: 22
+                  cache: npm
+            - run: npm ci
+            - run: npm run build
+            - uses: oven-sh/setup-bun@v2
+            - run: npm install -g opencode-stable
+            - name: Run E2E scenarios
+              run: |
+                  SKIP_BUILD=1 ./scripts/e2e/run-e2e.sh \
+                    scripts/e2e/scenarios/01-basic-compress.json \
+                    scripts/e2e/scenarios/02-quality-reject.json \
+                    scripts/e2e/scenarios/03-quality-acknowledge.json \
+                    scripts/e2e/scenarios/04-batch-compress.json \
+                    scripts/e2e/scenarios/05-subagent-compress.json \
+                    scripts/e2e/scenarios/06-nudge-triggered.json \
+                    scripts/e2e/scenarios/07-protection-filtered.json \
+                    scripts/e2e/scenarios/08-nudge-with-protection.json \
+                    scripts/e2e/scenarios/09-nudge-refire-after-compress.json \
+                    scripts/e2e/scenarios/10-autonomous-nudge-refire.json \
+                    scripts/e2e/scenarios/11-tier2-baseline-preserved-after-compress.json \
+                    scripts/e2e/scenarios/12-consumed-call-hiding.json \
+                    scripts/e2e/scenarios/13-adaptive-compression-candidates.json
+            - name: Dump diagnostics on failure
+              if: failure()
+              run: |
+                  echo "=== opencode logs ==="
+                  find /tmp/acp-e2e -name '*.log' -exec cat {} \; 2>/dev/null || echo "(no logs)"
+                  echo "=== turn 1 output (first 30 lines) ==="
+                  head -30 /tmp/acp-e2e-turn-1.json 2>/dev/null || echo "(no turn output)"
+                  echo "=== turn 4 output (first 30 lines) ==="
+                  head -30 /tmp/acp-e2e-turn-4.json 2>/dev/null || echo "(no turn output)"
+                  echo "=== fake LLM log ==="
+                  cat /tmp/acp-e2e-fakellm.log 2>/dev/null || echo "(no fake LLM log)"
+                  echo "=== observations ==="
+                  cat /tmp/acp-e2e-observations.json 2>/dev/null || echo "(no observations)"
+                  echo "=== storage tree ==="
+                  find /tmp/acp-e2e/.local/share/opencode -type f 2>/dev/null | head -20 || echo "(no storage)"

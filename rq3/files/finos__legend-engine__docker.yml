@@ -1,0 +1,74 @@
+# Copyright 2022 Goldman Sachs
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: Docker
+
+# Scans the images we actually publish, rather than rebuilding a stand-in from a
+# Dockerfile. The `snapshot` tag is republished on every master merge, so base
+# image bumps and dependency changes reach this scan without any path triggers.
+on:
+  schedule:
+    - cron: "0 0 * * 2" # every Tuesday on default/base branch
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  scan:
+    name: Scan Published Images
+    if: github.repository == 'finos/legend-engine'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - id: engine-server
+            ref: finos/legend-engine-server-http-server:snapshot
+          - id: pure-ide-light
+            ref: finos/legend-engine-pure-ide-light-http-server:snapshot
+          - id: sql-postgres-server
+            ref: finos/legend-engine-xt-sql-postgres-server:snapshot
+    steps:
+      # upload-sarif associates the analysis with a commit, so it needs the repo
+      # present even though nothing here is built from source.
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Scan image for security issues
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          # TODO: we should probably also setup misconfiguration scanning
+          # See https://github.com/aquasecurity/trivy-action#using-trivy-to-scan-infrastucture-as-code
+          scan-type: image
+          image-ref: ${{ matrix.image.ref }}
+          scanners: vuln
+          format: sarif
+          output: trivy-${{ matrix.image.id }}.sarif
+          # Ignore unpatched/unfixed vulnerabilities/CVEs
+          ignore-unfixed: true
+          severity: CRITICAL,HIGH
+          # Findings are reported to the Security tab rather than failing the
+          # run, so they are triaged alongside Dependabot alerts.
+          exit-code: 0
+          # Manually increase timeout as the default 2-minute is not enough
+          # See https://github.com/aquasecurity/trivy/issues/802
+          timeout: 20m
+
+      - name: Upload results to the Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-${{ matrix.image.id }}.sarif
+          category: container-${{ matrix.image.id }}

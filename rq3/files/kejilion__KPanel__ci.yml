@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - "feature/**"
+      - "fix/**"
+      - "docs/**"
+      - "release/**"
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.27.2"
+          cache: true
+
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24.21.0"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Run change-aware verification
+        env:
+          GOVERNANCE_CI_TOKEN: ${{ github.token }}
+          VERIFY_BASE_REF: ${{ github.event.pull_request.base.sha || (github.event.before != '0000000000000000000000000000000000000000' && github.event.before) || 'origin/main' }}
+        run: make verify-change
+
+      - name: Detect races in privileged core packages
+        run: go test -race ./internal/panel ./internal/auth ./internal/dockerx
+
+      - name: Scan Go call paths for known vulnerabilities
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
+
+      - name: Audit Node dependencies
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            if npm audit --prefix web --audit-level=high; then
+              exit 0
+            fi
+            if [[ "$attempt" -lt 3 ]]; then
+              sleep $((attempt * 10))
+            fi
+          done
+          exit 1
+
+      - name: Scan source, dependencies, secrets, and configuration
+        env:
+          TRIVY_CACHE_DIR: ${{ runner.temp }}/trivy-cache
+        run: bash scripts/security-scan.sh source
+
+      - name: Verify kejilion.sh application lifecycle
+        run: |
+          docker run --rm \
+            -e KPANEL_APP_CONF_TEST_ROOTFS=1 \
+            -v "$PWD:/src:ro" \
+            bash:5.2.37-alpine3.22@sha256:3bee76a96d86d5d2d5efc7c1c570e5a7c95db22348a26944e0e546fa174e3324 \
+            bash /src/packaging/tests/app-conf-lifecycle.sh /src
+          docker run --rm \
+            -e KPANEL_APP_CONF_TEST_ROOTFS=1 \
+            -v "$PWD:/src:ro" \
+            alpine:3.24@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b \
+            sh -ec 'apk add --no-cache bash >/dev/null && bash /src/packaging/tests/app-conf-openrc-lifecycle.sh /src'

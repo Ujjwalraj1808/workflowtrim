@@ -1,0 +1,47 @@
+name: Release notes
+
+# 打 tag 推送后自动跑：CHANGELOG 该版小节 + 现场生成的 ### i18n，创建/更新 GitHub Release。
+# 本地手动流程（docs/release.md 第 7 步）只做预览确认；这里是 Release 公示的最终写入口。
+# 已存在同名 Release 则更新 notes（幂等，失败可重推 tag 或手动重跑）。
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  notes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+
+      - name: Compose release notes (CHANGELOG section + fresh i18n)
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          VER="${TAG#v}"
+          PREV="$(git tag --sort=-v:refname | grep -vx "$TAG" | head -n 1)"
+          if [ -z "$PREV" ]; then echo "no previous tag found"; exit 1; fi
+          echo "version=$VER base=$PREV"
+          node scripts/release-notes.mjs "$VER" --base "$PREV" --out /tmp/notes.md
+          echo "---- notes preview ----"
+          cat /tmp/notes.md
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --notes-file /tmp/notes.md
+          else
+            gh release create "$TAG" --title "$TAG" --notes-file /tmp/notes.md
+          fi

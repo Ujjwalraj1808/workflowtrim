@@ -1,0 +1,712 @@
+name: Integration Build
+
+permissions: {}
+
+on:
+  workflow_dispatch:        # Allows manual trigger
+    inputs:
+      java_version:
+        description: 'Java version to use'
+        type: choice
+        required: true
+        default: '["17"]'
+        options:
+          - '["17"]'
+          - '["21"]'
+          - '["25"]'
+          - '["17", "21"]'
+          - '["17", "25"]'
+          - '["21", "25"]'
+          - '["17", "21", "25"]'
+      skip_build:
+        description: 'Skip build: Deactivate to perform the regular project build. Required for release.'
+        type: boolean
+        default: true
+      skip_tests:
+        description: 'Skip tests: Skip test execution for faster build'
+        type: boolean
+        default: true
+      integration_tests:
+        description: 'Integration Tests: Enable/Disable'
+        type: boolean
+        default: true
+      testsuite:
+        description: 'Integration Tests: Test suite to run'
+        type: choice
+        required: true
+        default: '["engine", "webapps"]'
+        options:
+          - '["engine"]'
+          - '["webapps"]'
+          - '["engine", "webapps"]'
+      distro:
+        description: 'Integration Tests: Distribution to use'
+        type: choice
+        required: true
+        default: '["operaton", "tomcat", "wildfly"]'
+        options:
+          - '["operaton"]'
+          - '["tomcat"]'
+          - '["wildfly"]'
+          - '["operaton", "tomcat", "wildfly"]'
+      database:
+        description: 'Integration Tests: Database to use'
+        type: choice
+        required: true
+        default: '["h2"]'
+        options:
+          - '["h2"]'
+          - '["postgresql"]'
+          - '["postgresql-xa"]'
+          - '["mariadb"]'
+          - '["sqlserver"]'
+          - '["mysql"]'
+          - '["oracle"]'
+          - '["db2"]'
+          - '["h2", "postgresql"]'
+          - '["h2", "postgresql", "mariadb", "mysql", "oracle", "db2"]'
+      dry_run:
+        description: 'Dry Run: Skips remote operations when true'
+        type: boolean
+        required: true
+        default: false
+  push:
+    branches:
+      # when developing the workflow itself, create this branch and push to it
+      - main
+      - release/**
+      - ci-dev/integration-build
+    paths-ignore:
+      - '.github/workflows/**'
+      - '!.github/workflows/integration-build.yml'
+      - '.github/jreleaser/changelog.tpl'
+      - '.github/ISSUE_TEMPLATE/**'
+      - '.github/PULL_REQUEST_TEMPLATE/**'
+      - '.github/dependabot.yml'
+      - '.github/auto-merge.config.yml'
+      - '.claude/**'
+      - '**/*.md'
+      - 'distro/**'
+      - 'settings/**'
+      - '.gitingore'
+      - 'LICENSE'
+      - 'NOTICE'
+
+concurrency:
+  group: "${{ github.workflow }}-${{ github.ref }}"
+  cancel-in-progress: true
+
+jobs:
+  determine-pr-config:
+    name: Determine PR Configuration
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
+    outputs:
+      needs_integration_build: ${{ steps.check-pr.outputs.needs_build }}
+      needs_spring_boot_starter_tests: ${{ steps.check-pr.outputs.needs_spring_boot_starter_tests }}
+      java_versions: ${{ steps.compute-matrix.outputs.java_versions }}
+      distros: ${{ steps.compute-matrix.outputs.distros }}
+      databases: ${{ steps.compute-matrix.outputs.databases }}
+      testsuites: ${{ steps.compute-matrix.outputs.testsuites }}
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check PR conditions
+        id: check-pr
+        env:
+          PR_LABELS: ${{ toJson(github.event.pull_request.labels.*.name) }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+        run: |
+          echo "PR Labels: $PR_LABELS"
+          echo "PR Author: $PR_AUTHOR"
+
+          # Check if PR is from Dependabot
+          if [[ "$PR_AUTHOR" == "dependabot"* ]]; then
+            echo "🤖 PR is from Dependabot"
+            NEEDS_BUILD=true
+          # Check if PR has dependency label
+          elif echo "$PR_LABELS" | grep -q '"dependencies"'; then
+            echo "📦 PR has dependencies label"
+            NEEDS_BUILD=true
+          # Check if PR has distro: labels
+          elif echo "$PR_LABELS" | grep -q '"distro:'; then
+            echo "🏗️ PR has distro labels"
+            NEEDS_BUILD=true
+          # Check if PR has database: labels
+          elif echo "$PR_LABELS" | grep -q '"database:'; then
+            echo "🗄️ PR has database labels"
+            NEEDS_BUILD=true
+          else
+            echo "✅ PR doesn't require integration build"
+            NEEDS_BUILD=false
+          fi
+
+          # Detect scope:spring-boot label or changes to files that affect the Spring Boot Starter
+          NEEDS_SBS_TESTS=false
+          if echo "$PR_LABELS" | grep -q '"scope:spring-boot"'; then
+            echo "🍃 PR has scope:spring-boot label"
+            NEEDS_SBS_TESTS=true
+          elif [ "${{ github.event_name }}" = "pull_request" ]; then
+            CHANGED_FILES=$(git diff --name-only origin/${GITHUB_BASE_REF}...HEAD 2>/dev/null || true)
+            if echo "$CHANGED_FILES" | grep -qE '^(parent/pom\.xml|bom/|engine/pom\.xml|engine-dmn/)'; then
+              echo "📦 Changes to platform core files (parent/pom.xml, bom/, engine/pom.xml, engine-dmn/) affect the Spring Boot Starter"
+              NEEDS_SBS_TESTS=true
+            fi
+          fi
+          echo "needs_spring_boot_starter_tests=$NEEDS_SBS_TESTS" >> $GITHUB_OUTPUT
+
+          echo "needs_build=$NEEDS_BUILD" >> $GITHUB_OUTPUT
+      - name: Compute matrix values
+        id: compute-matrix
+        if: steps.check-pr.outputs.needs_build == 'true'
+        env:
+          PR_LABELS: ${{ toJson(github.event.pull_request.labels.*.name) }}
+        run: |
+          # Java version is always 17 for PR builds
+          JAVA_VERSIONS='["17"]'
+          echo "java_versions=$JAVA_VERSIONS" >> $GITHUB_OUTPUT
+
+          # Determine testsuites based on labels
+          if echo "$PR_LABELS" | grep -q '"dependencies:npm"'; then
+            # NPM dependency updates affect frontend, run webapps tests
+            TESTSUITES='["webapps"]'
+            echo "🎯 Using webapps testsuite for npm dependencies: $TESTSUITES"
+          else
+            # Default to engine tests for other PRs
+            TESTSUITES='["engine"]'
+            echo "🎯 Using default engine testsuite: $TESTSUITES"
+          fi
+          echo "testsuites=$TESTSUITES" >> $GITHUB_OUTPUT
+
+          # Determine distros based on labels
+          DISTRO_LABELS=$(echo "$PR_LABELS" | jq --raw-output '.[] | select(startswith("distro:")) | sub("distro:"; "")')
+          if [[ -n "$DISTRO_LABELS" ]]; then
+            # Convert to JSON array
+            DISTROS=$(echo "$DISTRO_LABELS" | jq --raw-input --slurp --compact-output 'split("\n") | map(select(. != ""))')
+            echo "🎯 Using specific distros from labels: $DISTROS"
+          else
+            # Default to all distros
+            DISTROS='["operaton", "tomcat", "wildfly"]'
+            echo "🎯 Using default distros: $DISTROS"
+          fi
+          echo "distros=$DISTROS" >> $GITHUB_OUTPUT
+
+          # Determine databases based on labels
+          DATABASE_LABELS=$(echo "$PR_LABELS" | jq --raw-output '.[] | select(startswith("database:")) | sub("database:"; "")')
+          if [[ -n "$DATABASE_LABELS" ]]; then
+            # Convert to JSON array
+            DATABASES=$(echo "$DATABASE_LABELS" | jq --raw-input --slurp --compact-output 'split("\n") | map(select(. != ""))')
+            echo "🎯 Using specific databases from labels: $DATABASES"
+          else
+            # Default to h2 only
+            DATABASES='["h2"]'
+            echo "🎯 Using default database: $DATABASES"
+          fi
+          echo "databases=$DATABASES" >> $GITHUB_OUTPUT
+
+  early-exit:
+    name: Early Exit Check
+    runs-on: ubuntu-latest
+    needs: determine-pr-config
+    if: github.event_name == 'pull_request' && needs.determine-pr-config.outputs.needs_integration_build == 'false' && needs.determine-pr-config.outputs.needs_spring_boot_starter_tests == 'false'
+    steps:
+      - name: Cancel workflow
+        run: |
+          echo "🚫 Integration build not needed for this PR"
+          echo "✅ No dependency/distro/database labels found"
+          echo "Workflow will be cancelled gracefully"
+          exit 0
+
+  build:
+    name: Build
+    strategy:
+      fail-fast: true
+      matrix:
+        java: ${{ github.event_name == 'pull_request' && needs.determine-pr-config.outputs.needs_integration_build == 'true' && fromJson(needs.determine-pr-config.outputs.java_versions) || fromJson(github.event.inputs.java_version || '["17", "21", "25"]') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    needs:
+      - determine-pr-config
+    if: |
+      always() && !cancelled() && github.event_name != 'push' && (
+        (github.event_name == 'workflow_dispatch' && github.event.inputs.skip_build == 'false') ||
+        (github.event_name == 'pull_request' && needs.determine-pr-config.outputs.needs_integration_build == 'true')
+      )
+    outputs:
+      version: ${{steps.maven-build.outputs.version}}
+      project_version: ${{steps.maven-build.outputs.project_version}}
+      database_version: ${{steps.maven-build.outputs.database_version}}
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Restore Maven packages
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.m2
+          key: "${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}"
+          restore-keys: ${{ runner.os }}-m2
+      - name: Set up Java
+        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: 'temurin'
+          java-version: ${{ matrix.java }}
+      - name: Maven Build
+        id: maven-build
+        shell: bash
+        env:
+          INPUT_SKIP_TESTS: ${{ github.event.inputs.skip_tests || false }}
+        run: |
+          .github/scripts/jacoco-create-flag-files.sh
+          PROJECT_VERSION=$(./mvnw help:evaluate -Dexpression=project.version -q -DforceStdout | tail -n 1)
+          RELEASE_VERSION=$(echo $PROJECT_VERSION | sed 's/-SNAPSHOT//')
+          echo "project_version=$PROJECT_VERSION" >> $GITHUB_OUTPUT
+          echo "project_version=$PROJECT_VERSION"
+          echo "version=$RELEASE_VERSION" >> $GITHUB_OUTPUT
+          echo "version=$RELEASE_VERSION"
+          DATABASE_VERSION=$(grep '<operaton.dbscheme.current.version>' database/pom.xml | sed -e 's/.*<operaton.dbscheme.current.version>\(.*\)<\/operaton.dbscheme.current.version>.*/\1/')
+          echo "database_version=$DATABASE_VERSION" >> $GITHUB_OUTPUT
+          echo "database_version=$DATABASE_VERSION"
+          SKIP_TESTS="${INPUT_SKIP_TESTS}"
+
+          # -Dmaven.build.cache.enabled=false: this job publishes artifacts, so
+          # everything it ships is built from source. The build cache is
+          # enabled only in build.yml and pr-build.yml. Passed explicitly
+          # rather than relying on the default in .mvn/maven.config.
+          CMD=".devenv/scripts/build/build.sh --profile=max --reports -Dmaven.build.cache.enabled=false"
+          if [ "$SKIP_TESTS" = "true" ]; then
+              CMD="$CMD --skip-tests"
+          fi
+          $CMD
+
+          .github/scripts/prepare-reports.sh
+          ./mvnw -Dmaven.build.cache.enabled=false -Psonatype-oss-release -DskipTests=true -Dskip.frontend.build=true deploy
+          find target -name maven-metadata.* -delete
+          ./mvnw --non-recursive org.jacoco:jacoco-maven-plugin:report-aggregate
+      # Run-scoped handoffs go through artifacts, NOT actions/cache: the repo
+      # cache pool is a shared 10 GB LRU, run-id-keyed entries were evicted
+      # mid-run (the recurring nightly Release failure) and pushed out the
+      # reusable m2 cache. Tarred first — thousands of small files upload
+      # slowly through upload-artifact.
+      # Only the Java 17 build's artifacts are consumed downstream (Release job,
+      # IT staging) — 17 is what ships. The 21/25 builds validate compile+test
+      # only; bundling their output would upload ~2 GB nobody reads.
+      - name: Bundle build artifacts
+        if: matrix.java == '17'
+        shell: bash
+        run: |
+          shopt -s globstar nullglob
+          for f in \
+            distro/**/*.tar.gz \
+            distro/**/*.zip \
+            distro/webjar/target/operaton-webapp-webjar-*.jar \
+            */staging-deploy/** \
+            **/target/reports/** \
+            **/target/surefire-reports/*.xml \
+            target/*.zip; do
+            [ -f "$f" ] && printf '%s\n' "$f"
+          done > /tmp/build-artifacts.lst
+          tar -czf /tmp/build-artifacts-${MATRIX_JAVA}.tar.gz --files-from /tmp/build-artifacts.lst
+        env:
+          MATRIX_JAVA: ${{ matrix.java }}
+      - name: Upload build artifacts
+        if: matrix.java == '17'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: build-artifacts-${{ matrix.java }}
+          path: /tmp/build-artifacts-${{ matrix.java }}.tar.gz
+          retention-days: 3
+          if-no-files-found: error
+      - name: Stage artifacts for integration tests
+        if: matrix.java == '17'
+        run: tar -czf /tmp/it-stage.tar.gz -C ~/.m2/repository org/operaton
+      - name: Upload staged artifacts
+        if: matrix.java == '17'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: it-stage
+          path: /tmp/it-stage.tar.gz
+          retention-days: 1
+          if-no-files-found: error
+
+  integration-tests:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: write
+    needs:
+      - determine-pr-config
+      - build
+    strategy:
+      fail-fast: false
+      matrix:
+        java: ${{ fromJson('["17"]') }}
+        testsuite: ${{ github.event_name == 'pull_request' && needs.determine-pr-config.outputs.needs_integration_build == 'true' && fromJson(needs.determine-pr-config.outputs.testsuites) || fromJson(github.event.inputs.testsuite || '["engine", "webapps"]') }}
+        distro: ${{ github.event_name == 'pull_request' && needs.determine-pr-config.outputs.needs_integration_build == 'true' && fromJson(needs.determine-pr-config.outputs.distros) || fromJson(github.event.inputs.distro || '["operaton", "tomcat", "wildfly"]') }}
+        database: ${{ github.event_name == 'pull_request' && needs.determine-pr-config.outputs.needs_integration_build == 'true' && fromJson(needs.determine-pr-config.outputs.databases) || fromJson(github.event.inputs.database || '["h2", "postgresql", "mariadb", "mysql", "oracle", "db2"]') }}
+        # Webapps tests only ever execute on h2 (both test steps are h2-gated);
+        # every other database produced a no-op cell that checked out, restored
+        # caches and exited without running anything.
+        exclude:
+          - testsuite: webapps
+            database: postgresql
+          - testsuite: webapps
+            database: postgresql-xa
+          - testsuite: webapps
+            database: mariadb
+          - testsuite: webapps
+            database: sqlserver
+          - testsuite: webapps
+            database: mysql
+          - testsuite: webapps
+            database: oracle
+          - testsuite: webapps
+            database: db2
+    # needs.build.result != 'failure' keeps the matrix off when the build broke,
+    # while still allowing a dispatch with skip_build=true (build skipped): the
+    # cells then fall back to building the tested modules themselves.
+    if: |
+      always() && !cancelled() && needs.build.result != 'failure' && (
+        (github.event_name == 'workflow_dispatch' && (github.event.inputs.integration_tests == 'true' || github.event.inputs.integration_tests == true)) ||
+        (github.event_name == 'pull_request' && needs.determine-pr-config.outputs.needs_integration_build == 'true')
+      )
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Restore Maven packages
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.m2
+          key: "${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}"
+          restore-keys: ${{ runner.os }}-m2
+      - name: Restore staged artifacts
+        if: needs.build.result == 'success'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: it-stage
+          path: /tmp
+      - name: Unpack staged artifacts
+        if: needs.build.result == 'success'
+        run: mkdir -p ~/.m2/repository && tar -xzf /tmp/it-stage.tar.gz -C ~/.m2/repository
+      - name: Set up Java
+        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: 'temurin'
+          java-version: ${{ matrix.java }}
+      - name: Execute Engine Integration Tests
+        id: maven-engine-integration-tests
+        if: ${{ matrix.testsuite == 'engine' }}
+        shell: bash
+        env:
+          MATRIX_TESTSUITE: ${{ matrix.testsuite }}
+          MATRIX_DISTRO: ${{ matrix.distro }}
+          MATRIX_DATABASE: ${{ matrix.database }}
+        run: |
+          NO_BUILD=""
+          if [ "${{ needs.build.result }}" = "success" ]; then NO_BUILD="--no-build"; fi
+          .devenv/scripts/build/build-and-run-integration-tests.sh $NO_BUILD --testsuite=${MATRIX_TESTSUITE} --distro=${MATRIX_DISTRO} --db=${MATRIX_DATABASE}
+      - name: Execute Webapps Integration Tests
+        id: maven-webapps-integration-tests
+        if: ${{ matrix.testsuite == 'webapps' && matrix.database == 'h2' }}
+        shell: bash
+        env:
+          MATRIX_TESTSUITE: ${{ matrix.testsuite }}
+          MATRIX_DISTRO: ${{ matrix.distro }}
+          MATRIX_DATABASE: ${{ matrix.database }}
+        run: |
+          NO_BUILD=""
+          if [ "${{ needs.build.result }}" = "success" ]; then NO_BUILD="--no-build"; fi
+          .github/scripts/install-chrome-and-driver.sh
+          .devenv/scripts/build/build-and-run-integration-tests.sh $NO_BUILD --testsuite=${MATRIX_TESTSUITE} --distro=${MATRIX_DISTRO} --db=${MATRIX_DATABASE}
+      - name: Execute Database Upgrade Tests
+        id: maven-db-upgrade-tests
+        if: ${{ matrix.database == 'h2' }}
+        shell: bash
+        env:
+          MATRIX_DATABASE: ${{ matrix.database }}
+        run: |
+          .devenv/scripts/build/build-and-run-database-update-tests.sh --db=${MATRIX_DATABASE} --no-build
+      - name: Publish Test Report
+        if: ${{ matrix.testsuite != 'webapps' || matrix.database == 'h2' }}
+        uses: mikepenz/action-junit-report@a9170d5795813c01ab4901ffb045b52bab4ab09d #v6.5.0
+        with:
+          # TEST-*.xml only: the glob must not match failsafe-summary.xml,
+          # which has no testsuite root and makes the action emit annotations
+          report_paths: ${{ github.workspace }}/**/target/*-reports/TEST-*.xml
+          require_passed_tests: true
+      - name: Upload Artifacts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: surefire-reports-${{ matrix.testsuite }}-${{ matrix.distro }}-${{ matrix.database }}
+          path: |
+            ${{ github.workspace }}/**/target/surefire-reports/**
+            ${{ github.workspace }}/**/target/failsafe-reports/**
+            ${{ github.workspace }}/qa/**/target/**/logs/**
+            ${{ github.workspace }}/**/target/cargo.log
+          retention-days: 30
+          overwrite: true
+
+  spring-boot-starter-integration-tests:
+    name: Spring Boot Starter Integration Tests
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: write
+    needs:
+      - determine-pr-config
+    if: |
+      always() && !cancelled() && (
+        (github.event_name == 'workflow_dispatch' && (github.event.inputs.integration_tests == 'true' || github.event.inputs.integration_tests == true)) ||
+        (github.event_name == 'pull_request' && needs.determine-pr-config.outputs.needs_spring_boot_starter_tests == 'true')
+      )
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Restore Maven packages
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.m2
+          key: "${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}"
+          restore-keys: ${{ runner.os }}-m2
+      - name: Set up Java
+        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+      - name: Execute Spring Boot Starter Integration Tests
+        id: maven-spring-boot-starter-integration-tests
+        shell: bash
+        run: |
+          .devenv/scripts/build/build-and-run-spring-boot-starter.sh
+      - name: Publish Test Report
+        if: always()
+        uses: mikepenz/action-junit-report@a9170d5795813c01ab4901ffb045b52bab4ab09d #v6.5.0
+        with:
+          report_paths: ${{ github.workspace }}/spring-boot-starter/**/target/failsafe-reports/TEST-*.xml
+          require_passed_tests: true
+      - name: Upload Artifacts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: failsafe-reports-spring-boot-starter
+          path: |
+            ${{ github.workspace }}/spring-boot-starter/**/target/surefire-reports/**
+            ${{ github.workspace }}/spring-boot-starter/**/target/failsafe-reports/**
+          retention-days: 30
+          overwrite: true
+
+  documentation:
+    name: Documentation
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    needs:
+      - determine-pr-config
+    if: |
+      always() && !cancelled() && (
+        github.event_name == 'workflow_dispatch' && github.event.inputs.skip_build == 'false'
+      )
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Documentation
+        if: always()
+        run: |
+          .devenv/scripts/build/javadoc.sh
+          .devenv/scripts/build/check-api-compatibility.sh
+          .devenv/scripts/build/rest-api-doc.sh
+      - name: Upload documentation artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: documentation-artifacts
+          path: target/*.zip
+          retention-days: 3
+          if-no-files-found: error
+
+  deploy-snapshots:
+    name: Deploy Snapshots
+    needs:
+      - build
+      - integration-tests
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    if: |
+      always() && !cancelled() && (
+        github.event_name == 'workflow_dispatch' && github.event.inputs.skip_build == 'false'
+      )
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: zulu
+          java-version: 17
+      - name: Restore Maven packages
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.m2
+          key: "${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}"
+          restore-keys: ${{ runner.os }}-m2
+      - name: Import GPG key
+        shell: bash
+        run: |
+          echo "$GPG_SECRET_KEY" | gpg --batch --import
+          gpg --list-secret-keys --keyid-format LONG
+        env:
+          GPG_SECRET_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+      - name: Create settings.xml
+        env:
+          USERNAME: ${{ secrets.OSSRH_USERNAME2 }}
+          PASSWORD: ${{ secrets.OSSRH_PASSWORD2 }}
+        shell: bash
+        run: |
+          cat > .mvn/settings.xml <<EOF
+          <settings>
+          <servers>
+           <server>
+             <id>central</id>
+             <username>$USERNAME</username>
+             <password>$PASSWORD</password>
+           </server>
+          </servers>
+          </settings>
+          EOF
+      - name: Deploy to Maven Central
+        run: |
+          ./mvnw -Dmaven.build.cache.enabled=false deploy -DskipTests -s ./.mvn/settings.xml -Psonatype-oss-snapshot,-distro
+        env:
+          MAVEN_GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+
+  release:
+    name: Release
+    needs:
+      - build
+      - integration-tests
+      - documentation
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      checks: write
+    if: |
+      always() && !cancelled() && (
+        github.event_name == 'workflow_dispatch' && github.event.inputs.skip_build == 'false'
+      )
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # Explicitly the Java 17 build's artifacts — the previous run-id cache key
+      # was written by whichever build matrix job finished first.
+      - name: Download build artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: build-artifacts-17
+          path: /tmp
+      - name: Unpack build artifacts
+        run: tar -xzf /tmp/build-artifacts-17.tar.gz
+
+      - name: Download documentation artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: documentation-artifacts
+          path: target
+
+      - name: Release with JReleaser
+        uses: jreleaser/release-action@90ac653bb9c79d11179e65d81499f3f34527dcd5 # 2.5.0
+        env:
+          JRELEASER_PROJECT_VERSION: ${{needs.build.outputs.project_version}}
+          JRELEASER_GITHUB_TOKEN: ${{secrets.GITHUB_TOKEN}}
+          JRELEASER_GPG_PUBLIC_KEY: ${{secrets.GPG_PUBLIC_KEY}}
+          JRELEASER_GPG_SECRET_KEY: ${{secrets.GPG_PRIVATE_KEY}}
+          JRELEASER_GPG_PASSPHRASE: ${{secrets.GPG_PASSPHRASE}}
+          JRELEASER_MAVENCENTRAL_USERNAME: ${{secrets.OSSRH_USERNAME}}
+          JRELEASER_MAVENCENTRAL_PASSWORD: ${{secrets.OSSRH_PASSWORD}}
+          JRELEASER_DRY_RUN: ${{ github.event.inputs.dry_run }}
+          JRELEASER_PRERELEASE_ENABLED: true
+          JRELEASER_PROJECT_SNAPSHOT_LABEL: ${{needs.build.outputs.project_version}}
+        with:
+          arguments: full-release -POPERATON_DATABASE_VERSION=${{needs.build.outputs.database_version}}
+
+      - name: Publish Test Report
+        if: ${{ github.event.inputs.skip_tests == 'false'}}
+        uses: mikepenz/action-junit-report@a9170d5795813c01ab4901ffb045b52bab4ab09d #v6.5.0
+        with:
+          report_paths: ${{ github.workspace }}/**/target/surefire-reports/TEST-*.xml
+          require_passed_tests: true
+
+      - name: Archive Reports
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: reports
+          path: |
+            **/target/reports/**
+
+      - name: Archive Staging Repo
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: staging
+          path: |
+            ./*/staging-deploy/**
+          retention-days: 10
+
+  post_release:
+    name: Post-Release
+    runs-on: ubuntu-latest
+    needs:
+      - build
+      - release
+    if: |
+      always() && !cancelled() && (
+        github.event_name == 'workflow_dispatch' && github.event.inputs.dry_run == 'false'
+      )
+    steps:
+      - name: Notify Docker Repository
+        env:
+          DOCKER_ACTION_DISPATCH_TOKEN: ${{ secrets.DOCKER_ACTION_DISPATCH_TOKEN }}
+          NEEDS_BUILD_OUTPUTS_VERSION: ${{ needs.build.outputs.version}}
+        run: |
+          response=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
+            -H "Authorization: Bearer $DOCKER_ACTION_DISPATCH_TOKEN" \
+            -H "Accept: application/vnd.github.v3+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            -d '{"ref":"main","inputs":{"version": "${NEEDS_BUILD_OUTPUTS_VERSION}","snapshot": "true"}}' \
+            https://api.github.com/repos/operaton/operaton-docker/actions/workflows/build-test-and-publish.yml/dispatches)
+          if [ "$response" -ne 204 ]; then
+            echo "Failed to notify Docker repository. HTTP response code: $response"
+            exit 1
+          fi
+      - name: Upload server logs on failure
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: server-logs
+          path: |
+            qa/wildfly-runtime/target/server/wildfly-*.Final/standalone/log
+            qa/tomcat-runtime/target/server/apache-tomcat-*/logs
+          if-no-files-found: ignore
+

@@ -1,0 +1,2438 @@
+name: CI - KSail
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  merge_group:
+  workflow_dispatch:
+    inputs:
+      run_system_tests:
+        description: "Run system tests"
+        required: false
+        type: boolean
+        default: true
+      run_local_recovery_trial:
+        description: "Run the provider-free local recovery trial and always-on security checks"
+        required: false
+        type: boolean
+        default: false
+
+env:
+  # Comma, not pipe: Go falls back to direct only when the proxy answers 404/410. A pipe also
+  # falls back on a transient proxy error, and direct cannot serve every pinned module (a
+  # test-only transitive dependency can name a tag the upstream repo no longer has), so a
+  # momentary proxy blip would surface as a bogus "unknown revision" dependency failure.
+  GOPROXY: "https://proxy.golang.org,direct"
+  # Soft memory limit for Go build toolchain (compiler, linker). The KSail
+  # binary links a large dependency tree and the Go linker can exceed the
+  # default runner memory on cache-miss builds. Setting GOMEMLIMIT makes the
+  # GC work harder to stay within budget, reducing peak RSS.
+  GOMEMLIMIT: "6GiB"
+
+concurrency:
+  # On main each run is its own verification record, so it gets a run-unique
+  # group. Sharing a group there is not made safe by cancel-in-progress alone: a
+  # group holds one running plus one pending run, and a third merge cancels the
+  # pending one — so the second merge's checks would still be lost. A unique key
+  # means nothing on main ever queues behind, or evicts, anything else.
+  #
+  # Pull requests and merge-queue entries keep the ref-keyed group, so superseded
+  # runs there still cancel exactly as before.
+  # An opted-in local recovery trial cannot cancel ordinary CI on the same ref.
+  group: "ci-ksail-${{ github.workflow }}-${{ github.ref == 'refs/heads/main' && github.run_id || github.ref }}${{ inputs.run_local_recovery_trial && '-local-recovery-trial' || '' }}"
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions: {}
+
+jobs:
+  # cancel-stale-merge-queue — kept for future use when jobs are moved to merge_group
+  # cancel-stale-merge-queue:
+  #   name: 🧹 Cancel Stale Merge Queue Runs
+  #   if: github.event_name == 'merge_group'
+  #   runs-on: ubuntu-latest
+  #   timeout-minutes: 2
+  #   permissions:
+  #     actions: write
+  #   steps:
+  #     - name: Cancel previous runs for same merge queue entry
+  #       uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+  #       with:
+  #         script: |
+  #           const ref = context.ref;
+  #           const match = ref.match(/^(refs\/heads\/gh-readonly-queue\/.+)-[0-9a-f]+$/);
+  #           if (!match) {
+  #             console.log('Not a merge queue ref, skipping');
+  #             return;
+  #           }
+  #           const stablePrefix = match[1];
+  #
+  #           for (const status of ['in_progress', 'queued']) {
+  #             let page = 1;
+  #             while (true) {
+  #               const { data: { workflow_runs: runs } } = await github.rest.actions.listWorkflowRuns({
+  #                 owner: context.repo.owner,
+  #                 repo: context.repo.repo,
+  #                 workflow_id: 'ci.yaml',
+  #                 event: 'merge_group',
+  #                 status,
+  #                 per_page: 100,
+  #                 page,
+  #               });
+  #
+  #               if (runs.length === 0) break;
+  #
+  #               for (const run of runs) {
+  #                 if (run.run_number >= context.runNumber) continue;
+  #                 const runRef = `refs/heads/${run.head_branch}`;
+  #                 const runMatch = runRef.match(/^(refs\/heads\/gh-readonly-queue\/.+)-[0-9a-f]+$/);
+  #                 if (runMatch && runMatch[1] === stablePrefix) {
+  #                   console.log(`Cancelling stale run ${run.id} (${runRef})`);
+  #                   try {
+  #                     await github.rest.actions.cancelWorkflowRun({
+  #                       owner: context.repo.owner,
+  #                       repo: context.repo.repo,
+  #                       run_id: run.id,
+  #                     });
+  #                   } catch (error) {
+  #                     if (error && (error.status === 409 || error.status === 422)) {
+  #                       console.log(`Skipping run ${run.id}; it is no longer cancellable (${error.status})`);
+  #                       continue;
+  #                     }
+  #                     throw error;
+  #                   }
+  #                 }
+  #               }
+  #
+  #               if (runs.length < 100) break;
+  #               page += 1;
+  #             }
+  #           }
+
+  # Wait for sufficient GitHub API rate limit before proceeding
+  rate-limit-gate:
+    name: ⏳ Rate Limit Gate
+    if: github.event_name != 'merge_group' && !inputs.run_local_recovery_trial
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: 📄 Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/rate-limit-gate
+        with:
+          # Stay under this job's 5-minute timeout so the gate can report an outage or exhaustion
+          # itself instead of being cancelled by the runner.
+          max-wait: "240"
+
+  # Detect which file categories changed to conditionally run jobs
+  changes:
+    name: 🔍 Detect Changes
+    if: github.event_name != 'merge_group'
+    needs: [rate-limit-gate]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+      dependency-test-graph: ${{ steps.filter.outputs.dependency-test-graph }}
+      dependency-contracts: ${{ steps.filter.outputs.dependency-contracts }}
+      govuln-allowlist: ${{ steps.filter.outputs.govuln-allowlist }}
+      release-graph-audit: ${{ steps.filter.outputs.release-graph-audit }}
+      todos-contract: ${{ steps.filter.outputs.todos-contract }}
+      release-config: ${{ steps.filter.outputs.release-config }}
+      system-test: ${{ steps.filter.outputs.system-test }}
+      schema: ${{ steps.filter.outputs.schema }}
+      cli: ${{ steps.filter.outputs.cli }}
+      vsce: ${{ steps.filter.outputs.vsce }}
+      docs: ${{ steps.filter.outputs.docs }}
+      docs-deps: ${{ steps.filter.outputs.docs-deps }}
+      vsce-deps: ${{ steps.filter.outputs.vsce-deps }}
+      copilot-plugin: ${{ steps.filter.outputs.copilot-plugin }}
+      operator-chart: ${{ steps.filter.outputs.operator-chart }}
+      calico-cni: ${{ steps.filter.outputs.calico-cni }}
+      cask-pr-handoff: ${{ steps.filter.outputs.cask-pr-handoff }}
+      eks-smoke-scripts: ${{ steps.filter.outputs.eks-smoke-scripts }}
+      k3k-sentinel-scripts: ${{ steps.filter.outputs.k3k-sentinel-scripts }}
+      rate-limit-gate-script: ${{ steps.filter.outputs.rate-limit-gate-script }}
+      hetzner-cleanup-script: ${{ steps.filter.outputs.hetzner-cleanup-script }}
+      gitops-assert-scripts: ${{ steps.filter.outputs.gitops-assert-scripts }}
+      kubeconform-cancellation: ${{ steps.filter.outputs.kubeconform-cancellation }}
+    steps:
+      - name: 📄 Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: 🔍 Filter paths
+        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+        id: filter
+        with:
+          filters: |
+            kubeconform-cancellation:
+              - 'pkg/client/kubeconform/**'
+              - '.github/workflows/ci.yaml'
+            code:
+              - '**/*.go'
+              - 'go.mod'
+              - 'go.sum'
+              - '.govulncheck-allow.txt'
+              - '.github/actions/**'
+            # The Go harness in internal/ciharness checks release-ref safety and the to-do scanner
+            # caller. Its subject is a WORKFLOW file, not a Go file, so the org-required
+            # validate-go-project run cannot reach it: that workflow gates its own test job
+            # on a `go` filter of **/*.go|go.mod|go.sum|.golangci.* and skips everything
+            # else. A scanner-only bump therefore merges with the contract unexecuted and
+            # reddens main instead (ksail#6750 merged 2026-08-28T17:17Z with its test job
+            # `skipped`; main went red 94 minutes later). This filter feeds a job of its own
+            # so that class of change is gated on the PR that makes it. The harness sources
+            # and THIS workflow are included for the same reason dependency-test-graph
+            # includes ci.yaml below: the job and its assertions both live in files this
+            # filter would otherwise not match, so a PR editing only one of them could
+            # weaken or delete the gate while the aggregator recorded it as an ordinary
+            # skip.
+            # The harness reads far more than those files: every workflow (one test globs the
+            # whole directory), the system-test composite actions, and the EKS cleanup scripts.
+            # Listing them one by one drifted, and ksail#7008 then broke an EKS workflow contract
+            # with every check green (ksail#7009). The patterns below cover the three trees as a
+            # whole, and TestWorkflowContractFilterCoversEveryFileTheHarnessReads fails if a
+            # file the harness reads is ever left out again.
+            # ("to-do" is deliberately lowercase and hyphenated here: the scanner keys on the
+            # uppercase marker, so spelling it out in prose files an issue against this very
+            # comment. ksail#6763 was exactly that — a false positive with no work behind it.)
+            todos-contract:
+              - '.github/workflows/**'
+              - '.github/actions/**'
+              - '.github/scripts/**'
+              - '.github/fixtures/workflow-run-cleanup/**'
+              - '.github/fixtures/talos-schematic-trial.yaml'
+              - 'internal/ciharness/**'
+              # Authenticate every copied byte, including embedded data and
+              # metadata edits that the shared Go source filter does not select.
+              - 'third_party/cel-go/**'
+              - 'third_party/glamour/**'
+              - 'third_party/go-macholibre/**'
+              - 'third_party/kyverno-jmespath/**'
+              - 'third_party/jmespath/**'
+              - 'third_party/ansi/**'
+              - 'third_party/ansi-runtime/**'
+              - 'third_party/redisotel/**'
+              - 'third_party/rediscmd/**'
+              - 'third_party/dynamiclistener/**'
+              - '.gitattributes'
+              - '.mega-linter.yml'
+              - '.jscpd.json'
+              - 'go.mod'
+              - 'go.sum'
+            # The release build configuration is the subject of Go tests too: the OTel
+            # reachability guard in pkg/client/kubescape pins a digest of every file below, and
+            # other tests read the GoReleaser files and the CD workflow. The org-required Go
+            # validation skips its test job when no Go file changed, so a pull request changing
+            # only these files would merge with those assertions unexecuted and the mismatch
+            # would surface on the next unrelated Go change (ksail#7400). This filter feeds a
+            # job that runs the suite for that class of change; it includes THIS workflow for
+            # the same reason todos-contract does. TestReleaseConfigFilterCoversTheReleaseFiles
+            # fails if a release file is dropped from it.
+            release-config:
+              - '.goreleaser.yaml'
+              - '.goreleaser.desktop.yaml'
+              - '.github/workflows/cd.yaml'
+              - '.github/scripts/publish-operator-chart.sh'
+              - '.github/actions/setup-desktop-build/**'
+              - '.github/actions/free-disk-space/**'
+              - 'scripts/stage-webui.sh'
+              - '.github/workflows/ci.yaml'
+            # Deliberately NARROWER than `code`: the job resolves a module graph, so only the
+            # module files matter — not every .go file. It also includes THIS workflow, because
+            # the check lives here and a workflow-only PR would otherwise be able to weaken or
+            # delete it without ever running it.
+            dependency-test-graph:
+              - 'go.mod'
+              - 'go.sum'
+              - '.github/workflows/ci.yaml'
+            # The contracts in internal/depcontract read two files the Go build cannot see: the
+            # Dependabot configuration and the Cilium chart pin. A change to either one alone
+            # skips the shared Go tests, for the reason todos-contract gives above, and would
+            # merge with its contract unexecuted. This filter feeds a job of its own for that
+            # class of change. TestDependencyContractsRunWhenOnlyTheirInputsChange fails if a
+            # file those contracts read is ever left out of it.
+            dependency-contracts:
+              - 'internal/depcontract/**'
+              - 'pkg/svc/installer/cni/cilium/Dockerfile'
+              - '.github/dependabot.yaml'
+              - 'go.mod'
+              - 'go.sum'
+              - '.github/workflows/ci.yaml'
+            govuln-allowlist:
+              - '.govulncheck-allow.txt'
+            # Release inputs are outside Go's cache and the shared Go source filter.
+            release-graph-audit:
+              - '.goreleaser.yaml'
+              - '.goreleaser.desktop.yaml'
+              - '.github/workflows/cd.yaml'
+              - '.github/actions/setup-desktop-build/**'
+              - '.github/actions/free-disk-space/**'
+              - 'scripts/stage-webui.sh'
+              - 'pkg/client/kubescape/**'
+              - 'desktop/**'
+              - 'internal/ciharness/**'
+              - 'go.mod'
+              - 'go.sum'
+              - '.govulncheck-allow.txt'
+              - '.github/workflows/ci.yaml'
+            system-test:
+              # NOTE: Do not use negative patterns (!) here.
+              # dorny/paths-filter v4 uses picomatch where negated patterns
+              # like '!**/*_test.go' match ANY file that is not a test file
+              # (including .mdx, .json, etc.), causing docs-only PRs to
+              # falsely trigger system tests.
+              # Use an explicit allowlist of directories whose changes truly
+              # require system tests (cluster/workload code, providers,
+              # provisioners, installers, client libraries). Chat, MCP,
+              # cipher, toolgen, docs generators, and schema generators are
+              # intentionally omitted.
+              - 'main.go'
+              - 'internal/buildmeta/**'
+              - 'pkg/apis/**'
+              - 'pkg/cli/annotations/**'
+              - 'pkg/cli/cmd/cluster/**'
+              - 'pkg/cli/cmd/workload/**'
+              - 'pkg/cli/cmd/tenant/**'
+              - 'pkg/cli/dockerutil/**'
+              - 'pkg/cli/editor/**'
+              - 'pkg/cli/flags/**'
+              - 'pkg/cli/kubeconfig/**'
+              - 'pkg/cli/kubeconfighook/**'
+              - 'pkg/cli/lifecycle/**'
+              - 'pkg/cli/setup/**'
+              - 'pkg/cli/ui/asciiart/**'
+              - 'pkg/cli/ui/confirm/**'
+              - 'pkg/cli/ui/errorhandler/**'
+              - 'pkg/cli/ui/picker/**'
+              - 'pkg/client/**'
+              - 'pkg/di/**'
+              - 'pkg/envvar/**'
+              - 'pkg/fsutil/**'
+              - 'pkg/k8s/**'
+              - 'pkg/notify/**'
+              - 'pkg/runner/**'
+              - 'pkg/svc/detector/**'
+              - 'pkg/svc/diff/**'
+              - 'pkg/svc/image/**'
+              - 'pkg/svc/installer/**'
+              - 'pkg/svc/gitops/render/**'
+              - 'pkg/svc/provider/**'
+              - 'pkg/svc/provisioner/**'
+              - 'pkg/svc/registryresolver/**'
+              - 'pkg/svc/state/**'
+              - 'pkg/svc/tenant/**'
+              - 'pkg/svc/versionresolver/**'
+              - 'pkg/timer/**'
+              - 'go.mod'
+              - 'go.sum'
+              - '.github/actions/**'
+              - '.github/fixtures/**'
+              - '.github/scripts/assert-gitops-deployed.sh'
+              - '.github/workflows/ci.yaml'
+            schema:
+              - 'pkg/apis/**/*.go'
+              - 'go.mod'
+              - 'schemas/gen_schema.go'
+            cli:
+              - 'cmd/**/*.go'
+              - 'pkg/**/*.go'
+              - 'go.mod'
+              - 'docs/gen_docs.go'
+              - 'docs/gen_docs_prose.go'
+            vsce:
+              - 'vsce/**'
+              - '.github/workflows/ci.yaml'
+            docs:
+              # Matches docs content (MDX, Astro, config) but not Go generators.
+              # Avoid negative patterns — see system-test comment above.
+              - 'docs/src/**'
+              - 'docs/public/**'
+              - 'docs/astro.config.*'
+              - 'docs/tsconfig.json'
+              - 'docs/package*.json'
+              - 'docs/.npmrc'
+              - '.github/workflows/ci.yaml'
+            docs-deps:
+              - 'docs/package*.json'
+              - '.github/actions/npm-audit-and-fix/**'
+            vsce-deps:
+              - 'vsce/package*.json'
+              - '.github/actions/npm-audit-and-fix/**'
+            copilot-plugin:
+              - 'copilot-plugin/**'
+              - '.github/workflows/ci.yaml'
+            operator-chart:
+              # Operator Helm chart E2E. Covers the chart, the web UI, the
+              # operator runtime (`ksail operator` subcommand), the reconciler,
+              # the Cluster CRD types, and the image build inputs.
+              - 'charts/ksail-operator/**'
+              - 'web/ui/**'
+              - 'pkg/operator/**'
+              - 'internal/controller/**'
+              - 'pkg/cli/cmd/operator/**'
+              - 'pkg/apis/**'
+              - 'Dockerfile'
+              - '.github/actions/operator-chart-e2e/**'
+              - 'scripts/stage-webui.sh'
+              - '.github/workflows/ci.yaml'
+            calico-cni:
+              # The Calico installer derives the tigera-operator chart version
+              # from the calico/node image tag in this Dockerfile (see
+              # version.go's chartVersion()). A node-image patch can outpace the
+              # operator chart release, leaving the derived version unpublished,
+              # so guard a bump to this file with validate-calico-chart.
+              - 'pkg/svc/installer/cni/calico/Dockerfile'
+              - '.github/workflows/ci.yaml'
+            cask-pr-handoff:
+              - '.goreleaser.yaml'
+              - '.goreleaser.desktop.yaml'
+              - '.github/fixtures/cask-pr-handoff/**'
+              - '.github/scripts/cask-pr-handoff-workflow.test.sh'
+              - '.github/scripts/collect-cask-pr-handoff.sh'
+              - '.github/scripts/collect-cask-pr-handoff.test.sh'
+              - '.github/scripts/finish-cask-pr-handoff.sh'
+              - '.github/scripts/finish-cask-pr-handoff.test.sh'
+              - '.github/scripts/find-merged-cask-pr-handoff.sh'
+              - '.github/scripts/find-merged-cask-pr-handoff.test.sh'
+              - '.github/scripts/redraft-evergreen-cask-prs.sh'
+              - '.github/scripts/redraft-evergreen-cask-prs.test.sh'
+              - '.github/scripts/resolve-release-publish-state.sh'
+              - '.github/scripts/resolve-release-publish-state.test.sh'
+              - '.github/scripts/style-clean-cask-branch.sh'
+              - '.github/scripts/style-clean-cask-branch.test.sh'
+              - '.github/scripts/upload-release-assets.sh'
+              - '.github/scripts/upload-release-assets.test.sh'
+              - '.github/scripts/validate-cask-pr-handoff.sh'
+              - '.github/scripts/validate-cask-pr-handoff.test.sh'
+              - '.github/workflows/cd.yaml'
+              - '.github/workflows/ci.yaml'
+            eks-smoke-scripts:
+              - '.github/scripts/delete-eks-smoke-cluster.sh'
+              - '.github/scripts/delete-eks-smoke-cluster.test.sh'
+              - '.github/scripts/report-eks-create-failure.sh'
+              - '.github/scripts/report-eks-create-failure.test.sh'
+              - '.github/scripts/report-eks-account-capacity.sh'
+              - '.github/scripts/report-eks-account-capacity.test.sh'
+              - '.github/scripts/eks-report-test-lib.sh'
+              - '.shellcheckrc'
+              - '.github/workflows/eks-account-capacity.yaml'
+              - '.github/workflows/system-test-eks.yaml'
+              - '.github/workflows/ci.yaml'
+            k3k-sentinel-scripts:
+              - '.github/scripts/assert-k3k-server-creator.sh'
+              - '.github/scripts/assert-k3k-server-creator.test.sh'
+              - '.github/actions/ksail-test-kubernetes-provider/action.yaml'
+              - '.github/workflows/ci.yaml'
+            rate-limit-gate-script:
+              - '.github/actions/rate-limit-gate/**'
+              - '.github/workflows/ci.yaml'
+            hetzner-cleanup-script:
+              - '.github/actions/cleanup-hetzner/**'
+              - '.github/workflows/ci.yaml'
+            gitops-assert-scripts:
+              - '.github/scripts/assert-gitops-deployed.sh'
+              - '.github/scripts/assert-gitops-deployed.test.sh'
+              - '.github/actions/ksail-test-workload/**'
+              - '.github/actions/ksail-system-test/helm-values-precedence.sh'
+              - '.github/workflows/ci.yaml'
+
+  eks-smoke-scripts:
+    name: 🧹 Validate EKS Smoke Teardown
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [changes]
+    if: needs.changes.outputs.eks-smoke-scripts == 'true'
+    permissions:
+      contents: read
+    steps:
+      - name: 📄 Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: 🧹 Verify EKS smoke teardown reports only real leaks
+        run: |
+          shellcheck \
+            .github/scripts/delete-eks-smoke-cluster.sh \
+            .github/scripts/delete-eks-smoke-cluster.test.sh
+          .github/scripts/delete-eks-smoke-cluster.test.sh
+
+      - name: 🔎 Verify the EKS create-failure report only reads and never fails
+        run: |
+          shellcheck \
+            .github/scripts/report-eks-create-failure.sh \
+            .github/scripts/eks-report-test-lib.sh \
+            .github/scripts/report-eks-create-failure.test.sh
+          .github/scripts/report-eks-create-failure.test.sh
+
+      - name: 🔎 Verify the EKS account capacity report only reads and prints no identifier
+        run: |
+          shellcheck \
+            .github/scripts/report-eks-account-capacity.sh \
+            .github/scripts/report-eks-account-capacity.test.sh
+          .github/scripts/report-eks-account-capacity.test.sh
+
+  k3k-sentinel-scripts:
+    name: 🔐 Validate k3k Sentinel Scripts
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [changes]
+    if: needs.changes.outputs.k3k-sentinel-scripts == 'true'
+    permissions:
+      contents: read
+    steps:
+      - name: 📄 Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: 🔐 Verify the k3k server-creator assertion rejects every wrong principal
+        run: |
+          shellcheck \
+            .github/scripts/assert-k3k-server-creator.sh \
+            .github/scripts/assert-k3k-server-creator.test.sh
+          .github/scripts/assert-k3k-server-creator.test.sh
+
+  rate-limit-gate-script:
+    name: ⏳ Validate Rate Limit Gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [changes]
+    if: needs.changes.outputs.rate-limit-gate-script == 'true'
+    permissions:
+      contents: read
+    steps:
+      - name: 📄 Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: ⏳ Verify an unreachable API is never reported as rate-limit exhaustion
+        run: |
+          shellcheck \
+            .github/actions/rate-limit-gate/wait-for-rate-limit.sh \
+            .github/actions/rate-limit-gate/wait-for-rate-limit.test.sh
+          .github/actions/rate-limit-gate/wait-for-rate-limit.test.sh
+
+  hetzner-cleanup-script:
+    name: 🧹 Validate Hetzner Cleanup
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [changes]
+    if: needs.changes.outputs.hetzner-cleanup-script == 'true'
+    permissions:
+      contents: read
+    steps:
+      - name: 📄 Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: 🧹 Verify a failed Hetzner call is never reported as a clean cleanup
+        run: |
+          shellcheck \
+            .github/actions/cleanup-hetzner/cleanup-hetzner.sh \
+            .github/actions/cleanup-hetzner/cleanup-hetzner.test.sh
+          .github/actions/cleanup-hetzner/cleanup-hetzner.test.sh
+
+  gitops-assert-scripts:
+    name: 🔐 Validate GitOps And Workload Guards
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [changes]
+    if: needs.changes.outputs.gitops-assert-scripts == 'true'
+    permissions:
+      contents: read
+    steps:
+      - name: 📄 Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: 🔐 Verify GitOps and workload guards fail closed
+        run: |
+          shellcheck \
+            .github/actions/ksail-test-workload/reject-remote-kustomize-resources.sh \
+            .github/actions/ksail-test-workload/remote-resource-guard.test.sh \
+            .github/actions/ksail-test-workload/install-with-recovery.sh \
+            .github/actions/ksail-test-workload/install-with-recovery.test.sh \
+            .github/scripts/assert-gitops-deployed.sh \
+            .github/scripts/assert-gitops-deployed.test.sh \
+            .github/actions/ksail-system-test/helm-values-precedence.sh
+          .github/scripts/assert-gitops-deployed.test.sh
+          .github/actions/ksail-test-workload/remote-resource-guard.test.sh
+          .github/actions/ksail-test-workload/install-with-recovery.test.sh
+
+  cask-pr-handoff:
+    name: 🔐 Validate Cask PR Handoff
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [changes]
+    if: needs.changes.outputs.cask-pr-handoff == 'true'
+    permissions:
+      contents: read
+    steps:
+      - name: 📄 Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: 🔐 Verify fail-closed cask PR handoff
+        run: |
+          shellcheck \
+            .github/fixtures/cask-pr-handoff/fake-bin/gh \
+            .github/scripts/collect-cask-pr-handoff.sh \
+            .github/scripts/collect-cask-pr-handoff.test.sh \
+            .github/scripts/finish-cask-pr-handoff.sh \
+            .github/scripts/finish-cask-pr-handoff.test.sh \
+            .github/scripts/find-merged-cask-pr-handoff.sh \
+            .github/scripts/find-merged-cask-pr-handoff.test.sh \
+            .github/scripts/redraft-evergreen-cask-prs.sh \
+            .github/scripts/redraft-evergreen-cask-prs.test.sh \
+            .github/scripts/resolve-release-publish-state.sh \
+            .github/scripts/resolve-release-publish-state.test.sh \
+            .github/scripts/style-clean-cask-branch.sh \
+            .github/scripts/style-clean-cask-branch.test.sh \
+            .github/scripts/upload-release-assets.sh \
+            .github/scripts/upload-release-assets.test.sh \
+            .github/scripts/validate-cask-pr-handoff.sh \
+            .github/scripts/validate-cask-pr-handoff.test.sh \
+            .github/scripts/cask-pr-handoff-workflow.test.sh
+          .github/scripts/collect-cask-pr-handoff.test.sh
+          .github/scripts/finish-cask-pr-handoff.test.sh
+          .github/scripts/find-merged-cask-pr-handoff.test.sh
+          .github/scripts/redraft-evergreen-cask-prs.test.sh
+          .github/scripts/resolve-release-publish-state.test.sh
+          .github/scripts/style-clean-cask-branch.test.sh
+          .github/scripts/upload-release-assets.test.sh
+          .github/scripts/validate-cask-pr-handoff.test.sh
+          .github/scripts/cask-pr-handoff-workflow.test.sh
+
+  ci-go:
+    name: ✅ Validate Main Go and Allowlist Changes
+    needs: [changes]
+    # The two arms below cover what the ORG-REQUIRED workflow does not, and nothing
+    # more. validate-go-project.yaml carries its own `pull_request:` / `merge_group:`
+    # triggers alongside its `workflow_call` interface, so GitHub already runs the
+    # complete Go suite directly on every pull request here, with no help from this
+    # file. That direct run publishes its checks WITHOUT this caller's name
+    # prefix, which is why a prefix-filtered read of a pull request shows "skipped"
+    # over a suite that has in fact passed (ksail#6563, ksail#6564 — both closed as
+    # measurement errors of exactly that shape).
+    #
+    #   * push to main — the required workflow is pull-request scoped and never runs
+    #     on the default branch, so this arm is the ONLY Go validation main gets.
+    #
+    #   * pull_request, gated on govuln-allowlist — DELIBERATELY NARROW. The required
+    #     run takes `scan-default-branch`'s default of false, so it will not scan a
+    #     pull request that edits only a .govulncheck-allow.txt; this arm exists so a
+    #     risk acceptance is validated by the scanner it applies to. Do NOT widen this
+    #     to `code`: .govulncheck-allow.txt is already a member of the `code` filter,
+    #     so `code` is a strict superset whose extra region is precisely where the
+    #     required workflow already runs the identical nine jobs. Widening it buys no
+    #     coverage and doubles the Go suite on every Go pull request.
+    if: >-
+      (github.event_name == 'push' && github.ref == 'refs/heads/main')
+      || (github.event_name == 'pull_request'
+      && github.event.pull_request.head.repo.full_name == github.repository
+      && needs.changes.outputs.govuln-allowlist == 'true')
+    uses: devantler-tech/.github/.github/workflows/validate-go-project.yaml@fca583ac795d56928c5b542944b6e0963ea1e270 # v7.8.5
+    # The canonical defaults make a default-branch run answer "did the check run" rather than
+    # "did the diff touch a Go file". On main the branch's green IS the protection
+    # signal, so a path filter that skips the suite or the scan leaves main green
+    # over breakage it never looked at:
+    #
+    #   * scan-default-branch — an advisory published against already-merged code
+    #     makes unchanged code vulnerable. A diff filter structurally cannot see
+    #     that, so main stayed unscanned until someone happened to touch a Go file.
+    #
+    #   * test-default-branch — a Go test may read a non-Go file as its subject, so
+    #     a commit touching only those files skips the suite while breaking it.
+    #
+    # Both default true at this immutable canonical revision, so the caller
+    # inherits the corrected coverage without redundant arguments. Scan input
+    # retirement remains tracked in devantler-tech/.github#285; the separate
+    # default-branch maintenance pilot is tracked in #276.
+    with:
+      # Run module hygiene and dead-code checks on main without enabling fixes.
+      maintenance-default-branch: true
+      # The org-required direct run is the sole signed-fix writer for a PR.
+      # Keep this additional invocation read-only while retaining its checks.
+      apply-signed-fixes: false
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+      code-quality: write
+    secrets:
+      APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
+
+  # Gate: wait for the invoked Go workflow, then retain the independent check
+  # verification before starting expensive system tests. Organization-required
+  # checks remain enforced separately. This gate does not run on workflow_dispatch.
+  wait-for-validate-go:
+    name: ⏳ Wait for Go Validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: [changes, ci-go]
+    if: >-
+      !cancelled()
+      && github.event_name == 'pull_request'
+      && needs.changes.outputs.system-test == 'true'
+      && github.event.pull_request.head.repo.full_name == github.repository
+    permissions:
+      checks: read
+    steps:
+      - name: Verify invoked Go validation result
+        env:
+          GO_VALIDATION_RESULT: ${{ needs.ci-go.result }}
+          GO_VALIDATION_SELECTED: ${{ needs.changes.outputs.govuln-allowlist }}
+        run: |
+          case "$GO_VALIDATION_RESULT:$GO_VALIDATION_SELECTED" in
+            success:true|success:false)
+              echo 'Invoked Go validation passed.'
+              ;;
+            skipped:false)
+              echo 'Go validation invocation was deliberately unselected.'
+              ;;
+            *)
+              echo "::error::Unverified Go validation result: $GO_VALIDATION_RESULT (selected=$GO_VALIDATION_SELECTED)"
+              exit 1
+              ;;
+          esac
+
+      - name: Wait for invoked Go validation checks
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          GO_VALIDATION_SELECTED: ${{ needs.changes.outputs.govuln-allowlist }}
+        with:
+          script: |
+            const sha = context.payload.pull_request.head.sha;
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const prefix = '✅ Validate Main Go and Allowlist Changes';
+            const maxWait = 25 * 60 * 1000; // 25 minutes
+            const poll = 30 * 1000; // 30 seconds
+            const start = Date.now();
+
+            while (Date.now() - start < maxWait) {
+              const { data: checks } = await github.rest.checks.listForRef({
+                owner, repo, ref: sha, per_page: 100,
+              });
+
+              const relevant = checks.check_runs.filter(cr =>
+                cr.name.startsWith(prefix)
+              );
+
+              if (relevant.length > 0) {
+                const pending = relevant.filter(cr => cr.status !== 'completed');
+                if (pending.length === 0) {
+                  const failed = relevant.filter(cr =>
+                    !['success', 'skipped', 'neutral'].includes(cr.conclusion)
+                  );
+                  if (failed.length > 0) {
+                    const names = failed.map(cr => `${cr.name}: ${cr.conclusion}`).join('\n');
+                    core.setFailed(`Go validation failed:\n${names}`);
+                    return;
+                  }
+                  core.info(`✅ All ${relevant.length} Go validation check(s) passed`);
+                  return;
+                }
+                core.info(`⏳ Waiting for ${pending.length}/${relevant.length} check(s)...`);
+              } else {
+                core.info('⏳ No Go validation checks found yet...');
+              }
+
+              await new Promise(r => setTimeout(r, poll));
+            }
+
+            // An absent invoked check set is accepted only when the change
+            // filter explicitly proves that the invocation was unselected.
+            const { data: final } = await github.rest.checks.listForRef({
+              owner, repo, ref: sha, per_page: 100,
+            });
+            const remaining = final.check_runs.filter(cr =>
+              cr.name.startsWith(prefix)
+            );
+            if (remaining.length === 0 && process.env.GO_VALIDATION_SELECTED === 'false') {
+              core.info('No invoked Go validation checks were required for these changes');
+              return;
+            }
+            core.setFailed('Timed out waiting for Go validation checks to complete');
+
+  verify-go-archive:
+    name: 🔐 Verify go-archive Provenance
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: 📄 Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: ⚙️ Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: 📦 Verify release installer
+        run: .github/scripts/install-release.test.sh
+
+      - name: 🧪 Verify parity guard behavior
+        run: .github/scripts/verify-go-archive-parity.test.sh
+
+      - name: 🔐 Verify reviewed upstream bytes
+        run: .github/scripts/verify-go-archive-parity.sh
+
+      - name: 🔐 Verify OTel logging adapter provenance
+        run: |
+          .github/scripts/verify-otelzap-parity.sh
+          .github/scripts/verify-otelzap-parity.test.sh
+
+  verify-vulnerability-identities:
+    name: 🔐 Verify Local Source Vulnerability Identities
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: 📄 Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: ⚙️ Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: 📦 Install pinned vulnerability scanner
+        env:
+          GOBIN: ${{ runner.temp }}/vulnerability-scanner
+        run: go install golang.org/x/vuln/cmd/govulncheck@v1.8.0
+
+      - name: 🧪 Verify actual scanner positive and negative controls
+        env:
+          GOVULNCHECK_BIN: ${{ runner.temp }}/vulnerability-scanner/govulncheck
+        run: |
+          scanner_module_cache="$(go env GOMODCACHE)"
+          printf -v GOVULNCHECK_TEST_DB '%s:%s%s/golang.org/x/vuln@v1.8.0/internal/client/testdata/vulndb-v1' file // "$scanner_module_cache"
+          export GOVULNCHECK_TEST_DB
+          go test -tags integration ./internal/vulnidentity/... -count=1
+
+      - name: 🔐 Query every published local-source identity
+        run: go run ./internal/vulnidentity/cmd/vulnidentity -scanner "$RUNNER_TEMP/vulnerability-scanner/govulncheck"
+
+  build-artifact:
+    name: 🏗️ Build KSail Binary
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: [changes]
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && (needs.changes.outputs.code == 'true' || needs.changes.outputs.cli == 'true' || needs.changes.outputs.system-test == 'true' || needs.changes.outputs.kubeconform-cancellation == 'true'))
+    permissions:
+      contents: read
+    outputs:
+      artifact-id: ${{ steps.binary-artifact.outputs.artifact-id }}
+      binary-sha256: ${{ steps.binary-checksum.outputs.binary-sha256 }}
+    steps:
+      - name: 📄 Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: 🧹 Free disk space
+        # The KSail binary links the full embedded-CLI import graph into a large
+        # binary; the Go linker can exhaust a stock runner's disk on a cache-miss
+        # build ("no space left on device"). Reclaim space before building.
+        uses: ./.github/actions/free-disk-space
+
+      - name: ⚙️ Setup Go
+        id: setup-go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: 📦 Cache KSail Binary
+        id: binary
+        uses: ./.github/actions/cache-ksail-binary
+        with:
+          go-version: ${{ steps.setup-go.outputs.go-version }}
+          source-hash: ${{ hashFiles('go.mod', 'go.sum', '**/*.go') }}
+          output-path: /usr/local/bin/ksail
+
+      - name: 🧪 Repeat schema cancellation acceptance
+        id: schema-cancellation
+        if: needs.changes.outputs.kubeconform-cancellation == 'true'
+        run: |
+          set -euo pipefail
+          git rev-parse HEAD
+          go test ./pkg/client/kubeconform \
+            -run '^TestValidateBytesStopsBetweenDocumentsWhenContextCancelled$' \
+            -count=20 -json > "$RUNNER_TEMP/kubeconform-cancellation.json"
+          jq -e -s '
+            . as $events
+            | ([ $events[] | select(.Action == "run" and .Test == "TestValidateBytesStopsBetweenDocumentsWhenContextCancelled") ] | length) == 20
+            and ([ $events[] | select(.Action == "pass" and .Test == "TestValidateBytesStopsBetweenDocumentsWhenContextCancelled") ] | length) == 20
+            and ([ $events[] | select(.Action == "fail" or .Action == "skip") ] | length) == 0
+          ' "$RUNNER_TEMP/kubeconform-cancellation.json"
+          go test ./pkg/client/kubeconform -count=1
+
+      - name: 📤 Preserve schema cancellation observations
+        if: ${{ always() && steps.schema-cancellation.outcome != 'skipped' && steps.schema-cancellation.outcome != '' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: kubeconform-cancellation-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/kubeconform-cancellation.json
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: 🔍 Seal prepared KSail binary
+        id: binary-checksum
+        env:
+          BINARY_PATH: ${{ steps.binary.outputs.binary-path }}
+        run: |
+          if [[ ! -f "$BINARY_PATH" || -L "$BINARY_PATH" || ! -s "$BINARY_PATH" ]]; then
+            echo "Missing or invalid prepared KSail binary" >&2
+            exit 1
+          fi
+          checksum=$(sha256sum "$BINARY_PATH" | cut -d ' ' -f 1)
+          echo "binary-sha256=$checksum" >> "$GITHUB_OUTPUT"
+
+      - name: 📤 Publish KSail binary
+        id: binary-artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ksail-binary-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ steps.binary.outputs.binary-path }}
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+  generate:
+    name: 📝 Generate Schema, CRD & Docs
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    # Depend on build-artifact so the Go build cache is warm by the time
+    # `go generate ./docs/...` (and ./schemas/...) re-compiles the cli import
+    # graph. On events where build-artifact is skipped (push to main), this
+    # falls through and the job still runs.
+    # Docs-content changes also trigger this job: the chat assistant docs
+    # (pkg/svc/chat/docs_generated.go) are generated from docs/src/content/docs
+    # and go stale on docs-only PRs otherwise.
+    needs: [changes, build-artifact]
+    if: >-
+      !cancelled()
+      && github.event_name != 'merge_group'
+      && (needs.changes.outputs.schema == 'true'
+        || needs.changes.outputs.cli == 'true'
+        || needs.changes.outputs.docs == 'true')
+      && (needs.build-artifact.result == 'success' || needs.build-artifact.result == 'skipped')
+    permissions:
+      contents: read
+    steps:
+      - name: 📄 Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          repository: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name || github.repository }}
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+
+      - name: 🧹 Free disk space
+        # `go generate ./docs/...` re-links the full embedded-CLI import graph
+        # (kubectl, helm, kind, k3d, vcluster, flux, argocd, eksctl, …) into a
+        # large binary; on a stock ubuntu-latest runner the linker can exhaust
+        # disk ("no space left on device"). Reclaim space before Go is set up.
+        uses: ./.github/actions/free-disk-space
+
+      - name: ⚙️ Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: 📝 Generate JSON schema
+        if: needs.changes.outputs.schema == 'true'
+        run: go generate ./schemas/...
+
+      - name: 📐 Generate CRD & DeepCopy
+        if: needs.changes.outputs.schema == 'true'
+        run: go generate ./pkg/apis/...
+
+      - name: 📚 Generate reference documentation
+        if: needs.changes.outputs.cli == 'true'
+        run: go generate ./docs/...
+
+      - name: 💬 Generate chat assistant docs
+        # pkg/svc/chat/docs_generated.go embeds the docs content, so it goes
+        # stale on BOTH docs-content changes and CLI changes (the reference
+        # docs regenerated above feed into it; ordering matters). Unlike the
+        # docs generator, gen_docs.go is a lightweight stdlib-only file reader
+        # — it does not link the embedded-CLI graph, so it adds no disk-space
+        # pressure to this job.
+        if: needs.changes.outputs.cli == 'true' || needs.changes.outputs.docs == 'true'
+        run: go generate ./pkg/svc/chat/...
+
+      - name: ⚙️ Setup Node.js
+        if: needs.changes.outputs.schema == 'true'
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+          cache: "npm"
+          cache-dependency-path: "web/ui/package-lock.json"
+
+      - name: 🧬 Generate web UI config types
+        # The web UI build regenerates its types at build time (`npm run build`
+        # runs gen:types), so the SHIPPED UI is always fresh — but the COMMITTED
+        # web/ui/src/generated/ksail-config.ts is only ever updated by hand and
+        # silently drifts when the JSON schema changes. Regenerate it here so
+        # the patch/auto-commit machinery below diff-checks and fixes it.
+        if: needs.changes.outputs.schema == 'true'
+        run: |
+          npm --prefix web/ui ci
+          npm --prefix web/ui run gen:types
+
+      - name: 📤 Upload patch
+        run: |
+          git add -N .
+          git diff > /tmp/generate.patch
+          if [ -s /tmp/generate.patch ]; then
+            echo "Changes detected"
+          else
+            echo "No changes"
+          fi
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: generate-patch
+          path: /tmp/generate.patch
+          if-no-files-found: ignore
+          retention-days: 1
+
+      - name: ❌ Fail if generated files are out of date (fork PR)
+        if: >-
+          github.event_name == 'pull_request'
+          && github.event.pull_request.head.repo.full_name != github.repository
+        shell: bash
+        run: |
+          if [ -s /tmp/generate.patch ]; then
+            echo "::error::Generated files are out of date. Please run 'make generate' locally and commit the results."
+            echo ""
+            cat /tmp/generate.patch
+            exit 1
+          fi
+
+  auto-commit:
+    name: 📤 Auto-Commit Generated Changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [changes, generate, audit-docs, audit-vsce]
+    if: >-
+      always()
+      && github.event_name != 'merge_group'
+      && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+      && (needs.generate.result == 'success' || needs.audit-docs.outputs.repair-patch == 'true' || needs.audit-vsce.outputs.repair-patch == 'true')
+      && (github.event_name != 'pull_request' || (github.event.pull_request.user.login != 'dependabot[bot]' && github.event.pull_request.user.login != 'renovate[bot]'))
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: 🔑 Generate GitHub App Token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        id: generate-token
+        with:
+          client-id: ${{ vars.APP_CLIENT_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }} # zizmor: ignore[secrets-outside-env] - GitHub App token generation, no environment scoping available for app installations
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: 📄 Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.head_ref || github.ref_name }}
+          persist-credentials: false
+          token: ${{ steps.generate-token.outputs.token }}
+
+      - name: 📥 Download patches
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: "*-patch"
+          merge-multiple: true
+          path: /tmp/patches
+
+      - name: 📋 Apply patches
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          for patch in /tmp/patches/*.patch; do
+            if [ -s "$patch" ]; then
+              patch_name="$(basename "$patch")"
+              echo "Applying ${patch_name}..."
+
+              if git apply --3way "$patch"; then
+                echo "Applied ${patch_name} with 3-way merge."
+              else
+                echo "3-way apply failed for ${patch_name}; falling back to direct apply with rejects..." >&2
+
+                if git apply --reject "$patch"; then
+                  echo "Applied ${patch_name} with rejects."
+                  rej_files=$(find . -name '*.rej' 2>/dev/null || true)
+                  if [ -n "$rej_files" ]; then
+                    echo "::error::Reject files found after applying ${patch_name}:"
+                    echo "${rej_files}"
+                    git status --short || true
+                    echo "Failing job to avoid committing partially-applied patches." >&2
+                    exit 1
+                  fi
+                else
+                  echo "::error::Failed to apply patch ${patch_name}. See diagnostics above." >&2
+                  git status --short || true
+                  exit 1
+                fi
+              fi
+            else
+              echo "Skipping empty patch $(basename "$patch")"
+            fi
+          done
+
+      # Commits through the GitHub API rather than the git CLI, because the repository
+      # requires signed commits and API-created commits are signed by GitHub automatically.
+      # A CLI commit here is unsigned and makes the pull request permanently unmergeable.
+      #
+      # Limitation: the API's FileAddition carries only a path and its contents, so file
+      # modes are not expressible. Reject anything other than a regular 0644 file below
+      # rather than dereferencing a symlink or silently losing an executable bit.
+      - name: 📤 Commit and push generated changes (PR branch)
+        # A foreign commit prevents Dependabot rebasing. Both entry points now use
+        # its root manifest; generated docs are repaired after the bump merges.
+        if: github.event_name == 'pull_request' && github.event.pull_request.user.login != 'dependabot[bot]' && github.event.pull_request.user.login != 'renovate[bot]'
+        env:
+          GH_TOKEN: ${{ steps.generate-token.outputs.token }}
+          BRANCH: ${{ github.head_ref }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          workdir="$(mktemp -d)"
+          trap 'rm -rf "$workdir"' EXIT
+          additions="$workdir/additions.ndjson"
+          deletions="$workdir/deletions.ndjson"
+          : >"$additions"
+          : >"$deletions"
+
+          # Written to a file rather than read through process substitution: a process
+          # substitution's exit status is invisible to both `set -e` and `pipefail`, so a
+          # failing `git status` would otherwise look exactly like "nothing to commit" and
+          # leave the branch silently stale with a green build.
+          # -uall lists untracked files individually; without it git collapses a new
+          # directory into a single "dir/" entry, which is not a file we can encode.
+          git status --porcelain -z --no-renames -uall >"$workdir/status"
+
+          while IFS= read -r -d '' entry; do
+            entry_status="${entry:0:2}"
+            entry_path="${entry:3}"
+            [ -n "$entry_path" ] || continue
+            case "$entry_status" in
+              *D*)
+                jq -n --arg p "$entry_path" '{path: $p}' >>"$deletions"
+                ;;
+              *)
+                # FileAddition cannot represent symlinks, special files, or executable
+                # modes. In particular, reading a symlink here would dereference it and
+                # could publish sensitive runner files as an ordinary repository file.
+                if [ -L "$entry_path" ] || [ ! -f "$entry_path" ] || [ -x "$entry_path" ]; then
+                  echo "::error file=${entry_path}::Generated change is not a regular non-executable file"
+                  exit 1
+                fi
+                # File content must never reach argv. Linux caps a single argv entry at
+                # MAX_ARG_STRLEN (128 KiB) independently of ARG_MAX, and generated files
+                # here run to hundreds of KiB (pkg/svc/chat/docs_generated.go alone is
+                # ~0.5 MB, ~0.67 MB once base64-encoded). Passing it with --arg fails with
+                # E2BIG on exactly the pull requests this step exists to serve. --rawfile
+                # reads it from disk instead, and base64 output is ASCII so binary inputs
+                # survive the round trip.
+                base64 -w0 <"$entry_path" >"$workdir/content.b64"
+                jq -n --arg p "$entry_path" --rawfile c "$workdir/content.b64" \
+                  '{path: $p, contents: ($c | gsub("\\s"; ""))}' >>"$additions"
+                ;;
+            esac
+          done <"$workdir/status"
+
+          # The whole point of using the API is that the commit is signed, so prove it
+          # rather than assuming it: an unsigned commit here blocks the pull request.
+          verify_signed() {
+            local sha="$1"
+            local verified
+            verified="$(gh api "repos/${REPO}/commits/${sha}" --jq '.commit.verification.verified')"
+            if [ "$verified" != "true" ]; then
+              echo "::error::Generated commit ${sha} is not signed (verified=${verified})."
+              exit 1
+            fi
+            echo "Verified signature on ${sha}."
+          }
+
+          if [ ! -s "$additions" ] && [ ! -s "$deletions" ]; then
+            echo "No generated changes to commit."
+            # Committing below pushes to the PR branch, which raises `synchronize`. That new
+            # run shares this workflow's concurrency group with cancel-in-progress, so it can
+            # cancel the committing run before it verifies. The replacement run then lands
+            # here, with the work already committed and nothing left to do — so verify the
+            # head instead of exiting blind, or a signing regression escapes unreported and
+            # silently re-creates the unmergeable-PR condition this step exists to prevent.
+            if [ "$(git log -1 --format=%s)" = "chore: sync modules and update generated files" ]; then
+              echo "Head is a generated commit; verifying it here in case the run that created it was cancelled."
+              verify_signed "$(git rev-parse HEAD)"
+            fi
+            exit 0
+          fi
+
+          # --slurpfile keeps the aggregate off argv too: the combined payload is bounded
+          # by total changed content, which routinely exceeds the same 128 KiB cap.
+          jq -n \
+            --arg repo "$REPO" \
+            --arg branch "$BRANCH" \
+            --arg oid "$(git rev-parse HEAD)" \
+            --slurpfile additions "$additions" \
+            --slurpfile deletions "$deletions" \
+            '{
+              query: "mutation($input: CreateCommitOnBranchInput!) { createCommitOnBranch(input: $input) { commit { oid } } }",
+              variables: {
+                input: {
+                  branch: {
+                    repositoryNameWithOwner: $repo,
+                    branchName: $branch
+                  },
+                  message: { headline: "chore: sync modules and update generated files" },
+                  expectedHeadOid: $oid,
+                  fileChanges: { additions: $additions, deletions: $deletions }
+                }
+              }
+            }' >"$workdir/mutation.json"
+
+          # `gh api graphql` exits non-zero on a GraphQL error, so the assignment itself
+          # would abort under `set -e` and skip these diagnostics. Handle the failure
+          # inline so the operator gets a labelled annotation instead of one stderr line.
+          if ! response="$(gh api graphql --input "$workdir/mutation.json" 2>"$workdir/stderr")"; then
+            echo "::error::createCommitOnBranch failed"
+            cat "$workdir/stderr" >&2
+            jq '.errors // .' <<<"$response" 2>/dev/null || printf '%s\n' "$response"
+            exit 1
+          fi
+          # Capture first, then assert with a builtin. `jq -e` as the if-condition cannot
+          # distinguish "the filter was false" (exit 1) from "jq itself failed" (exit 4 on
+          # empty input, 5 on malformed), so a truncated or non-JSON response would take
+          # the no-errors path and continue. Capturing instead puts jq's failure where
+          # `set -e` catches it, so a bad response stops here rather than surfacing later
+          # as an unrelated error against a commit id of "null".
+          errors="$(jq -c '.errors // empty' <<<"$response")"
+          if [ -n "$errors" ]; then
+            echo "::error::createCommitOnBranch failed"
+            printf '%s\n' "$errors"
+            exit 1
+          fi
+
+          oid="$(jq -r '.data.createCommitOnBranch.commit.oid // empty' <<<"$response")"
+          if [ -z "$oid" ]; then
+            echo "::error::createCommitOnBranch returned no commit oid"
+            printf '%s\n' "$response"
+            exit 1
+          fi
+          echo "Committed generated changes as ${oid}."
+          verify_signed "$oid"
+
+      - name: 📤 Open PR for generated changes (protected branch)
+        id: protected-repair
+        if: github.event_name != 'pull_request'
+        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
+        with:
+          token: ${{ steps.generate-token.outputs.token }}
+          commit-message: "chore: sync modules and update generated files"
+          sign-commits: true
+          branch: chore/sync-generated-files/${{ github.ref_name }}
+          base: ${{ github.ref_name }}
+          title: "chore: sync generated files and npm audit repairs"
+          body: |
+            Corrections detected on `${{ github.ref_name }}`.
+            This PR delivers generated-file changes and eligible npm repairs.
+            Repair patches pass their re-audit before delivery. Source audit
+            findings clear only after the correction is committed and checked again.
+          delete-branch: true
+
+      - name: 🔏 Verify protected-branch correction signatures
+        if: steps.protected-repair.outputs.pull-request-operation == 'created' || steps.protected-repair.outputs.pull-request-operation == 'updated'
+        env:
+          COMMITS_VERIFIED: ${{ steps.protected-repair.outputs.pull-request-commits-verified }}
+        run: |
+          if [ "$COMMITS_VERIFIED" != "true" ]; then
+            echo "::error::Protected-branch correction commits are not verified."
+            exit 1
+          fi
+
+  home-isolation:
+    name: 🏠 Home Isolation Guard
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    needs: [changes]
+    if: github.event_name != 'merge_group' && needs.changes.outputs.code == 'true'
+    permissions:
+      contents: read
+    steps:
+      - name: 📄 Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: ⚙️ Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: 🏠 Verify tests never touch the real home directory
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Preserve Go caches so redirecting $HOME does not trigger a cold
+          # rebuild and so build/module artifacts land outside the sandbox.
+          GOCACHE="$(go env GOCACHE)"
+          GOMODCACHE="$(go env GOMODCACHE)"
+          GOPATH="$(go env GOPATH)"
+          export GOCACHE GOMODCACHE GOPATH
+
+          sandbox="$(mktemp -d)"
+          trap 'rm -rf "$sandbox"' EXIT
+          mkdir -p "$sandbox/.kube" "$sandbox/.ksail"
+          cat > "$sandbox/.kube/config" <<'EOF'
+          apiVersion: v1
+          kind: Config
+          current-context: admin@home-isolation-guard
+          clusters:
+            - cluster:
+                server: https://localhost:6443
+              name: home-isolation-guard
+          contexts:
+            - context:
+                cluster: home-isolation-guard
+                user: admin@home-isolation-guard
+              name: admin@home-isolation-guard
+          users:
+            - name: admin@home-isolation-guard
+          EOF
+          printf '{"recent":["__home_isolation_guard__"]}' > "$sandbox/.ksail/switch-history.json"
+
+          kube_before="$(sha256sum "$sandbox/.kube/config" | cut -d' ' -f1)"
+          hist_before="$(sha256sum "$sandbox/.ksail/switch-history.json" | cut -d' ' -f1)"
+          tree_before="$(find "$sandbox/.kube" "$sandbox/.ksail" | sort)"
+
+          # Run the whole suite with $HOME redirected to the sandbox. Test
+          # pass/fail is the main test workflow's job; this guard only asserts
+          # that no test mutated the real home directory, so failures here are
+          # tolerated.
+          HOME="$sandbox" go test ./... >/dev/null 2>&1 || true
+
+          # Capture the post-run state with errexit disabled: a test that
+          # deletes the canary files/dirs is itself a violation, and the empty
+          # captures below will differ from the "before" values and trip the
+          # actionable ::error:: messages rather than aborting the step.
+          set +e
+          kube_after="$(sha256sum "$sandbox/.kube/config" 2>/dev/null | cut -d' ' -f1)"
+          hist_after="$(sha256sum "$sandbox/.ksail/switch-history.json" 2>/dev/null | cut -d' ' -f1)"
+          tree_after="$(find "$sandbox/.kube" "$sandbox/.ksail" 2>/dev/null | sort)"
+          set -e
+
+          status=0
+          if [ "$kube_before" != "$kube_after" ]; then
+            echo "::error::A test mutated \$HOME/.kube/config. Add a homeenv.Run/Isolate TestMain to the offending package (see internal/testutil/homeenv)."
+            status=1
+          fi
+          if [ "$hist_before" != "$hist_after" ]; then
+            echo "::error::A test mutated \$HOME/.ksail/switch-history.json. Add a homeenv.Run/Isolate TestMain to the offending package."
+            status=1
+          fi
+          if [ "$tree_before" != "$tree_after" ]; then
+            echo "::error::A test created or removed files under \$HOME/.kube or \$HOME/.ksail. Add a homeenv.Run/Isolate TestMain to the offending package."
+            diff <(printf '%s\n' "$tree_before") <(printf '%s\n' "$tree_after") || true
+            status=1
+          fi
+          exit "$status"
+
+  audit-docs:
+    name: 🔍 Audit Docs Dependencies
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [changes]
+    if: github.event_name != 'merge_group' && needs.changes.outputs.docs-deps == 'true'
+    permissions:
+      contents: read
+    outputs:
+      repair-patch: ${{ steps.npm-audit.outputs.patch-created }}
+    steps:
+      - name: 📄 Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: 🔍 NPM Audit and Fix
+        id: npm-audit
+        uses: ./.github/actions/npm-audit-and-fix
+        with:
+          working-directory: docs
+          patch-artifact-name: npm-audit-docs-patch
+
+  audit-vsce:
+    name: 🔍 Audit VSCode Extension Dependencies
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [changes]
+    if: github.event_name != 'merge_group' && needs.changes.outputs.vsce-deps == 'true'
+    permissions:
+      contents: read
+    outputs:
+      repair-patch: ${{ steps.npm-audit.outputs.patch-created }}
+    steps:
+      - name: 📄 Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: 🔍 NPM Audit and Fix
+        id: npm-audit
+        uses: ./.github/actions/npm-audit-and-fix
+        with:
+          working-directory: vsce
+          patch-artifact-name: npm-audit-vsce-patch
+
+  build-docs:
+    name: 📚 Build Documentation
+    runs-on: ubuntu-latest
+    needs: [changes]
+    if: github.event_name == 'pull_request' && needs.changes.outputs.docs == 'true'
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: 📄 Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: ⚙️ Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+          cache: "npm"
+          cache-dependency-path: docs/package-lock.json
+
+      - name: 📦 Install dependencies
+        working-directory: docs
+        run: npm ci
+
+      - name: 🏗️ Build with Astro
+        working-directory: docs
+        run: npm run build
+
+  vscode-extension:
+    name: 🧩 VSCode Extension
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [changes]
+    if: github.event_name != 'merge_group' && needs.changes.outputs.vsce == 'true'
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: vsce
+    steps:
+      - name: 📄 Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: ⚙️ Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+          cache: "npm"
+          cache-dependency-path: "vsce/package-lock.json"
+
+      - name: 📦 Install dependencies
+        run: npm ci
+
+      - name: 🏗️ Compile
+        run: npm run compile
+
+      - name: 📦 Package extension
+        run: npm run package
+
+      - name: 📦 Create VSIX package
+        if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
+        run: npx @vscode/vsce package --out ksail.vsix
+
+      - name: 📤 Upload VSIX artifact
+        if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ksail-vsix
+          path: ksail.vsix
+          retention-days: 7
+
+  copilot-plugin:
+    name: 🧩 KSail Skill
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [changes]
+    if: github.event_name != 'merge_group' && needs.changes.outputs.copilot-plugin == 'true'
+    permissions:
+      contents: read
+    steps:
+      - name: 📄 Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: 🧪 Validate the KSail skill
+        run: |
+          set -euo pipefail
+          # devantler-tech/agent-plugins installs this skill by provenance from this exact path at
+          # each release tag, so moving or renaming it breaks the shared marketplace's plugin.
+          f=copilot-plugin/skills/ksail/SKILL.md
+          test -f "$f"
+          # The frontmatter must open the file, be closed by a second `---`, name the skill `ksail` and give
+          # it a non-empty description. An unterminated block fails rather than being read to end-of-file.
+          [ "$(head -n 1 "$f")" = "---" ]
+          frontmatter="$(awk 'NR == 1 { next } /^---$/ { closed = 1; exit } { print } END { if (!closed) exit 1 }' "$f")"
+          printf '%s\n' "$frontmatter" | grep -qx 'name: ksail'
+          printf '%s\n' "$frontmatter" | grep -Eq '^description:[[:space:]]*[^[:space:]]'
+
+  operator-chart-lint:
+    name: ⛵ Operator Chart Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [changes]
+    if: github.event_name != 'merge_group' && needs.changes.outputs.operator-chart == 'true'
+    permissions:
+      contents: read
+    steps:
+      - name: 📄 Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: 🔍 Helm lint
+        run: helm lint charts/ksail-operator
+
+      - name: 📐 Helm template (value permutations)
+        run: |
+          set -euo pipefail
+          echo "=== defaults (operator only) ==="
+          helm template ksail-operator charts/ksail-operator >/dev/null
+          echo "=== ui.ingress.enabled ==="
+          helm template ksail-operator charts/ksail-operator \
+            --set ui.ingress.enabled=true >/dev/null
+          echo "=== auth.oidc.enabled ==="
+          # OIDC requires a redirectURL (or ui.ingress) plus a client secret;
+          # the operator does not run here, so dummy values are sufficient to
+          # exercise the secret/deployment templates.
+          helm template ksail-operator charts/ksail-operator \
+            --set ui.ingress.enabled=true \
+            --set auth.oidc.enabled=true \
+            --set auth.oidc.issuerURL=https://dex.example \
+            --set auth.oidc.clientID=ksail \
+            --set auth.oidc.clientSecret=dummy \
+            --set auth.oidc.redirectURL=https://ksail.local/api/v1/auth/callback >/dev/null
+          echo "✅ All chart template permutations rendered"
+
+  operator-chart-e2e:
+    name: ⛵ Operator Chart E2E
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: [changes]
+    # Local images only — no secrets/GHCR — so this also runs on fork PRs.
+    if: >-
+      !cancelled()
+      && !inputs.run_local_recovery_trial
+      && (
+        (github.event_name == 'pull_request' && needs.changes.outputs.operator-chart == 'true')
+        || github.event_name == 'workflow_dispatch'
+      )
+    permissions:
+      contents: read
+    steps:
+      - name: 📄 Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: 🧹 Free disk space
+        # E2E builds the operator image and spins up a Kubernetes cluster in
+        # Docker — reclaim disk first to avoid runner "no space left on device".
+        uses: ./.github/actions/free-disk-space
+        with:
+          docker-prune: "true"
+
+      - name: ⚙️ Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: 🧪 Run Operator Chart E2E
+        uses: ./.github/actions/operator-chart-e2e
+
+  warm-helm-cache:
+    name: 🔥 Warm Helm Cache
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: [changes, build-artifact, wait-for-validate-go]
+    if: >-
+      !cancelled()
+      && (needs.wait-for-validate-go.result == 'success' || needs.wait-for-validate-go.result == 'skipped')
+      && (
+        (github.event_name == 'pull_request'
+        && needs.changes.outputs.system-test == 'true'
+        && github.event.pull_request.head.repo.full_name == github.repository)
+        || (github.event_name == 'workflow_dispatch' && inputs.run_system_tests == true && !inputs.run_local_recovery_trial)
+      )
+    permissions:
+      contents: read
+    outputs:
+      cache-key: ${{ steps.warm.outputs.cache-key }}
+    steps:
+      - name: 📄 Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: 🧹 Free disk space
+        # Builds the ksail binary on a cache miss and pulls Helm charts —
+        # reclaim disk first to avoid runner "no space left on device".
+        uses: ./.github/actions/free-disk-space
+
+      - name: ⚙️ Setup Go
+        id: setup-go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: 📦 Cache KSail Binary
+        uses: ./.github/actions/cache-ksail-binary
+        with:
+          go-version: ${{ steps.setup-go.outputs.go-version }}
+          source-hash: ${{ hashFiles('go.mod', 'go.sum', '**/*.go') }}
+          output-path: /usr/local/bin/ksail
+          save: "false"
+
+      - name: 🔥 Warm Helm chart cache
+        id: warm
+        uses: ./.github/actions/warm-helm-cache
+
+  warm-mirror-cache:
+    name: 🔥 Warm Mirror Cache
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: [changes, build-artifact, wait-for-validate-go]
+    if: >-
+      !cancelled()
+      && (needs.wait-for-validate-go.result == 'success' || needs.wait-for-validate-go.result == 'skipped')
+      && (
+        (github.event_name == 'pull_request'
+        && needs.changes.outputs.system-test == 'true'
+        && github.event.pull_request.head.repo.full_name == github.repository)
+        || (github.event_name == 'workflow_dispatch' && inputs.run_system_tests == true && !inputs.run_local_recovery_trial)
+      )
+    permissions:
+      contents: read
+    outputs:
+      cache-key: ${{ steps.warm.outputs.cache-key }}
+      artifact-id: ${{ steps.mirror-artifact.outputs.artifact-id }}
+    steps:
+      - name: 📄 Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: 🔍 Verify restored cache rejects missing image data
+        run: |
+          shellcheck .github/actions/warm-mirror-cache/cache-validation.test.sh
+          bash .github/actions/warm-mirror-cache/cache-validation.test.sh
+          shellcheck .github/actions/ksail-system-test/offline-ecr-upstream.sh \
+            .github/actions/ksail-system-test/offline-ecr-upstream.test.sh \
+            .github/actions/ksail-system-test/verify-offline-ecr-pull.sh \
+            .github/actions/ksail-system-test/verify-offline-ecr-pull.test.sh
+          bash .github/actions/ksail-system-test/offline-ecr-upstream.test.sh
+          bash .github/actions/ksail-system-test/verify-offline-ecr-pull.test.sh
+
+      - name: 🧹 Free disk space
+        # Pulls every system-test image through five mirror registries and tars
+        # the volumes (multi-GB) — the prime "no space left on device" offender
+        # (e.g. run 27774791970). Reclaim disk before warming the cache.
+        uses: ./.github/actions/free-disk-space
+
+      - name: ⚙️ Setup Go
+        id: setup-go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: 📦 Cache KSail Binary
+        uses: ./.github/actions/cache-ksail-binary
+        with:
+          go-version: ${{ steps.setup-go.outputs.go-version }}
+          source-hash: ${{ hashFiles('go.mod', 'go.sum', '**/*.go') }}
+          output-path: /usr/local/bin/ksail
+          save: "false"
+
+      # The ECR Public copy falls back to Docker Hub for Docker Official
+      # Images when ECR Public rate-limits the runner; skopeo reads this login.
+      - name: 🔐 Login to Docker Hub
+        if: ${{ vars.DOCKERHUB_USERNAME != '' }}
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }} # zizmor: ignore[secrets-outside-env] - third-party action input, no environment scoping available
+
+      - name: 🔥 Warm mirror cache
+        id: warm
+        uses: ./.github/actions/warm-mirror-cache
+
+      - name: 📤 Publish validated mirror artifact
+        id: mirror-artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: mirror-cache-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ steps.warm.outputs.archive-path }}/*.tar
+            ${{ steps.warm.outputs.archive-path }}/cache-key
+            ${{ steps.warm.outputs.archive-path }}/SHA256SUMS
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+  # Docker-based system tests run in full parallelism with no concurrency
+  # constraints — each job gets its own runner with local Docker containers.
+  system-test-docker:
+    name: 🧪 System Test (Docker)
+    runs-on: ubuntu-latest
+    # The Talos host + full nested Kubernetes-provider coverage (Vanilla,K3s,VCluster,Talos)
+    # has a ~77-min worst case. 120 gives comfortable headroom to absorb runtime variance
+    # without trimming test coverage.
+    timeout-minutes: 120
+    needs:
+      [
+        changes,
+        build-artifact,
+        warm-helm-cache,
+        warm-mirror-cache,
+        wait-for-validate-go,
+      ]
+    if: >-
+      !cancelled()
+      && needs.warm-mirror-cache.result == 'success'
+      && (needs.wait-for-validate-go.result == 'success' || needs.wait-for-validate-go.result == 'skipped')
+      && (
+        (github.event_name == 'pull_request'
+        && needs.changes.outputs.system-test == 'true'
+        && github.event.pull_request.head.repo.full_name == github.repository)
+        || (github.event_name == 'workflow_dispatch' && inputs.run_system_tests == true && !inputs.run_local_recovery_trial)
+      )
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      # fail-fast: false so a single failing leg does not cancel its siblings. This surfaces
+      # every failing distribution/arg combination in one run (aligning with the goal of
+      # making all CI errors visible and blocking) instead of masking later legs behind the
+      # first failure, and it lets the diagnostic-bearing legs run to completion.
+      fail-fast: false
+      max-parallel: 15
+      matrix:
+        distribution: [KWOK, Vanilla, K3s, VCluster, Talos]
+        provider: [Docker]
+        init: [true]
+        args:
+          - ""
+          - "--name system-test-cluster --cni Cilium --csi Enabled --load-balancer Enabled --metrics-server Enabled --policy-engine Kyverno --cert-manager Enabled --gitops-engine Flux"
+          - "--cni Calico --csi Disabled --load-balancer Disabled --metrics-server Disabled --policy-engine Gatekeeper --gitops-engine ArgoCD"
+          - "--gitops-engine Flux --local-registry ghcr.io/devantler-tech/ksail/system-test-manifests"
+          - "--gitops-engine ArgoCD --local-registry ghcr.io/devantler-tech/ksail/system-test-manifests"
+        # init=false (CLI-flag-only path without ksail.yaml) is now covered by
+        # unit tests (TestCreate_NoConfigFile_*) instead of full E2E clusters.
+        include:
+          - distribution: Talos
+            provider: Docker
+            init: true
+            args: "--name system-test-cluster-with-image-verification --image-verification Enabled"
+          # Enable Kubernetes provider tests on the default (init=true, args="")
+          # entry for each distribution. This tests all 4 nested distributions
+          # (Vanilla,K3s,VCluster,Talos) on each host type, once per matrix.
+          # The three mirror-supported distributions also opt into their smoke
+          # test here so it runs once per distribution rather than for all args.
+          - distribution: Vanilla
+            provider: Docker
+            init: true
+            args: ""
+            test-kubernetes-provider: "true"
+            test-workload-mirror: "true"
+          - distribution: K3s
+            provider: Docker
+            init: true
+            args: ""
+            test-kubernetes-provider: "true"
+            test-workload-mirror: "true"
+          - distribution: Talos
+            provider: Docker
+            init: true
+            args: ""
+            kubernetes-upgrade-from: "v1.36.2"
+            kubernetes-upgrade-to: "v1.37.1"
+            test-kubernetes-provider: "true"
+          - distribution: VCluster
+            provider: Docker
+            init: true
+            args: ""
+            test-kubernetes-provider: "true"
+            test-workload-mirror: "true"
+          # Exercise Argo CD's Redis pull with both the proxy upstream and
+          # containerd's fallback pointed at an empty local registry.
+          - distribution: VCluster
+            provider: Docker
+            init: true
+            args: "--gitops-engine ArgoCD --local-registry ghcr.io/devantler-tech/ksail/system-test-manifests"
+            ecr-public-offline: "true"
+          # Validate Calico on the Kubernetes (k3k) provider. Calico v3.30+'s CRD
+          # chart ships MutatingAdmissionPolicy resources that need the v1beta1
+          # admissionregistration API enabled on the embedded k3s server via the k3k
+          # Cluster serverArgs. The default test-kubernetes-provider legs above use
+          # the distribution-default CNI, so this leg is the only one exercising the
+          # k3k+Calico serverArgs path. A unique host args value keeps this as a
+          # standalone matrix combination (not merged into the args="" Vanilla leg).
+          - distribution: Vanilla
+            provider: Docker
+            init: true
+            args: "--name k3k-calico-host"
+            test-kubernetes-provider: "true"
+            kubernetes-provider-distributions: "K3s"
+            kubernetes-provider-cni: "Calico"
+          # NOTE: KWOK excluded — simulated nodes cannot run real workloads (DinD pods)
+    steps:
+      - name: 📄 Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: 🧹 Free disk space
+        # Reclaim ~30 GB before pulling system-test images and spinning up
+        # clusters in Docker; docker-prune also clears the Docker daemon.
+        uses: ./.github/actions/free-disk-space
+        with:
+          docker-prune: "true"
+
+      - name: 🔐 Login to Docker Hub
+        if: ${{ vars.DOCKERHUB_USERNAME != '' }}
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }} # zizmor: ignore[secrets-outside-env] - third-party action input, no environment scoping available
+
+      - name: ⚙️ Setup Go
+        id: setup-go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: 📥 Restore KSail binary
+        # Pin the identical published action until actionlint supports $/ references.
+        uses: devantler-tech/ksail/.github/actions/restore-ksail-binary@3115397431e2bdf31d911930908a9002a93a4340
+        with:
+          artifact-id: ${{ needs.build-artifact.outputs.artifact-id }}
+          binary-sha256: ${{ needs.build-artifact.outputs.binary-sha256 }}
+
+      - name: 📥 Restore Helm Cache
+        uses: ./.github/actions/restore-helm-cache
+
+      - name: 📥 Restore Mirror Cache
+        uses: ./.github/actions/restore-mirror-cache
+        with:
+          cache-key: ${{ needs.warm-mirror-cache.outputs.cache-key }}
+          artifact-id: ${{ needs.warm-mirror-cache.outputs.artifact-id }}
+          require-artifact: "true"
+
+      - name: 📥 Pre-pull registry image for offline ECR check
+        if: ${{ matrix.ecr-public-offline == 'true' }}
+        run: bash .github/actions/pull-registry-image/pull-registry-image.sh
+
+      - name: 🚫 Start empty ECR Public fallback
+        id: offline-ecr
+        if: ${{ matrix.ecr-public-offline == 'true' }}
+        run: bash .github/actions/ksail-system-test/offline-ecr-upstream.sh start
+
+      - name: 🧪 Run KSail System Test
+        id: system-test
+        uses: ./.github/actions/ksail-system-test
+        with:
+          distribution: ${{ matrix.distribution }}
+          provider: ${{ matrix.provider }}
+          init: ${{ matrix.init }}
+          args: ${{ matrix.args }}
+          kubernetes-upgrade-from: ${{ matrix.kubernetes-upgrade-from || '' }}
+          kubernetes-upgrade-to: ${{ matrix.kubernetes-upgrade-to || '' }}
+          ecr-public-upstream: ${{ steps.offline-ecr.outputs.remote-url || 'https://ecr-public.aws.com' }}
+          apply-overlay-path: ".github/fixtures/podinfo-overlay"
+          test-kubernetes-provider: ${{ matrix.test-kubernetes-provider || 'false' }}
+          test-workload-mirror: ${{ matrix.test-workload-mirror || 'false' }}
+          kubernetes-provider-distributions: ${{ matrix.kubernetes-provider-distributions || 'Vanilla,K3s,VCluster,Talos' }}
+          kubernetes-provider-cni: ${{ matrix.kubernetes-provider-cni || '' }}
+
+          ghcr-user: ${{ github.actor }}
+          ghcr-token: ${{ secrets.GITHUB_TOKEN }}
+          dockerhub-user: ${{ vars.DOCKERHUB_USERNAME }}
+          dockerhub-token: ${{ secrets.DOCKERHUB_TOKEN }}
+          # Composite-action steps cannot set timeout-minutes. Upload from the
+          # workflow instead so a stalled artifact service is hard-bounded.
+          # Defer cleanup until the failure diagnostics have been uploaded.
+          upload-artifacts: "false"
+          cleanup: "false"
+          # A reserved K3s pod sandbox can wedge every API-backed command in the
+          # rich debug action. Keep its essential diagnostics on bounded calls.
+          comprehensive-debug: ${{ matrix.distribution == 'K3s' && 'false' || 'true' }}
+
+      - name: 🔍 Verify offline ECR consumer pull
+        if: ${{ matrix.ecr-public-offline == 'true' && steps.system-test.outcome == 'success' }}
+        env:
+          OFFLINE_ECR_UPSTREAM: ${{ steps.offline-ecr.outputs.remote-url }}
+        run: bash .github/actions/ksail-system-test/verify-offline-ecr-pull.sh "$OFFLINE_ECR_UPSTREAM"
+
+      - name: 📤 Upload system test diagnostics
+        if: ${{ failure() && steps.system-test.outcome == 'failure' }}
+        continue-on-error: true
+        timeout-minutes: 5
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: system-test-diagnostics-${{ steps.system-test.outputs.artifact-tag }}
+          path: /tmp/system-test-diagnostics/
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: 🧪 Cleanup KSail System Test
+        if: ${{ always() && steps.system-test.outcome != 'skipped' && steps.system-test.outcome != '' }}
+        uses: ./.github/actions/ksail-system-test-cleanup
+        with:
+          distribution: ${{ matrix.distribution }}
+          provider: ${{ matrix.provider }}
+          args: ${{ matrix.args }}
+
+      - name: 🧹 Stop empty ECR Public fallback
+        if: ${{ always() && steps.offline-ecr.outcome == 'success' }}
+        env:
+          OFFLINE_ECR_CONTAINER: ${{ steps.offline-ecr.outputs.container-name }}
+        run: bash .github/actions/ksail-system-test/offline-ecr-upstream.sh stop "$OFFLINE_ECR_CONTAINER"
+
+      - name: 📤 Upload system test logs
+        if: ${{ always() && steps.system-test.outcome != 'skipped' && steps.system-test.outcome != '' }}
+        continue-on-error: true
+        timeout-minutes: 5
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: system-test-logs-${{ steps.system-test.outputs.artifact-tag }}
+          path: /tmp/ksail-system-test-logs/
+          retention-days: 7
+          if-no-files-found: ignore
+
+  validate-calico-chart:
+    name: 🔍 Validate Calico Chart Version
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [changes]
+    # Cheap pre-flight: a calico/node image bump (Dependabot updates the
+    # Dockerfile) can outpace the tigera-operator chart release, so the chart
+    # version version.go derives from the tag points at a chart that is not
+    # published. Without this, the bad pin only surfaces after the full ~30-min
+    # System Test matrix as an opaque "Calico not detected". Fail fast and
+    # legibly instead. See https://github.com/devantler-tech/ksail/issues/5463.
+    if: needs.changes.outputs.calico-cni == 'true'
+    permissions:
+      contents: read
+    steps:
+      - name: 📄 Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: 🔍 Verify the derived tigera-operator chart version is published
+        run: |
+          set -euo pipefail
+          dockerfile="pkg/svc/installer/cni/calico/Dockerfile"
+          # Mirror version.go's chartVersion(): the chart version is the
+          # calico/node image tag (FROM docker.io/calico/node:<tag>@sha256:…).
+          version="$(sed -nE 's|.*docker\.io/calico/node:([^@[:space:]]+).*|\1|p' "$dockerfile" | head -1)"
+          if [ -z "$version" ]; then
+            echo "::error file=$dockerfile::Could not derive the calico/node tag from $dockerfile — has the FROM line format changed? Update this guard and version.go together."
+            exit 1
+          fi
+          echo "Derived Calico chart version: $version"
+
+          repo_url="https://docs.tigera.io/calico/charts"
+          helm repo add projectcalico "$repo_url" >/dev/null
+          helm repo update projectcalico >/dev/null
+
+          # The installer installs BOTH the operator chart and the CRD chart at
+          # this version (installer.go chartSpec/crdChartSpec); a bump that
+          # outpaces either chart leaves the install unresolvable.
+          status=0
+          for chart in tigera-operator projectcalico.org.v3; do
+            if helm show chart "projectcalico/$chart" --version "$version" >/dev/null 2>&1; then
+              echo "✅ projectcalico/$chart $version is published"
+            else
+              echo "::error file=$dockerfile::projectcalico/$chart has no published $version chart. The calico/node image tag was bumped ahead of the tigera-operator chart release — pin $dockerfile to a calico/node tag whose matching chart is published at $repo_url (the calico/node tag must equal the chart version)."
+              status=1
+            fi
+          done
+          exit "$status"
+
+  verify-dependency-test-graph:
+    name: 🔗 Verify Dependency Test Graph
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [changes]
+    if: github.event_name != 'merge_group' && needs.changes.outputs.dependency-test-graph == 'true'
+    permissions:
+      contents: read
+    steps:
+      - name: 📄 Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          repository: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name || github.repository }}
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+
+      - name: ⚙️ Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      # `go build ./...` and `go test ./...` resolve only THIS module's packages and their own
+      # tests. Neither resolves the tests of a DEPENDENCY, so a dependency whose test imports a
+      # package no module in the graph provides leaves every repo check green. Dependabot does
+      # resolve that wider graph on each update, so the break surfaces only as an aborted update
+      # in the Dependabot logs — invisible unless someone goes looking (ksail#6666: four straight
+      # days of failed root go_modules updates while CI was green throughout).
+      #
+      # sops/v3/hcvault.test is the concrete chain that broke, via
+      # dockertest/v3 -> docker/pkg/idtools -> opencontainers/runc/libcontainer/user.
+      # Resolving it here turns a silent Dependabot abort into a failing check on the PR that
+      # introduces it.
+      - name: 🔗 Resolve dependency test graph
+        run: |
+          if ! out="$(go list -deps -test github.com/getsops/sops/v3/hcvault 2>&1 >/dev/null)"; then
+            echo "::error::A dependency's test graph no longer resolves, so Dependabot cannot update root Go modules."
+            printf '%s\n' "$out"
+            echo "Fix: keep a module that still provides the missing package in the graph."
+            echo "Because MVS selects the MAXIMUM version, a 'require' is only a floor — use a 'replace'."
+            exit 1
+          fi
+          echo "Dependency test graph resolves."
+
+  verify-dependency-contracts:
+    name: 🔗 Verify Dependency Contracts
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [changes]
+    if: needs.changes.outputs.dependency-contracts == 'true'
+    permissions:
+      contents: read
+    steps:
+      - name: 📄 Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          repository: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name || github.repository }}
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+
+      - name: ⚙️ Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      # The contracts keep the Gateway API CRDs KSail installs on the line the pinned Cilium
+      # release is built against, and keep the module carrying their version tracked by
+      # Dependabot (ksail#7472). Two of their inputs, the Cilium chart pin and the Dependabot
+      # configuration, are not Go sources, so a pull request changing only one of them reaches
+      # no other test run.
+      # -count=1 is load-bearing for the same reason: those inputs are outside Go's test cache,
+      # so a cached PASS could be replayed over a changed pin.
+      - name: 🔗 Verify dependency contracts
+        run: go test ./internal/depcontract/... -count=1
+
+  verify-todos-workflow-contract:
+    name: 🧾 Verify Workflow Contracts
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [changes]
+    if: github.event_name != 'merge_group' && needs.changes.outputs.todos-contract == 'true'
+    permissions:
+      contents: read
+    steps:
+      - name: 📄 Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          repository: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name || github.repository }}
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+
+      - name: ⚙️ Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      # -count=1 is load-bearing: this test's real subject is a YAML file the Go build graph
+      # cannot see, so a cached PASS from an earlier run would be replayed over a changed
+      # workflow and report success without executing anything.
+      - name: 🧹 Check workflow cleanup scripts
+        run: |
+          shellcheck \
+            .github/scripts/delete-old-workflow-runs.sh \
+            .github/scripts/delete-old-workflow-runs.test.sh \
+            .github/fixtures/workflow-run-cleanup/fake-bin/gh
+
+      - name: 🧾 Verify workflow contracts
+        run: |
+          if ! go test ./internal/ciharness/... -count=1; then
+            echo "::error::A workflow no longer matches its contract in internal/ciharness."
+            echo "Fix the reported workflow or script failure while preserving its safety properties."
+            exit 1
+          fi
+
+  verify-bash-32-workflow-contract:
+    name: 🧪 Verify Bash 3.2 Workflow Contract
+    runs-on: macos-latest
+    timeout-minutes: 10
+    needs: [changes]
+    if: github.event_name != 'merge_group' && needs.changes.outputs.todos-contract == 'true'
+    permissions:
+      contents: read
+    steps:
+      - name: 📄 Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          repository: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name || github.repository }}
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+
+      - name: ⚙️ Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: 🧪 Verify empty arguments under Bash 3.2
+        env:
+          KSAIL_REQUIRE_BASH32: "true"
+        run: go test ./internal/ciharness -run '^TestSystemTestTalosUpgradeEmptyArgumentsUnderBash32$' -count=1
+
+  # Runs the Go suite when only the release build configuration changed. The org-required Go
+  # validation skips its test job on such a pull request, because no Go file changed, while
+  # Go tests assert on exactly these files (see the release-config filter, ksail#7400).
+  # Pull requests only: on main, ci-go already runs the whole suite on every push
+  # (test-default-branch).
+  test-release-config:
+    name: 🧪 Test Release Configuration
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: [changes]
+    if: github.event_name == 'pull_request' && needs.changes.outputs.release-config == 'true'
+    permissions:
+      contents: read
+    steps:
+      - name: 📄 Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: ⚙️ Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      # -count=1 is load-bearing: the files under test are invisible to the Go build graph,
+      # so a cached PASS from an earlier run would be replayed over the changed configuration.
+      - name: 🧪 Test
+        run: go test ./... -count=1
+  release-graph-audit:
+    name: 🔐 Audit Shipped Dependency Graphs
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: [changes]
+    if: needs.changes.outputs.release-graph-audit == 'true'
+    permissions:
+      contents: read
+    steps:
+      - name: 📄 Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          repository: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name || github.repository }}
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+
+      - name: 🧹 Free disk space
+        env:
+          DOCKER_PRUNE: "false"
+        run: bash .github/actions/free-disk-space/free-disk-space.sh
+
+      - name: ⚙️ Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: 🔐 Audit Shipped Dependency Graphs
+        # Release files are outside Go's test-cache inputs; always execute the audit.
+        run: go test ./pkg/client/kubescape/... -count=1
+
+  local-recovery-trial:
+    name: 🧪 Local Connection Recovery Acceptance
+    if: github.event_name == 'workflow_dispatch' && inputs.run_local_recovery_trial
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    env:
+      GOMAXPROCS: "2"
+      GOMEMLIMIT: "4GiB"
+      GOFLAGS: "-p=2"
+    steps:
+      - name: 📄 Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: 🧹 Free runner disk
+        uses: devantler-tech/ksail/.github/actions/free-disk-space@065b9e08b85a396b9e936c01f01b512bb23f8aa9
+      - name: ⚙️ Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: 🧪 Reproduce local safety and partial-deletion cases
+        id: local-safety
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/local-recovery-evidence"
+          printf '%s\n' "$GITHUB_SHA" > "$RUNNER_TEMP/local-recovery-evidence/head.txt"
+          go test ./pkg/k8s ./pkg/cli/cmd/cluster -run 'TestForget|TestKubernetesCleanup_PartialDeletion' -count=1 -v 2>&1 | tee "$RUNNER_TEMP/local-recovery-evidence/regressions.log"
+      - name: 🏗️ Build the actual CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          go build -o "$RUNNER_TEMP/ksail-local-recovery" . 2>&1 | tee "$RUNNER_TEMP/local-recovery-evidence/build.log"
+      - name: 🧪 Exercise the actual CLI with local files and a recording API
+        shell: bash
+        run: |
+          set -euo pipefail
+          go run .github/scripts/local-connection-recovery-trial.go "$RUNNER_TEMP/ksail-local-recovery" 2>&1 | tee "$RUNNER_TEMP/local-recovery-evidence/cli-trial.log"
+      - name: 🧪 Validate the complete Go suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test ./... -count=1 2>&1 | tee "$RUNNER_TEMP/local-recovery-evidence/go-test.log"
+      - name: ⚙️ Install the canonical CI linter
+        if: ${{ !cancelled() && steps.local-safety.outcome == 'success' }}
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          version: v2.11.4
+          install-only: true
+          verify: false
+      - name: 🔍 Validate with the canonical CI linter
+        if: ${{ !cancelled() && steps.local-safety.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          golangci-lint version | tee "$RUNNER_TEMP/local-recovery-evidence/lint-version.log"
+          golangci-lint run --fix --timeout 15m \
+            --max-issues-per-linter 0 --max-same-issues 0 2>&1 | tee "$RUNNER_TEMP/local-recovery-evidence/lint.log"
+      - name: ⚙️ Setup Node.js for canonical generation
+        if: ${{ !cancelled() && steps.local-safety.outcome == 'success' }}
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+      - name: 📝 Regenerate all maintained artifacts
+        if: ${{ !cancelled() && steps.local-safety.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          go install github.com/vektra/mockery/v3@v3.5.4
+          make generate 2>&1 | tee "$RUNNER_TEMP/local-recovery-evidence/generate.log"
+      - name: 📚 Build the documentation
+        if: ${{ !cancelled() && steps.local-safety.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm --prefix docs ci
+          npm --prefix docs run build 2>&1 | tee "$RUNNER_TEMP/local-recovery-evidence/docs-build.log"
+      - name: 🔐 Require the tested source to remain unchanged
+        if: ${{ !cancelled() && steps.local-safety.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --binary > "$RUNNER_TEMP/local-recovery-evidence/generated.patch"
+          git status --porcelain --untracked-files=all > "$RUNNER_TEMP/local-recovery-evidence/working-tree.txt"
+          if [[ -s "$RUNNER_TEMP/local-recovery-evidence/working-tree.txt" ]]; then
+            cat "$RUNNER_TEMP/local-recovery-evidence/working-tree.txt"
+            echo '::error::Lint or generation changed the tested source. Apply the retained output and rerun acceptance at the resulting commit.'
+            exit 1
+          fi
+      - name: 📤 Preserve exact-head acceptance evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: local-recovery-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/local-recovery-evidence
+          if-no-files-found: error
+          retention-days: 14
+
+  retired-repo-links:
+    name: Retired repository links
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check active documentation
+        id: links
+        uses: devantler-tech/.github/actions/validate-retired-repo-links@8d3327fe87f216d6e107941de4ce1ae019294cea # v7.9.1
+        with:
+          enabled: "true"
+      - name: Require a completed scan
+        env:
+          VALIDATED: ${{ steps.links.outputs.validated }}
+        run: test "$VALIDATED" = true
+      - name: Check out the exact validator for refusal controls
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: devantler-tech/.github
+          ref: bd0035dd8f41fcf1459b878882b8897443f8dc59 # v4.9.4
+          path: .retired-link-validator-source
+          persist-credentials: false
+      - name: Prove retired links and incomplete scans fail
+        env:
+          GOWORK: "off"
+          GOFLAGS: ""
+          GOTOOLCHAIN: local
+        run: |
+          set -euo pipefail
+          control=$(mktemp -d "$RUNNER_TEMP/retired-links.XXXXXX")
+          trap 'rm -rf "$control"' EXIT
+          mkdir "$control/.github"
+          cp .github/retired-repo-links.json "$control/.github/"
+          cp README.md AGENTS.md "$control/"
+          go -C .retired-link-validator-source/actions/validate-retired-repo-links build -mod=readonly -trimpath -o "$control/validator" .
+          printf '\nhttps://github.com/devantler-tech/reusable-workflows\n' >>"$control/README.md"
+          status=0
+          "$control/validator" --root "$control" >"$control/negative.log" 2>&1 || status=$?
+          test "$status" = 1 || { cat "$control/negative.log"; exit 1; }
+          grep -Eq '^README.md:[0-9]+: link targets retired repository devantler-tech/reusable-workflows$' "$control/negative.log"
+          rm "$control/.github/retired-repo-links.json"
+          status=0
+          "$control/validator" --root "$control" >"$control/missing.log" 2>&1 || status=$?
+          test "$status" = 2 || { cat "$control/missing.log"; exit 1; }
+          grep -q '^Invalid configuration:' "$control/missing.log"
+          echo 'PASS: clean scan, seeded retired link rejection, and missing configuration refusal'
+
+  require-checks-in-pr:
+    name: ${{ github.event_name == 'workflow_dispatch' && inputs.run_local_recovery_trial && 'Local Recovery Trial - Checks' || 'CI - Required Checks' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs:
+      [
+        retired-repo-links,
+        rate-limit-gate,
+        changes,
+        ci-go,
+        wait-for-validate-go,
+        verify-go-archive,
+        verify-vulnerability-identities,
+        build-artifact,
+        generate,
+        auto-commit,
+        warm-helm-cache,
+        warm-mirror-cache,
+        system-test-docker,
+        home-isolation,
+        audit-docs,
+        audit-vsce,
+        build-docs,
+        vscode-extension,
+        copilot-plugin,
+        operator-chart-lint,
+        operator-chart-e2e,
+        validate-calico-chart,
+        verify-dependency-test-graph,
+        verify-dependency-contracts,
+        verify-todos-workflow-contract,
+        verify-bash-32-workflow-contract,
+        test-release-config,
+        release-graph-audit,
+        cask-pr-handoff,
+        k3k-sentinel-scripts,
+        rate-limit-gate-script,
+        hetzner-cleanup-script,
+        gitops-assert-scripts,
+        local-recovery-trial,
+      ]
+    if: ${{ always() }}
+    steps:
+      - uses: devantler-tech/actions/aggregate-job-checks@1d726483facb9340655489913f609082677be8f5 # v13.10.6
+        with:
+          job-results: >-
+            ${{ needs.retired-repo-links.result }}
+            ${{ needs.rate-limit-gate.result }}
+            ${{ needs.changes.result }}
+            ${{ needs.ci-go.result }}
+            ${{ needs.wait-for-validate-go.result }}
+            ${{ needs.verify-go-archive.result }}
+            ${{ needs.verify-vulnerability-identities.result }}
+            ${{ needs.build-artifact.result }}
+            ${{ needs.generate.result }}
+            ${{ needs.auto-commit.result }}
+            ${{ needs.warm-helm-cache.result }}
+            ${{ needs.warm-mirror-cache.result }}
+            ${{ needs.system-test-docker.result }}
+            ${{ needs.home-isolation.result }}
+            ${{ needs.audit-docs.result }}
+            ${{ needs.audit-vsce.result }}
+            ${{ needs.build-docs.result }}
+            ${{ needs.vscode-extension.result }}
+            ${{ needs.copilot-plugin.result }}
+            ${{ needs.operator-chart-lint.result }}
+            ${{ needs.operator-chart-e2e.result }}
+            ${{ needs.validate-calico-chart.result }}
+            ${{ needs.verify-dependency-test-graph.result }}
+            ${{ needs.verify-dependency-contracts.result }}
+            ${{ needs.verify-todos-workflow-contract.result }}
+            ${{ needs.verify-bash-32-workflow-contract.result }}
+            ${{ needs.test-release-config.result }}
+            ${{ needs.release-graph-audit.result }}
+            ${{ needs.cask-pr-handoff.result }}
+            ${{ needs.k3k-sentinel-scripts.result }}
+            ${{ needs.rate-limit-gate-script.result }}
+            ${{ needs.hetzner-cleanup-script.result }}
+            ${{ needs.gitops-assert-scripts.result }}
+            ${{ needs.local-recovery-trial.result }}

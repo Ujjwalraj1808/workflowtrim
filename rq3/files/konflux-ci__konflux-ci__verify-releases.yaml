@@ -1,0 +1,86 @@
+name: Verify Releases
+
+on:
+  # Run weekly on Tuesday at 2 AM UTC (one day after auto-tag-weekly)
+  schedule:
+    - cron: '0 2 * * 2'
+  # Allow manual triggering
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  get-branches:
+    name: List branches to verify
+    runs-on: ubuntu-latest
+    outputs:
+      branches: ${{ steps.set.outputs.branches }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          fetch-depth: 0
+
+      - name: List branches
+        id: set
+        run: |
+          BRANCHES=$(.github/scripts/list-release-branches.sh)
+          echo "branches=$BRANCHES" >> "$GITHUB_OUTPUT"
+          echo "Branches to verify: $BRANCHES"
+
+  verify-release:
+    name: Verify Release (${{ matrix.branch }})
+    runs-on: ubuntu-latest
+    needs: get-branches
+    if: needs.get-branches.outputs.branches != '[]'
+    strategy:
+      fail-fast: false
+      matrix:
+        branch: ${{ fromJson(needs.get-branches.outputs.branches) }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          ref: ${{ matrix.branch }}
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Verify releases
+        id: verify
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          .github/scripts/verify-releases.sh \
+            "${{ github.repository }}" \
+            "${{ matrix.branch }}"
+
+      - name: Create issue on verification failure
+        if: steps.verify.outputs.verification_failed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          WORKFLOW_NAME: Verify Releases
+        run: |
+          .github/scripts/create-or-update-issue.sh \
+            "Weekly Release Verification Failed (${{ matrix.branch }})" \
+            "Release verification failed for branch **${{ matrix.branch }}**." \
+            /tmp/verification-details.txt
+
+      - name: Create issue on unexpected failure
+        if: failure() && steps.verify.outputs.verification_failed != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          WORKFLOW_NAME: Verify Releases
+        run: |
+          .github/scripts/create-or-update-issue.sh \
+            "Weekly Release Verification Workflow Failed" \
+            "The weekly release verification workflow encountered an unexpected error. Please check the workflow logs to identify and fix the issue."

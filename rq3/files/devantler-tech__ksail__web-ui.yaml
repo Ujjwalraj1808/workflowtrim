@@ -1,0 +1,52 @@
+name: 🧩 Web UI
+
+on:
+  pull_request:
+    paths:
+      - "web/ui/**"
+      - ".github/workflows/web-ui.yaml"
+  push:
+    branches: [main]
+    paths:
+      - "web/ui/**"
+      - ".github/workflows/web-ui.yaml"
+
+permissions:
+  contents: read
+
+# The web UI is embedded into the binary (go:embed via pkg/webui) and served by the operator and
+# `ksail open web`/`ksail open desktop` themselves — there is no separate UI container image. This workflow is the fast
+# type-check/build gate for UI changes; the embedded bundle is produced during the operator image
+# build (see .goreleaser.yaml and .github/actions/operator-chart-e2e).
+jobs:
+  build:
+    name: 🏗️ Build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: web/ui
+    steps:
+      - name: 📄 Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: ⚙️ Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+          cache: "npm"
+          cache-dependency-path: "web/ui/package-lock.json"
+
+      - name: 📦 Install dependencies
+        run: npm ci
+
+      - name: 🏗️ Build
+        run: npm run build
+
+      - name: 🌐 Install browser
+        run: npx playwright install --with-deps chromium
+
+      - name: 🧪 Test responsive layouts
+        run: npm run test:e2e

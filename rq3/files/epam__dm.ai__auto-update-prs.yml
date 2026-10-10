@@ -1,0 +1,77 @@
+name: Auto-update open PRs when main or PRs change
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
+  schedule:
+    # Fallback: auto-merge commits made via PAT still may not trigger push events
+    # in some edge cases. Poll every 15 minutes (offset to avoid the :00/:30 herd).
+    - cron: '7,22,37,52 * * * *'
+  workflow_dispatch: {}
+
+concurrency:
+  # Serialize updates but never cancel an in-progress run.
+  # Push/schedule/workflow_dispatch update all PRs; pull_request updates only the triggering PR.
+  group: auto-update-prs-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.event_name }}
+  cancel-in-progress: false
+
+jobs:
+  update-prs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Update all open PRs that are behind main
+        if: github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+        run: |
+          # After a push to main, GitHub invalidates cached mergeability for all open PRs
+          # and recomputes asynchronously — returning "UNKNOWN" until ready. Retry until
+          # no PRs are stuck in UNKNOWN (up to ~90s) so the MERGEABLE filter doesn't miss them.
+          for attempt in $(seq 1 6); do
+            unknown=$(gh pr list --repo ${{ github.repository }} --state open --base main \
+              --json number,mergeable \
+              --jq '[.[] | select(.mergeable == "UNKNOWN")] | length')
+            echo "Attempt $attempt: $unknown PR(s) still in UNKNOWN mergeability state"
+            [ "$unknown" -eq 0 ] && break
+            sleep 15
+          done
+
+          prs=$(gh pr list --repo ${{ github.repository }} --state open --base main \
+            --json number,mergeable,isDraft,mergeStateStatus \
+            --jq '.[]
+                   | select(.isDraft == false)
+                   | select(.mergeable == "MERGEABLE")
+                   | select(.mergeStateStatus != "DIRTY")
+                   | .number')
+
+          if [ -z "$prs" ]; then
+            echo "No candidate PRs found."
+            exit 0
+          fi
+
+          for pr in $prs; do
+            echo "Attempting to update PR #$pr..."
+            gh pr update-branch "$pr" --repo ${{ github.repository }} \
+              || echo "PR #$pr skipped (already up to date or conflict)"
+          done
+
+      - name: Update triggering PR if it is behind main
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          echo "Attempting to update PR #$PR_NUMBER..."
+          gh pr update-branch "$PR_NUMBER" --repo ${{ github.repository }} \
+            || echo "PR #$PR_NUMBER skipped (already up to date or conflict)"

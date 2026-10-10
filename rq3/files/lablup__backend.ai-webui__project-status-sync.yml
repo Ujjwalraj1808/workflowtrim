@@ -1,0 +1,439 @@
+name: "Sync PR Project Status"
+
+# Mirrors a PR's review lifecycle into the GitHub Project V2 "Status" column of
+# its linked issues. This repo's convention is that issues — not PRs — are
+# attached to the project, so we walk PR -> linked issues -> each issue's
+# project item.
+#
+# Triggers: pull_request_target opened / ready_for_review / review_requested /
+# converted_to_draft, and pull_request_review submitted (changes_requested only).
+# The target Status is derived from the PR's current state, not from the event:
+#   draft                                                      -> "In progress"
+#   a reviewer's latest opinionated review is CHANGES_REQUESTED
+#     and that reviewer is not currently re-requested          -> "Requested changes"
+#   otherwise                                                  -> "In review"
+#
+# Iteration: when the target is "In progress" or "In review" and the item's
+# Iteration field is empty, it is set to the current iteration (start date <=
+# today < start + duration). An Iteration that is already set is never changed.
+#
+# Link detection combines:
+#   1. GitHub's canonical `closingIssuesReferences` (covers manual "Development"
+#      links and closing keywords auto-detected by GitHub).
+#   2. A regex fallback over the PR body that matches `(close|fix|resolve)
+#      [sd|es|ed]? #<num>`. GitHub only registers closing keywords for PRs
+#      targeting the repo's default branch, so stacked PRs (common here via
+#      GitHub Stacked PRs / gh stack) never populate (1). The fallback is
+#      load-bearing — without it this workflow would be a near-total no-op
+#      for stacked PRs.
+#
+# Configuration (repository or organization variables):
+#   vars.PROJECT_ORGANIZATION  — organization login that owns the Project V2.
+#                                User-owned projects are not supported; the
+#                                metadata query only resolves `organization(login:)`.
+#   vars.PROJECT_NUMBER        — project number (integer). If unset, the
+#                                workflow is a no-op. Once both variables and
+#                                the secret are set, an unreadable project or a
+#                                missing Status field/option fails the job.
+#
+# Secret:
+#   secrets.PROJECT_TOKEN      — PAT or GitHub App token with `project` scope.
+#                                The default GITHUB_TOKEN cannot write to
+#                                Projects V2. If unset, the workflow is a no-op.
+#
+# Notes:
+#   * Uses `pull_request_target` and `pull_request_review` so the workflow has
+#     access to secrets for PRs opened from forks. No PR code is checked out
+#     or executed — only metadata is used via the GraphQL API.
+#   * Cross-repo references (e.g. `Resolves owner/repo#123`) are not resolved.
+#     Only same-repo issue numbers are followed.
+#   * If a linked issue is not attached to the configured project, that issue
+#     is skipped with a notice. No project items are created.
+
+on:
+  pull_request_target:
+    types:
+      - opened
+      - ready_for_review
+      - converted_to_draft
+      - review_requested
+  pull_request_review:
+    types:
+      - submitted
+
+permissions:
+  pull-requests: read
+
+concurrency:
+  # Runs serialize per PR; each run writes an absolute status, so
+  # last-event-wins is correct — do NOT cancel-in-progress here.
+  group: project-status-sync-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  sync-project-status:
+    # Approved/commented reviews cannot move the Status — skip them before a
+    # runner is allocated.
+    if: >-
+      github.event_name != 'pull_request_review' ||
+      github.event.review.state == 'changes_requested'
+    runs-on: ubuntu-latest
+    env:
+      ORGANIZATION: ${{ vars.PROJECT_ORGANIZATION }}
+      PROJECT_NUMBER: ${{ vars.PROJECT_NUMBER }}
+      STATUS_FIELD_NAME: "Status"
+      ITERATION_FIELD_NAME: "Iteration"
+      IN_REVIEW_STATUS_NAME: "In review"
+      IN_PROGRESS_STATUS_NAME: "In progress"
+      CHANGES_REQUESTED_STATUS_NAME: "Requested changes"
+    steps:
+      - name: Resolve target status from PR state
+        id: target
+        env:
+          GH_TOKEN: ${{ secrets.PROJECT_TOKEN }}
+          REPO_FULL_NAME: ${{ github.event.pull_request.base.repo.full_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::warning::secrets.PROJECT_TOKEN is not configured. Skipping."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          gh api graphql \
+            -f query='
+              query($owner: String!, $name: String!, $number: Int!) {
+                repository(owner: $owner, name: $name) {
+                  pullRequest(number: $number) {
+                    isDraft
+                    latestOpinionatedReviews(first: 50) { nodes { state author { login } } }
+                    reviewRequests(first: 50) {
+                      nodes { requestedReviewer { ... on User { login } ... on Team { name } ... on Bot { login } } }
+                    }
+                  }
+                }
+              }' \
+            -f owner="${REPO_FULL_NAME%/*}" \
+            -f name="${REPO_FULL_NAME#*/}" \
+            -F number="$PR_NUMBER" \
+            > pr_state.json
+
+          is_draft=$(jq -r '.data.repository.pullRequest.isDraft | select(. != null)' pr_state.json)
+          if [ -z "$is_draft" ]; then
+            echo "::error::Could not read the state of PR #${PR_NUMBER}."
+            exit 1
+          fi
+          # Reviewers whose latest opinionated review requests changes and who are not re-requested.
+          blocking=$(jq -r '
+            .data.repository.pullRequest as $pr
+            | [$pr.reviewRequests.nodes[]?.requestedReviewer | (.login // .name) | select(. != null)] as $requested
+            | [$pr.latestOpinionatedReviews.nodes[]? | select(.state == "CHANGES_REQUESTED")
+                | .author.login | select(. != null and (IN($requested[]) | not))]
+            | join(",")' pr_state.json)
+
+          if [ "$is_draft" = "true" ]; then
+            target="${IN_PROGRESS_STATUS_NAME}"
+          elif [ -n "$blocking" ]; then
+            target="${CHANGES_REQUESTED_STATUS_NAME}"
+            echo "::notice::Changes requested by: ${blocking}."
+          else
+            target="${IN_REVIEW_STATUS_NAME}"
+          fi
+          case "${target}" in
+            "${IN_PROGRESS_STATUS_NAME}" | "${IN_REVIEW_STATUS_NAME}") set_iteration=true ;;
+            *) set_iteration=false ;;
+          esac
+          echo "status_name=${target}" >> "$GITHUB_OUTPUT"
+          echo "set_iteration=${set_iteration}" >> "$GITHUB_OUTPUT"
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch Project V2 metadata
+        id: project
+        if: steps.target.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.PROJECT_TOKEN }}
+          TARGET_STATUS: ${{ steps.target.outputs.status_name }}
+          SET_ITERATION: ${{ steps.target.outputs.set_iteration }}
+        run: |
+          if [ -z "$ORGANIZATION" ] || [ -z "$PROJECT_NUMBER" ]; then
+            echo "::warning::vars.PROJECT_ORGANIZATION or vars.PROJECT_NUMBER is not configured. Skipping."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::warning::secrets.PROJECT_TOKEN is not configured. Skipping."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # gh may exit 0 with a null project (observed with the broken token), so
+          # the exit status and the payload are both checked below.
+          gh_status=0
+          gh api graphql \
+            -f query='
+              query($org: String!, $number: Int!) {
+                organization(login: $org) {
+                  projectV2(number: $number) {
+                    id
+                    fields(first: 50) {
+                      nodes {
+                        ... on ProjectV2SingleSelectField {
+                          id
+                          name
+                          options { id name }
+                        }
+                        ... on ProjectV2IterationField {
+                          id
+                          name
+                          configuration {
+                            iterations { id title startDate duration }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }' \
+            -f org="$ORGANIZATION" \
+            -F number="$PROJECT_NUMBER" \
+            > project.json || gh_status=$?
+
+          project_id=$(jq -r '.data.organization.projectV2.id // empty' project.json 2>/dev/null || true)
+          if [ "$gh_status" -ne 0 ] || [ -z "$project_id" ]; then
+            api_errors=$(jq -r '[.errors[]?.message] | join("; ")' project.json 2>/dev/null || true)
+            echo "::error::Project V2 '${ORGANIZATION}/#${PROJECT_NUMBER}' not found or inaccessible (gh exit ${gh_status}${api_errors:+: ${api_errors}}). Check PROJECT_TOKEN permissions."
+            exit 1
+          fi
+
+          status_field_id=$(jq -r \
+            --arg name "$STATUS_FIELD_NAME" \
+            '.data.organization.projectV2.fields.nodes[]? | select(.name == $name) | .id // empty' \
+            project.json)
+
+          option_id=$(jq -r \
+            --arg name "$STATUS_FIELD_NAME" \
+            --arg option "$TARGET_STATUS" \
+            '.data.organization.projectV2.fields.nodes[]? | select(.name == $name) | .options[]? | select(.name == $option) | .id // empty' \
+            project.json)
+
+          if [ -z "$status_field_id" ] || [ -z "$option_id" ]; then
+            echo "::error::Status field '$STATUS_FIELD_NAME' or option '$TARGET_STATUS' not found in project '${ORGANIZATION}/#${PROJECT_NUMBER}'."
+            exit 1
+          fi
+
+          iteration_field_id=""
+          iteration_id=""
+          if [ "$SET_ITERATION" = "true" ]; then
+            iteration_field_id=$(jq -r \
+              --arg name "$ITERATION_FIELD_NAME" \
+              '.data.organization.projectV2.fields.nodes[]? | select(.name == $name and has("configuration")) | .id // empty' \
+              project.json)
+            # Current = startDate <= today < startDate + duration days (UTC, ISO dates compare as strings).
+            iteration_id=$(jq -r \
+              --arg name "$ITERATION_FIELD_NAME" \
+              --arg today "$(date -u +%F)" \
+              '[.data.organization.projectV2.fields.nodes[]? | select(.name == $name and has("configuration"))
+                | .configuration.iterations[]?
+                | select(.startDate <= $today and $today < ((.startDate + "T00:00:00Z" | fromdateiso8601) + .duration * 86400 | strftime("%Y-%m-%d")))
+                | .id] | first // empty' \
+              project.json)
+            if [ -z "$iteration_field_id" ]; then
+              echo "::notice::Project has no iteration field named '$ITERATION_FIELD_NAME'. Iteration will not be set."
+            elif [ -z "$iteration_id" ]; then
+              echo "::notice::Field '$ITERATION_FIELD_NAME' has no current iteration. Iteration will not be set."
+              iteration_field_id=""
+            fi
+          fi
+
+          echo "project_id=$project_id" >> "$GITHUB_OUTPUT"
+          echo "status_field_id=$status_field_id" >> "$GITHUB_OUTPUT"
+          echo "option_id=$option_id" >> "$GITHUB_OUTPUT"
+          echo "iteration_field_id=$iteration_field_id" >> "$GITHUB_OUTPUT"
+          echo "iteration_id=$iteration_id" >> "$GITHUB_OUTPUT"
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+      - name: Collect linked issue numbers
+        id: issues
+        if: steps.target.outputs.skip != 'true' && steps.project.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.PROJECT_TOKEN }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          # Source 1: GitHub's canonical closingIssuesReferences.
+          gh api graphql \
+            -f query='
+              query($url: URI!) {
+                resource(url: $url) {
+                  ... on PullRequest {
+                    closingIssuesReferences(first: 20) {
+                      nodes { number }
+                    }
+                  }
+                }
+              }' \
+            -f url="$PR_URL" \
+            > closing.json
+          api_numbers=$(jq -r '.data.resource.closingIssuesReferences.nodes[]?.number // empty' closing.json)
+
+          # Source 2: regex fallback over PR body. Many PRs in this repo use
+          # `Resolves #123 (FR-123)` without a GitHub-detected link; without
+          # this fallback the workflow would be a near-total no-op.
+          body_numbers=$(
+            printf '%s' "$PR_BODY" \
+              | grep -oiE '(close[sd]?|fix(es|ed)?|resolve[sd]?)[[:space:]]+#[0-9]+' \
+              | grep -oE '#[0-9]+' \
+              | tr -d '#' \
+              || true
+          )
+
+          numbers=$(printf '%s\n%s\n' "$api_numbers" "$body_numbers" \
+            | grep -E '^[0-9]+$' \
+            | sort -u \
+            || true)
+
+          if [ -z "$numbers" ]; then
+            echo "::notice::No linked issues detected for PR #${{ github.event.pull_request.number }}. Nothing to update."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Detected linked issues:"
+          echo "$numbers" | sed 's/^/  - #/'
+
+          {
+            echo "numbers<<__EOF__"
+            echo "$numbers"
+            echo "__EOF__"
+          } >> "$GITHUB_OUTPUT"
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+      - name: Update project status for each linked issue
+        if: steps.target.outputs.skip != 'true' && steps.project.outputs.skip != 'true' && steps.issues.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.PROJECT_TOKEN }}
+          REPO_FULL_NAME: ${{ github.event.pull_request.base.repo.full_name }}
+          PROJECT_ID: ${{ steps.project.outputs.project_id }}
+          STATUS_FIELD_ID: ${{ steps.project.outputs.status_field_id }}
+          OPTION_ID: ${{ steps.project.outputs.option_id }}
+          ITERATION_FIELD_ID: ${{ steps.project.outputs.iteration_field_id }}
+          ITERATION_ID: ${{ steps.project.outputs.iteration_id }}
+          TARGET_STATUS: ${{ steps.target.outputs.status_name }}
+          NUMBERS: ${{ steps.issues.outputs.numbers }}
+        run: |
+          owner_name="${REPO_FULL_NAME%/*}"
+          repo_name="${REPO_FULL_NAME#*/}"
+          updated=0
+          skipped=0
+          failed=0
+
+          while IFS= read -r issue_number; do
+            [ -z "$issue_number" ] && continue
+
+            # gh exits 1 for a number that is not an issue (e.g. a doc example in the PR body).
+            read_status=0
+            gh api graphql \
+              -f query='
+                query($owner: String!, $name: String!, $number: Int!, $iterationField: String!) {
+                  repository(owner: $owner, name: $name) {
+                    issue(number: $number) {
+                      projectItems(first: 20) {
+                        nodes {
+                          id
+                          project { id }
+                          iteration: fieldValueByName(name: $iterationField) {
+                            ... on ProjectV2ItemFieldIterationValue { iterationId }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }' \
+              -f owner="$owner_name" \
+              -f name="$repo_name" \
+              -F number="$issue_number" \
+              -f iterationField="$ITERATION_FIELD_NAME" \
+              > "issue_${issue_number}.json" || read_status=$?
+
+            if [ "$read_status" -ne 0 ] || [ "$(jq -r '.data.repository.issue != null' "issue_${issue_number}.json" 2>/dev/null)" != "true" ]; then
+              read_errors=$(jq -r '[.errors[]?.message] | join("; ")' "issue_${issue_number}.json" 2>/dev/null || true)
+              echo "::notice::#${issue_number} could not be resolved as an issue (gh exit ${read_status}${read_errors:+: ${read_errors}}). Skipping."
+              skipped=$((skipped + 1))
+              continue
+            fi
+
+            item_id=$(jq -r \
+              --arg pid "$PROJECT_ID" \
+              '[.data.repository.issue.projectItems.nodes[]? | select(.project.id == $pid) | .id] | first // empty' \
+              "issue_${issue_number}.json")
+            current_iteration=$(jq -r \
+              --arg pid "$PROJECT_ID" \
+              '[.data.repository.issue.projectItems.nodes[]? | select(.project.id == $pid) | .iteration.iterationId // empty] | first // empty' \
+              "issue_${issue_number}.json")
+
+            if [ -z "$item_id" ]; then
+              echo "::notice::Issue #${issue_number} is not attached to '${ORGANIZATION}/#${PROJECT_NUMBER}'. Skipping."
+              skipped=$((skipped + 1))
+              continue
+            fi
+
+            write_status=0
+            gh api graphql \
+              -f query='
+                mutation($project: ID!, $item: ID!, $field: ID!, $option: String!) {
+                  updateProjectV2ItemFieldValue(input: {
+                    projectId: $project
+                    itemId: $item
+                    fieldId: $field
+                    value: { singleSelectOptionId: $option }
+                  }) {
+                    projectV2Item { id }
+                  }
+                }' \
+              -f project="$PROJECT_ID" \
+              -f item="$item_id" \
+              -f field="$STATUS_FIELD_ID" \
+              -f option="$OPTION_ID" \
+              > /dev/null || write_status=$?
+            if [ "$write_status" -ne 0 ]; then
+              echo "::error::Could not set the status of issue #${issue_number} (gh exit ${write_status})."
+              failed=$((failed + 1))
+              continue
+            fi
+
+            echo "::notice::Issue #${issue_number} status set to \"${TARGET_STATUS}\"."
+            updated=$((updated + 1))
+
+            # ITERATION_FIELD_ID is empty unless the target wants an iteration and one is current.
+            if [ -n "$ITERATION_FIELD_ID" ] && [ -z "$current_iteration" ]; then
+              write_status=0
+              gh api graphql \
+                -f query='
+                  mutation($project: ID!, $item: ID!, $field: ID!, $iteration: String!) {
+                    updateProjectV2ItemFieldValue(input: {
+                      projectId: $project
+                      itemId: $item
+                      fieldId: $field
+                      value: { iterationId: $iteration }
+                    }) {
+                      projectV2Item { id }
+                    }
+                  }' \
+                -f project="$PROJECT_ID" \
+                -f item="$item_id" \
+                -f field="$ITERATION_FIELD_ID" \
+                -f iteration="$ITERATION_ID" \
+                > /dev/null || write_status=$?
+              if [ "$write_status" -ne 0 ]; then
+                echo "::error::Could not set the iteration of issue #${issue_number} (gh exit ${write_status})."
+                failed=$((failed + 1))
+              else
+                echo "::notice::Issue #${issue_number} iteration set to the current iteration."
+              fi
+            fi
+          done <<< "$NUMBERS"
+
+          echo "::notice::PR #${{ github.event.pull_request.number }} sync summary: updated=${updated}, skipped=${skipped}, failed=${failed}."
+          # A failed write is a project-level failure; unresolvable numbers are not.
+          [ "$failed" -eq 0 ]

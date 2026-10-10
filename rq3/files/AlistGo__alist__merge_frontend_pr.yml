@@ -1,0 +1,70 @@
+name: merge companion frontend pr
+
+on:
+  pull_request:
+    branches:
+      - 'main'
+    types:
+      - closed
+  workflow_dispatch:
+    inputs:
+      frontend_pr:
+        description: 'Frontend PR reference, e.g. AlistGo/alist-web#301 or https://github.com/AlistGo/alist-web/pull/301'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  merge_frontend_pr:
+    name: Merge companion frontend PR
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    steps:
+      - name: Find frontend PR
+        id: frontend
+        env:
+          INPUT_FRONTEND_PR: ${{ inputs.frontend_pr }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          set -euo pipefail
+
+          text="${INPUT_FRONTEND_PR:-${PR_BODY:-}}"
+          ref="$(printf '%s\n' "$text" | grep -Eo '(https://github\.com/(AlistGo|alist-org)/alist-web/pull/[0-9]+)|((AlistGo|alist-org)/alist-web#[0-9]+)|(alist-web#[0-9]+)' | head -n1 || true)"
+
+          if [[ -z "$ref" ]]; then
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "No companion frontend PR referenced."
+            exit 0
+          fi
+
+          if [[ "$ref" == *"/pull/"* ]]; then
+            number="${ref##*/}"
+          else
+            number="${ref##*#}"
+          fi
+
+          echo "found=true" >> "$GITHUB_OUTPUT"
+          echo "url=https://github.com/AlistGo/alist-web/pull/$number" >> "$GITHUB_OUTPUT"
+          echo "Found companion frontend PR #$number."
+
+      - name: Merge frontend PR
+        if: steps.frontend.outputs.found == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.MY_TOKEN }}
+          FRONTEND_PR: ${{ steps.frontend.outputs.url }}
+        run: |
+          set -euo pipefail
+
+          state="$(gh pr view "$FRONTEND_PR" --json state --jq .state)"
+          if [[ "$state" == "MERGED" ]]; then
+            echo "$FRONTEND_PR is already merged."
+            exit 0
+          fi
+          if [[ "$state" != "OPEN" ]]; then
+            echo "$FRONTEND_PR is $state and cannot be merged."
+            exit 1
+          fi
+
+          gh pr merge "$FRONTEND_PR" --auto --merge || gh pr merge "$FRONTEND_PR" --merge

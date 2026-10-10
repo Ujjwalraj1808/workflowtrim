@@ -1,0 +1,284 @@
+name: E2E Test Coverage
+on: 
+  push:
+    paths-ignore:
+      - "**.md"
+      - "channel.yaml"
+      - "install.sh"
+      - "tests/**"
+      - "!tests/e2e**"
+      - "!tests/docker**"
+      - "!tests/client.go"
+      - ".github/**"
+      - "!.github/actions/**"
+      - "!.github/workflows/e2e.yaml"
+      - "!.github/workflows/build-k3s.yaml"
+  pull_request:
+    paths-ignore:
+      - "**.md"
+      - "channel.yaml"
+      - "install.sh"
+      - "tests/**"
+      - "!tests/e2e**"
+      - "!tests/docker**"
+      - "!tests/client.go"
+      - ".github/**"
+      - "!.github/actions/**"
+      - "!.github/workflows/e2e.yaml"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    uses: ./.github/workflows/build-k3s.yaml
+    with:
+      upload-image: true
+      test-coverage: true
+  build-arm64:
+    uses: ./.github/workflows/build-k3s.yaml
+    with:
+      platforms: linux/arm64
+      upload-image: true
+  e2e:
+    name: "E2E Tests"
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        # Ordered longest-first from CI timings to reduce matrix tail latency.
+        etest: [startup, s3, embeddedmirror, privateregistry, wasm, externalip, rootless, multus, btrfs]
+      max-parallel: 5
+    steps:
+      - name: Remove Unnecessary Tools
+        working-directory: /
+        run: |
+          sudo rm -rf \
+            /home/linuxbrew \
+            /home/packer \
+            /opt/az \
+            /opt/microsoft \
+            /usr/lib/firefox \
+            /usr/lib/google-cloud-sdk \
+            /usr/local/julia* \
+            /usr/local/share/boost \
+            /usr/local/share/chromium \
+            /usr/local/share/powershell \
+            /usr/share/az* \
+            /usr/share/dotnet \
+            /usr/share/miniconda \
+            /usr/share/swift
+          df -khl
+      - name: "Checkout"
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with: {fetch-depth: 1}
+      - name: Install Go
+        uses: ./.github/actions/setup-go
+      - name: Set up Docker
+        uses: docker/setup-docker-action@77e84dbf09b47d1e29270283c22f16145aa85ca1 # v5.4.0
+        with:
+          version: type=image,tag=29
+          daemon-config: '{"features":{"containerd-snapshotter":true}}'
+          set-host: true
+      - name: Set up vagrant and libvirt
+        uses: ./.github/actions/vagrant-setup
+      - name: Vagrant Box R/W Cache
+        if: matrix.etest != 'btrfs' && github.ref == 'refs/heads/main'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+             ~/.vagrant.d/boxes
+          key: ${{ matrix.etest != 'btrfs' && 'vagrant-box-ubuntu-2404' || 'vagrant-box-leap' }}
+      - name: Vagrant Box Read Cache
+        if: matrix.etest != 'btrfs' && github.ref != 'refs/heads/main'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+             ~/.vagrant.d/boxes
+          key: ${{ matrix.etest != 'btrfs' && 'vagrant-box-ubuntu-2404' || 'vagrant-box-leap' }}
+      - name: Vagrant Plugins R/W Cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: github.ref == 'refs/heads/main'
+        with:
+          path: |
+             ~/.vagrant.d/gems
+             ~/.vagrant.d/plugins.json
+          key: vagrant-plugins
+      - name: Vagrant Plugins Read Cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: github.ref != 'refs/heads/main'
+        with:
+          path: |
+             ~/.vagrant.d/gems
+             ~/.vagrant.d/plugins.json
+          key: vagrant-plugins
+      - name: "Vagrant Plugin(s)"
+        run: |
+          for plugin in vagrant-k3s vagrant-reload vagrant-scp; do
+            if ! vagrant plugin list | grep -q "^${plugin} "; then
+              vagrant plugin install "${plugin}"
+            fi
+          done
+      - name: "Download k3s binary"
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: k3s-amd64
+          path: ./dist/artifacts
+      - name: Install kubectl from K3s artifacts
+        run: |
+          chmod +x ./dist/artifacts/k3s
+          sudo install -o root -g root -m 0755 ./dist/artifacts/bin-k3s /usr/local/bin/k3s
+          sudo ln -sf /usr/local/bin/k3s /usr/local/bin/kubectl
+      - name: Run ${{ matrix.etest }} Test
+        env:
+          E2E_GOCOVER: "true"
+        run: |
+          mkdir -p /tmp/k3scov
+          go install github.com/onsi/ginkgo/v2/ginkgo@$(. ./scripts/version.sh; get-module-version github.com/onsi/ginkgo/v2)
+          ginkgo run -v -timeout=45m ./tests/e2e/${{ matrix.etest }}/ -- -ci -local
+      - name: On Failure, Upload Journald Logs
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ failure() }}
+        with:
+          name: e2e-${{ matrix.etest }}-logs
+          path: tests/e2e/${{ matrix.etest }}/*log.txt
+          retention-days: 30
+      - name: Upload Results To Codecov
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: tests/e2e/${{ matrix.etest }}/coverage.out
+          flags: e2etests # optional
+          verbose: true # optional (default = false)
+  
+  docker-go:
+    needs: [build, build-arm64]
+    name: Docker
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        dtest: [autoimport, basics, bootstraptoken, cacerts, dualstack, etcd, t4, hardened, lazypull, network, nixsnapshotter, skew, secretsencryption, snapshotrestore, svcpoliciesandfirewall, token, upgrade]
+        arch: [amd64, arm64]
+        exclude:
+          - dtest: autoimport
+            arch: arm64
+          - dtest: dualstack
+            arch: arm64
+          - dtest: nixsnapshotter
+            arch: arm64
+          - dtest: secretsencryption
+            arch: arm64
+          - dtest: snapshotrestore
+            arch: arm64
+          - dtest: svcpoliciesandfirewall
+            arch: arm64
+          - dtest: network
+            arch: arm64
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+    steps:
+    - name: Remove Unnecessary Tools
+      working-directory: /
+      run: |
+        sudo rm -rf \
+          /home/linuxbrew \
+          /home/packer \
+          /opt/az \
+          /opt/microsoft \
+          /usr/lib/firefox \
+          /usr/lib/google-cloud-sdk \
+          /usr/local/julia* \
+          /usr/local/share/boost \
+          /usr/local/share/chromium \
+          /usr/local/share/powershell \
+          /usr/share/az* \
+          /usr/share/dotnet \
+          /usr/share/miniconda \
+          /usr/share/swift
+        df -khl
+    - name: Checkout
+      uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+    - name: Install Go
+      uses: ./.github/actions/setup-go
+    - name: "Download K3s image"
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+      with:
+        name: k3s-${{ matrix.arch }}
+        path: ./dist/artifacts
+    - name: Set up Docker
+      uses: docker/setup-docker-action@77e84dbf09b47d1e29270283c22f16145aa85ca1 # v5.4.0
+      with:
+        version: type=image,tag=29
+        daemon-config: '{"features":{"containerd-snapshotter":true}}'
+        set-host: true
+    - name: Load and set K3s image
+      run: |
+        if [ ${{ matrix.arch }} = "arm64" ]; then
+          mv ./dist/artifacts/k3s-arm64 ./dist/artifacts/k3s
+        fi
+        chmod +x ./dist/artifacts/k3s
+        docker image load -i ./dist/artifacts/k3s-image.tar
+        IMAGE_TAG=$(docker image ls --format '{{.Repository}}:{{.Tag}}' | grep 'rancher/k3s')
+        echo "K3S_IMAGE=$IMAGE_TAG" >> $GITHUB_ENV
+    - name: Install Nix
+      if: matrix.dtest == 'nixsnapshotter'
+      uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa # v23
+      with:
+        summarize: false
+    - name: Build nix test image
+      if: matrix.dtest == 'nixsnapshotter'
+      run: |
+        nix build github:pdtpartners/nix-snapshotter#image-hello
+        cp result ./tests/docker/resources/nix-hello-image.tar
+    - name: Determine channel
+      run: |
+        echo CHANNEL=$(. ./scripts/version.sh; echo $VERSION_K8S | cut -d'.' -f1,2) >> $GITHUB_ENV
+    - name: Run ${{ matrix.dtest }} Test
+      run: |
+        go install github.com/onsi/ginkgo/v2/ginkgo@$(. ./scripts/version.sh; get-module-version github.com/onsi/ginkgo/v2)
+        # These tests use rancher/systemd-node and have different flags.
+        CI_TESTS="autoimport dualstack hardened secretsencryption svcpoliciesandfirewall token"
+        if [ ${{ matrix.dtest }} = "upgrade" ] || [ ${{ matrix.dtest }} = "skew" ]; then
+          ginkgo run -v -timeout=0 ./tests/docker/${{ matrix.dtest }}/ -- -k3sImage=$K3S_IMAGE -channel=$CHANNEL
+        elif [ ${{ matrix.dtest }} = "snapshotrestore" ]; then
+          ginkgo run -v --procs=4 -timeout=0 ./tests/docker/${{ matrix.dtest }}/ -- -ci
+        elif [[ $CI_TESTS =~ ${{ matrix.dtest }} ]]; then
+          ginkgo run -v -timeout=0 ./tests/docker/${{ matrix.dtest }}/ -- -ci
+        else
+          ginkgo run -v -timeout=0 ./tests/docker/${{ matrix.dtest }}/ -- -k3sImage=$K3S_IMAGE
+        fi
+
+  docker-large:
+    needs: build
+    name: Docker Large
+    timeout-minutes: 45
+    runs-on: cncf-ubuntu-32-128-x86
+    if: github.repository_owner == 'k3s-io'
+    steps:
+    - name: Checkout
+      uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+    - name: Install Go
+      uses: ./.github/actions/setup-go
+    - name: Set up Docker
+      uses: docker/setup-docker-action@77e84dbf09b47d1e29270283c22f16145aa85ca1 # v5.4.0
+      with:
+        version: type=image,tag=29
+        set-host: true
+    - name: "Download K3s image"
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+      with:
+        name: k3s-amd64
+        path: ./dist/artifacts
+    - name: Load and set K3s image
+      run: |
+        chmod +x ./dist/artifacts/k3s
+        docker image load -i ./dist/artifacts/k3s-image.tar
+        IMAGE_TAG=$(docker image ls --format '{{.Repository}}:{{.Tag}}' | grep 'rancher/k3s')
+        echo "K3S_IMAGE=$IMAGE_TAG" >> $GITHUB_ENV
+    - name: Run scale test
+      run: |
+        go install github.com/onsi/ginkgo/v2/ginkgo@$(. ./scripts/version.sh; get-module-version github.com/onsi/ginkgo/v2)
+        ginkgo run -v -timeout=40m ./tests/docker/scale/ -- -ci -k3sImage=$K3S_IMAGE

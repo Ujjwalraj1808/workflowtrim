@@ -1,0 +1,81 @@
+name: "PR description template check"
+
+on: # zizmor: ignore[dangerous-triggers]
+  pull_request_target:
+    types: [opened, reopened]
+
+permissions:
+  pull-requests: write
+  issues: write
+  contents: read
+
+jobs:
+  check-pr-description:
+    if: github.repository == 'louislam/uptime-kuma'
+    name: Check PR description and close if missing template phrase
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      issues: write
+    steps:
+      - name: Check PR description
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+            const body = (pr && pr.body) ? pr.body : "";
+            const requiredPhrase = "avoid unnecessary back and forth";
+
+            const exclude = ["UptimeKumaBot", "Copilot", "copilot-swe-agent", "dependabot[bot]"];
+            const excludeLower = exclude.map((e) => e.toLowerCase());
+            const author = pr?.user?.login || "";
+
+            // If author is in exclude list, skip
+            if (author && excludeLower.includes(author.toLowerCase())) {
+              core.info(`PR #${pr.number} opened by excluded user '${author}', skipping template check.`);
+              return;
+            }
+
+            // Skip maintainers/admins (repo owner, org members, and collaborators with write access)
+            const exemptAssociations = ["OWNER", "MEMBER", "COLLABORATOR"];
+            const association = pr?.author_association || "";
+            if (exemptAssociations.includes(association)) {
+              core.info(`PR #${pr.number} opened by maintainer/admin '${author}' (${association}), skipping template check.`);
+              return;
+            }
+
+            // Skip release PRs (created by the release workflow)
+            const isReleasePR = (pr?.head?.ref || "").startsWith("release-");
+            if (isReleasePR) {
+              core.info(`PR #${pr.number} is a release PR, skipping template check.`);
+              return;
+            }
+
+            // If is revert PR, skip
+            const isRevertPR = (pr?.title || "").toLowerCase().startsWith("Revert ");
+            if (isRevertPR) {
+              core.info(`PR #${pr.number} is a revert PR, skipping template check.`);
+              return;
+            }
+
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const number = pr.number;
+
+            if (!body || !body.toLowerCase().includes(requiredPhrase.toLowerCase())) {
+
+              const commentBody = `Hello! This pull request does not follow the repository's PR template and is being closed automatically.`;
+
+              // Post comment
+              await github.rest.issues.createComment({ owner, repo, issue_number: number, body: commentBody });
+
+              // Close
+              await github.rest.pulls.update({ owner, repo, pull_number: number, state: "closed" });
+
+              core.info(`Closed PR #${number} because required phrase was not present.`);
+            } else {
+              core.info("PR description contains required phrase; no action taken.");
+
+              const commentBody = `Thanks for the PR! If anyone would like to help with testing, run: \`npx kuma-pr ${pr.user.login}:${pr.head.ref}\` (requires Node.js and Docker)`;
+              await github.rest.issues.createComment({ owner, repo, issue_number: number, body: commentBody });
+            }

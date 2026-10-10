@@ -1,0 +1,41 @@
+name: End-to-end install tests
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read # to fetch code (actions/checkout)
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@a37ce9120846195fa4ece8f58b268e6043cb2f26 # actions/checkout@v3
+
+      - name: Set up Node 18
+        uses: actions/setup-node@3235b876344d2a9aa001b8d1453c930bba69e610 # actions/setup-node@v3
+        with:
+          node-version: 18
+
+      - name: Test npm
+        run: |
+          npm i -g npm@next-7
+          time make test-e2e-npm
+
+      - name: Test pnpm
+        run: |
+          npm i -g pnpm@next-7
+          time make test-e2e-pnpm
+
+      - name: Test yarn (classic)
+        run: |
+          npm i -g yarn@latest
+          time make test-e2e-yarn
+
+      - name: Test yarn (berry)
+        run: |
+          npm i -g yarn@latest
+          time make test-e2e-yarn-berry

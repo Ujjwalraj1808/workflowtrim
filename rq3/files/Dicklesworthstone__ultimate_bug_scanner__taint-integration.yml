@@ -1,0 +1,85 @@
+name: Taint Integration
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/taint-integration.yml
+      - modules/helpers/ubs_core/analyzers/taint_py.py
+      - modules/helpers/ubs_core/analyzers/taint_go.py
+      - modules/helpers/ubs_core/py_detectors/command_injection.py
+      - test-suite/quality/test_taint*.py
+      - test-suite/quality/test_python_command_injection_dataflow.py
+      - test-suite/shareable/test_contract_checksums.py
+      - test-suite/shareable/test_helper_python_floor.py
+      - modules/lib/ubs-common.sh
+      - ubs
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  checked-in-dataflow:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+      UBS_NO_AUTO_UPDATE: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install real scanner validation dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq ripgrep rsync shellcheck
+          npm install --global @ast-grep/cli
+      - name: Verify checked-in runtime before execution
+        run: |
+          ./scripts/verify_checksums.sh
+          ./scripts/verify_sha256sums.sh
+          shellcheck -S warning ubs modules/lib/ubs-common.sh scripts/new-module.sh modules/ubs-*.sh
+      - name: Run Python, Go and command-injection dataflow regressions
+        run: |
+          set -o pipefail
+          python3 -m unittest discover -s test-suite/quality -p 'test_taint_python_*.py' -v 2>&1 | tee "$RUNNER_TEMP/python-taint-unit.log"
+          python3 -m unittest discover -s test-suite/quality -p 'test_taint_go*.py' -v 2>&1 | tee "$RUNNER_TEMP/go-taint-unit.log"
+          python3 -m unittest discover -s test-suite/quality -p test_python_command_injection_dataflow.py -v 2>&1 | tee "$RUNNER_TEMP/command-taint-unit.log"
+      - name: Exercise real JSON and SARIF scanners
+        env:
+          UBS_TAINT_E2E: '1'
+        run: |
+          set -o pipefail
+          for suite in test_taint_python_dataflow.py test_taint_python_effects.py test_taint_go_decoding.py; do
+            python3 -m unittest discover -s test-suite/quality -p "$suite" -v 2>&1 | tee "$RUNNER_TEMP/${suite%.py}-e2e.log"
+          done
+      - name: Verify supply-chain invariants and Python 3.9 compatibility
+        run: |
+          set -o pipefail
+          python3.9 --version
+          python3 -m unittest discover -s test-suite/shareable -p test_contract_checksums.py -v 2>&1 | tee "$RUNNER_TEMP/contract-checksums.log"
+          python3 -m unittest discover -s test-suite/shareable -p test_helper_python_floor.py -v 2>&1 | tee "$RUNNER_TEMP/python-floor.log"
+          python3 scripts/update_checksums.py
+          ./scripts/verify_checksums.sh
+          ./scripts/verify_sha256sums.sh
+          git diff --exit-code
+          test -z "$(git ls-files --others --exclude-standard)"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: taint-integration-validation
+          path: |
+            ${{ runner.temp }}/*taint-unit.log
+            ${{ runner.temp }}/test_taint*-e2e.log
+            ${{ runner.temp }}/contract-checksums.log
+            ${{ runner.temp }}/python-floor.log
+            test-suite/artifacts/go-decoding
+            test-suite/artifacts/python-mutable-effects
+          retention-days: 3

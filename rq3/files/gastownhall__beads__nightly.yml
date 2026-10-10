@@ -1,0 +1,91 @@
+name: Nightly
+
+# Every nightly test runs under Bazel on rbe-west: the `bazel` call below is
+# the full suite with no cached test results. Nothing here runs go test on a
+# runner (ga-96smfk.22).
+on:
+  schedule:
+    # Run at 2am UTC daily
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  BD_DISABLE_METRICS: "1"
+  BD_DISABLE_EVENT_FLUSH: "1"
+
+jobs:
+  # Bazel lane with the full equivalence listing (package and test-name sets;
+  # PRs gate on it through pr.yml). Remote execution when the repo secrets
+  # are present; bazel.yml gets the four RBE secrets plus rbe-prewarm's
+  # bazel-allocator app private key (same-repo/scheduled trigger only, so
+  # pre-warming is safe here - see bazel.yml's "rbe-west Pre-warm" header and
+  # engdocs/CI_REQUIRED_CHECK_TOPOLOGY.md).
+  bazel:
+    name: Bazel (fresh, full detail)
+    # A called workflow's job gets at most this call's token permissions, and
+    # GitHub checks them when the run starts, even for a job whose if: skips
+    # it (startup_failure otherwise; gascity #7478): bazel.yml's rrc-seed asks
+    # id-token: write (push to main only) and rrc-verify issues: write
+    # (schedule and dispatch only). rrc-verify runs here (its alert issue);
+    # rrc-seed never does, every other bazel.yml job keeps contents: read,
+    # and rbe-west's mint refuses any OIDC token but a main-push bazel.yml one
+    # (scripts/bazel_rrc_test.go, TestBazelWorkflowCallersGrantEveryRequestedPermission).
+    permissions:
+      contents: read
+      id-token: write
+      issues: write
+    uses: ./.github/workflows/bazel.yml
+    secrets:
+      RBE_WEST_EXECUTOR: ${{ secrets.RBE_WEST_EXECUTOR }}
+      RBE_TLS_CERT: ${{ secrets.RBE_TLS_CERT }}
+      RBE_TLS_KEY: ${{ secrets.RBE_TLS_KEY }}
+      RBE_TLS_CA: ${{ secrets.RBE_TLS_CA }}
+      RBE_POOL_APP_PRIVATE_KEY: ${{ secrets.RBE_POOL_APP_PRIVATE_KEY }}
+    with:
+      details: true
+      # The one run that re-executes every test (no cached test results):
+      # PRs, merge groups and pushes to main reuse unchanged tests' PASSes,
+      # so this keeps sampling flaky and -race failures every night.
+      fresh-test-results: true
+
+  # rbe-west's pool workers are gascity's and advertise the sha256 of
+  # gascity's worker-env manifest; beads' tools/rbe/worker-env.txt is a
+  # byte-for-byte copy and platforms/BUILD.bazel carries the same pin. A copy
+  # that falls behind queues every remote action (bazel.yml's rbe job runs
+  # the same check before each remote run and fails it fast), so check every
+  # night and, out of step, open or update a ci/infra issue with the diff and
+  # the pin to commit (tools/rbe/worker-env-sync-issue). The only job here
+  # with issues: write, and only its last step uses the token. gascity
+  # unreachable (exit 2) fails the job without an issue.
+  rbe-worker-env-sync:
+    name: rbe worker-env in step with gascity
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
+
+      - name: Compare the worker-env manifest and pin with gascity's main
+        id: sync
+        env:
+          WORKER_ENV_SYNC_REPORT: ${{ runner.temp }}/worker-env-sync.md
+        run: |
+          rc=0
+          tools/rbe/worker-env-sync main || rc=$?
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          exit "$rc"
+
+      - name: Open or update the out-of-step issue
+        if: ${{ failure() && steps.sync.outputs.rc == '1' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPORT: ${{ runner.temp }}/worker-env-sync.md
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: tools/rbe/worker-env-sync-issue "$REPORT" "$RUN_URL"

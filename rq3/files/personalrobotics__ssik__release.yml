@@ -1,0 +1,206 @@
+name: Release
+
+# Tag-driven release pipeline (#132).
+#
+# Tag patterns:
+#   v*rc*    -> build wheels + sdist, publish to TestPyPI (dry run)
+#   v*       -> build wheels + sdist, publish to real PyPI
+#   manual workflow_dispatch -> build wheels + sdist only (a pre-merge check of
+#                               the artifacts users install); publishes to
+#                               TestPyPI only with publish_testpypi=true
+#
+# Auth: Trusted Publishing (PyPI / TestPyPI OIDC). No API tokens in CI.
+# The publish jobs run inside named GitHub environments (`release` /
+# `testpypi-release`) so the org's environment-protection rules apply.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      publish_testpypi:
+        description: "Also publish the built artifacts to TestPyPI"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  build_wheels:
+    name: Wheels — ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Linux x86_64 (manylinux), macOS arm64 + x86_64 (both from the
+        # M-class runner via cibuildwheel cross-compile -- see
+        # [tool.cibuildwheel.macos] in pyproject.toml), Windows x86_64.
+        # GitHub's Intel macOS runner pool (macos-13) has multi-hour
+        # queue latency as Intel hosts are deprecated; cross-compiling
+        # x86_64 from arm64 avoids the bottleneck without dropping
+        # Intel-Mac wheel coverage.
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # hatch-vcs derives version from git tags
+
+      - name: Build wheels
+        # v2.21 pinned ``packaging==24.1`` in its build-isolation constraints,
+        # which conflicts with ``hatchling>=1.27`` requiring ``packaging>=24.2``
+        # (broke macOS arm64 + Windows on v1.0.0rc1; Linux happened to resolve
+        # because the manylinux constraints file is slightly different).
+        # v3.x has updated pins.
+        uses: pypa/cibuildwheel@v3.4.1
+
+      - name: Upload wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.os }}
+          path: wheelhouse/*.whl
+
+  build_sdist:
+    name: Source distribution
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Build sdist
+        run: uv build --sdist
+
+      - name: Upload sdist
+        uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist/*.tar.gz
+
+  publish_testpypi:
+    name: Publish → TestPyPI
+    needs: [build_wheels, build_sdist]
+    runs-on: ubuntu-latest
+    # Run on RC tags (e.g. v1.0.0rc1), and on manual triggers only when asked:
+    # a plain dispatch is build-only. The real PyPI job below runs on non-RC
+    # v* tags only.
+    if: >-
+      (startsWith(github.ref, 'refs/tags/v') && contains(github.ref, 'rc')) ||
+      (github.event_name == 'workflow_dispatch' && inputs.publish_testpypi)
+    environment:
+      name: testpypi-release
+      url: https://test.pypi.org/p/ssik
+    permissions:
+      id-token: write  # Trusted Publishing OIDC
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Verify built version matches the tag
+        # Same guard as publish_pypi (#364): catch a version/tag mismatch in
+        # the rc dry-run, before the real release.
+        run: |
+          TAG="${GITHUB_REF#refs/tags/v}"
+          echo "tag version: $TAG"; ls -1 dist/
+          SDIST=$(ls dist/ssik-*.tar.gz 2>/dev/null | head -1)
+          [ -n "$SDIST" ] || { echo "::error::no sdist in dist/"; exit 1; }
+          BUILT=$(basename "$SDIST" .tar.gz); BUILT="${BUILT#ssik-}"
+          echo "built version: $BUILT"
+          if [ "$BUILT" != "$TAG" ]; then
+            echo "::error::built version '$BUILT' != tag '$TAG' -- refusing to publish (likely two tags on one commit; ensure a single v* tag points at the release commit)"
+            exit 1
+          fi
+          for w in dist/ssik-*.whl; do
+            case "$(basename "$w")" in
+              ssik-"$TAG"-*) ;;
+              *) echo "::error::wheel $(basename "$w") is not version $TAG"; exit 1 ;;
+            esac
+          done
+          echo "OK: all dist artifacts are version $TAG"
+
+      - name: Publish to TestPyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+
+  publish_pypi:
+    name: Publish → PyPI
+    needs: [build_wheels, build_sdist]
+    runs-on: ubuntu-latest
+    # Real PyPI: only on v* tags that DON'T contain 'rc' (e.g. v1.0.0,
+    # v1.0.1). The RC dry-run job above handles v*rc* tags.
+    if: startsWith(github.ref, 'refs/tags/v') && !contains(github.ref, 'rc')
+    environment:
+      name: release
+      url: https://pypi.org/p/ssik
+    permissions:
+      id-token: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Verify built version matches the tag
+        # Guard against the "two v* tags on one commit" footgun (#364): when
+        # both e.g. v3.0.0rc1 and v3.0.0 point at the same commit, hatch-vcs
+        # (via ``git describe``) can resolve the *rc*, so the v3.0.0 run builds
+        # ssik-3.0.0rc1 wheels and would publish those to real PyPI. Refuse to
+        # publish unless every artifact carries the tag's exact version. Tag
+        # convention: ``vX.Y.Z`` / ``vX.Y.ZrcN`` (no dash; already PEP 440).
+        run: |
+          TAG="${GITHUB_REF#refs/tags/v}"
+          echo "tag version: $TAG"; ls -1 dist/
+          SDIST=$(ls dist/ssik-*.tar.gz 2>/dev/null | head -1)
+          [ -n "$SDIST" ] || { echo "::error::no sdist in dist/"; exit 1; }
+          BUILT=$(basename "$SDIST" .tar.gz); BUILT="${BUILT#ssik-}"
+          echo "built version: $BUILT"
+          if [ "$BUILT" != "$TAG" ]; then
+            echo "::error::built version '$BUILT' != tag '$TAG' -- refusing to publish (likely two tags on one commit; ensure a single v* tag points at the release commit)"
+            exit 1
+          fi
+          for w in dist/ssik-*.whl; do
+            case "$(basename "$w")" in
+              ssik-"$TAG"-*) ;;
+              *) echo "::error::wheel $(basename "$w") is not version $TAG"; exit 1 ;;
+            esac
+          done
+          echo "OK: all dist artifacts are version $TAG"
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+
+  create_github_release:
+    name: Create GitHub Release
+    needs: publish_pypi
+    runs-on: ubuntu-latest
+    # Only on stable releases (non-RC). The GitHub Release is what fires
+    # the Zenodo GitHub-integration webhook, which mints a new version DOI
+    # (concept DOI stays constant). Without this step, tags exist but
+    # Zenodo never archives them.
+    if: startsWith(github.ref, 'refs/tags/v') && !contains(github.ref, 'rc')
+    permissions:
+      contents: write   # required to create the Release
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # needed for auto-generated release notes
+
+      - name: Create Release
+        # action-gh-release is idempotent: if a Release already exists for
+        # this tag (e.g. created manually before the workflow finished),
+        # it updates rather than failing.
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ssik ${{ github.ref_name }}
+          generate_release_notes: true   # GitHub auto-generates from merged PRs since previous tag
+          draft: false
+          prerelease: false

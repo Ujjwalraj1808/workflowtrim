@@ -1,0 +1,79 @@
+name: Python Framework Taint
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/python-framework-taint.yml
+      - ubs
+      - modules/ubs-python.sh
+      - modules/lib/ubs-common.sh
+      - modules/helpers/ubs_core/**
+      - test-suite/quality/test_taint_python_*.py
+      - test-suite/quality/test_suppression_intervals.py
+      - test-suite/quality/test_ubs_core.py
+      - test-suite/manifest.json
+      - test-suite/run_manifest.py
+  workflow_dispatch:
+
+# The framework analyzer is shipped; validate the revision that triggered CI.
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 25
+    env:
+      UBS_NO_AUTO_UPDATE: '1'
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.14'
+      - name: Install scanner dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq ripgrep rsync shellcheck
+          python3 -m pip install pyyaml jsonschema
+          npm install --global @ast-grep/cli
+      - name: Record the production revision under test
+        run: echo "FRAMEWORK_REVISION $(git rev-parse HEAD)"
+      - name: Run source regressions and actual scanner integration
+        run: |
+          UBS_TAINT_E2E=1 python3 -m unittest discover -s test-suite/quality -p 'test_taint_python_*.py' -v
+          PYTHONPATH=modules/helpers python3 - <<'PY'
+          from ubs_core.analyzers.taint_py import SELF_TESTS
+          for name, test in SELF_TESTS:
+              test()
+              print('LEGACY_SELFTEST_PASS', name)
+          PY
+          python3 -m unittest discover -s test-suite/quality -p test_suppression_intervals.py -v
+          python3 -m unittest discover -s test-suite/quality -p test_ubs_core.py -v
+          python3 test-suite/run_manifest.py --case python-taint-buggy --case python-taint-clean
+      - name: Verify the production integrity chain and deterministic regeneration
+        run: |
+          ./scripts/verify_checksums.sh
+          ./scripts/verify_sha256sums.sh
+          bash -n ubs
+          bash -n modules/lib/ubs-common.sh
+          bash -n scripts/new-module.sh
+          for module in modules/ubs-*.sh; do bash -n "$module"; done
+          shellcheck -S warning ubs modules/lib/ubs-common.sh scripts/new-module.sh modules/ubs-*.sh
+          git diff --check
+          git diff > "$RUNNER_TEMP/python-framework-tested.diff"
+          python3 scripts/update_checksums.py
+          ./scripts/update_sha256sums.sh
+          git diff > "$RUNNER_TEMP/python-framework-idempotent.diff"
+          cmp "$RUNNER_TEMP/python-framework-tested.diff" "$RUNNER_TEMP/python-framework-idempotent.diff"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: python-framework-scanner-results
+          path: |
+            test-suite/artifacts/python-framework-sources/
+            ${{ runner.temp }}/python-framework-*.diff
+          retention-days: 3

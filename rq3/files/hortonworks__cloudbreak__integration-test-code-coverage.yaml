@@ -1,0 +1,200 @@
+name: cloudbreak-integration-test-code-coverage
+
+env:
+  APP_NAME: cloudbreak
+  namespace: cloudbreak
+  TARGET_BRANCH: master
+
+on:
+  schedule:
+    - cron:  '0 1 * * 1'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  integration-test-code-coverage:
+    permissions: write-all
+    name: Integration Test Code Coverage
+    runs-on: [ cb-ubuntu22-large ]
+    timeout-minutes: 90
+
+    steps:
+      - name: checkout
+        id: checkout
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+      - name: prepare
+        uses: ./.github/actions/pull-request/base
+      - name: integration_test
+        continue-on-error: true
+        run: |-
+          export INTEGRATIONTEST_SUITE_FILES=file:/it/src/main/resources/testsuites/v4/mock/all-in-mock-package.yaml
+          export AWS=false
+          export INTEGRATIONTEST_UMS_HOST=thunderhead-mock
+          export INTEGRATIONTEST_UMS_PORT=8982
+          export INTEGRATIONTEST_CDL_HOST=thunderhead-mock
+          export INTEGRATIONTEST_CDL_PORT=8982
+          export INTEGRATIONTEST_AUTHDISTRIBUTOR_HOST=thunderhead-mock
+          export INTEGRATIONTEST_THREADCOUNT=4
+          export USE_FEDRAMP_CONTAINERS=false
+          
+          cd integration-test
+          make start-integration-test
+      - name: collect_code_coverage_reports
+        run: |-
+          cd integration-test
+          make collect-integration-test-code-coverage
+          make create-xml-reports-from-code-coverage-results
+      - name: upload_code_coverage_reports_to_sonar
+        run: |-
+          #!/bin/bash -x
+          export SONAR_COVERAGE_EXCLUSION_COMMON="**/proto/**,**/generated/**,**/flow/**/*State.java,**/flow/**/event/*Event.java,**/flow/**/event/**/*Event.java,**/flow*/**/*Config.java,**/*Repository.java,**/configuration/*Properties.java,**/configuration/**/*Config.java,**/domain/**,**/Aspects/**"
+          export CORE_SONAR_COVERAGE_EXCLUSION="${SONAR_COVERAGE_EXCLUSION_COMMON},**/reactor/api/event/**,**/flow2/**/*Config.java,**/flow2/**/*State.java,**/flow2/**/*Event.java"
+          export DL_SONAR_COVERAGE_EXCLUSION="${SONAR_COVERAGE_EXCLUSION_COMMON},**/datalake/configuration/**"
+          export ENV_SONAR_COVERAGE_EXCLUSION="${SONAR_COVERAGE_EXCLUSION_COMMON}"
+          export FREEIPA_SONAR_COVERAGE_EXCLUSION="${SONAR_COVERAGE_EXCLUSION_COMMON}"
+          export REMOTE_ENV_SONAR_COVERAGE_EXCLUSION="${SONAR_COVERAGE_EXCLUSION_COMMON},**/config/**,**/flow/**"
+          export SONAR_EXCLUSION=**/proto/**,**/generated/**,**/test/**,**/build/**,**/reports/**,**/resources/**
+          export SONAR_JAVA_BINARIES=build/classes
+          export SONAR_SOURCES=src/main/java/
+          export E1_IGNORE_RULE_KEY="java:S1854"
+          export E1_IGNORE_RESOURCE="**/*Actions.java"
+          
+          cd core && sonar-scanner -X \
+          -Dsonar.token=$SONAR_TOKEN \
+          -Dsonar.coverage.jacoco.xmlReportPaths=../integration-test/integcb/jacoco-reports/cbreak_cloudbreak_1_jacoco_report.xml \
+          -Dsonar.language=java \
+          -Dsonar.java.binaries=$SONAR_JAVA_BINARIES \
+          -Dsonar.java.libraries=$SONAR_JAVA_BINARIES \
+          -Dsonar.verbose=true \
+          -Dsonar.sources=$SONAR_SOURCES \
+          -Dsonar.branch.name=it_master \
+          -Dsonar.projectKey=cloudbreak:cloudbreak:cloudbreak_core_service \
+          -Dsonar.coverage.exclusions=$CORE_SONAR_COVERAGE_EXCLUSION \
+          -Dsonar.exclusions=$SONAR_EXCLUSION \
+          -Dsonar.issue.ignore.multicriteria=e1 \
+          -Dsonar.issue.ignore.multicriteria.e1.ruleKey=$E1_IGNORE_RULE_KEY \
+          -Dsonar.issue.ignore.multicriteria.e1.resourceKey=$E1_IGNORE_RESOURCE \
+          -Dsonar.host.url=$SONAR_HOST
+          
+          cd .. && cd datalake && sonar-scanner -X \
+          -Dsonar.token=$SONAR_TOKEN \
+          -Dsonar.coverage.jacoco.xmlReportPaths=../integration-test/integcb/jacoco-reports/cbreak_datalake_1_jacoco_report.xml \
+          -Dsonar.language=java \
+          -Dsonar.java.binaries=$SONAR_JAVA_BINARIES \
+          -Dsonar.java.libraries=$SONAR_JAVA_BINARIES \
+          -Dsonar.verbose=true \
+          -Dsonar.sources=$SONAR_SOURCES \
+          -Dsonar.branch.name=it_master \
+          -Dsonar.projectKey=cloudbreak:cloudbreak:datalake_service \
+          -Dsonar.coverage.exclusions=$DL_SONAR_COVERAGE_EXCLUSION\
+          -Dsonar.exclusions=$SONAR_EXCLUSION \
+          -Dsonar.issue.ignore.multicriteria=e1 \
+          -Dsonar.issue.ignore.multicriteria.e1.ruleKey=$E1_IGNORE_RULE_KEY \
+          -Dsonar.issue.ignore.multicriteria.e1.resourceKey=$E1_IGNORE_RESOURCE \
+          -Dsonar.host.url=$SONAR_HOST
+          
+          cd .. && cd environment && sonar-scanner -X \
+          -Dsonar.token=$SONAR_TOKEN \
+          -Dsonar.coverage.jacoco.xmlReportPaths=../integration-test/integcb/jacoco-reports/cbreak_environment_1_jacoco_report.xml \
+          -Dsonar.language=java \
+          -Dsonar.java.binaries=$SONAR_JAVA_BINARIES \
+          -Dsonar.java.libraries=$SONAR_JAVA_BINARIES \
+          -Dsonar.verbose=true \
+          -Dsonar.sources=$SONAR_SOURCES \
+          -Dsonar.branch.name=it_master \
+          -Dsonar.projectKey=cloudbreak:cloudbreak:environment_service \
+          -Dsonar.coverage.exclusions=$ENV_SONAR_COVERAGE_EXCLUSION \
+          -Dsonar.exclusions=$SONAR_EXCLUSION \
+          -Dsonar.issue.ignore.multicriteria=e1 \
+          -Dsonar.issue.ignore.multicriteria.e1.ruleKey=$E1_IGNORE_RULE_KEY \
+          -Dsonar.issue.ignore.multicriteria.e1.resourceKey=$E1_IGNORE_RESOURCE \
+          -Dsonar.host.url=$SONAR_HOST
+          
+          cd .. && cd externalized-compute && sonar-scanner -X \
+          -Dsonar.token=$SONAR_TOKEN \
+          -Dsonar.coverage.jacoco.xmlReportPaths=../integration-test/integcb/jacoco-reports/cbreak_externalized-compute_1_jacoco_report.xml \
+          -Dsonar.language=java \
+          -Dsonar.java.binaries=$SONAR_JAVA_BINARIES \
+          -Dsonar.java.libraries=$SONAR_JAVA_BINARIES \
+          -Dsonar.verbose=true \
+          -Dsonar.sources=$SONAR_SOURCES \
+          -Dsonar.branch.name=it_master \
+          -Dsonar.projectKey=cloudbreak:cloudbreak:externalized_compute_service \
+          -Dsonar.coverage.exclusions=$SONAR_COVERAGE_EXCLUSION_COMMON \
+          -Dsonar.exclusions=$SONAR_EXCLUSION \
+          -Dsonar.issue.ignore.multicriteria=e1 \
+          -Dsonar.issue.ignore.multicriteria.e1.ruleKey=$E1_IGNORE_RULE_KEY \
+          -Dsonar.issue.ignore.multicriteria.e1.resourceKey=$E1_IGNORE_RESOURCE \
+          -Dsonar.host.url=$SONAR_HOST
+          
+          cd .. && cd freeipa && sonar-scanner -X \
+          -Dsonar.token=$SONAR_TOKEN \
+          -Dsonar.coverage.jacoco.xmlReportPaths=../integration-test/integcb/jacoco-reports/cbreak_freeipa_1_jacoco_report.xml \
+          -Dsonar.language=java \
+          -Dsonar.java.binaries=$SONAR_JAVA_BINARIES \
+          -Dsonar.java.libraries=$SONAR_JAVA_BINARIES \
+          -Dsonar.verbose=true \
+          -Dsonar.sources=$SONAR_SOURCES \
+          -Dsonar.branch.name=it_master \
+          -Dsonar.projectKey=cloudbreak:cloudbreak:freeipa_service \
+          -Dsonar.coverage.exclusions=$FREEIPA_SONAR_COVERAGE_EXCLUSION \
+          -Dsonar.exclusions=$SONAR_EXCLUSION \
+          -Dsonar.issue.ignore.multicriteria=e1 \
+          -Dsonar.issue.ignore.multicriteria.e1.ruleKey=$E1_IGNORE_RULE_KEY \
+          -Dsonar.issue.ignore.multicriteria.e1.resourceKey=$E1_IGNORE_RESOURCE \
+          -Dsonar.host.url=$SONAR_HOST
+          
+          cd .. && cd redbeams && sonar-scanner -X \
+          -Dsonar.token=$SONAR_TOKEN \
+          -Dsonar.coverage.jacoco.xmlReportPaths=../integration-test/integcb/jacoco-reports/cbreak_redbeams_1_jacoco_report.xml \
+          -Dsonar.language=java \
+          -Dsonar.java.binaries=$SONAR_JAVA_BINARIES \
+          -Dsonar.java.libraries=$SONAR_JAVA_BINARIES \
+          -Dsonar.verbose=true \
+          -Dsonar.sources=$SONAR_SOURCES \
+          -Dsonar.branch.name=it_master \
+          -Dsonar.projectKey=cloudbreak:cloudbreak:redbeams_service \
+          -Dsonar.coverage.exclusions=$SONAR_COVERAGE_EXCLUSION_COMMON \
+          -Dsonar.exclusions=$SONAR_EXCLUSION \
+          -Dsonar.issue.ignore.multicriteria=e1 \
+          -Dsonar.issue.ignore.multicriteria.e1.ruleKey=$E1_IGNORE_RULE_KEY \
+          -Dsonar.issue.ignore.multicriteria.e1.resourceKey=$E1_IGNORE_RESOURCE \
+          -Dsonar.host.url=$SONAR_HOST
+          
+          cd .. && cd environment-remote && sonar-scanner -X \
+          -Dsonar.token=$SONAR_TOKEN \
+          -Dsonar.coverage.jacoco.xmlReportPaths=../integration-test/integcb/jacoco-reports/cbreak_remote-environment_1_jacoco_report.xml \
+          -Dsonar.language=java \
+          -Dsonar.java.binaries=$SONAR_JAVA_BINARIES \
+          -Dsonar.java.libraries=$SONAR_JAVA_BINARIES \
+          -Dsonar.verbose=true \
+          -Dsonar.sources=$SONAR_SOURCES \
+          -Dsonar.branch.name=it_master \
+          -Dsonar.projectKey=cloudbreak:cloudbreak:remote_environment_service \
+          -Dsonar.coverage.exclusions=$REMOTE_ENV_SONAR_COVERAGE_EXCLUSION \
+          -Dsonar.exclusions=$SONAR_EXCLUSION \
+          -Dsonar.issue.ignore.multicriteria=e1 \
+          -Dsonar.issue.ignore.multicriteria.e1.ruleKey=$E1_IGNORE_RULE_KEY \
+          -Dsonar.issue.ignore.multicriteria.e1.resourceKey=$E1_IGNORE_RESOURCE \
+          -Dsonar.host.url=$SONAR_HOST
+               
+          cd .. && cd autoscale && sonar-scanner -X \
+          -Dsonar.token=$SONAR_TOKEN \
+          -Dsonar.coverage.jacoco.xmlReportPaths=../integration-test/integcb/jacoco-reports/cbreak_periscope_1_jacoco_report.xml \
+          -Dsonar.language=java \
+          -Dsonar.java.binaries=$SONAR_JAVA_BINARIES \
+          -Dsonar.java.libraries=$SONAR_JAVA_BINARIES \
+          -Dsonar.verbose=true \
+          -Dsonar.sources=$SONAR_SOURCES \
+          -Dsonar.branch.name=it_master \
+          -Dsonar.projectKey=cloudbreak:cloudbreak:autoscale_service \
+          -Dsonar.coverage.exclusions=$SONAR_COVERAGE_EXCLUSION_COMMON \
+          -Dsonar.exclusions=$SONAR_EXCLUSION \
+          -Dsonar.issue.ignore.multicriteria=e1 \
+          -Dsonar.issue.ignore.multicriteria.e1.ruleKey=$E1_IGNORE_RULE_KEY \
+          -Dsonar.issue.ignore.multicriteria.e1.resourceKey=$E1_IGNORE_RESOURCE \
+          -Dsonar.host.url=$SONAR_HOST

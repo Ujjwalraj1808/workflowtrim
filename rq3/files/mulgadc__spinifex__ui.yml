@@ -1,0 +1,62 @@
+name: UI Build and Test
+
+on:
+  push:
+    branches:
+      - main
+      - dev
+    paths:
+      - spinifex/services/spinifexui/frontend/**
+      - .github/workflows/ui.yml
+  pull_request:
+    branches:
+      - main
+      - dev
+    paths:
+      - spinifex/services/spinifexui/frontend/**
+      - .github/workflows/ui.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ui_build_and_test:
+    name: UI Build and Test
+    runs-on: ubuntu-26.04
+    defaults:
+      run:
+        working-directory: spinifex/services/spinifexui/frontend
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v7
+        with:
+          sparse-checkout: spinifex/services/spinifexui/frontend
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          package_json_file: spinifex/services/spinifexui/frontend/package.json
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          cache: "pnpm"
+          cache-dependency-path: spinifex/services/spinifexui/frontend/pnpm-lock.yaml
+          node-version-file: spinifex/services/spinifexui/frontend/.nvmrc
+
+      - name: Install Dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run Lint
+        run: pnpm lint
+
+      - name: Run Tests with Coverage
+        run: pnpm test:coverage
+
+      - name: Build Frontend
+        run: pnpm build
+
+      - name: Check for generated route tree drift
+        run: git diff --exit-code -- src/routeTree.gen.ts

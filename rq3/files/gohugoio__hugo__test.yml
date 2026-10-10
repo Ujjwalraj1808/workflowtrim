@@ -1,0 +1,150 @@
+on:
+  push:
+    branches: [master]
+  pull_request:
+name: Test
+env:
+  GOPROXY: https://proxy.golang.org
+  GO111MODULE: on
+  SASS_VERSION: 1.80.3
+  DART_SASS_SHA_LINUX: 7c933edbad0a7d389192c5b79393485c088bd2c4398e32f5754c32af006a9ffd
+  DART_SASS_SHA_MACOS: 79e060b0e131c3bb3c16926bafc371dc33feab122bfa8c01aa337a072097967b
+  DART_SASS_SHA_WINDOWS: 0bc4708b37cd1bac4740e83ac5e3176e66b774f77fd5dd364da5b5cfc9bfb469
+permissions:
+  contents: read
+jobs:
+  test:
+    strategy:
+      matrix:
+        go-version: [1.27.x]
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - if: matrix.os == 'ubuntu-latest'
+        name: Free Disk Space (Ubuntu)
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Install Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version: ${{ matrix.go-version }}
+          check-latest: true
+          cache: true
+      - name: Install Node
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: "22"
+      - name: Install Ruby
+        uses: ruby/setup-ruby@7372622e62b60b3cb750dcd2b9e32c247ffec26a # v1.302.0
+        with:
+          ruby-version: "3.4.5"
+      - name: Install Ruby gems
+        run: |
+          gem install asciidoctor -v "2.0.26"
+          gem install asciidoctor-diagram -v "3.1.0"
+          gem install asciidoctor-html5s -v "0.5.1"
+      - name: Install GoAT
+        run: go install github.com/blampe/goat/cmd/goat@177de93b192b8ffae608e5d9ec421cc99bf68402
+      - name: Install Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.x"
+      - name: Install Mage
+        run: go install github.com/magefile/mage@v1.15.0
+      - name: Install gotmplfmt
+        run: go install github.com/gohugoio/gotmplfmt@latest
+      - name: Install docutils
+        run: |
+          pip install docutils Pygments
+          rst2html --version
+      - if: matrix.os == 'ubuntu-latest'
+        name: Install pandoc on Linux
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y pandoc
+      - if: matrix.os == 'macos-latest'
+        run: |
+          brew install pandoc
+      - if: matrix.os == 'windows-latest'
+        run: |
+          choco install pandoc
+      - run: pandoc -v
+      - if: matrix.os == 'windows-latest'
+        run: |
+          choco install mingw
+      - if: matrix.os == 'ubuntu-latest'
+        name: Install dart-sass Linux
+        run: |
+          echo "Install Dart Sass version ${SASS_VERSION} ..."
+          curl -LJO "https://github.com/sass/dart-sass/releases/download/${SASS_VERSION}/dart-sass-${SASS_VERSION}-linux-x64.tar.gz";
+          echo "${DART_SASS_SHA_LINUX}  dart-sass-${SASS_VERSION}-linux-x64.tar.gz" | sha256sum -c;
+          tar -xvf "dart-sass-${SASS_VERSION}-linux-x64.tar.gz";
+          echo "$GOBIN"
+          echo "$GITHUB_WORKSPACE/dart-sass/" >> $GITHUB_PATH
+      - if: matrix.os == 'macos-latest'
+        name: Install dart-sass MacOS
+        run: |
+          echo "Install Dart Sass version ${SASS_VERSION} ..."
+          curl -LJO "https://github.com/sass/dart-sass/releases/download/${SASS_VERSION}/dart-sass-${SASS_VERSION}-macos-x64.tar.gz";
+          echo "${DART_SASS_SHA_MACOS}  dart-sass-${SASS_VERSION}-macos-x64.tar.gz" | shasum -a 256 -c;
+          tar -xvf "dart-sass-${SASS_VERSION}-macos-x64.tar.gz";
+          echo "$GITHUB_WORKSPACE/dart-sass/" >> $GITHUB_PATH
+      - if: matrix.os == 'windows-latest'
+        name: Install dart-sass Windows
+        run: |
+          echo "Install Dart Sass version ${env:SASS_VERSION} ..."
+          curl -LJO "https://github.com/sass/dart-sass/releases/download/${env:SASS_VERSION}/dart-sass-${env:SASS_VERSION}-windows-x64.zip";
+          Expand-Archive -Path "dart-sass-${env:SASS_VERSION}-windows-x64.zip" -DestinationPath .;
+          echo  "$env:GITHUB_WORKSPACE/dart-sass/" | Out-File -FilePath $Env:GITHUB_PATH -Encoding utf-8 -Append
+      - if: matrix.os == 'ubuntu-latest'
+        name: Install staticcheck
+        #run: go install honnef.co/go/tools/cmd/staticcheck@latest
+        # Temporary workaround for https://github.com/dominikh/go-tools/issues/1832
+        run: |
+          cd $(mktemp -d) && go mod init tmp
+          go get honnef.co/go/tools/cmd/staticcheck@latest golang.org/x/tools@latest                     
+          go build -o $(go env GOPATH)/bin/staticcheck honnef.co/go/tools/cmd/staticcheck
+      - if: matrix.os == 'ubuntu-latest'
+        name: Check embedded go template formatting
+        run: "diff <(gotmplfmt -d tpl/tplimpl/embedded/templates) <(printf '')"
+      - if: matrix.os == 'ubuntu-latest'
+        name: Run staticcheck
+        run: |
+          export STATICCHECK_CACHE="${{ runner.temp }}/staticcheck"
+          staticcheck ./...
+          rm -rf ${{ runner.temp }}/staticcheck
+      - if: matrix.os != 'windows-latest'
+        name: Check
+        run: |
+          sass --version;
+          mage -v check;
+        env:
+          HUGO_BUILD_TAGS: extended,withdeploy
+      - if: matrix.os == 'windows-latest'
+        # See issue #11052. We limit the build to regular test (no -race flag) on Windows for now.
+        name: Test
+        run: |
+          mage -v test
+        env:
+          HUGO_BUILD_TAGS: extended,withdeploy
+      - if: matrix.os == 'ubuntu-latest'
+        name: Test 386
+        run: |
+          mage -v test386
+      - if: matrix.os == 'ubuntu-latest'
+        name: Build for dragonfly
+        run: |
+          go install
+          go clean -i -cache
+        env:
+          GOARCH: amd64
+          GOOS: dragonfly

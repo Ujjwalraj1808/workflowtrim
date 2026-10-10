@@ -1,0 +1,143 @@
+name: Quality Check
+
+on:
+  pull_request:
+    branches:
+      - main
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: quality-check-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  preflight:
+    name: Plan and repository checks
+    runs-on: ubuntu-latest
+    env:
+      BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+    outputs:
+      matrix: ${{ steps.scope.outputs.matrix }}
+      verify: ${{ steps.scope.outputs.verify }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+
+      - name: Plan affected application checks
+        id: scope
+        run: node .github/scripts/quality-check-scope.mjs --base "$BASE_SHA" --head "$HEAD_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Validate OpenViking runtime revision
+        run: |
+          node .github/scripts/probe-openviking-runtime-release.mjs \
+            --config .github/openviking-runtime-inputs.json \
+            --check-revision-base "$BASE_SHA"
+
+      - name: Validate release note
+        run: node scripts/release-notes.mjs check-range "$BASE_SHA" "$HEAD_SHA"
+
+      - name: Test repository tooling
+        run: npm run test:repo
+
+  verify:
+    name: Verify ${{ matrix.label }} (${{ matrix.os }})
+    needs: preflight
+    if: needs.preflight.outputs.verify == 'true'
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.preflight.outputs.matrix) }}
+    runs-on: ${{ matrix.os }}
+    env:
+      ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
+      npm_config_audit: "false"
+      npm_config_cache: ${{ github.workspace }}/.ci-npm-cache
+      npm_config_fund: "false"
+      npm_config_prefer_offline: "true"
+      AGENT_RECALL_TEST_NPM_CACHE: ${{ github.workspace }}/.ci-npm-cache
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: ${{ matrix.directory }}/package-lock.json
+
+      - name: Install application dependencies
+        run: npm run setup:${{ matrix.app }}
+
+      - name: Test complete application suite
+        if: runner.os == 'Linux'
+        run: npm --prefix "${{ matrix.directory }}" test
+
+      - name: Test platform-specific scripts
+        if: runner.os != 'Linux'
+        run: npm --prefix "${{ matrix.directory }}" run test:scripts
+
+      - name: Test Windows process and filesystem integrations
+        if: runner.os == 'Windows' && matrix.app == 'v2'
+        run: npm --prefix "${{ matrix.directory }}" exec -- vitest run src/automation/engine/main/agents/dsh/dsh-windows-launcher.test.ts src/automation/engine/main/agents/dsh/dsh-runner.test.ts src/core/managed-skill-library.test.ts
+
+      - name: Typecheck and smoke-test packaged application
+        run: |
+          npm --prefix "${{ matrix.directory }}" run typecheck
+          node "${{ matrix.directory }}/scripts/package-smoke.mjs"
+
+  cli:
+    name: Verify CLI (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - name: Install CLI development dependencies
+        run: npm run setup:cli
+      - name: Test CLI
+        run: npm run test:cli
+      - name: Test isolated package lifecycle
+        run: npm run package:smoke:cli
+
+  quality-gate:
+    name: Quality gate
+    needs: [preflight, verify, cli]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every check to pass
+        env:
+          SHOULD_VERIFY: ${{ needs.preflight.outputs.verify }}
+          PREFLIGHT_RESULT: ${{ needs.preflight.result }}
+          VERIFY_RESULT: ${{ needs.verify.result }}
+          CLI_RESULT: ${{ needs.cli.result }}
+        run: |
+          test "$CLI_RESULT" = "success"
+          case "$PREFLIGHT_RESULT:$SHOULD_VERIFY:$VERIFY_RESULT" in
+            success:true:success|success:false:skipped)
+              ;;
+            *)
+              echo "Quality checks did not complete successfully." >&2
+              exit 1
+              ;;
+          esac

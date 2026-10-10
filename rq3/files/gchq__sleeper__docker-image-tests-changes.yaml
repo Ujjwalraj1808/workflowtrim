@@ -1,0 +1,13 @@
+name: Docker Image Tests
+on:
+  pull_request:
+    paths:
+      - 'rust/**' # We've seen Rust failures because of code built against a different glibc version than is present in the image
+      - 'scripts/build/**'
+      - '.github/workflows/docker-image-tests.yaml'
+
+jobs:
+  build:
+    uses: ./.github/workflows/docker-image-tests.yaml
+    with:
+      dockerOptions: --cache-from type=gha

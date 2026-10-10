@@ -1,0 +1,50 @@
+name: Lint
+on:
+  # Enable manually triggering this workflow via the API or web UI
+  workflow_dispatch:
+  pull_request:
+    paths-ignore:
+      - 'docs/**'
+      - 'release notes/**'
+
+defaults:
+  run:
+    shell: bash
+
+permissions:
+  contents: read
+
+jobs:
+  generate-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Resolve Go versions
+        id: go_versions
+        uses: grafana/k6-ci/.github/actions/go-versions@bc53c239916ae45b50a0bdea2a37698589219c84 # v0.5.3
+      - name: Install Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          # Use Go 1.26 until https://github.com/grafana/k6/issues/6399 is resolved.
+          go-version: ${{ steps.go_versions.outputs.prev }}
+          check-latest: true
+      - name: Check code generation
+        run: |
+          make generate
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "make generate produced changes:"
+            git status --porcelain
+            git --no-pager diff
+            exit 1
+          fi
+
+  k6-ci:
+    uses: grafana/k6-ci/.github/workflows/all.yml@bc53c239916ae45b50a0bdea2a37698589219c84 # v0.5.3
+    with:
+      k6-ci-ref: bc53c239916ae45b50a0bdea2a37698589219c84 # v0.5.3
+      skip-tests: true
+      skip-extension-testing: true

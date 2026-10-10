@@ -1,0 +1,227 @@
+name: Test
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+jobs:
+  server-test:
+    name: Go Tests (SQLite)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: "1.26"
+          cache-dependency-path: server/go.sum
+
+      - name: Install SQLite
+        run: sudo apt-get install -y gcc sqlite3 libsqlite3-dev
+
+      - name: Download dependencies
+        working-directory: ./server
+        run: GOPROXY=https://goproxy.cn,direct go mod download
+
+      - name: Install swag
+        run: go install github.com/swaggo/swag/cmd/swag@latest
+
+      - name: Generate Swagger docs
+        working-directory: ./server
+        run: swag init -g cmd/server/main.go -o docs --parseDependency --parseInternal
+
+      - name: Vet
+        working-directory: ./server
+        run: go vet ./...
+
+      - name: Test
+        working-directory: ./server
+        run: go test ./... -v -count=1 -coverprofile=coverage.out
+
+      - name: Build
+        working-directory: ./server
+        run: CGO_ENABLED=1 go build -o bin/bonds-server cmd/server/main.go
+
+  server-postgres-test:
+    name: Go Tests (PostgreSQL 18)
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: bonds
+          POSTGRES_PASSWORD: bonds
+          POSTGRES_DB: bonds_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U bonds -d bonds_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      BONDS_TEST_POSTGRES_DSN: postgres://bonds:bonds@127.0.0.1:5432/bonds_test?sslmode=disable
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: "1.26"
+          cache-dependency-path: server/go.sum
+
+      - name: Install SQLite
+        run: sudo apt-get install -y gcc sqlite3 libsqlite3-dev
+
+      - name: Download dependencies
+        working-directory: ./server
+        run: GOPROXY=https://goproxy.cn,direct go mod download
+
+      - name: Install swag
+        run: go install github.com/swaggo/swag/cmd/swag@latest
+
+      - name: Generate Swagger docs
+        working-directory: ./server
+        run: swag init -g cmd/server/main.go -o docs --parseDependency --parseInternal
+
+      - name: Test against PostgreSQL
+        working-directory: ./server
+        run: go test ./... -v -count=1 -timeout=40m
+
+  web-test:
+    name: Frontend Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: "1.26"
+          cache-dependency-path: server/go.sum
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install swag
+        run: go install github.com/swaggo/swag/cmd/swag@latest
+
+      - name: Generate Swagger docs
+        working-directory: ./server
+        run: swag init -g cmd/server/main.go -o docs --parseDependency --parseInternal
+
+      - name: Install dependencies
+        working-directory: ./web
+        run: bun install
+
+      - name: Generate API client
+        working-directory: ./web
+        run: bun run gen:api
+
+      - name: Lint
+        working-directory: ./web
+        run: bun run lint
+
+      - name: Unit tests
+        working-directory: ./web
+        run: bun run test
+
+      - name: Build
+        working-directory: ./web
+        run: bun run build
+
+  docker-runtime-test:
+    name: Docker Runtime Smoke Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build final Docker image
+        run: docker build -t bonds-runtime-smoke .
+
+      - name: Start PostgreSQL 18 for compatibility check
+        run: |
+          docker run -d --rm \
+            --name bonds-postgres-18 \
+            -e POSTGRES_PASSWORD=bonds \
+            -e POSTGRES_DB=bonds \
+            -p 55432:5432 \
+            postgres:18
+
+          until docker exec bonds-postgres-18 psql -U postgres -d bonds -c 'SELECT 1' >/dev/null 2>&1; do
+            sleep 1
+          done
+
+      - name: Seed PostgreSQL 18 test data
+        run: |
+          docker exec bonds-postgres-18 psql -U postgres -d bonds -c 'CREATE TABLE issue_203_probe(id integer primary key, note text);'
+          docker exec bonds-postgres-18 psql -U postgres -d bonds -c "INSERT INTO issue_203_probe(id, note) VALUES (1, 'pg18 compatibility');"
+
+      - name: Verify packaged pg_dump against PostgreSQL 18
+        run: |
+          docker run --rm --network host bonds-runtime-smoke sh -c \
+            'PGPASSWORD=bonds pg_dump --host 127.0.0.1 --port 55432 --username postgres --dbname bonds --file /tmp/issue-203.sql && grep -q issue_203_probe /tmp/issue-203.sql'
+
+      - name: Verify packaged psql against PostgreSQL 18
+        run: |
+          docker run --rm --network host bonds-runtime-smoke sh -c \
+            'PGPASSWORD=bonds psql --host 127.0.0.1 --port 55432 --username postgres --dbname bonds -c "SELECT note FROM issue_203_probe WHERE id = 1" | grep -q "pg18 compatibility"'
+
+      - name: Stop PostgreSQL 18 test container
+        if: always()
+        run: docker rm -f bonds-postgres-18 || true
+
+  e2e-test:
+    name: E2E Tests
+    runs-on: ubuntu-latest
+    needs: [server-test, web-test]
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: "1.26"
+          cache-dependency-path: server/go.sum
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install SQLite
+        run: sudo apt-get install -y gcc sqlite3 libsqlite3-dev
+
+      - name: Download Go dependencies
+        working-directory: ./server
+        run: GOPROXY=https://goproxy.cn,direct go mod download
+
+      - name: Install swag
+        run: go install github.com/swaggo/swag/cmd/swag@latest
+
+      - name: Generate Swagger docs
+        working-directory: ./server
+        run: swag init -g cmd/server/main.go -o docs --parseDependency --parseInternal
+
+      - name: Build server
+        working-directory: ./server
+        run: CGO_ENABLED=1 go build -o bin/bonds-server cmd/server/main.go
+
+      - name: Install frontend deps
+        working-directory: ./web
+        run: bun install
+
+      - name: Generate API client
+        working-directory: ./web
+        run: bun run gen:api
+
+      - name: Install Playwright
+        working-directory: ./web
+        run: bunx playwright install --with-deps chromium
+
+      - name: Run E2E tests
+        working-directory: ./web
+        run: bunx playwright test
+        env:
+          CI: true
+        timeout-minutes: 45

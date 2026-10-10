@@ -1,0 +1,397 @@
+# Copyright 2024 the Operaton contributors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at:
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      next_version:
+        description: 'The next development version to set (without -SNAPSHOT suffix). Leave empty to auto-compute based on branch.'
+        required: false
+        default: ''
+      preliminary_release_qualifier:
+        description: 'Optional preliminary release qualifier. Must match M[0-9] or RC[0-9].'
+        required: false
+        default: ''
+      dry_run:
+        description: 'Dry-Run: Skips remote operations when true'
+        type: boolean
+        required: true
+        default: true
+jobs:
+
+  prepare:
+    name: Prepare
+    runs-on: ubuntu-slim
+    permissions:
+      contents: read
+    outputs:
+      next_version: ${{steps.compute-next-version.outputs.next_version}}
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up JDK
+        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Compute next development version
+        id: compute-next-version
+        env:
+          GITHUB_EVENT_INPUTS_NEXT_VERSION: ${{github.event.inputs.next_version}}
+        run: |
+          INPUT_VERSION="${GITHUB_EVENT_INPUTS_NEXT_VERSION}"
+          BRANCH_NAME="${GITHUB_REF_NAME}"
+
+          if [ -n "$INPUT_VERSION" ]; then
+            # Use the provided version
+            echo "next_version=$INPUT_VERSION" >> $GITHUB_OUTPUT
+            echo "Using provided next version: $INPUT_VERSION"
+          else
+            # Compute version based on branch
+            CURRENT_VERSION=$(./mvnw help:evaluate -Dexpression=project.version -q -DforceStdout | tail -n 1 | sed -e 's/-SNAPSHOT//')
+            if [ -z "$CURRENT_VERSION" ]; then
+              echo "::error::Failed to retrieve current version from pom.xml"
+              exit 1
+            fi
+            echo "Current version (without -SNAPSHOT): $CURRENT_VERSION"
+
+            if [[ "$CURRENT_VERSION" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)(.*)$ ]]; then
+              MAJOR="${BASH_REMATCH[1]}"
+              MINOR="${BASH_REMATCH[2]}"
+              PATCH="${BASH_REMATCH[3]}"
+              SUFFIX="${BASH_REMATCH[4]}"
+
+              if [ "$BRANCH_NAME" == "main" ]; then
+                # main branch: increment minor, set patch to 0
+                NEXT_MINOR=$((MINOR + 1))
+                COMPUTED_VERSION="${MAJOR}.${NEXT_MINOR}.0${SUFFIX}"
+                echo "Branch 'main': incrementing minor version"
+              elif [[ "$BRANCH_NAME" =~ ^release/ ]]; then
+                # release/* branches: increment patch
+                NEXT_PATCH=$((PATCH + 1))
+                COMPUTED_VERSION="${MAJOR}.${MINOR}.${NEXT_PATCH}${SUFFIX}"
+                echo "Branch '$BRANCH_NAME': incrementing patch version"
+              else
+                echo "::error::Cannot auto-compute next version for branch '$BRANCH_NAME'. Please provide the next_version input explicitly."
+                exit 1
+              fi
+
+              echo "next_version=$COMPUTED_VERSION" >> $GITHUB_OUTPUT
+              echo "Computed next version: $COMPUTED_VERSION"
+            else
+              echo "::error::Unable to parse current version '$CURRENT_VERSION'. Please provide the next_version input explicitly."
+              exit 1
+            fi
+          fi
+
+  release_build:
+    name: Release Build
+    needs:
+      - prepare
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      version: ${{steps.version.outputs.version}}
+      base_version: ${{steps.version.outputs.base_version}}
+      database_version: ${{steps.version.outputs.database_version}}
+      is_prerelease: ${{steps.version.outputs.is_prerelease}}
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          # persist-credentials must stay true (default): the "Commit changes"
+          # step later in this job (EndBug/add-and-commit) pushes using the
+          # credentials this checkout leaves in the git config.
+          persist-credentials: true
+
+      - name: Set up JDK
+        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Version
+        id: version
+        shell: bash
+        env:
+          GITHUB_EVENT_INPUTS_PRELIMINARY_RELEASE_QUALIFIER: ${{github.event.inputs.preliminary_release_qualifier}}
+        run: .github/scripts/prepare-release-version.sh
+
+      - name: Maven Build
+        run: |
+          PROJECT_ROOT=$(pwd)
+          # Make a verification build. Also the deploy step will need the tomcat distro for building, but we don't want to deploy it.
+          # -Dmaven.build.cache.enabled=false: released artifacts are always
+          # built from source. The build cache is enabled in build.yml and
+          # pr-build.yml, and restoring a module here would ship an artifact
+          # this pipeline never compiled or tested. Passed explicitly rather
+          # than relying on the default in .mvn/maven.config, so that changing
+          # that default cannot reach the release.
+          ./mvnw \
+            -Dmaven.build.cache.enabled=false \
+            -Pdistro,distro-run,distro-tomcat,distro-wildfly,distro-webjar,distro-webjar-neo,distro-starter,distro-serverless,h2-in-memory \
+            install \
+            versions:dependency-updates-aggregate-report \
+            versions:plugin-updates-aggregate-report \
+            -Dsave=true -Ddisplay=false io.github.orhankupusoglu:sloc-maven-plugin:sloc \
+            -Dbuildplan.appendOutput=true -Dbuildplan.outputFile=$PROJECT_ROOT/target/reports/buildplan.txt fr.jcgay.maven.plugins:buildplan-maven-plugin:list
+          .github/scripts/prepare-reports.sh
+          .github/scripts/prepare-deploy.sh
+          ./mvnw -Dmaven.build.cache.enabled=false -Psonatype-oss-release -DskipTests=true -Dskip.frontend.build=true deploy
+          find target -name maven-metadata.* -delete
+      - name: Commit changes
+        uses: EndBug/add-and-commit@cc9c08ba6c8df3b93a8f2db63e89b98368ae2ae8 # v11.1.1
+        if: ${{github.event.inputs.dry_run == 'false' }}
+        with:
+          message: "chore(release) Releasing version ${{steps.version.outputs.version}}"
+      - name: Cache build artifacts
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            distro/**/*.tar.gz
+            distro/**/*.zip
+            distro/webjar/target/operaton-webapp-webjar-*.jar
+            ./*/staging-deploy/**
+            **/target/reports/**
+            **/target/surefire-reports/*.xml
+            target/*.zip
+          key: ${{ github.run_id }}-build-artifacts
+
+  documentation:
+    name: Documentation
+    needs:
+      - prepare
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up JDK
+        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Version
+        shell: bash
+        env:
+          GITHUB_EVENT_INPUTS_PRELIMINARY_RELEASE_QUALIFIER: ${{github.event.inputs.preliminary_release_qualifier}}
+        run: .github/scripts/prepare-release-version.sh
+
+      - name: Documentation
+        run: |
+          .devenv/scripts/build/javadoc.sh
+          .devenv/scripts/build/check-api-compatibility.sh
+          .devenv/scripts/build/rest-api-doc.sh
+          .devenv/scripts/build/build-sbom.sh
+          pip install --only-binary :all: pystache==0.6.8
+
+      - name: Cache documentation artifacts
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            target/javadoc.zip
+            target/javadoc/**
+            target/clirr-reports.zip
+            target/rest-api.zip
+            target/rest-api/**
+            target/sbom/**
+            **/target/reports/**
+          key: ${{ github.run_id }}-documentation-artifacts
+
+  release:
+    name: Release
+    needs:
+      - release_build
+      - documentation
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Restore build artifacts cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            distro/**/*.tar.gz
+            distro/**/*.zip
+            distro/webjar/target/operaton-webapp-webjar-*.jar
+            ./*/staging-deploy/**
+            **/target/reports/**
+            **/target/surefire-reports/*.xml
+            target/*.zip
+          key: ${{ github.run_id }}-build-artifacts
+          fail-on-cache-miss: true
+
+      - name: Restore documentation cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            target/javadoc.zip
+            target/javadoc/**
+            target/clirr-reports.zip
+            target/rest-api.zip
+            target/rest-api/**
+            target/sbom/**
+            **/target/reports/**
+          key: ${{ github.run_id }}-documentation-artifacts
+          fail-on-cache-miss: true
+
+      - name: Modify jreleaser.yml for release
+        env:
+          NEEDS_RELEASE_BUILD_OUTPUTS_IS_PRERELEASE: ${{ needs.release_build.outputs.is_prerelease }}
+        run: |
+          # set prerelease flag
+          perl -0777 -pe 's/(prerelease:\s*\n\s*enabled:\s*)(true|false)/$1${NEEDS_RELEASE_BUILD_OUTPUTS_IS_PRERELEASE}/' -i jreleaser.yml
+
+      - name: Release with JReleaser
+        uses: jreleaser/release-action@90ac653bb9c79d11179e65d81499f3f34527dcd5 # 2.5.0
+        env:
+          JRELEASER_PROJECT_VERSION: ${{needs.release_build.outputs.version}}
+          JRELEASER_GITHUB_TOKEN: ${{secrets.GITHUB_TOKEN}}
+          JRELEASER_GPG_PUBLIC_KEY: ${{secrets.GPG_PUBLIC_KEY}}
+          JRELEASER_GPG_SECRET_KEY: ${{secrets.GPG_PRIVATE_KEY}}
+          JRELEASER_GPG_PASSPHRASE: ${{secrets.GPG_PASSPHRASE}}
+          JRELEASER_MAVENCENTRAL_USERNAME: ${{secrets.OSSRH_USERNAME}}
+          JRELEASER_MAVENCENTRAL_PASSWORD: ${{secrets.OSSRH_PASSWORD}}
+          JRELEASER_DRY_RUN: ${{github.event.inputs.dry_run}}
+        with:
+          arguments: full-release -POPERATON_DATABASE_VERSION=${{needs.release_build.outputs.database_version}} -PPRERELEASE_ENABLED=${{needs.release_build.outputs.is_prerelease}} -PSLACK_BOT_TOKEN=${{secrets.SLACK_BOT_TOKEN}} -PSLACK_WEBHOOK_URL=${{secrets.SLACK_WEBHOOK_URL}}
+
+      - name: Restore jreleaser.yml after release
+        if: always()
+        run: |
+          git restore jreleaser.yml
+
+      - name: Publish Test Report
+        if: always()
+        uses: mikepenz/action-junit-report@a9170d5795813c01ab4901ffb045b52bab4ab09d #v6.5.0
+        with:
+          report_paths: ${{ github.workspace }}/**/target/surefire-reports/*.xml
+          require_passed_tests: true
+
+      - name: Archive Reports
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: reports
+          path: |
+            **/target/reports/**
+
+      - name: Archive Staging Repo
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: staging
+          path: |
+            ./*/staging-deploy/**
+          retention-days: 10
+
+  post_release:
+    name: Post-Release
+    needs:
+      - prepare
+      - release
+      - release_build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Notify Docker Repository
+        if: ${{github.event.inputs.dry_run == 'false' }}
+        env:
+          DOCKER_ACTION_DISPATCH_TOKEN: ${{ secrets.DOCKER_ACTION_DISPATCH_TOKEN }}
+          NEEDS_RELEASE_BUILD_OUTPUTS_VERSION: ${{ needs.release_build.outputs.version}}
+        run: |
+          PAYLOAD=$(jq -n --arg version "$NEEDS_RELEASE_BUILD_OUTPUTS_VERSION" \
+            '{ref: "main", inputs: {version: $version, snapshot: "false"}}')
+          response=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
+            -H "Authorization: Bearer $DOCKER_ACTION_DISPATCH_TOKEN" \
+            -H "Accept: application/vnd.github.v3+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            -d "$PAYLOAD" \
+            https://api.github.com/repos/operaton/operaton-docker/actions/workflows/build-test-and-publish.yml/dispatches)
+          if [ "$response" -ne 204 ]; then
+            echo "Failed to notify Docker repository. HTTP response code: $response"
+            exit 1
+          fi
+
+      - name: Check out the code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: true # required by add-and-commit action to push with the same credentials
+      - name: Update the release branch
+        run: |
+          git pull
+      - name: Delete snapshot release
+        if: ${{github.event.inputs.dry_run == 'false' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NEEDS_RELEASE_BUILD_OUTPUTS_VERSION: ${{ needs.release_build.outputs.version }}
+        run: |
+          SNAPSHOT_TAGS=(
+            "${NEEDS_RELEASE_BUILD_OUTPUTS_VERSION}-SNAPSHOT"
+            "v${NEEDS_RELEASE_BUILD_OUTPUTS_VERSION}-SNAPSHOT"
+          )
+
+          for SNAPSHOT_TAG in "${SNAPSHOT_TAGS[@]}"; do
+            echo "Attempting to delete snapshot release: $SNAPSHOT_TAG"
+
+            if gh release view "$SNAPSHOT_TAG" > /dev/null 2>&1; then
+              echo "Found snapshot release $SNAPSHOT_TAG, deleting..."
+              gh release delete "$SNAPSHOT_TAG" --yes --cleanup-tag
+              echo "Successfully deleted snapshot release $SNAPSHOT_TAG"
+            else
+              echo "Snapshot release $SNAPSHOT_TAG not found, skipping deletion"
+            fi
+          done
+
+      - name: Set next development version
+        id: set-next-version
+        env:
+          GITHUB_EVENT_INPUTS_PRELIMINARY_RELEASE_QUALIFIER: ${{github.event.inputs.preliminary_release_qualifier}}
+          NEEDS_RELEASE_BUILD_OUTPUTS_BASE_VERSION: ${{needs.release_build.outputs.base_version}}
+          NEEDS_PREPARE_OUTPUTS_NEXT_VERSION: ${{needs.prepare.outputs.next_version}}
+        run: |
+          if [ -n "${GITHUB_EVENT_INPUTS_PRELIMINARY_RELEASE_QUALIFIER}" ]; then
+            NEXT_VERSION=${NEEDS_RELEASE_BUILD_OUTPUTS_BASE_VERSION}-SNAPSHOT
+          else
+            NEXT_VERSION=${NEEDS_PREPARE_OUTPUTS_NEXT_VERSION}-SNAPSHOT
+          fi
+          .github/scripts/set-project-version.sh $NEXT_VERSION
+          echo "next_version=$NEXT_VERSION" >> $GITHUB_OUTPUT
+
+      - name: Commit changes
+        uses: EndBug/add-and-commit@cc9c08ba6c8df3b93a8f2db63e89b98368ae2ae8 # v11.1.1
+        if: ${{github.event.inputs.dry_run == 'false' }}
+        with:
+          message: "[releng] Bump version to ${{steps.set-next-version.outputs.next_version}}"
+          pull: '--rebase --autostash'
+        continue-on-error: true

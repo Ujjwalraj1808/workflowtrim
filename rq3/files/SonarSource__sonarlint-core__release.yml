@@ -1,0 +1,28 @@
+name: sonar-release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        type: string
+        description: Version
+        required: true
+      dryRun:
+        type: boolean
+        description: Flag to enable the dry-run execution
+        default: false
+        required: false
+
+jobs:
+  release:
+    permissions:
+      id-token: write
+      contents: write
+    uses: SonarSource/gh-action_release/.github/workflows/main.yaml@bf4faffefea8fce5e434a3b185d2ac03fba5592c # 7.7.1
+    with:
+      version: ${{ inputs.version }}
+      dryRun: ${{ inputs.dryRun }}
+      publishToBinaries: false
+      mavenCentralSync: true
+      # Slack channel squad-devex-private
+      slackChannel: C02E6L5C01H

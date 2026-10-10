@@ -1,0 +1,812 @@
+
+name: ci
+
+## RUNNERS
+# https://docs.github.com/en/actions/reference/runners/github-hosted-runners
+# ubuntu-24.04 = 4cpu, 16GB
+# ubuntu-latest-128 = 32, 128GB
+# ubuntu-24.04-arm = 4cpu, 16GB
+# macos-13 = 4cpu, 14GB
+# macos-15 = 3cpu(M1), 7GB
+# gha-runner-scale-set-ubuntu-24-amd64-med   = 4 , 16G
+# gha-runner-scale-set-ubuntu-24-amd64-large = 8 , 32G
+# gha-runner-scale-set-ubuntu-24-amd64-xl = 16 , 64G
+# gha-runner-scale-set-ubuntu-24-amd64-xxl = 32 , 128G
+
+on:
+  push:
+    branches:
+      - master
+    tags:
+      - '*'
+  pull_request:
+    branches:
+      - master
+      - '**prototype**'
+      - '**devnet**'
+  workflow_dispatch:
+    inputs:
+      include_hash_in_docker:
+        description: 'include_hash_in_docker'
+        required: false
+        default: 'false'
+      gradle_log_level:
+        description: 'Gradle log level for test jobs'
+        required: false
+        type: choice
+        default: 'lifecycle'
+        options:
+          - lifecycle
+          - info
+          - debug
+
+# if a new commit is made on a PR, cancel this run; master/tag pushes queue instead so
+# in-flight publish jobs (Docker push, Cloudsmith/Maven upload) never get killed mid-way
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  JAVA_TOOL_OPTIONS: -Xmx4096m
+  GRADLE_OPTS: -Dorg.gradle.daemon=false -Dorg.gradle.parallel=true -Xmx4096m
+
+permissions: read-all
+
+jobs:
+
+  # ============================================================================
+  # ** DOCS-ONLY SHORT-CIRCUIT (the `changes` gate) **
+  # ----------------------------------------------------------------------------
+  # WHAT: Skip the heavy CI pipeline when a PR/push changes ONLY docs-type files
+  # (see the path list in the `changes` job below), while still satisfying the
+  # required status checks on branch protection.
+  #
+  # HOW: `changes` diffs the PR/push and sets the output `code`, which every
+  # gated job reads as needs.changes.outputs.code:
+  #
+  #     code == "true"   ->  FULL pipeline runs  (all gated jobs execute)
+  #     code == "false"  ->  heavy jobs are SKIPPED  (docs-only short-circuit);
+  #                          the test aggregators report success, so the required
+  #                          checks (spotless, moduleChecks, assemble, unitTests,
+  #                          integrationTests, propertyTests, referenceTests) go
+  #                          green in seconds.
+  #
+  # code is "true" when any non-doc file changed, OR it's a tag build, OR a manual
+  # (workflow_dispatch) run. It is "false" only for a docs-only push/PR.
+  #
+  # WHY ONE GATE (and not two workflows): this replaces the old
+  # ci.yml + ci-skipped.yml pair. On a mixed (code + docs) PR BOTH of those fired,
+  # emitting two status checks per required name and racing -- the no-op stub could
+  # flip auto-merge green before the real CI finished. One gate => one check per
+  # name => no race.
+  #
+  # IMPORTANT: ci.yml must NOT use `paths-ignore`. A job skipped via `if:` counts
+  # as a PASSING required check, but a whole workflow skipped by a path filter
+  # leaves its required checks stuck on "Expected" forever and blocks merge.
+  # ============================================================================
+  changes:
+    runs-on: ubuntu-24.04
+    outputs:
+      code: ${{ steps.detect.outputs.code }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+      - name: Detect non-doc changes
+        id: detect
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BEFORE_SHA: ${{ github.event.before }}
+          CURRENT_SHA: ${{ github.sha }}
+          FORCE_FULL_CI: ${{ startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch' }}
+        run: |
+          set -uo pipefail
+
+          emit() { echo "code=$1" >> "$GITHUB_OUTPUT"; echo "Result: code=$1"; exit 0; }
+
+          is_doc_path() {
+            local f="$1"
+            # List of doc-classified changes
+            case "$f" in
+              *.md | \
+              CODEOWNERS | \
+              .gitignore | \
+              .gitattributes | \
+              .codespell/* | \
+              specrefs/* | \
+              mlc_config.json) return 0 ;;
+              LICENSE* | \
+              NOTICE* | \
+              CHANGELOG*) [[ "$f" != */* ]] ;;
+              *) return 1 ;;
+            esac
+          }
+
+          if [ "$FORCE_FULL_CI" = "true" ]; then
+            echo "Tag or manual run; running full pipeline."
+            emit true
+          fi
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            base="$PR_BASE_SHA"
+            head="$PR_HEAD_SHA"
+            diff_args=("$base...$head")
+          else
+            base="$BEFORE_SHA"
+            head="$CURRENT_SHA"
+            diff_args=("$base" "$head")
+          fi
+          # Without a usable base (new branch/tag, force-push) we cannot diff: run full.
+          if [ -z "${base:-}" ] || [ -z "${head:-}" ] || [ "$base" = "0000000000000000000000000000000000000000" ]; then
+            echo "No usable base/head ('${base:-}'/'${head:-}'); running full pipeline."
+            emit true
+          fi
+          if ! changed="$(git diff --name-only "${diff_args[@]}")"; then
+            echo "git diff failed for base '$base' and head '$head'; running full pipeline."
+            emit true
+          fi
+          echo "Changed files:"
+          echo "$changed"
+
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            if ! is_doc_path "$f"; then
+              echo "Non-doc file changed: $f"
+              emit true
+            fi
+          done <<< "$changed"
+          emit false
+
+  spotless:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          submodules: 'recursive'
+      - name: Prepare
+        uses: ./.github/actions/prepare
+      - name: Spotless
+        run: |
+          ./gradlew spotlessCheck
+
+  moduleChecks:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          submodules: 'recursive'
+      - name: Prepare
+        uses: ./.github/actions/prepare
+      - name: Check modules
+        run: |
+          ./gradlew checkMavenCoordinateCollisions checkModuleDependencies
+
+  assemble:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    # assemble is in our critical path so we want it to finish as quick as possible
+    runs-on: ubuntu-latest-128
+    outputs:
+      workflow-run-id: ${{ steps.workflowdetails.outputs.run_id }}
+      publish-version: ${{ steps.projectDetails.outputs.publish-version }}
+      ref-cache-key: ${{ steps.ref-cache-key.outputs.key }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          submodules: 'recursive'
+          # The Docker image is built here and the acceptance tests check teku's reported
+          # version, which comes from git describe. Without tags it is UNKNOWN+g<sha>.
+          fetch-depth: 0
+          fetch-tags: true
+      - name: get workflow_details
+        id: workflowdetails
+        shell: bash
+        run: |
+          echo "run_id=${{ github.run_id }}" >> $GITHUB_OUTPUT
+          echo "build_date=$(date --rfc-3339=date)" >> $GITHUB_OUTPUT
+          echo "vcs_ref=${{ github.sha }}" >> $GITHUB_OUTPUT
+      # assemble is the only writer of the shared Gradle cache entry: it resolves the widest set of
+      # dependencies (see resolveCiDependencies) and it completes before every job that consumes the
+      # cache. Letting other jobs write would race for the same key and could publish a Gradle home
+      # that is missing the test dependencies the shards need.
+      - name: Prepare
+        uses: ./.github/actions/prepare
+        with:
+          gradle-cache-write: 'true'
+      - name: Determine Teku version
+        id: projectDetails
+        uses: ./.github/actions/get-project-version
+      - name: Compute reference test cache key
+        id: ref-cache-key
+        shell: bash
+        run: |
+          # Derive the cache key from the reference test version definitions, the set of archives
+          # built, the converter and the per-archive conversion options, so unrelated root
+          # build.gradle edits don't bust the cache. The archive set matters because the cached
+          # directory is used as-is when it is restored: the tests mount every <config>.zip in it,
+          # so a key that ignored the set would keep serving an archive after it was switched off.
+          LINES=$(grep -E '^def (refTestVersion|blsRefTestVersion|slashingProtectionInterchangeRefTestVersion|compTestsAvailable)' build.gradle)
+          if [ -z "$LINES" ]; then
+            echo "Could not find reference test version definitions in build.gradle" >&2
+            exit 1
+          fi
+          HASH=$( (echo -n "$LINES"; cat eth-tests/src/main/java/tech/pegasys/teku/ethtests/ReferenceTestArchiveConverter.java eth-reference-tests/build.gradle) | sha256sum | cut -c1-16)
+          echo "key=reftests-archives-$HASH" >> "$GITHUB_OUTPUT"
+      - name: Restore reference test archives
+        id: ref-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: build/refTests/*/archives/
+          key: ${{ steps.ref-cache-key.outputs.key }}
+      - name: Fetch reference tests
+        shell: bash
+        run: |
+          # The zip archives are the only fixtures the tests need. Convert (which downloads the
+          # tarballs first) only when the cache did not provide them.
+          if ! ls build/refTests/*/archives/*.zip >/dev/null 2>&1
+          then
+            ./gradlew --no-daemon convertRefTests
+          fi
+          ls -la build/refTests/*/archives/
+      # No "clean": runners are ephemeral with a fresh checkout, and clean would wipe the restored
+      # build/refTests archives. Reference test classes are generated and compiled here so they
+      # travel with the workspace and its Gradle task history, and the shards see them up to date.
+      - name: Assemble
+        shell: bash
+        run: |
+          ./gradlew -x convertRefTests compileJava compileTestJava compileJmhJava compileIntegrationTestJava compileAcceptanceTestJava compilePropertyTestJava resolveCiDependencies assemble distDocker generateReferenceTestClasses compileReferenceTestJava
+      - name: Save reference test archives
+        if: steps.ref-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: build/refTests/*/archives/
+          key: ${{ steps.ref-cache-key.outputs.key }}
+      - name: Save Teku docker image
+        shell: bash
+        run: |
+          docker save consensys/teku:develop | zstd -T0 -3 -o teku-docker-image.tar.zst
+          ls -la teku-docker-image.tar.zst
+      - name: Upload Teku docker image
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: teku-docker-image
+          path: teku-docker-image.tar.zst
+          retention-days: 1
+      - name: Upload distribution tar
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: distribution-tar
+          path: |
+            build/distributions/*.tar.gz
+          retention-days: 14
+      - name: Upload distribution zip
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: distribution-zip
+          path: |
+            build/distributions/*.zip
+          retention-days: 7
+      # One zstd tarball instead of ~100k loose files: upload-artifact zips file by file (slow for
+      # the generated reference tests) and drops empty directories, which Gradle treats as removed
+      # task outputs. build/tmp stays in: build/tmp/<compileTask>/previous-compilation-data.bin is a
+      # declared output of every JavaCompile task, so without it no compile task is up to date in
+      # the shards. GNU tar --exclude patterns are unanchored, so build/docs matches at any depth.
+      - name: Pack workspace
+        shell: bash
+        run: |
+          tar --use-compress-program='zstd -T0 -3' -cf "$RUNNER_TEMP/assemble-output.tar.zst" \
+            --exclude=.git \
+            --exclude=teku-docker-image.tar.zst \
+            --exclude=build/docker-teku \
+            --exclude=build/distributions \
+            --exclude=build/refTests \
+            --exclude=build/docs \
+            --exclude=build/reports \
+            --exclude=build/test-results \
+            --exclude=build/jacoco \
+            .
+          ls -la "$RUNNER_TEMP/assemble-output.tar.zst"
+      - name: Upload workspace build
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: assemble-output
+          path: ${{ runner.temp }}/assemble-output.tar.zst
+          compression-level: 0
+          retention-days: 1
+
+  prDistributions:
+    needs: changes
+    if: github.event_name == 'pull_request' && needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest-32
+    steps:
+      - name: Checkout PR head
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          submodules: 'recursive'
+          persist-credentials: false
+      - name: Prepare
+        uses: ./.github/actions/prepare
+      - name: Assemble distributions
+        run: |
+          ./gradlew clean distTar distZip
+      - name: Upload distribution tar
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: distribution-tar
+          path: |
+            build/distributions/*.tar.gz
+          retention-days: 14
+      - name: Upload distribution zip
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: distribution-zip
+          path: |
+            build/distributions/*.zip
+          retention-days: 7
+
+  ## OpenAPI spec
+  extractAPISpec:
+    needs: assemble
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          submodules: 'recursive'
+      - name: Prepare
+        uses: ./.github/actions/prepare
+      - name: Download assemble-output
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.run_id }}
+          name: assemble-output
+          path: ${{ runner.temp }}
+      - name: Unpack assemble-output
+        shell: bash
+        run: |
+          tar --use-compress-program=zstd -xf "$RUNNER_TEMP/assemble-output.tar.zst" -C "$GITHUB_WORKSPACE"
+          rm "$RUNNER_TEMP/assemble-output.tar.zst"
+      - name: Build runnable Teku binaries
+        shell: bash
+        run: |
+          ./gradlew --no-daemon --parallel installDist
+      - name: Extract OpenAPI spec
+        shell: bash
+        run: |
+          mkdir -p .openapidoc/spec
+
+          build/install/teku/bin/teku --network=mainnet --ee-endpoint=unsafe-test-stub --ignore-weak-subjectivity-period-enabled --Xinterop-enabled=true --rest-api-enabled=true --rest-api-docs-enabled=true 2>&1 > teku_output.log &
+          TEKU_PID=$!
+
+          EXIT_CODE=0
+          wget --timeout=30 --retry-connrefused --output-document=.openapidoc/spec/teku.json http://localhost:5051/swagger-docs
+          if [ $? != 0 ]; then
+            EXIT_CODE=1
+          fi
+
+          kill $TEKU_PID
+          exit $EXIT_CODE
+      - name: Upload openapi spec
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: openapi-spec
+          path: |
+            .openapidoc/spec/teku.json
+          retention-days: 7
+
+  publishAPISpec:
+    if: github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/')
+    needs: extractAPISpec
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          submodules: 'recursive'
+      - name: Prepare
+        uses: ./.github/actions/prepare
+      - name: Download openapi spec
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: openapi-spec
+          path: ${{ github.workspace }}/.openapidoc/spec
+      - name: List openapidoc spec
+        run: |
+          ls -R .openapidoc/spec/
+      - name: Use Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 22
+          cache-dependency-path: .openapidoc/package-lock.json
+          cache: 'npm'
+      - name: Prepare OpenAPI spec for publishing
+        working-directory: .openapidoc
+        env:
+          OA_GIT_URL: https://github.com/${{ github.repository }}.git
+          OA_GH_PAGES_BRANCH: gh-pages
+        run: |
+          npm ci
+          node publish.js
+      - name: Deploy to GitHub Pages
+        uses: JamesIves/github-pages-deploy-action@fa24774553152dd7873cd16ebd8d959b010c5445 # v4.9.0
+        with:
+          folder: .openapidoc/dist
+          branch: gh-pages
+          commit-message: "[skip ci] OpenAPI Publish"
+          clean: false
+
+  ## Tests
+  unitTestsSuite:
+    needs: assemble
+    permissions:
+      actions: read
+      contents: read
+    uses: ./.github/workflows/matrix-tests-template.yml
+    with:
+      assemble_output_run_id: ${{ github.run_id }}
+      stage_name: Unit Tests
+      stage_key: unit
+      gradle_task: test
+      # unit and integration shards finish in ~3 minutes; 8 instead of 12 frees large runners for
+      # the acceptance shards, which are the long ones and otherwise queue behind these
+      shard_count: 8
+      src_pattern: "*/src/test/java/*"
+      src_root: "src/test/java"
+      runner: "ubuntu-latest-128"
+      gradle_args: ${{ (inputs.gradle_log_level == 'info' && '--info') || (inputs.gradle_log_level == 'debug' && '--debug') || '' }}
+
+  unitTestsResult:
+    name: unitTests
+    runs-on: ubuntu-24.04
+    needs: [changes, unitTestsSuite]
+    if: always()
+    steps:
+      - run: |
+          if [ "${{ needs.changes.result }}" = "success" ] && [ "${{ needs.changes.outputs.code }}" = "false" ]; then
+            echo "⏭️ Docs-only change; unitTests not required."
+            exit 0
+          fi
+          echo "unitTests result: ${{ needs.unitTestsSuite.result }}"
+          if [ "${{ needs.unitTestsSuite.result }}" != "success" ]; then
+            echo "❌ One or more unitTests matrix jobs failed."
+            exit 1
+          fi
+          echo "✅ All unitTests matrix jobs passed."
+
+  # Runs in its own job: this org's action-allowlist policy is enforced per-job, so if
+  # capture-test-timings shared a job with anything that references a disallowed action,
+  # the whole job gets killed part-way through regardless of continue-on-error
+  # (verified: https://github.com/Consensys-Incorporated/teku/pull/11204).
+  # Test result reports are published by test-reports.yml (workflow_run), so they also
+  # work for PRs from forks, whose pull_request token cannot create check runs.
+  unitTestsCaptureTimings:
+    runs-on: ubuntu-24.04
+    needs: [changes, unitTestsSuite]
+    if: always() && needs.changes.outputs.code == 'true'
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: ./.github/actions/capture-test-timings
+        continue-on-error: true
+        if: always()
+        with:
+          stage_key: unit
+
+  integrationTestsSuite:
+    needs: assemble
+    permissions:
+      actions: read
+      contents: read
+    uses: ./.github/workflows/matrix-tests-template.yml
+    with:
+      assemble_output_run_id: ${{ github.run_id }}
+      stage_name: Integration Tests
+      stage_key: integration
+      gradle_task: integrationTest
+      # unit and integration shards finish in ~3 minutes; 8 instead of 12 frees large runners for
+      # the acceptance shards, which are the long ones and otherwise queue behind these
+      shard_count: 8
+      src_pattern: "*/src/integration-test/java/*"
+      src_root: "src/integration-test/java"
+      runner: "ubuntu-latest-128"
+      gradle_args: ${{ (inputs.gradle_log_level == 'info' && '--info') || (inputs.gradle_log_level == 'debug' && '--debug') || '' }}
+      retry_attempts: 3
+
+  integrationTestsResult:
+    name: integrationTests
+    runs-on: ubuntu-24.04
+    needs: [changes, integrationTestsSuite]
+    if: always()
+    steps:
+      - run: |
+          if [ "${{ needs.changes.result }}" = "success" ] && [ "${{ needs.changes.outputs.code }}" = "false" ]; then
+            echo "⏭️ Docs-only change; integrationTests not required."
+            exit 0
+          fi
+          echo "integrationTests result: ${{ needs.integrationTestsSuite.result }}"
+          if [ "${{ needs.integrationTestsSuite.result }}" != "success" ]; then
+            echo "❌ One or more integrationTests matrix jobs failed."
+            exit 1
+          fi
+          echo "✅ All integrationTests matrix jobs passed."
+
+  integrationTestsCaptureTimings:
+    runs-on: ubuntu-24.04
+    needs: [changes, integrationTestsSuite]
+    if: always() && needs.changes.outputs.code == 'true'
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: ./.github/actions/capture-test-timings
+        continue-on-error: true
+        if: always()
+        with:
+          stage_key: integration
+
+  propertyTestsSuite:
+    needs: assemble
+    permissions:
+      actions: read
+      contents: read
+    uses: ./.github/workflows/matrix-tests-template.yml
+    with:
+      assemble_output_run_id: ${{ github.run_id }}
+      stage_name: Property Tests
+      stage_key: property
+      gradle_task: propertyTest
+      src_pattern: "*/src/property-test/java/*"
+      src_root: "src/property-test/java"
+      runner: "ubuntu-latest-128"
+      gradle_args: ${{ (inputs.gradle_log_level == 'info' && '--info') || (inputs.gradle_log_level == 'debug' && '--debug') || '' }}
+
+  propertyTestsResult:
+    name: propertyTests
+    runs-on: ubuntu-24.04
+    needs: [changes, propertyTestsSuite]
+    if: always()
+    steps:
+      - run: |
+          if [ "${{ needs.changes.result }}" = "success" ] && [ "${{ needs.changes.outputs.code }}" = "false" ]; then
+            echo "⏭️ Docs-only change; propertyTests not required."
+            exit 0
+          fi
+          echo "propertyTests result: ${{ needs.propertyTestsSuite.result }}"
+          if [ "${{ needs.propertyTestsSuite.result }}" != "success" ]; then
+            echo "❌ One or more propertyTests matrix jobs failed."
+            exit 1
+          fi
+          echo "✅ All propertyTests matrix jobs passed."
+
+  propertyTestsCaptureTimings:
+    runs-on: ubuntu-24.04
+    needs: [changes, propertyTestsSuite]
+    if: always() && needs.changes.outputs.code == 'true'
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: ./.github/actions/capture-test-timings
+        continue-on-error: true
+        if: always()
+        with:
+          stage_key: property
+
+  acceptanceTestsSuite:
+    needs: assemble
+    permissions:
+      actions: read
+      contents: read
+    uses: ./.github/workflows/matrix-tests-template.yml
+    with:
+      assemble_output_run_id: ${{ github.run_id }}
+      stage_name: Acceptance Tests
+      stage_key: acceptance
+      gradle_task: acceptanceTest
+      src_pattern: "*/src/acceptance-test/java/*"
+      src_root: "src/acceptance-test/java"
+      runner: "ubuntu-latest-128"
+      gradle_args: ${{ (inputs.gradle_log_level == 'info' && '--info') || (inputs.gradle_log_level == 'debug' && '--debug') || '' }} -x distDocker
+      retry_attempts: 3
+
+  acceptanceTestsResult:
+    name: acceptanceTests
+    runs-on: ubuntu-24.04
+    needs: [changes, acceptanceTestsSuite]
+    if: always()
+    steps:
+      - run: |
+          if [ "${{ needs.changes.result }}" = "success" ] && [ "${{ needs.changes.outputs.code }}" = "false" ]; then
+            echo "⏭️ Docs-only change; acceptanceTests not required."
+            exit 0
+          fi
+          echo "acceptanceTests result: ${{ needs.acceptanceTestsSuite.result }}"
+          if [ "${{ needs.acceptanceTestsSuite.result }}" != "success" ]; then
+            echo "❌ One or more acceptanceTests matrix jobs failed."
+            exit 1
+          fi
+          echo "✅ All acceptanceTests matrix jobs passed."
+
+  acceptanceTestsCaptureTimings:
+    runs-on: ubuntu-24.04
+    needs: [changes, acceptanceTestsSuite]
+    if: always() && needs.changes.outputs.code == 'true'
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: ./.github/actions/capture-test-timings
+        continue-on-error: true
+        if: always()
+        with:
+          stage_key: acceptance
+
+  referenceTests:
+    needs: assemble
+    runs-on: "ubuntu-latest-128"
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0,1,2,3,4,5,6,7]   # parallel shards
+        total: [8]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          submodules: 'recursive'
+      - name: Prepare
+        uses: ./.github/actions/prepare
+      - name: Download assemble-output
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.run_id }}
+          name: assemble-output
+          path: ${{ runner.temp }}
+      - name: Unpack assemble-output
+        shell: bash
+        run: |
+          tar --use-compress-program=zstd -xf "$RUNNER_TEMP/assemble-output.tar.zst" -C "$GITHUB_WORKSPACE"
+          rm "$RUNNER_TEMP/assemble-output.tar.zst"
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: build/refTests/*/archives/
+          key: ${{ needs.assemble.outputs.ref-cache-key }}
+          fail-on-cache-miss: true
+      - name: Compute shard ${{ matrix.shard }} of ${{ matrix.total }} for ReferenceTests
+        id: shard
+        shell: bash
+        run: |
+          # 1) Collect test classes by pattern = FQNs, generated tests plus the handwritten ones
+          CLASSNAMES=$(for SRC_ROOT in src/referenceTest/generated_tests src/referenceTest/java; do
+              find . -type f -path "*/$SRC_ROOT/*Test.java" -not -path "*/build/*" \
+                | sed "s@.*/$SRC_ROOT/@@"
+            done \
+            | sed 's@/@.@g' \
+            | sed 's/.\{5\}$//' \
+            | sort)
+          # 2) Modulo split
+          CLASSES_FOR_SHARD=$(printf "%s\n" "$CLASSNAMES" \
+            | awk -v shards=${{ matrix.total }} -v shard=${{ matrix.shard }} '((NR-1) % shards) == shard')
+
+          if [ -z "$CLASSES_FOR_SHARD" ]; then
+            echo "args=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # 3) Build --tests args
+          GRADLE_ARGS=$(printf "%s\n" "$CLASSES_FOR_SHARD" | awk '{printf "--tests %s ", $0}')
+          echo "Prepared arguments for Gradle (ReferenceTests): $GRADLE_ARGS"
+          echo "args=$GRADLE_ARGS" >> "$GITHUB_OUTPUT"
+      - name: Run ReferenceTests (shard)
+        if: steps.shard.outputs.args != ''
+        run: |
+          ./gradlew --no-daemon --parallel \
+            -x convertRefTests \
+            -x generateReferenceTestClasses \
+            -x cleanReferenceTestClasses \
+            referenceTest ${{ (inputs.gradle_log_level == 'info' && '--info') || (inputs.gradle_log_level == 'debug' && '--debug') || '' }} ${{ steps.shard.outputs.args }}
+      - name: Merge JUnit XML for ReferenceTests
+        if: always()
+        uses: ./.github/actions/merge-junit-xml
+        with:
+          output: build/test-results/merged/TEST-reference-${{ matrix.shard }}.xml
+      - name: Upload JUnit XML + HTML for ReferenceTests
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: reference-reports-${{ matrix.shard }}
+          # XML only: the HTML report is 16k files / 130MB per shard for the generated classes and
+          # nothing reads it; test-reports.yml and capture-test-timings only need the merged XML.
+          path: |
+            build/test-results/merged/TEST-*.xml
+          if-no-files-found: ignore
+          retention-days: 1
+          # A rerun of one failed shard would otherwise add a second artifact with the same
+          # name next to the stale one, and test-reports.yml / capture-test-timings download both.
+          overwrite: true
+
+  referenceTestsResult:
+    name: referenceTests
+    runs-on: ubuntu-24.04
+    needs: [changes, referenceTests]
+    if: always()
+    steps:
+      - run: |
+          if [ "${{ needs.changes.result }}" = "success" ] && [ "${{ needs.changes.outputs.code }}" = "false" ]; then
+            echo "⏭️ Docs-only change; referenceTests not required."
+            exit 0
+          fi
+          echo "referenceTests result: ${{ needs.referenceTests.result }}"
+          if [ "${{ needs.referenceTests.result }}" != "success" ]; then
+            echo "❌ One or more referenceTests matrix jobs failed."
+            exit 1
+          fi
+          echo "✅ All referenceTests matrix jobs passed."
+
+  # DockerTags
+  # develop = develop-jdk25
+
+  publishDockerJDK25:
+    if: github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/')
+    needs: [assemble, unitTestsSuite, integrationTestsSuite, propertyTestsSuite, acceptanceTestsSuite, referenceTests]
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/publish-docker.yml
+    with:
+      assemble_run_id: ${{ github.run_id }}
+      jdk_version: jdk25
+      include_hash_in_docker: ${{ github.event_name == 'workflow_dispatch' && inputs.include_hash_in_docker || 'false' }}
+    secrets: inherit
+
+  publishDockerJDK26:
+    if: github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/')
+    needs: [assemble, unitTestsSuite, integrationTestsSuite, propertyTestsSuite, acceptanceTestsSuite, referenceTests]
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/publish-docker.yml
+    with:
+      assemble_run_id: ${{ github.run_id }}
+      jdk_version: jdk26
+      include_hash_in_docker: ${{ github.event_name == 'workflow_dispatch' && inputs.include_hash_in_docker || 'false' }}
+    secrets: inherit
+
+  # Release Distribution
+  publishRelease:
+    if: github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/')
+    needs: [assemble, unitTestsSuite, integrationTestsSuite, propertyTestsSuite, acceptanceTestsSuite, referenceTests]
+    permissions:
+      actions: read
+      contents: write
+    uses: ./.github/workflows/publish-release.yml
+    with:
+      assemble_run_id: ${{ github.run_id }}
+      publish_version: ${{ needs.assemble.outputs.publish-version }}
+    secrets: inherit

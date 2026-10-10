@@ -1,0 +1,183 @@
+name: Draft next releases
+
+# Keeps two draft GitHub releases open with rolled-up notes:
+#   - ``next-prerelease`` — what the next nightly auto-release would
+#                           publish.
+#   - ``next-stable``     — what a manually-cut stable release would
+#                           ship today.
+# Maintainers use both as a live preview — landing a labelled PR
+# refreshes them within a minute. The actual cut is still done by
+# ``release.yml``; these drafts never publish.
+#
+# Each draft uses a stable tag-name placeholder (``next-prerelease`` /
+# ``next-stable``) rather than a version-shaped one, so a real
+# ``release.yml`` run (which keys its own draft on the version)
+# doesn't collide with the rolling previews. The computed next-version
+# is shown in the release title so it's still visible at a glance.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Multiple pushes to main collapse onto the latest one — an older
+# computation is always superseded by the newer commitish, so
+# cancelling mid-run is correct here (unlike release.yml where
+# a half-finished publish must not be interrupted).
+concurrency:
+  group: draft-next-releases
+  cancel-in-progress: true
+
+jobs:
+  draft:
+    name: Update ${{ matrix.kind }} draft
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - kind: prerelease
+            tag: next-prerelease
+            title-prefix: "Next prerelease"
+            is-prerelease: "true"
+          - kind: stable
+            tag: next-stable
+            title-prefix: "Next stable"
+            is-prerelease: "false"
+    steps:
+      - name: Mint GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1  # v3.2.0
+        with:
+          client-id: ${{ vars.ESPHOME_GITHUB_APP_CLIENT_ID }}
+          private-key: ${{ secrets.ESPHOME_GITHUB_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+          permission-pull-requests: read
+
+      - name: Check out code from GitHub
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Resolve previous tag and next version
+        id: versions
+        uses: ./.github/actions/resolve-release-versions
+        with:
+          # No ``version`` input — the action computes the next
+          # version per the matrix's ``mode`` and resolves the diff
+          # base to match.
+          mode: ${{ matrix.kind }}
+          github-token: ${{ steps.app-token.outputs.token }}
+
+      # The next three steps are skipped for the stable matrix entry
+      # when no prior stable exists — there's no meaningful preview to
+      # render against an empty diff base, and we'd rather show nothing
+      # than fall back to "since last beta" (which doesn't represent a
+      # stable shipping baseline). The prerelease entry is unaffected;
+      # ``previous-tag`` can be empty there only on a never-released
+      # project, where the generator's "first release" path is fine.
+      - name: Generate release notes
+        id: notes
+        if: matrix.kind != 'stable' || steps.versions.outputs.previous-tag != ''
+        uses: ./.github/actions/generate-release-notes
+        with:
+          version: ${{ steps.versions.outputs.version }}
+          previous-tag: ${{ steps.versions.outputs.previous-tag }}
+          commitish: ${{ github.sha }}
+          github-token: ${{ steps.app-token.outputs.token }}
+
+      - name: Prepend maintainer header to notes
+        # The header is the first thing a maintainer sees when they
+        # click into the draft from the releases list — it's the
+        # signal that this draft is a preview, not something to hit
+        # the publish button on. The ``kind`` controls which workflow
+        # the header points the maintainer to. Prose lines are left
+        # unwrapped and GitHub re-flows them on render.
+        if: matrix.kind != 'stable' || steps.versions.outputs.previous-tag != ''
+        shell: python
+        env:
+          NOTES_FILE: ${{ steps.notes.outputs.release-notes-file }}
+          REPO_URL: ${{ github.server_url }}/${{ github.repository }}
+          KIND: ${{ matrix.kind }}
+        run: |
+          import os
+          from pathlib import Path
+
+          repo = os.environ["REPO_URL"]
+          kind = os.environ["KIND"]
+          notes = Path(os.environ["NOTES_FILE"])
+
+          # Source lines wrap to keep the file readable; the rendered
+          # output stays a single paragraph per ``>`` line because adjacent
+          # string literals concatenate and only the explicit ``\n``s
+          # introduce line breaks. Trailing spaces on continued fragments
+          # matter — without them, words would run together at the joins.
+          if kind == "stable":
+              instr = (
+                  "Stable releases are cut by manually running the "
+                  f"[Release workflow]({repo}/actions/workflows/release.yml), "
+                  "which creates and publishes its own version-tagged draft."
+              )
+          else:
+              instr = (
+                  "Prereleases are cut by the "
+                  f"[Auto Release workflow]({repo}/actions/workflows/auto-release.yml) "
+                  "nightly (or manually from the same workflow), which creates "
+                  "and publishes its own version-tagged draft."
+              )
+
+          header = (
+              "> ⚠️ **Maintainer note — do not publish this draft.**\n"
+              ">\n"
+              f"> This is a rolling preview of the next {kind}. {instr} "
+              "Publishing this draft is rejected by a repository ruleset "
+              "anyway — only that workflow can create release tags — so "
+              "the rolling preview is purely a read-only changelog view.\n"
+              "\n"
+              "---\n"
+              "\n"
+          )
+          notes.write_text(header + notes.read_text())
+
+      - name: Create or update the rolling draft
+        if: matrix.kind != 'stable' || steps.versions.outputs.previous-tag != ''
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          NOTES_FILE: ${{ steps.notes.outputs.release-notes-file }}
+          VERSION: ${{ steps.versions.outputs.version }}
+          TAG: ${{ matrix.tag }}
+          TITLE_PREFIX: ${{ matrix.title-prefix }}
+          IS_PRERELEASE: ${{ matrix.is-prerelease }}
+        run: |
+          set -euo pipefail
+          # The placeholder tag-names ``next-prerelease`` / ``next-stable``
+          # are never published — they exist only as the stable keys for
+          # these previews. If a future change ever flips one to non-draft,
+          # fail loudly rather than silently turning the preview into a
+          # real release.
+          title="$TITLE_PREFIX: $VERSION"
+          if existing=$(gh release view "$TAG" --json isDraft --jq '.isDraft' 2>/dev/null); then
+            if [ "$existing" != "true" ]; then
+              echo "::error::Release '$TAG' exists and is not a draft; refusing to overwrite."
+              exit 1
+            fi
+            gh release edit "$TAG" \
+              --notes-file "$NOTES_FILE" \
+              --target "${{ github.sha }}" \
+              --title "$title" \
+              --draft \
+              --prerelease="$IS_PRERELEASE"
+          else
+            gh release create "$TAG" \
+              --notes-file "$NOTES_FILE" \
+              --target "${{ github.sha }}" \
+              --title "$title" \
+              --draft \
+              --prerelease="$IS_PRERELEASE"
+          fi

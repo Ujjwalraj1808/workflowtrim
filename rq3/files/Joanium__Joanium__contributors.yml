@@ -1,0 +1,97 @@
+name: 🤝 Auto-Update Contributors
+
+on:
+  push:
+    branches: [main, master]
+  schedule:
+    - cron: '0 0 * * 0' # Every Sunday midnight UTC
+  workflow_dispatch:
+
+permissions: read-all
+
+jobs:
+  update-contributors:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Generate CONTRIBUTORS.md
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const { data: contributors } = await github.rest.repos.listContributors({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              per_page: 100
+            });
+
+            const humanContributors = contributors.filter(
+              c => c.type !== 'Bot' && !c.login.endsWith('[bot]') && c.login !== 'invalid-email-address'
+            );
+
+            const lines = [
+              `# 🤝 Contributors`,
+              ``,
+              `Thanks to everyone who has contributed to **Joanium**!`,
+              `This file is automatically regenerated every week. 🤖`,
+              ``,
+              `> **Total contributors:** ${humanContributors.length}  `,
+              `> **Last updated:** ${new Date().toUTCString()}`,
+              ``,
+              `---`,
+              ``,
+              `| | Contributor | Commits |`,
+              `|---|---|---|`,
+            ];
+
+            for (const c of humanContributors) {
+              lines.push(
+                `| <img src="${c.avatar_url}&s=32" width="32" height="32" alt="${c.login} avatar" style="border-radius:50%"/> | [@${c.login}](${c.html_url}) | ${c.contributions} |`
+              );
+            }
+
+            lines.push(``);
+            lines.push(`---`);
+            lines.push(``);
+            lines.push(`*Want your name here? Read [CONTRIBUTING.md](CONTRIBUTING.md) to get started!*`);
+            lines.push(``);
+
+            const fs = require('fs');
+            fs.writeFileSync('CONTRIBUTORS.md', lines.join('\n'));
+            console.log(`✅ Written ${humanContributors.length} contributors to CONTRIBUTORS.md`);
+
+            // Update README.md contributor avatars between markers
+            const avatarHtml = humanContributors
+              .map(c => `<a href="${c.html_url}"><img src="${c.avatar_url}&s=48" width="48" height="48" alt="${c.login}" title="${c.login}" style="border-radius:50%;margin:4px"/></a>`)
+              .join('');
+            const readmePath = 'README.md';
+            let readme = fs.readFileSync(readmePath, 'utf8');
+            const start = '<!-- contributors-start -->';
+            const end = '<!-- contributors-end -->';
+            const block = `${start}\n${avatarHtml}\n${end}`;
+            if (readme.includes(start) && readme.includes(end)) {
+              readme = readme.replace(new RegExp(`${start}[\\s\\S]*?${end}`), block);
+            } else {
+              console.log('⚠️  No contributor markers found in README.md — skipping README update');
+            }
+            fs.writeFileSync(readmePath, readme);
+            console.log(`✅ Updated README.md with ${humanContributors.length} contributor avatars`);
+
+      - name: Commit if changed
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add CONTRIBUTORS.md README.md
+          if git diff --staged --quiet; then
+            echo "No changes."
+          else
+            git commit -m "chore: 🤖 auto-update contributors [skip ci]"
+            git push
+          fi

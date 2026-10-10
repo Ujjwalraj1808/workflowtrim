@@ -1,0 +1,197 @@
+name: Nightly Release & Integration Tests
+
+on:
+  schedule:
+    # Every day at 02:00 UTC
+    - cron: '0 2 * * *'
+  workflow_dispatch: # Allow manual trigger
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # There is one engine since the legacy sdk/mpr backend was deleted
+        # (docs/plans/2026-09-14-retire-legacy-engine.md), so the matrix is over
+        # Mendix versions alone. MXCLI_TEST_ENGINES is left unset: its default is
+        # every engine, and a name that no longer exists fails loudly rather than
+        # selecting nothing.
+        mendix-version:
+          - '10.24.24.119349'
+          - '11.6.8'
+          - '11.12.2'
+          - '11.13.0'
+          - '11.14.0'
+          - '11.15.0'
+      fail-fast: false
+    name: test (Mendix ${{ matrix.mendix-version }})
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # testdata/testapp (ako/TestApp) is the Studio Pro-authored fixture
+          # the roundtrip suite and mdl/backend/modelsdk read (#743); without it
+          # those tests skip, as push-test.yml's roundtrip/parity jobs know.
+          # upgrade-full-corpus (PedApp only) and the release job do not read
+          # it and check out without it.
+          submodules: true
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.2'
+
+      - name: Cache ANTLR4 JAR
+        uses: actions/cache@v6
+        with:
+          path: ~/.m2/repository/org/antlr/antlr4
+          key: antlr4-4.13.2
+      - name: Install ANTLR4
+        run: pip install 'antlr4-tools==0.2.2'
+      - name: Generate parser
+        run: make grammar
+        env:
+          ANTLR4_TOOLS_ANTLR_VERSION: '4.13.2'
+      - name: Build
+        run: make build
+
+      - name: Unit tests
+        run: make test
+
+      - name: Setup mxbuild ${{ matrix.mendix-version }}
+        run: ./bin/mxcli setup mxbuild --version ${{ matrix.mendix-version }}
+
+      # One step, every package: go test runs the packages in parallel, so the
+      # wall time is the slowest one's (mdl/roundtrip, ~21 min on this runner in
+      # ako/mxcli#757's measurement) and grows as the round trip gains fixtures.
+      # Per-PR CI splits this into parallel jobs instead (push-test.yml).
+      - name: "Integration tests (Mendix ${{ matrix.mendix-version }})"
+        run: make test-integration
+        timeout-minutes: 60
+
+  # The upgrade property test over the WHOLE mdl-examples corpus, header-only
+  # scripts included (MXCLI_UPGRADE_ALL). Per-PR CI executes only the scripts
+  # the upgrade rewrites beyond the header and terminators; this is the run that
+  # proves langver's gating on the rest (ako/mxcli#757). Independent of the
+  # Mendix version — it runs on the committed PedApp fixture and never calls
+  # mx — so it runs once, not per matrix entry. It does not gate the release.
+  upgrade-full-corpus:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ['1/3', '2/3', '3/3']
+    name: upgrade full corpus (${{ matrix.shard }})
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.2'
+      - name: Cache ANTLR4 JAR
+        uses: actions/cache@v6
+        with:
+          path: ~/.m2/repository/org/antlr/antlr4
+          key: antlr4-4.13.2
+      - name: Install ANTLR4
+        run: pip install 'antlr4-tools==0.2.2'
+      - name: Generate parser
+        run: make grammar
+        env:
+          ANTLR4_TOOLS_ANTLR_VERSION: '4.13.2'
+      - name: Build
+        run: make build
+      - name: Upgrade property test, full corpus (${{ matrix.shard }})
+        run: make test-integration-upgrade
+        env:
+          MXCLI_UPGRADE_ALL: '1'
+          MXCLI_UPGRADE_SHARD: ${{ matrix.shard }}
+        timeout-minutes: 45
+
+  nightly:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.2'
+
+      - uses: oven-sh/setup-bun@v2
+
+      - name: Cache ANTLR4 JAR
+        uses: actions/cache@v6
+        with:
+          path: ~/.m2/repository/org/antlr/antlr4
+          key: antlr4-4.13.2
+      - name: Install ANTLR4
+        run: pip install 'antlr4-tools==0.2.2'
+      - name: Generate parser
+        run: make grammar
+        env:
+          ANTLR4_TOOLS_ANTLR_VERSION: '4.13.2'
+
+      - name: Check for new commits since last nightly
+        id: check
+        run: |
+          LAST_NIGHTLY=$(gh release view nightly --json publishedAt -q .publishedAt 2>/dev/null || echo "")
+          if [ -n "$LAST_NIGHTLY" ]; then
+            COMMITS=$(git log --since="$LAST_NIGHTLY" --oneline origin/main | wc -l)
+            if [ "$COMMITS" -eq 0 ]; then
+              echo "No new commits since last nightly, skipping."
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "$COMMITS new commit(s) since last nightly."
+          fi
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Build release binaries
+        if: steps.check.outputs.skip != 'true'
+        run: VERSION=nightly-$(date -u +%Y%m%d)-$(git rev-parse --short HEAD) make release
+
+      - name: Generate changelog
+        if: steps.check.outputs.skip != 'true'
+        id: changelog
+        run: |
+          {
+            echo "body<<NIGHTLY_EOF"
+            echo "**Nightly build from \`main\` — $(date -u +%Y-%m-%d)**"
+            echo ""
+            echo "Commit: [\`$(git rev-parse --short HEAD)\`](https://github.com/${{ github.repository }}/commit/$(git rev-parse HEAD))"
+            echo ""
+            echo "### Recent changes"
+            echo ""
+            git log --oneline -20 origin/main
+            echo ""
+            echo "> This is an automated pre-release build. Use tagged releases for production."
+            echo "NIGHTLY_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Delete previous nightly release
+        if: steps.check.outputs.skip != 'true'
+        run: gh release delete nightly --cleanup-tag -y 2>/dev/null || true
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Create nightly release
+        if: steps.check.outputs.skip != 'true'
+        # Pass the notes body via an env var, NOT via `${{ }}` interpolation into
+        # the shell. Interpolating it directly lets the shell re-interpret the
+        # body's backticks (command substitution) and double quotes (from commit
+        # subjects in the git log), which broke the release step. `"$NOTES"` is
+        # inert literal data.
+        run: |
+          gh release create nightly \
+            --prerelease \
+            --title "Nightly $(date -u +%Y-%m-%d)" \
+            --notes "$NOTES" \
+            bin/mxcli-*
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NOTES: ${{ steps.changelog.outputs.body }}

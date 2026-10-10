@@ -1,0 +1,433 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  # The frontend gate runs as two lanes on separate runners, because its two
+  # halves share nothing: the unit/type/lint checks, and the production build
+  # plus the real-browser guards. Each takes about three minutes; run one
+  # after the other on one runner they took over six. `web`, the required
+  # check, passes only when both lanes do.
+  web-unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: cmd/evener-hub/frontend/package-lock.json
+
+      # The gate itself is Go: make test-web builds and runs evener-dev.
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.work
+          cache: false
+
+      - uses: ./.github/actions/go-cache-restore
+        with:
+          kind: web-unit
+
+      - name: Typecheck, unit tests, and lint
+        run: make test-web
+
+      - uses: ./.github/actions/go-cache-save
+
+  web-browser:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: cmd/evener-hub/frontend/package-lock.json
+
+      # The retirement and skill browser guards run go test against
+      # cmd/evener-hub, with and without the browserguard tag.
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.work
+          cache: false
+
+      - uses: ./.github/actions/go-cache-restore
+        with:
+          kind: web
+
+      - name: Build and browser guards
+        run: make test-web-browser
+
+      - uses: ./.github/actions/go-cache-save
+
+      # The skill guard keeps its driver log, screenshots and helper logs under
+      # a temporary directory when it fails, deliberately, so a failing run can
+      # be read afterwards. On a runner nobody reads it: the directory goes
+      # with the machine, and the failure arrives as one line naming a path
+      # that no longer exists. This is the only copy that outlives the job.
+      # Named for the run so two failures on the same PR do not collide.
+      # The cascade guard keeps its evidence the same way (its temp dir is
+      # KeptTempDir, which on a runner is /tmp), so its path is collected too.
+      - name: Keep the browser guards' artifacts
+        if: failure()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: browser-guards-artifacts-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            /tmp/skillguard-browser-*/artifacts/**
+            /tmp/cascadeguard-browser-*/**
+          retention-days: 7
+          # The step also fires when make build-web is what failed, and then
+          # there is nothing to collect: say so quietly instead of adding a
+          # warning that reads like a second failure.
+          if-no-files-found: ignore
+
+  web:
+    if: always()
+    needs: [web-unit, web-browser]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require both frontend lanes
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          echo "$RESULTS"
+          test "$(jq -r '[.[].result] | all(. == "success")' <<<"$RESULTS")" = true
+
+  native:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: mobile-native/package-lock.json
+
+      - name: Install native dependencies
+        run: npm ci --prefix mobile-native
+
+      - name: Podfile.lock locks every autolinked iOS module
+        run: make check-podfile-lock
+
+      - name: Bundle, test native app and shared session core
+        timeout-minutes: 30
+        run: make test-native
+
+  api-package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: appwire-client/typescript/package-lock.json
+
+      - name: Install protocol development dependencies
+        run: npm ci --prefix appwire-client/typescript
+
+      - name: Qualify installed AppWire package
+        run: make test-api-package
+
+  static-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: ./.github/actions/setup-toolchain
+        with:
+          go-cache-kind: static-build
+
+      - name: Build runtime pair and all Go workspace packages
+        run: make build && make build-go
+
+      - name: Vet (all go.work modules)
+        run: make vet
+
+      # Nothing ships for Windows (.goreleaser.yml builds linux and darwin
+      # only). This cross-vet is a build-tag discipline check: a source or test
+      # file that reaches for Mkfifo, Stat_t, or an fd-based sandbox seam has to
+      # say so in a constraint instead of compiling by accident (issue #897).
+      - name: Vet (GOOS=windows — Unix-only sources must carry a build tag)
+        run: GOOS=windows make vet
+
+      - uses: ./.github/actions/go-cache-save
+
+  lint-golangci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.work
+          cache: false
+
+      - uses: ./.github/actions/go-cache-restore
+        with:
+          kind: lint-golangci
+
+      # The analysis cache lives where the Makefile's GOLANGCI_LINT_CACHE
+      # points. That path hashes the checkout path, which is the same on every
+      # hosted runner, so a restored cache lands where make lint looks. The
+      # key carries the linter version, its config, and the Go version; like
+      # the Go build cache it restores the newest entry by prefix and saves
+      # only on main.
+      - name: Resolve golangci-lint cache
+        id: golangci-cache
+        env:
+          CONFIG_HASH: ${{ hashFiles('.tool-versions', '.golangci.yml', '.golangci-appwire.yml') }}
+        run: |
+          echo "dir=$(scripts/lib/golangci-lint-cache.sh)" >> "$GITHUB_OUTPUT"
+          echo "prefix=golangci-lint-${ImageOS}-$(go env GOVERSION)-${CONFIG_HASH}-" >> "$GITHUB_OUTPUT"
+
+      - id: golangci-restore
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ steps.golangci-cache.outputs.dir }}
+          key: ${{ steps.golangci-cache.outputs.prefix }}${{ github.sha }}
+          restore-keys: ${{ steps.golangci-cache.outputs.prefix }}
+
+      - name: Install golangci-lint
+        run: |
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+          make tools-golangci
+
+      - name: Lint (golangci-lint across all go.work modules)
+        run: make lint-golangci
+
+      # The tagged compile floors use the same golangci-lint binary, so they
+      # share this lane's install instead of paying a second checkout,
+      # toolchain setup, and `go install` on a parallel runner.
+      - name: Lint tagged compile floors (evenerfuzz and eval)
+        run: make lint-evenerfuzz lint-eval
+
+      - uses: actions/cache/save@v6
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.golangci-restore.outputs.cache-hit != 'true'
+        with:
+          path: ${{ steps.golangci-cache.outputs.dir }}
+          key: ${{ steps.golangci-cache.outputs.prefix }}${{ github.sha }}
+
+      - uses: ./.github/actions/go-cache-save
+
+  lint-repository:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.work
+          cache: false
+
+      - uses: ./.github/actions/go-cache-restore
+        with:
+          kind: lint-repository
+
+      - name: Install gitleaks
+        run: |
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+          make tools-gitleaks
+
+      - name: Lint repository structure, generated output, formatting, and secrets
+        env:
+          EVENER_GITLEAKS_REQUIRED: "1"
+        run: make lint-generated lint-naming lint-gofmt lint-internal lint-package-imports secret-scan
+
+      - uses: ./.github/actions/go-cache-save
+
+  # Both fuzz consistency checks are fast, static AST analyses over the same
+  # target manifest and registry inputs; running them in one lane pays a
+  # single checkout and toolchain setup instead of two. Each make target runs
+  # its own script directly and fails the lane on its own verdict, so both
+  # gates keep their teeth.
+  fuzz-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.work
+          cache: false
+
+      - uses: ./.github/actions/go-cache-restore
+        with:
+          kind: fuzz-checks
+
+      - name: Fuzz gap check (every decode/parse package has a target — static, fast)
+        run: make fuzz-gap-check
+
+      - name: Fuzz registry check (manifest matches AST-discovered targets)
+        run: make fuzz-registry-check
+
+      - uses: ./.github/actions/go-cache-save
+
+  static:
+    if: always()
+    needs: [static-build, lint-golangci, lint-repository, fuzz-checks, api-package, native]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every static lane
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          echo "$RESULTS"
+          test "$(jq -r '[.[].result] | all(. == "success")' <<<"$RESULTS")" = true
+
+  # The root module's race run is two lanes on separate runners: cmd/evener-hub
+  # (its ~2100 mostly serial tests, as 12 shards) and everything else. On one
+  # 4-core runner the two competed for the same cores under -race's slowdown.
+  # `race-root`, the required check, passes only when both lanes do.
+  race-root-parts:
+    name: race-root / ${{ matrix.part }}
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [hub, rest]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Record pull request candidate identity
+        if: github.event_name == 'pull_request'
+        env:
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_MERGE_SHA: ${{ github.sha }}
+        run: |
+          echo "PR_HEAD_SHA=$PR_HEAD_SHA"
+          echo "PR_BASE_SHA=$PR_BASE_SHA"
+          echo "PR_MERGE_SHA=$PR_MERGE_SHA"
+
+      - uses: actions/checkout@v7
+
+      - uses: ./.github/actions/setup-toolchain
+        with:
+          go-cache-kind: race-root-${{ matrix.part }}
+
+      # A dedicated runner's cores are all this job's, but the gate's
+      # load-aware budgets read the one-minute load average, which on a fresh
+      # runner still carries checkout and cache restore; they would start a
+      # fraction of the shards (and too few root packages) at once. Size them
+      # to the runner instead.
+      - name: Test (race detector — root module, ${{ matrix.part }})
+        env:
+          ROOT_P: 4
+          HUB_SHARD_CONCURRENCY: 4
+          HUB_SHARD_PARALLEL: 2
+          CLI_SHARD_CONCURRENCY: 4
+          CLI_SHARD_PARALLEL: 2
+        run: make test-race RACE_SCOPE=root RACE_ROOT_PART=${{ matrix.part }}
+
+      - uses: ./.github/actions/go-cache-save
+
+  race-root:
+    if: always()
+    needs: [race-root-parts]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require both root race lanes
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          echo "$RESULTS"
+          test "$(jq -r '[.[].result] | all(. == "success")' <<<"$RESULTS")" = true
+
+  race-module-shards:
+    name: race-modules / ${{ matrix.scope }}
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        scope: [agent, nonagent]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: ./.github/actions/setup-toolchain
+        with:
+          go-cache-kind: race-${{ matrix.scope }}
+
+      - name: Test (race detector — ${{ matrix.scope }})
+        run: make test-race RACE_SCOPE=${{ matrix.scope }}
+
+      - uses: ./.github/actions/go-cache-save
+
+  race-modules:
+    if: always()
+    needs: [race-module-shards]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every non-root race lane
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          echo "$RESULTS"
+          test "$(jq -r '[.[].result] | all(. == "success")' <<<"$RESULTS")" = true
+
+  # The gate's two waves, the root module (full suite) and every other module,
+  # took 131s and 142s one after the other on a single runner; each part runs
+  # on its own runner instead. `tests` below keeps the required check name.
+  tests-parts:
+    name: tests / ${{ matrix.scope }}
+    strategy:
+      fail-fast: false
+      matrix:
+        scope: [root, nonroot]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: ./.github/actions/setup-toolchain
+        with:
+          go-cache-kind: tests-${{ matrix.scope }}
+
+      # The runner is this job's alone, but its checkout and cache restore are
+      # still in the load average when the gate sizes its budgets; at 1.85
+      # every Go budget came out as 2 of the 4 cores. Size them to the runner.
+      - name: Deterministic tests (full root suite; frontend covered by web job)
+        env:
+          LOAD_AWARE_LOAD1: "0"
+        run: ROOT_FULL=1 WEB=0 make test TEST_SCOPE=${{ matrix.scope }}
+
+      - uses: ./.github/actions/go-cache-save
+
+  tests:
+    if: always()
+    needs: [tests-parts]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require both test lanes
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          echo "$RESULTS"
+          test "$(jq -r '[.[].result] | all(. == "success")' <<<"$RESULTS")" = true
+
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: ./.github/actions/setup-toolchain
+        with:
+          go-cache-kind: fuzz
+
+      - name: Fuzz seed-corpus replay (committed crashers — no search, deterministic)
+        run: make fuzz
+
+      - uses: ./.github/actions/go-cache-save

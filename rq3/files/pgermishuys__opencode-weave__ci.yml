@@ -1,0 +1,82 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: Test & Typecheck
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Check generated config schema
+        run: bun run schema:config:check
+
+      - name: Typecheck
+        run: bun run typecheck
+
+      - name: Run tests
+        run: bun test
+
+      - name: Run deterministic PR smoke evals
+        run: bun run eval:smoke
+
+      - name: Audit dependencies for known vulnerabilities
+        run: bunx audit-ci --low
+        continue-on-error: true
+
+  e2e:
+    name: E2E
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Build plugin
+        run: bun run build
+
+      - name: Install opencode CLI
+        run: curl -fsSL https://opencode.ai/install | bash
+
+      - name: Configure opencode to load Weave plugin
+        run: |
+          mkdir -p "$HOME/.config/opencode"
+          cat > "$HOME/.config/opencode/opencode.json" << EOF
+          {
+            "\$schema": "https://opencode.ai/config.json",
+            "plugin": [
+              "${{ github.workspace }}"
+            ]
+          }
+          EOF
+          cat "$HOME/.config/opencode/opencode.json"
+
+      - name: Verify opencode loads Weave plugin
+        run: |
+          export PATH="$HOME/.opencode/bin:$PATH"
+          opencode --version
+          opencode debug agent "Loom (Main Orchestrator)"
+
+      - name: Run CLI e2e tests
+        run: |
+          export PATH="$HOME/.opencode/bin:$PATH"
+          bun test ./test/e2e/plugin-loading.e2e.test.ts ./test/e2e/tapestry-shuttle-delegation.e2e.test.ts

@@ -1,0 +1,21 @@
+name: Auto Assign
+
+permissions:
+  contents: read
+  pull-requests: write
+
+on:
+  pull_request:
+    types:
+      - opened
+      - reopened
+
+jobs:
+  add_labels:
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions-ecosystem/action-add-assignees@a5b84af721c4a621eb9c7a4a95ec20a90d0b88e9 # v1.0.1
+        if: ${{ !contains(github.actor,'[bot]') }}
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          assignees: ${{ github.actor }}

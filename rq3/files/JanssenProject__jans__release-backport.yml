@@ -1,0 +1,55 @@
+name: "Release: Backport"
+on:
+  pull_request_target:
+    types: [closed, labeled]
+    branches: [main, release-*]
+permissions:
+  contents: read
+  pull-requests: read
+# WARNING:
+# When extending this action, be aware that $GITHUB_TOKEN allows write access to
+# the GitHub repository. This means that it should not evaluate user input in a
+# way that allows code injection.
+
+jobs:
+  backport:
+    permissions:
+      pull-requests: write # so it can create pull requests and add comments
+    name: Backport Pull Request
+    # Run the action if a PR is merged with backport labels
+    # OR
+    # when already merged PR is labeled with backport labels
+    if: >
+      github.repository == 'JanssenProject/jans'
+      &&
+      github.event.pull_request.merged
+      && (
+        github.event.action == 'closed'
+        || (
+          github.event.action == 'labeled'
+          && startsWith(github.event.label.name, 'backport/')
+        )
+      )
+    runs-on: ubuntu-latest
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@8d3c67de8e2fe68ef647c8db1e6a09f647780f40 # v2.19.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Create backport PRs
+        uses: korthout/backport-action@3c06f323a58619da1e8522229ebc8d5de2633e46 # v4.3.0
+        with:
+          # Config README: https://github.com/zeebe-io/backport-action#backport-action
+          github_token: ${{ secrets.MOAUTO_WORKFLOW_TOKEN }}
+          github_workspace: ${{ github.workspace }}
+
+          # Regex pattern to match GitHub labels
+          # The capture group catches the target branch
+          # i.e. label backport/v1.0.0 will create backport PR for branch v1.0.0
+          label_pattern: ^backport\/([^ ]+)$
+
+          pull_description: |-
+            Automated backport to `${target_branch}`, triggered by a label in #${pull_number}.
+            See ${issue_refs}.

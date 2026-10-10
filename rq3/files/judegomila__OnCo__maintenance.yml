@@ -1,0 +1,113 @@
+name: Weekly maintenance (logos, structures, links, acronyms, search engines)
+
+# Runs the budget-free upkeep that used to need a person: fetch logos and molecule structures for new records, add
+# trial acronyms and subtype links for trials ingested on Monday, fill orphan back-links, then tell search engines
+# which pages changed. Identifier enrichment (HGNC, Wikidata) runs monthly because it is slow and rarely changes.
+
+on:
+  schedule:
+    - cron: "37 7 * * 2" # Tuesdays 07:37 UTC, after the Monday trial refresh
+    - cron: "17 8 1 * *" # first of the month 08:17 UTC: identifiers
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: maintenance
+  cancel-in-progress: false
+
+jobs:
+  weekly:
+    if: github.event.schedule != '17 8 1 * *'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run fetch:logos
+      - run: npx tsx scripts/fill-structures.ts --apply
+      - run: npx tsx scripts/trial-acronyms.ts --apply --quiet --max=600
+      - run: npx tsx scripts/subtype-trial-links.ts --apply
+      - run: npx tsx scripts/orphan-links.ts --apply
+      - run: npx tsx scripts/orphans.ts --write
+      # The merge below is unattended, so the tree the pull request carries must pass what a person's branch passes.
+      # The gates never fail the job: when one does the pull request is still opened, the merge step is skipped and
+      # the last step labels it for review, so a red run waits for a person instead of landing on main.
+      - id: gates
+        uses: ./.github/actions/gates
+      - uses: peter-evans/create-pull-request@v7
+        id: cpr
+        with:
+          branch: bot/maintenance
+          title: "Weekly maintenance: logos, structures, trial links and acronyms"
+          commit-message: "chore: weekly maintenance (logos, structures, trial links, acronyms, orphan links)"
+          body: |
+            Automated weekly upkeep: logos and molecule structures for new records, acronyms and subtype links for
+            newly ingested trials, orphan back-links, and the orphan floor. Validated and tested in this run.
+          labels: automated, pipeline
+          delete-branch: true
+      - name: Merge the maintenance (only when this run's gates passed)
+        if: steps.cpr.outputs.pull-request-number != '' && steps.gates.outputs.passed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh pr merge --squash --delete-branch "${{ steps.cpr.outputs.pull-request-number }}" || echo "merge deferred, the pull request stays open for review"
+      - name: Leave it for review (a gate failed in this run)
+        if: steps.cpr.outputs.pull-request-number != '' && steps.gates.outputs.passed != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh label create needs-review --color D93F0B --description "A person must check this before it lands" --force || true
+          gh pr edit "${{ steps.cpr.outputs.pull-request-number }}" --add-label needs-review
+          gh pr comment "${{ steps.cpr.outputs.pull-request-number }}" --body "Not merged: ${{ steps.gates.outputs.failed }} failed in [this run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}). The changes are on this branch for a person to read."
+      - name: Tell search engines which pages changed this week
+        run: npm run provenance && npm run indexnow -- --since=$(date -u -d '8 days ago' +%F)
+
+  monthly-identifiers:
+    if: github.event.schedule == '17 8 1 * *' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npx tsx scripts/enrich-target-ids.ts --budget=400
+      - run: npx tsx scripts/enrich-institution-ids.ts --budget=600
+      - run: npx tsx scripts/enrich-company-ids.ts --budget=600
+      # The merge below is unattended, so the tree the pull request carries must pass what a person's branch passes.
+      # The gates never fail the job: when one does the pull request is still opened, the merge step is skipped and
+      # the last step labels it for review, so a red run waits for a person instead of landing on main.
+      - id: gates
+        uses: ./.github/actions/gates
+      - uses: peter-evans/create-pull-request@v7
+        id: cpr
+        with:
+          branch: bot/identifiers
+          title: "Monthly maintenance: external identifiers"
+          commit-message: "chore: monthly identifier enrichment (HGNC, Wikidata)"
+          body: |
+            Automated monthly pass filling gene identifiers on targets and Wikipedia and Wikidata links on institutions
+            and companies, with the strict matching rules in the scripts. Validated and tested in this run.
+          labels: automated, pipeline
+          delete-branch: true
+      - name: Merge the identifiers (only when this run's gates passed)
+        if: steps.cpr.outputs.pull-request-number != '' && steps.gates.outputs.passed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh pr merge --squash --delete-branch "${{ steps.cpr.outputs.pull-request-number }}" || echo "merge deferred, the pull request stays open for review"
+      - name: Leave it for review (a gate failed in this run)
+        if: steps.cpr.outputs.pull-request-number != '' && steps.gates.outputs.passed != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh label create needs-review --color D93F0B --description "A person must check this before it lands" --force || true
+          gh pr edit "${{ steps.cpr.outputs.pull-request-number }}" --add-label needs-review
+          gh pr comment "${{ steps.cpr.outputs.pull-request-number }}" --body "Not merged: ${{ steps.gates.outputs.failed }} failed in [this run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}). The changes are on this branch for a person to read."

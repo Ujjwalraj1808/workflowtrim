@@ -1,0 +1,172 @@
+name: Human workspace
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 3 * * *"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_TARGET_DIR: ${{ github.workspace }}/.lane-target
+  CARGO_BUILD_JOBS: "4"
+
+jobs:
+  build-lint-test:
+    runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && 'ubuntu-24.04' || vars.CI_LINUX_RUNNER || 'lx-runner' }}
+    timeout-minutes: 35
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Install pinned Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 24.11.0
+          cache: npm
+          cache-dependency-path: human/apps/web/package-lock.json
+      - name: Install pinned Rust toolchain and policy auditor
+        run: >-
+          rustup toolchain install 1.91.1 --profile minimal --component clippy &&
+          cargo install cargo-deny --locked --version 0.19.0
+      - name: Install pinned Foundry toolchain
+        uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09 # v1.9.1
+      - name: Install pinned settlement compiler
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Download declared settlement modules
+        working-directory: .
+        run: go mod download
+      - name: Install Human and custody fixture dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential libssl-dev pkg-config python3-venv python3-pytest python3-yaml redis-server
+          python3 -m venv --system-site-packages .lane-venv
+          .lane-venv/bin/python -m pip install -r tests/bridge/requirements.txt
+          echo "$PWD/.lane-venv/bin" >> "$GITHUB_PATH"
+      - name: Build the real withdrawal fixture prerequisites
+        run: |
+          make -j4 CC=gcc LXP_REVISION="$(git rev-parse HEAD)" \
+            PROGRAMS_TARGET_DIR="$CARGO_TARGET_DIR" \
+            PROGRAMS_RUNTIME_LIB="$CARGO_TARGET_DIR/debug/liblayerx_programs_sandbox.a" \
+            build/bin/layerxd build/bin/layerx-genesis-build build/tests/bridge/sign-credit
+          echo "LAYERX_TEST_SIGN_CREDIT_BIN=$PWD/build/tests/bridge/sign-credit" >> "$GITHUB_ENV"
+      - name: Install the locked agent SDK workspace dependencies
+        run: npm --prefix agent/sdk/typescript ci --ignore-scripts --no-audit --no-fund
+      - name: Install locked Human web dependencies
+        run: make human-js-install
+      - name: Enforce component-library integrity, copy, policies, and strict lints
+        run: make human-check-ui human-lint human-check
+      - name: Build and test the isolated human workspace
+        run: make human-build human-test human-test-intents
+      - name: Scan the web bundle for payload-encoding code paths
+        run: >-
+          cargo run --manifest-path human/tools/boundary-check/Cargo.toml
+          --locked -- --web-bundle human/apps/web/.next
+
+  browser-real-stack:
+    if: vars.HUMAN_E2E_BASE_URL != '' && (github.event_name == 'schedule' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
+    runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && 'ubuntu-24.04' || vars.CI_LINUX_RUNNER || 'lx-runner' }}
+    timeout-minutes: 45
+    env:
+      HUMAN_E2E_BASE_URL: ${{ vars.HUMAN_E2E_BASE_URL }}
+      HUMAN_E2E_REAL_STACK: "1"
+      HUMAN_VISUAL_BASELINE_REVIEWED: ${{ vars.HUMAN_VISUAL_BASELINE_REVIEWED }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Install pinned Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 24.11.0
+          cache: npm
+          cache-dependency-path: human/apps/web/package-lock.json
+      - name: Install browser harness
+        run: >-
+          npm --prefix human/apps/web ci &&
+          npm --prefix human/apps/web exec playwright install --with-deps chromium
+      - name: Run merge browser suite
+        if: github.event_name == 'push'
+        run: make human-test-e2e
+      - name: Run scheduled repeated browser suite
+        if: github.event_name == 'schedule'
+        run: make human-test-e2e-long
+
+  browser-performance:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      LAYERX_BETA_BUILDER_ENVIRONMENT_DIR: ${{ github.workspace }}/build/browser-builder/rootfs
+      LAYERX_BETA_MIRROR_FOUNDRY_BIN: /home/runner/.foundry/bin
+      LAYERX_BETA_HUMAN_WEB_PORT: ""
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Install pinned Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 24.11.0
+          cache: npm
+          cache-dependency-path: human/apps/web/package-lock.json
+      - name: Install pinned Chromium
+        run: >-
+          npm --prefix human/apps/web ci &&
+          npm --prefix human/apps/web exec playwright install --with-deps chromium
+      - name: Install the settlement tools and production TLS prerequisites
+        uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09 # v1.9.1
+      - name: Prepare the disposable cluster host
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends authbind libnss3-tools openssl jq python3-yaml
+          sudo install -o "$(id -un)" -g "$(id -gn)" -m 0500 /dev/null /etc/authbind/byport/443
+          printf '127.0.0.1 paxportwallet.com\n' | sudo tee -a /etc/hosts >/dev/null
+      - name: Build the pinned Programs builder environment
+        run: bash platform/hosted/registry/builder-environment/build-env.sh build/browser-builder
+      - name: Start the actual beta services from this revision
+        run: make platform-beta-cluster-up
+      - name: Enforce route and browser performance budgets
+        timeout-minutes: 20
+        run: make human-e2e-perf
+      - name: Retain browser results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: human-production-browser
+          path: human/apps/web/test-results
+          if-no-files-found: ignore
+      - name: Tear down the disposable beta cluster
+        if: always()
+        run: make platform-beta-cluster-down
+
+  intent-fuzz:
+    if: github.event_name == 'schedule'
+    runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && 'ubuntu-24.04' || vars.CI_LINUX_RUNNER || 'lx-runner' }}
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Install pinned fuzz toolchain and runner
+        run: >-
+          rustup toolchain install nightly-2025-11-10 --profile minimal &&
+          cargo install cargo-fuzz --locked
+      - name: Fuzz intent parsing and compilation from the committed corpus
+        run: make human-fuzz-intents

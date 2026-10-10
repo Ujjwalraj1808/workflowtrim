@@ -1,0 +1,410 @@
+name: Desktop Build
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      signing_mode:
+        description: "Signing mode for macOS/Windows desktop artifacts"
+        required: false
+        default: auto
+        type: choice
+        options:
+          - auto
+          - official
+          - self-signed
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            arch: arm64
+            os_name: macos-arm64
+          - runner: macos-15-intel
+            arch: x64
+            os_name: macos-x64
+          - runner: ubuntu-22.04
+            arch: x64
+            os_name: linux-x64
+          - runner: windows-latest
+            arch: x64
+            os_name: windows-x64
+
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: write
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: package.json
+
+      - name: Resolve signing mode
+        id: signing
+        shell: bash
+        env:
+          SIGNING_MODE_INPUT: ${{ github.event_name == 'workflow_dispatch' && inputs.signing_mode || (startsWith(matrix.runner, 'macos-') && 'official' || 'auto') }}
+          APPLE_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_KEYCHAIN: ${{ secrets.APPLE_KEYCHAIN }}
+          APPLE_KEYCHAIN_PROFILE: ${{ secrets.APPLE_KEYCHAIN_PROFILE }}
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          mode="${SIGNING_MODE_INPUT}"
+          runner="${{ matrix.runner }}"
+          has_official=0
+          requires_signing=0
+          missing=()
+          notarization_missing=()
+
+          require_secret() {
+            name="$1"
+            value="$2"
+            if [ -z "${value}" ]; then
+              missing+=("${name}")
+            fi
+          }
+
+          if [[ "${runner}" == macos-* ]]; then
+            requires_signing=1
+            require_secret APPLE_CERTIFICATE "${APPLE_CERTIFICATE:-}"
+            require_secret APPLE_CERTIFICATE_PASSWORD "${APPLE_CERTIFICATE_PASSWORD:-}"
+
+            apple_id_present=0
+            apple_id_complete=0
+            api_key_present=0
+            api_key_complete=0
+            if [ -n "${APPLE_ID:-}" ] || [ -n "${APPLE_APP_SPECIFIC_PASSWORD:-}" ] || [ -n "${APPLE_TEAM_ID:-}" ]; then
+              apple_id_present=1
+              if [ -n "${APPLE_ID:-}" ] && [ -n "${APPLE_APP_SPECIFIC_PASSWORD:-}" ] && [ -n "${APPLE_TEAM_ID:-}" ]; then
+                apple_id_complete=1
+              fi
+            fi
+            if [ -n "${APPLE_API_KEY:-}" ] || [ -n "${APPLE_API_KEY_ID:-}" ] || [ -n "${APPLE_API_ISSUER:-}" ]; then
+              api_key_present=1
+              if [ -n "${APPLE_API_KEY:-}" ] && [ -n "${APPLE_API_KEY_ID:-}" ] && [ -n "${APPLE_API_ISSUER:-}" ]; then
+                api_key_complete=1
+              fi
+            fi
+            if [ -n "${APPLE_KEYCHAIN_PROFILE:-}" ]; then
+              if [ "${apple_id_complete}" -eq 0 ] && [ "${api_key_complete}" -eq 0 ]; then
+                if [ "${apple_id_present}" -eq 1 ]; then
+                  [ -n "${APPLE_ID:-}" ] || notarization_missing+=("APPLE_ID")
+                  [ -n "${APPLE_APP_SPECIFIC_PASSWORD:-}" ] || notarization_missing+=("APPLE_APP_SPECIFIC_PASSWORD")
+                  [ -n "${APPLE_TEAM_ID:-}" ] || notarization_missing+=("APPLE_TEAM_ID")
+                elif [ "${api_key_present}" -eq 1 ]; then
+                  [ -n "${APPLE_API_KEY:-}" ] || notarization_missing+=("APPLE_API_KEY")
+                  [ -n "${APPLE_API_KEY_ID:-}" ] || notarization_missing+=("APPLE_API_KEY_ID")
+                  [ -n "${APPLE_API_ISSUER:-}" ] || notarization_missing+=("APPLE_API_ISSUER")
+                else
+                  notarization_missing+=("APPLE_KEYCHAIN_PROFILE requires a complete Apple ID or App Store Connect API key set for provisioning")
+                fi
+              fi
+            elif [ "${apple_id_present}" -eq 1 ]; then
+              [ "${apple_id_complete}" -eq 1 ] || {
+                [ -n "${APPLE_ID:-}" ] || notarization_missing+=("APPLE_ID")
+                [ -n "${APPLE_APP_SPECIFIC_PASSWORD:-}" ] || notarization_missing+=("APPLE_APP_SPECIFIC_PASSWORD")
+                [ -n "${APPLE_TEAM_ID:-}" ] || notarization_missing+=("APPLE_TEAM_ID")
+              }
+            elif [ "${api_key_present}" -eq 1 ]; then
+              [ "${api_key_complete}" -eq 1 ] || {
+                [ -n "${APPLE_API_KEY:-}" ] || notarization_missing+=("APPLE_API_KEY")
+                [ -n "${APPLE_API_KEY_ID:-}" ] || notarization_missing+=("APPLE_API_KEY_ID")
+                [ -n "${APPLE_API_ISSUER:-}" ] || notarization_missing+=("APPLE_API_ISSUER")
+              }
+            else
+              notarization_missing+=("APPLE_API_KEY + APPLE_API_KEY_ID + APPLE_API_ISSUER (or APPLE_ID + APPLE_APP_SPECIFIC_PASSWORD + APPLE_TEAM_ID)")
+            fi
+          elif [ "${runner}" = "windows-latest" ]; then
+            requires_signing=1
+            require_secret WINDOWS_CERTIFICATE "${WINDOWS_CERTIFICATE:-}"
+            require_secret WINDOWS_CERTIFICATE_PASSWORD "${WINDOWS_CERTIFICATE_PASSWORD:-}"
+          fi
+
+          if [ "${requires_signing}" -eq 1 ] && [ "${#missing[@]}" -eq 0 ] && [ "${#notarization_missing[@]}" -eq 0 ]; then
+            has_official=1
+          fi
+
+          if [ "${mode}" = "official" ] && [ "${requires_signing}" -eq 0 ]; then
+            echo "::notice::Official signing is not applicable for ${runner}; using unsigned Linux packaging"
+            mode="self-signed"
+          fi
+
+          if [ "${mode}" = "official" ] && [ "${requires_signing}" -eq 1 ] && [ "${has_official}" -ne 1 ]; then
+            printf '::error::signing_mode=official but required signing/notarization secrets are missing: %s %s\n' "${missing[*]-}" "${notarization_missing[*]-}"
+            exit 1
+          fi
+
+          if [ "${mode}" = "auto" ]; then
+            if [ "${has_official}" -eq 1 ]; then
+              mode="official"
+            else
+              mode="self-signed"
+              printf '::warning::Official signing secrets missing; using self-signed mode: %s %s\n' "${missing[*]-}" "${notarization_missing[*]-}"
+            fi
+          fi
+          if [ "${mode}" != "official" ] && [ "${mode}" != "self-signed" ]; then
+            echo "::error::Invalid signing mode: ${mode}"
+            exit 1
+          fi
+          echo "mode=${mode}" >> "${GITHUB_OUTPUT}"
+          echo "Desktop signing mode: ${mode}"
+
+      - name: Configure Electron signing
+        if: steps.signing.outputs.mode == 'official'
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_KEYCHAIN: ${{ secrets.APPLE_KEYCHAIN }}
+          APPLE_KEYCHAIN_PROFILE: ${{ secrets.APPLE_KEYCHAIN_PROFILE }}
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          write_env() {
+            name="$1"
+            value="$2"
+            marker="EOF_${name}_$$"
+            {
+              echo "${name}<<${marker}"
+              printf '%s\n' "${value}"
+              echo "${marker}"
+            } >> "${GITHUB_ENV}"
+          }
+
+          if [[ "${{ matrix.runner }}" == macos-* ]]; then
+            write_env CSC_LINK "${APPLE_CERTIFICATE}"
+            write_env CSC_KEY_PASSWORD "${APPLE_CERTIFICATE_PASSWORD}"
+            api_key_path=""
+            if [ -n "${APPLE_API_KEY:-}" ] && [ -n "${APPLE_API_KEY_ID:-}" ] && [ -n "${APPLE_API_ISSUER:-}" ]; then
+              api_key_path="${RUNNER_TEMP}/signet-apple-api-key.p8"
+              printf '%s\n' "${APPLE_API_KEY}" > "${api_key_path}"
+              chmod 600 "${api_key_path}"
+            fi
+            if [ -n "${APPLE_KEYCHAIN_PROFILE:-}" ]; then
+              store_credentials=(notarytool store-credentials "${APPLE_KEYCHAIN_PROFILE}")
+              if [ -n "${api_key_path}" ]; then
+                store_credentials+=(--key "${api_key_path}" --key-id "${APPLE_API_KEY_ID}" --issuer "${APPLE_API_ISSUER}")
+              else
+                store_credentials+=(--apple-id "${APPLE_ID}" --password "${APPLE_APP_SPECIFIC_PASSWORD}" --team-id "${APPLE_TEAM_ID}")
+              fi
+              if [ -n "${APPLE_KEYCHAIN:-}" ]; then
+                store_credentials+=(--keychain "${APPLE_KEYCHAIN}")
+              fi
+              xcrun "${store_credentials[@]}"
+              write_env APPLE_ID ""
+              write_env APPLE_APP_SPECIFIC_PASSWORD ""
+              write_env APPLE_TEAM_ID ""
+              write_env APPLE_API_KEY ""
+              write_env APPLE_API_KEY_ID ""
+              write_env APPLE_API_ISSUER ""
+              write_env APPLE_KEYCHAIN "${APPLE_KEYCHAIN:-}"
+              write_env APPLE_KEYCHAIN_PROFILE "${APPLE_KEYCHAIN_PROFILE}"
+            else
+              write_env APPLE_ID "${APPLE_ID:-}"
+              write_env APPLE_APP_SPECIFIC_PASSWORD "${APPLE_APP_SPECIFIC_PASSWORD:-}"
+              write_env APPLE_TEAM_ID "${APPLE_TEAM_ID:-}"
+              write_env APPLE_API_KEY "${api_key_path}"
+              write_env APPLE_API_KEY_ID "${APPLE_API_KEY_ID:-}"
+              write_env APPLE_API_ISSUER "${APPLE_API_ISSUER:-}"
+              write_env APPLE_KEYCHAIN "${APPLE_KEYCHAIN:-}"
+              write_env APPLE_KEYCHAIN_PROFILE ""
+            fi
+          elif [ "${{ matrix.runner }}" = "windows-latest" ]; then
+            write_env CSC_LINK "${WINDOWS_CERTIFICATE}"
+            write_env CSC_KEY_PASSWORD "${WINDOWS_CERTIFICATE_PASSWORD}"
+          fi
+
+      - name: Install dependencies
+        run: bun install
+
+      - name: Build Electron desktop app
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: ${{ steps.signing.outputs.mode == 'official' && 'true' || 'false' }}
+          ELECTRON_BUILDER_ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          cd surfaces/desktop
+          delays=(120 300 600)
+          for attempt in 1 2 3 4; do
+            if bun run build:desktop -- --${{ matrix.arch }}; then
+              exit 0
+            fi
+            if [ "${attempt}" -eq 4 ]; then
+              break
+            fi
+            delay="${delays[$((attempt - 1))]}"
+            echo "::warning::Electron desktop build failed on attempt ${attempt}; retrying in ${delay}s after cleanup"
+            rm -rf release dist resources/daemon resources/runtime
+            sleep "${delay}"
+          done
+
+          echo "::error::Electron desktop build failed after 4 attempts"
+          exit 1
+
+      - name: Verify macOS signing, notarization, and Gatekeeper state
+        if: startsWith(matrix.runner, 'macos-') && steps.signing.outputs.mode == 'official'
+        run: |
+          set -euo pipefail
+          cd surfaces/desktop
+          bun test scripts/verify-macos-release.test.mjs
+          bun run verify:macos
+
+      - name: Generate AUR metadata
+        if: matrix.runner == 'ubuntu-22.04' && startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -euo pipefail
+          APPIMAGE="$(find surfaces/desktop/release -name '*.AppImage' | head -n 1)"
+          if [ -z "${APPIMAGE}" ]; then
+            echo "::error::No AppImage artifact found"
+            exit 1
+          fi
+          SHA="$(sha256sum "${APPIMAGE}" | awk '{print $1}')"
+          VER="${GITHUB_REF_NAME#v}"
+          URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/v${VER}/$(basename "${APPIMAGE}")"
+          bash deploy/aur/generate-pkgbuild.sh "${VER}" "${URL}" "${SHA}"
+
+      - name: Upload desktop artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-${{ matrix.os_name }}
+          path: |
+            surfaces/desktop/release/*.dmg
+            surfaces/desktop/release/*.zip
+            surfaces/desktop/release/*.AppImage
+            surfaces/desktop/release/*.deb
+            surfaces/desktop/release/*.exe
+            surfaces/desktop/release/*.blockmap
+            surfaces/desktop/release/latest*.yml
+          if-no-files-found: error
+
+      - name: Upload AUR metadata
+        if: matrix.runner == 'ubuntu-22.04' && startsWith(github.ref, 'refs/tags/v')
+        uses: actions/upload-artifact@v4
+        with:
+          name: aur-metadata
+          path: |
+            deploy/aur/PKGBUILD
+            deploy/aur/.SRCINFO
+          include-hidden-files: true
+
+      - name: Publish release assets
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          release_files=(
+            surfaces/desktop/release/*.dmg
+            surfaces/desktop/release/*.zip
+            surfaces/desktop/release/*.AppImage
+            surfaces/desktop/release/*.deb
+            surfaces/desktop/release/*.exe
+            surfaces/desktop/release/*.blockmap
+            surfaces/desktop/release/latest*.yml
+          )
+          publish_files=()
+          for file in "${release_files[@]}"; do
+            if [ "$(basename "${file}")" = "latest-mac.yml" ]; then
+              continue
+            fi
+            publish_files+=("${file}")
+          done
+          if [ "${#publish_files[@]}" -eq 0 ]; then
+            echo "::error::No desktop release assets found"
+            exit 1
+          fi
+          scripts/retry-github-release.sh gh release upload "${GITHUB_REF_NAME}" "${publish_files[@]}" --clobber --repo "${GITHUB_REPOSITORY}"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  publish-mac-update-manifest:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: package.json
+
+      - name: Download macOS x64 desktop artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: desktop-macos-x64
+          path: mac-update/x64
+
+      - name: Download macOS arm64 desktop artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: desktop-macos-arm64
+          path: mac-update/arm64
+
+      - name: Merge and publish latest-mac.yml
+        run: |
+          set -euo pipefail
+          bun surfaces/desktop/scripts/merge-mac-update-manifest.ts \
+            --x64 mac-update/x64/latest-mac.yml \
+            --arm64 mac-update/arm64/latest-mac.yml \
+            --out mac-update/latest-mac.yml
+          cat mac-update/latest-mac.yml
+          scripts/retry-github-release.sh gh release upload "${GITHUB_REF_NAME}" mac-update/latest-mac.yml --clobber --repo "${GITHUB_REPOSITORY}"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  validate-aur:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download AUR metadata
+        uses: actions/download-artifact@v4
+        with:
+          name: aur-metadata
+          path: deploy/aur
+
+      - name: Validate Arch package metadata
+        run: |
+          set -euo pipefail
+          test -f deploy/aur/PKGBUILD
+          test -f deploy/aur/.SRCINFO
+          docker run --rm \
+            -v "${PWD}:/work" \
+            -w /work/deploy/aur \
+            archlinux:latest \
+            bash -lc '
+              set -euo pipefail
+              pacman -Sy --noconfirm base-devel pacman-contrib sudo
+              useradd -m builder
+              chown -R builder:builder /work/deploy/aur
+              su builder -c "cd /work/deploy/aur && makepkg --printsrcinfo > /tmp/.SRCINFO.generated"
+              diff -u /work/deploy/aur/.SRCINFO /tmp/.SRCINFO.generated
+            '

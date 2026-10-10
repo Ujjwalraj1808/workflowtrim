@@ -1,0 +1,44 @@
+name: ci
+
+on:
+  push:
+    tags:
+    branches:
+      - main
+  pull_request:
+  merge_group:
+
+permissions:
+  actions: none
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    permissions:
+      # publish-unit-test-action writes to the PRefix
+      pull-requests: write
+      # and writes to the checks API
+      checks: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: bazel-contrib/setup-bazel@0.19.0
+        with:
+          # Avoid downloading Bazel each time
+          bazelisk-cache: true
+          # Store build cache per workflow
+          disk-cache: ${{ github.workflow }}
+          # Share repository cache between workflows
+          repository-cache: true
+      - name: bazel build
+        run: bazel build //...
+      - name: bazel test
+        run: bazel coverage --test_output=all --combined_report=lcov --instrument_test_targets --nocache_test_results --instrumentation_filter="^//" //...
+      - name: output bazel paths for test and coverage
+        if: always()
+        id: bazel_info
+        run: |
+          bazel info bazel-testlogs output_path | sed -e 's/: /=/' >> $GITHUB_OUTPUT
+      - uses: EnricoMi/publish-unit-test-result-action/linux@v2
+        if: always()
+        with:
+          files: ${{ steps.bazel_info.outputs.bazel-testlogs }}/**/test.xml

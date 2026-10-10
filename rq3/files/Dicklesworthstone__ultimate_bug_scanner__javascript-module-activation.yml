@@ -1,0 +1,23 @@
+name: JavaScript Module Integrity Audit
+
+# The verified runtime is active. No historical artifact or write permission.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  integrity:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Verify committed installation integrity
+        run: |
+          ./scripts/verify_checksums.sh
+          ./scripts/verify_sha256sums.sh
+          python3 scripts/update_checksums.py
+          git diff --exit-code

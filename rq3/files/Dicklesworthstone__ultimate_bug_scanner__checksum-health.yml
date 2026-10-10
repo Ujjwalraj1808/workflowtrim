@@ -1,0 +1,277 @@
+name: Checksum Health Check
+
+# Scheduled canary that detects stale checksums even if no pushes occur.
+# Runs twice daily and creates a GitHub issue if checksums are out of sync.
+
+on:
+  schedule:
+    # Run at 06:00 and 18:00 UTC every day
+    - cron: '0 6,18 * * *'
+  workflow_dispatch:  # Allow manual trigger
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  health-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          # The version-tag drift check below resolves
+          # `git show v$UBS_VERSION:modules/...`. The default fetch-depth
+          # of 1 doesn't include tag refs, so use 0 (full history +
+          # tags) — silently missing tags would let drift slip past
+          # the gate.
+          fetch-depth: 0
+
+      - name: Verify SHA256SUMS integrity
+        id: verify
+        run: |
+          set -euo pipefail
+
+          # Compute actual checksums
+          ACTUAL_UBS=$(sha256sum ubs | awk '{print $1}')
+          ACTUAL_INSTALL=$(sha256sum install.sh | awk '{print $1}')
+
+          # Extract expected checksums (2>/dev/null suppresses error if file missing)
+          EXPECTED_UBS=$(grep '  ubs$' SHA256SUMS 2>/dev/null | awk '{print $1}' || echo "")
+          EXPECTED_INSTALL=$(grep '  install.sh$' SHA256SUMS 2>/dev/null | awk '{print $1}' || echo "")
+
+          echo "ubs:"
+          echo "  Expected: $EXPECTED_UBS"
+          echo "  Actual:   $ACTUAL_UBS"
+          echo ""
+          echo "install.sh:"
+          echo "  Expected: $EXPECTED_INSTALL"
+          echo "  Actual:   $ACTUAL_INSTALL"
+
+          ERRORS=""
+          if [[ "$ACTUAL_UBS" != "$EXPECTED_UBS" ]]; then
+            ERRORS="${ERRORS}ubs checksum mismatch\n"
+          fi
+          if [[ "$ACTUAL_INSTALL" != "$EXPECTED_INSTALL" ]]; then
+            ERRORS="${ERRORS}install.sh checksum mismatch\n"
+          fi
+
+          # Always output the checksum values (needed for issue body even if only modules fail)
+          echo "actual_ubs=$ACTUAL_UBS" >> "$GITHUB_OUTPUT"
+          echo "expected_ubs=$EXPECTED_UBS" >> "$GITHUB_OUTPUT"
+          echo "actual_install=$ACTUAL_INSTALL" >> "$GITHUB_OUTPUT"
+          echo "expected_install=$EXPECTED_INSTALL" >> "$GITHUB_OUTPUT"
+
+          if [[ -n "$ERRORS" ]]; then
+            echo "healthy=false" >> "$GITHUB_OUTPUT"
+            echo "errors<<EOF" >> "$GITHUB_OUTPUT"
+            echo -e "$ERRORS" >> "$GITHUB_OUTPUT"
+            echo "EOF" >> "$GITHUB_OUTPUT"
+          else
+            echo "healthy=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::All checksums are healthy"
+          fi
+
+      - name: Verify module checksums
+        id: verify_modules
+        run: |
+          # Capture full output (with ANSI stripped) for the issue body so
+          # operators can see *which* module drifted, not just that something did.
+          if ./scripts/verify_checksums.sh > /tmp/modules.log 2>&1; then
+            echo "modules_healthy=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "modules_healthy=false" >> "$GITHUB_OUTPUT"
+          fi
+          # Strip ANSI color codes; keep only mismatch / failure lines for the body.
+          sed -E 's/\x1B\[[0-9;]*[A-Za-z]//g' /tmp/modules.log \
+            | grep -E '✗|MISMATCH|FAILED|Expected|Actual' \
+            | head -40 > /tmp/modules_summary.log || true
+
+      - name: Verify v$UBS_VERSION tag matches main's MODULE_CHECKSUMS (issue #45)
+        id: verify_version_tag_drift
+        run: |
+          if ./scripts/check-version-tag-drift.sh > /tmp/tag_drift.log 2>&1; then
+            echo "tag_drift_healthy=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag_drift_healthy=false" >> "$GITHUB_OUTPUT"
+          fi
+          # Keep the operator-facing diff intact (no color codes here in
+          # check-version-tag-drift.sh, but strip just in case).
+          sed -E 's/\x1B\[[0-9;]*[A-Za-z]//g' /tmp/tag_drift.log \
+            | head -60 > /tmp/tag_drift_summary.log || true
+
+      - name: Check for existing issue
+        id: check_issue
+        if: steps.verify.outputs.healthy == 'false' || steps.verify_modules.outputs.modules_healthy == 'false' || steps.verify_version_tag_drift.outputs.tag_drift_healthy == 'false'
+        run: |
+          # Check if there's already an open issue with our label
+          EXISTING=$(gh issue list --label "checksum-drift" --state open --json number --jq '.[0].number // empty')
+          if [[ -n "$EXISTING" ]]; then
+            echo "existing_issue=$EXISTING" >> "$GITHUB_OUTPUT"
+            echo "::notice::Existing issue #$EXISTING found, skipping creation"
+          else
+            echo "existing_issue=" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Ensure checksum-drift label exists
+        if: (steps.verify.outputs.healthy == 'false' || steps.verify_modules.outputs.modules_healthy == 'false' || steps.verify_version_tag_drift.outputs.tag_drift_healthy == 'false') && steps.check_issue.outputs.existing_issue == ''
+        run: |
+          # Create label if it doesn't exist (ignore error if it already exists)
+          gh label create "checksum-drift" --description "Automated: SHA256SUMS out of sync" --color "B60205" 2>/dev/null || true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build accurate issue body
+        id: build_body
+        if: (steps.verify.outputs.healthy == 'false' || steps.verify_modules.outputs.modules_healthy == 'false' || steps.verify_version_tag_drift.outputs.tag_drift_healthy == 'false') && steps.check_issue.outputs.existing_issue == ''
+        env:
+          FILE_HEALTHY: ${{ steps.verify.outputs.healthy }}
+          MODULES_HEALTHY: ${{ steps.verify_modules.outputs.modules_healthy }}
+          TAG_HEALTHY: ${{ steps.verify_version_tag_drift.outputs.tag_drift_healthy }}
+          EXPECTED_UBS: ${{ steps.verify.outputs.expected_ubs }}
+          ACTUAL_UBS: ${{ steps.verify.outputs.actual_ubs }}
+          EXPECTED_INSTALL: ${{ steps.verify.outputs.expected_install }}
+          ACTUAL_INSTALL: ${{ steps.verify.outputs.actual_install }}
+        run: |
+          set -euo pipefail
+          # Compose a category-aware issue body. Earlier versions only showed the
+          # top-level file table, which masked the real failure when modules or
+          # the version-tag drift check were the offenders (see #47).
+
+          status_icon() { [[ "$1" == "true" ]] && echo "✅" || echo "❌"; }
+          file_icon()   { [[ "$1" == "$2" ]] && echo "✅" || echo "❌"; }
+
+          # Pick a title that reflects the actual failure category. If multiple
+          # categories fail we fall back to a composite title.
+          fail_count=0
+          [[ "$FILE_HEALTHY"    == "false" ]] && fail_count=$((fail_count+1))
+          [[ "$MODULES_HEALTHY" == "false" ]] && fail_count=$((fail_count+1))
+          [[ "$TAG_HEALTHY"     == "false" ]] && fail_count=$((fail_count+1))
+          # IMPORTANT: keep titles to plain ASCII-ish text — no literal "$",
+          # no backticks, no "$(...)" command substitutions. The title is
+          # consumed by the next step via the ISSUE_TITLE env var (bash expands
+          # the env-var value once as a string, so a "$" inside the value is
+          # safe today), but the env-var pass is the only thing protecting us.
+          # If a future maintainer switches the consumer back to direct GitHub
+          # Actions expression interpolation into the bash command, any "$"
+          # in the title would be re-evaluated by bash as a parameter expansion
+          # and silently drop unset variables. Body is fine because it is
+          # read via `--body-file`, never interpolated by bash.
+          if   [[ $fail_count -gt 1 ]];                       then TITLE="URGENT: Multiple checksum drift categories detected"
+          elif [[ "$FILE_HEALTHY" == "false" ]];              then TITLE="URGENT: Top-level checksum drift (ubs/install.sh) — users cannot install"
+          elif [[ "$MODULES_HEALTHY" == "false" ]];           then TITLE="Module checksum drift — module file does not match expected hash in ubs"
+          else                                                     TITLE="Version-tag checksum drift — main modules differ from the tagged release"
+          fi
+          # Use the multi-line GITHUB_OUTPUT delimiter syntax so a future title
+          # containing "=" or other delimiter-significant chars stays intact.
+          {
+            echo "title<<TITLE_EOF"
+            printf '%s\n' "$TITLE"
+            echo "TITLE_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "## Checksum Health Check Failed"
+            echo ""
+            echo "| Category | Status |"
+            echo "|----------|--------|"
+            echo "| Top-level files (\`ubs\`, \`install.sh\`)        | $(status_icon "$FILE_HEALTHY")    |"
+            echo "| Module file hashes (\`MODULE_CHECKSUMS\` in ubs) | $(status_icon "$MODULES_HEALTHY") |"
+            echo "| Version-tag drift (main vs the tagged release)  | $(status_icon "$TAG_HEALTHY")     |"
+            echo ""
+
+            if [[ "$FILE_HEALTHY" == "false" ]]; then
+              echo "### Top-Level File Drift"
+              echo ""
+              echo "| File | Expected | Actual | Status |"
+              echo "|------|----------|--------|--------|"
+              echo "| \`ubs\`        | \`$EXPECTED_UBS\`     | \`$ACTUAL_UBS\`     | $(file_icon "$EXPECTED_UBS"     "$ACTUAL_UBS")     |"
+              echo "| \`install.sh\` | \`$EXPECTED_INSTALL\` | \`$ACTUAL_INSTALL\` | $(file_icon "$EXPECTED_INSTALL" "$ACTUAL_INSTALL") |"
+              echo ""
+              echo "**Impact:** Users running \`install.sh\` will get checksum mismatch errors."
+              echo ""
+              echo "**Fix:**"
+              echo ""
+              echo '```bash'
+              echo "./scripts/update_checksums.sh"
+              echo "git add SHA256SUMS ubs"
+              echo "git commit -m \"fix(checksum): sync SHA256SUMS\""
+              echo "git push"
+              echo '```'
+              echo ""
+            fi
+
+            if [[ "$MODULES_HEALTHY" == "false" ]]; then
+              echo "### Module Checksum Drift"
+              echo ""
+              echo "One or more module/helper files do not match the hash declared in the \`MODULE_CHECKSUMS\` table inside the \`ubs\` script. The runner will refuse to load these modules at runtime."
+              echo ""
+              echo "Failing entries (from \`scripts/verify_checksums.sh\`):"
+              echo ""
+              echo '```'
+              if [[ -s /tmp/modules_summary.log ]]; then
+                cat /tmp/modules_summary.log
+              else
+                echo "(no diagnostic lines captured — re-run scripts/verify_checksums.sh locally)"
+              fi
+              echo '```'
+              echo ""
+              echo "**Fix:** Update the module hash in \`ubs\` (search for the failing module name in the \`MODULE_CHECKSUMS\` block), or revert the module change."
+              echo ""
+            fi
+
+            if [[ "$TAG_HEALTHY" == "false" ]]; then
+              echo "### Version-Tag Drift (issue #45 follow-up)"
+              echo ""
+              echo "The current release tag's modules no longer match what main's \`ubs\` script expects (run \`scripts/check-version-tag-drift.sh\` for the exact tag name and per-module deltas). Users pinned to that tag will see runtime mismatches."
+              echo ""
+              echo "Drift report (from \`scripts/check-version-tag-drift.sh\`):"
+              echo ""
+              echo '```'
+              if [[ -s /tmp/tag_drift_summary.log ]]; then
+                cat /tmp/tag_drift_summary.log
+              else
+                echo "(no diagnostic lines captured — re-run scripts/check-version-tag-drift.sh locally)"
+              fi
+              echo '```'
+              echo ""
+              echo "**Fix one of:**"
+              echo ""
+              echo "1. Bump \`UBS_VERSION\` in \`ubs\` and cut a new tag whose modules match main."
+              echo "2. Revert the module change(s) on main so the runner stays compatible with the existing tag."
+              echo "3. Move the existing tag to the current commit (only safe if no users are pinned to it)."
+              echo ""
+            fi
+
+            echo "### Why This Happened"
+            echo ""
+            echo "The \`Checksum Sync\` workflow auto-fixes top-level drift on push to main, but module-level and version-tag drift require human judgement (which release category they belong to). See the [Checksum Sync workflow runs](https://github.com/${{ github.repository }}/actions/workflows/checksum-sync.yml) for top-level recovery status."
+            echo ""
+            echo "---"
+            echo "*This issue was automatically created by the Checksum Health Check workflow.*"
+          } > /tmp/issue_body.md
+
+      - name: Create issue for checksum drift
+        if: (steps.verify.outputs.healthy == 'false' || steps.verify_modules.outputs.modules_healthy == 'false' || steps.verify_version_tag_drift.outputs.tag_drift_healthy == 'false') && steps.check_issue.outputs.existing_issue == ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Pass the title through an env var rather than ${{ }} interpolation
+          # directly into the bash command. Direct interpolation would let bash
+          # re-evaluate any "$WORD" inside the title (silently dropping unset
+          # vars and, in principle, executing $(cmd) substitutions). The env-var
+          # form passes the value as a string that bash expands once via "$ISSUE_TITLE".
+          ISSUE_TITLE: ${{ steps.build_body.outputs.title }}
+        run: |
+          gh issue create \
+            --title "$ISSUE_TITLE" \
+            --label "checksum-drift" \
+            --body-file /tmp/issue_body.md
+
+      - name: Fail if unhealthy
+        if: steps.verify.outputs.healthy == 'false' || steps.verify_modules.outputs.modules_healthy == 'false' || steps.verify_version_tag_drift.outputs.tag_drift_healthy == 'false'
+        run: |
+          echo "::error::Checksum drift detected! SHA256SUMS is out of sync."
+          exit 1

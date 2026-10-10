@@ -1,0 +1,133 @@
+name: Checks
+
+on:
+  pull_request:
+  merge_group:
+  # The merge queue already checked this tree. Main still runs the full jobs when a cache key
+  # changes, because only main-saved caches are visible to other PRs.
+  push:
+    branches: [main]
+    paths:
+      - 'pnpm-lock.yaml'
+      - 'turbo.json'
+      - '.github/workflows/checks.yml'
+      - '.github/actions/**'
+
+# Cancel superseded PR runs. Other events get a per-run group: a shared one drops queued merge_group/push runs.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CI: 1
+  PRINT_GITHUB_ANNOTATIONS: 1
+
+defaults:
+  run:
+    shell: bash
+
+permissions:
+  contents: read
+  # update-pr-template reads the repo's label list (octo.issues.listLabelsForRepo).
+  issues: read
+
+jobs:
+  test:
+    name: 'Tests & checks'
+    timeout-minutes: 15
+    runs-on: ubuntu-latest-16-cores-arm-open # TODO: this should probably run on multiple OSes
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v6
+
+      - uses: ./.github/actions/setup
+
+      - name: Check for duplicate dependencies
+        run: pnpm dedupe --check
+
+      - name: Check packages
+        run: pnpm check-packages
+
+      - name: Check circular dependencies
+        run: pnpm check-circular-deps
+
+      - name: Restore build tool caches
+        uses: ./.github/actions/build-cache
+        with:
+          name: test-tools
+          save: true
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - name: Check bundle sizes
+        run: pnpm exec turbo run check-bundle-size
+
+      - name: Check PR template
+        run: pnpm update-pr-template --check
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Check API declarations and docs work as intended
+        run: pnpm api-check
+
+      - name: Lint
+        run: pnpm lint
+
+      - name: Check dotcom localizations
+        run: |
+          pnpm build-i18n 
+          git diff --exit-code --quiet ./apps/dotcom/client/public/tla/locales/ ./apps/dotcom/client/public/tla/locales-compiled/ || (echo "Please run pnpm build-i18n and commit the changes" && exit 1)
+
+      # vitest's fsModuleCache (~54MB gzipped). Entries are content-hashed, so a stale
+      # restore is safe - unmatched modules are just re-transformed. Keyed on pnpm-lock.yaml so
+      # one entry is reused across commits instead of saving a new copy on every run.
+      - name: Restore vitest module cache
+        uses: actions/cache@v5
+        with:
+          path: node_modules/.vitest-cache
+          key: vitest-cache-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}
+          restore-keys: vitest-cache-${{ runner.os }}-
+
+      - name: Test
+        run: pnpm test-ci
+
+  build:
+    name: 'Build all projects'
+    timeout-minutes: 15
+    runs-on: ubuntu-latest-16-cores-arm-open
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v6
+
+      - uses: ./.github/actions/setup
+
+      - name: Restore build tool caches
+        uses: ./.github/actions/build-cache
+        with:
+          name: build-tools
+          save: true
+
+      - name: Build packages
+        # the sed pipe makes sure that github annotations come through without
+        # turbo's prefix
+        run: "pnpm build-package | sed -E 's/^.*? ::/::/'"
+
+  # Perf is the only e2e workflow left on main and skips pushes outside its paths, so seed the
+  # x64 Playwright browsers cache here too.
+  warm-playwright-cache:
+    name: 'Warm Playwright cache'
+    if: github.event_name == 'push'
+    timeout-minutes: 10
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v6
+
+      - uses: ./.github/actions/setup
+
+      - name: Set up Playwright
+        uses: ./.github/actions/setup-playwright

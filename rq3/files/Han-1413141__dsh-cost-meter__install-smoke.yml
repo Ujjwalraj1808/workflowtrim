@@ -1,0 +1,277 @@
+name: install-smoke
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sidebar-search-recovery:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        dsh: ['0.1.7-rc.2', '0.2.0-rc.2']
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - name: Install reported and current workspace UI runtimes
+        env:
+          DSH_VERSION: ${{ matrix.dsh }}
+        run: |
+          npm install -g pnpm
+          pnpm install --frozen-lockfile
+          npm install --prefix .tmp-sidebar-host --no-audit --no-fund --ignore-scripts "@deepseek-ai/dsh-client-ui-workspace@$DSH_VERSION" react@18.2.0 react-dom@18.2.0 jsdom@28.1.0
+      - name: Verify query recovery and scoped credential editor
+        run: |
+          export DSH_TEST_NODE_MODULES="$PWD/.tmp-sidebar-host/node_modules"
+          node test/sidebar-search-recovery.mjs
+          node test/credential-editor-dom.mjs --baseline v1.8.6
+
+  statistics-client:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        dsh: ['0.1.7-rc.2', '0.2.0-rc.2']
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - name: Install reported and current browser runtimes
+        env:
+          DSH_VERSION: ${{ matrix.dsh }}
+        run: |
+          npm install -g pnpm
+          pnpm install --frozen-lockfile
+          npm install --prefix .tmp-statistics-client --no-audit --no-fund --ignore-scripts "@deepseek-ai/dsh-api-gateway@$DSH_VERSION" "@deepseek-ai/dsh-typert-registry@$DSH_VERSION" "@deepseek-ai/dsh-client-ui-model-selection@$DSH_VERSION" @deepseek-ai/cordis@4.0.4 react@18.2.0 react-dom@18.2.0 jsdom@28.1.0
+      - name: Verify statistics mount together, and that the cost dialog keeps its content on refetch
+        run: |
+          export DSH_TEST_NODE_MODULES="$PWD/.tmp-statistics-client/node_modules"
+          node test/statistics-remote-registration.mjs
+          node test/host-locale-client.mjs
+          node test/openrouter-catalog-client.mjs
+          node test/openrouter-picker-client.mjs
+          # 闪烁回归要真实驱动组件(jsdom + react),因此放在本作业执行:verify.mjs 所在的
+          # 两个作业只装 DSH 包,没有 jsdom —— 那样会在 import 阶段 MODULE_NOT_FOUND。
+          node test/statistics-flicker.mjs
+      - name: Verify the cost dialog clears the DSH titlebar in a real browser
+        # 唯一的弹窗几何护栏。前面任一步失败时 GitHub 会跳过本步,于是「弹窗压住标题栏」
+        # 这个用户可见回归拿不到信号;always() 让它独立执行(它自带 Chrome 安装与启动)。
+        if: always()
+        run: |
+          # 弹窗几何只能靠真实排版判定(jsdom 不做布局),用 runner 自带的 Chrome 无头执行。
+          # 测试自己拉起浏览器并等页面回报结果(--wait),找不到浏览器即以非零退出。
+          test -x /usr/bin/google-chrome || (sudo apt-get update && sudo apt-get install -y google-chrome-stable)
+          CM_TEST_BROWSER=/usr/bin/google-chrome node test/statistics-dialog-titlebar.mjs "$PWD/.tmp-statistics-client/node_modules" --wait --timeout=300000
+
+  native-search-rc2:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - node: '24.15.0'
+            undici: '8.10.2'
+          - node: '24'
+            undici: '8.11.2'
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ matrix.node }}
+      - name: Install the reported DSH search runtime
+        run: |
+          npm install -g pnpm
+          pnpm install --frozen-lockfile
+          npm install --prefix .tmp-native-search-host --no-audit --no-fund @deepseek-ai/dsh@0.2.0-rc.2 undici@${{ matrix.undici }}
+      - name: Verify real services, provider, transport and ledger
+        run: |
+          export DSH_TEST_NODE_MODULES="$PWD/.tmp-native-search-host/node_modules"
+          node test/native-search-host.mjs
+          node test/native-search-proxy.mjs
+          mkdir -p .tmp-native-package
+          npm pack --pack-destination .tmp-native-package
+          node test/native-search-profile.mjs .tmp-native-package/dsh-cost-meter-*.tgz
+
+  marketplace-git-install:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - name: Install reported DSH host and pnpm
+        shell: pwsh
+        run: |
+          npm install -g pnpm@11.21.0
+          New-Item -ItemType Directory -Path .tmp-next-host -Force | Out-Null
+          Copy-Item test/fixtures/next-host/package.json .tmp-next-host/package.json
+          npm install --prefix .tmp-next-host --no-audit --no-fund
+      - name: Install through the Plugin Hub Git URL
+        shell: pwsh
+        env:
+          TEST_REV: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          $env:DSH_HOME = Join-Path $env:RUNNER_TEMP 'dsh-cost-meter-git-install'
+          node .tmp-next-host/node_modules/@deepseek-ai/dsh/lib/bin.js plugin --profile web add "git+https://github.com/han-1413141/dsh-cost-meter.git#$env:TEST_REV"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $config = node .tmp-next-host/node_modules/@deepseek-ai/dsh/lib/bin.js --profile web --dump-config
+          if ($LASTEXITCODE -ne 0 -or -not ($config | Select-String 'name: dsh-cost-meter')) { exit 1 }
+
+  next-host-compatibility:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - name: Install pinned DSH 0.2 host
+        run: |
+          npm install -g pnpm
+          pnpm install --frozen-lockfile
+          mkdir -p .tmp-next-host
+          cp test/fixtures/next-host/package.json .tmp-next-host/package.json
+          npm install --prefix .tmp-next-host --no-audit --no-fund
+      - name: Verify compatibility, sessions and RPC on the next host
+        run: |
+          export DSH_TEST_NODE_MODULES="$PWD/.tmp-next-host/node_modules"
+          node test/host-peer-compatibility.mjs
+          node test/verify.mjs
+          node test/market-hot-install.mjs
+      - name: Install the packed plugin and start the real Web host
+        run: |
+          export DSH_TEST_NODE_MODULES="$PWD/.tmp-next-host/node_modules"
+          mkdir -p .tmp-next-package
+          npm pack --pack-destination .tmp-next-package
+          node test/next-host-install.mjs .tmp-next-package/dsh-cost-meter-*.tgz
+
+  market-hot-install:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - name: Install reported host and pinned RPC packages
+        run: |
+          npm install -g pnpm
+          pnpm install --frozen-lockfile
+          mkdir -p .tmp-market-host
+          cp test/fixtures/install-host/package.json .tmp-market-host/package.json
+          npm install --prefix .tmp-market-host --ignore-scripts --no-audit --no-fund
+      - name: Verify hot installation without restarting the host
+        run: |
+          export DSH_TEST_NODE_MODULES="$PWD/.tmp-market-host/node_modules"
+          node test/market-hot-install.mjs
+
+  source-host-codecs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      # npm 0.1.6-alpha.1 predates the create() contract in source checkouts (#149).
+      # Pin actual upstream code so a package-only smoke test cannot mask this failure.
+      - uses: actions/checkout@v7
+        with:
+          repository: deepseek-ai/deepseek-harness
+          ref: 0d1f50007f9bca3f52b06e1c3074fa14d5fb0720
+          path: .tmp-typert-upstream
+          persist-credentials: false
+          sparse-checkout: |
+            packages/typert
+            packages/api/gateway
+      - name: Install test dependencies
+        run: |
+          npm install -g pnpm
+          pnpm install --frozen-lockfile
+          npm install --prefix .tmp-typert-host --no-audit --no-fund @deepseek-ai/dsh@0.1.6-alpha.1
+      - name: Validate source host and shipped client codecs
+        run: |
+          export DSH_TEST_SOURCE_ROOT="$PWD/.tmp-typert-upstream"
+          export DSH_TEST_NODE_MODULES="$PWD/.tmp-typert-host/node_modules"
+          node test/typert-source-host.mjs
+
+  one-click-install:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            # Windows leg exercises install.ps1 end-to-end, including its
+            # pnpm auto-provisioning (pnpm is deliberately not preinstalled).
+            verify-cmd: pwsh -NoProfile -Command "dsh --profile web --dump-config | Select-String dsh-cost-meter"
+          - os: ubuntu-latest
+            # Linux leg exercises the README installer with the tested commit.
+            verify-cmd: dsh --profile web --dump-config | grep dsh-cost-meter
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - name: Install DeepSeek Harness
+        shell: bash
+        # Pin the tested host graph: upstream ^0.1.5-rc.1 ranges currently select
+        # rc.3 packages requiring an unpublished sidebar-documentpreview@rc.3.
+        # Exercise the real host and install.ps1 without skipping any assertions.
+        run: |
+          mkdir -p .tmp-install-host
+          cp test/fixtures/install-host/package.json .tmp-install-host/package.json
+          npm install --prefix .tmp-install-host --no-audit --no-fund
+          node -e 'require("fs").appendFileSync(process.env.GITHUB_PATH, require("path").resolve(".tmp-install-host/node_modules/.bin") + "\n")'
+      - name: Install pnpm (Linux leg only)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: npm install -g pnpm
+      - name: One-click install (Linux leg, tested commit)
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          TEST_REV: ${{ github.sha }}
+        run: dsh plugin --profile web add "github:Han-1413141/dsh-cost-meter#$TEST_REV"
+      # Both legs install the checked-out commit, including the PR merge commit.
+      # A previously published tag must not hide an installation regression.
+      - name: One-click install (Windows leg, install.ps1)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          TEST_REV: ${{ github.sha }}
+        run: |
+          Write-Host "[install-smoke] install.ps1 rev: $env:TEST_REV"
+          pwsh -NoProfile -ExecutionPolicy Bypass -File install.ps1 -Rev $env:TEST_REV
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Verify plugin joined the bundle graph
+        shell: bash
+        run: ${{ matrix.verify-cmd }}
+      # 回归与产物门禁需要工作区依赖(zod / dsh-credentials / dsh-home-paths / esbuild):
+      # 本 job 只做安装冒烟、从不装工作区依赖,故回归前按锁文件补装(pnpm v11.21 由
+      # install.ps1 在 Windows leg 供给、上一步在 Linux leg 显式安装)。--frozen-lockfile
+      # 保证 esbuild 与构建已提交 bundle 的 0.28.2 严格一致,产物比对逐字节可复现。
+      - name: Install workspace dependencies
+        shell: bash
+        run: pnpm install --frozen-lockfile
+      # 回归门禁(v1.6.8):CI 此前只验证「能装上」,不验证「算得对」——
+      # verify.mjs 回归套件(定价数学/峰谷边界/账本回归/端点白名单)此前完全靠人工执行。
+      - name: Run regression suite
+        shell: bash
+        run: |
+          export DSH_TEST_NODE_MODULES="$PWD/.tmp-install-host/node_modules"
+          node test/verify.mjs
+          node test/market-hot-install.mjs
+      # 产物漂移门禁(v1.6.8):lib/client.js 是提交进仓库的压缩产物,无 prepare/prepack
+      # 钩子,全靠手工构建后提交,此前实测已发生漂移。此处重新构建并比对,任何未提交
+      # 的产物差异都会让 CI 变红,杜绝把过期 bundle 发布出去。
+      - name: Check client bundle is in sync with src
+        shell: bash
+        run: node scripts/build.mjs && git diff --exit-code lib/client.js lib/client.statistics.js

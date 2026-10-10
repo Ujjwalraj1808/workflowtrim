@@ -1,0 +1,114 @@
+name: Infer
+permissions: {}
+on:
+  schedule:
+    - cron: '0 12 * * 0'
+  pull_request: {}
+  push:
+    branches: [master, v3.dev]
+  workflow_dispatch: {}
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+env:
+  DEVELOCITY_ACCESS_KEY: ${{ secrets.DEVELOCITY_ACCESS_KEY }}
+  ALLOWED_ENDPOINTS: >-
+    api.adoptium.net:443
+    api.foojay.io:443
+    api.github.com:443
+    caffeine.develocity.cloud:443
+    downloads.gradle.org:443
+    downloads.gradle-dn.com:443
+    github.com:443
+    maven-central.storage-download.googleapis.com:443
+    objects.githubusercontent.com:443
+    plugins.gradle.org:443
+    plugins-artifacts.gradle.org:443
+    raw.githubusercontent.com:443
+    release-assets.githubusercontent.com:443
+    repo.maven.apache.org:443
+    repo1.maven.org:443
+    services.gradle.org:443
+
+jobs:
+  infer:
+    name: Infer
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: write # Needed to annotate commit
+      actions: read # Needed for uploading security scan results
+      security-events: write # Needed for uploading security scan results
+    env:
+      JAVA_VERSION: 26
+      ORG_GRADLE_PROJECT_lint: 'false'
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          disable-sudo-and-containers: true
+          egress-policy: block
+          allowed-endpoints: ${{ env.ALLOWED_ENDPOINTS }}
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Setup Infer
+        uses: srz-zumix/setup-infer@530856effeae228d1f3c8251c91ea8348d9480ee # v1.1.1
+      - name: Setup Gradle
+        uses: $/.github/actions/run-gradle
+        with:
+          java: ${{ env.JAVA_VERSION }}
+          cache-encryption-key: ${{ secrets.GRADLE_ENCRYPTION_KEY }}
+      - name: Compute changed files
+        if: github.event_name == 'push' || github.event_name == 'pull_request'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_EVENT_NAME}" = "push" ]; then
+            echo "# For push events, compare with last 5 commits"
+            git diff --name-only HEAD~5..HEAD > /tmp/changed-files.txt
+          else
+            echo "# For pull request events, compare with base ref"
+            base_ref="${GITHUB_BASE_REF}"
+            git fetch origin "${base_ref}" --quiet
+            base_sha=$(git merge-base HEAD "origin/${base_ref}")
+            git diff --name-only "${base_sha}"..HEAD > /tmp/changed-files.txt
+          fi
+          cat /tmp/changed-files.txt
+      - name: Infer (changed files)
+        if: github.event_name == 'push' || github.event_name == 'pull_request'
+        continue-on-error: true
+        shell: bash
+        run: >
+          infer --changed-files-index /tmp/changed-files.txt
+          -- ./gradlew assemble -PearlyAccess=true --no-build-cache
+      - name: Infer (full)
+        if: github.event_name != 'push' && github.event_name != 'pull_request'
+        continue-on-error: true
+        shell: bash
+        run: infer -- ./gradlew assemble -PearlyAccess=true --no-build-cache
+      - name: Check file existence
+        id: check_files
+        uses: andstor/file-existence-action@558493d6c74bf472d87c84eab196434afc2fa029 # v3.1.0
+        with:
+          files: infer-out/report.sarif
+      - name: Check Infer report
+        if: >
+          (github.event_name == 'push' || github.event_name == 'pull_request')
+          && steps.check_files.outputs.files_exists == 'true'
+        uses: srz-zumix/reviewdog-action-infer@67cc69fad6e2342a5a7b255b2c00268c9e1f4f70 # v1.3.0
+      - name: Upload Reports
+        if: steps.check_files.outputs.files_exists == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          retention-days: 1
+          name: infer-reports
+          path: 'infer-out/report.*'
+      - name: Upload result to GitHub Code Scanning
+        uses: github/codeql-action/upload-sarif@1c5b675653bb5c22dbe9b12b556ec555138e09fd # v4.38.1
+        if: steps.check_files.outputs.files_exists == 'true'
+        continue-on-error: true
+        with:
+          sarif_file: infer-out/report.sarif

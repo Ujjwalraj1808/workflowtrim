@@ -1,0 +1,81 @@
+name: "📘 Deploy docs"
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish_branch:
+        type: string
+        required: false
+        description: "Target branch (default: gh-pages)"
+  workflow_call:
+    inputs:
+      publish_branch:
+        type: string
+        required: false
+        description: "Target branch (default: gh-pages)"
+  push:
+    branches:
+      - master
+    paths:
+      - "packages/docs/**"
+      - "CHANGELOG.md"
+
+concurrency:
+  group: deploy-docs-${{ inputs.publish_branch || 'gh-pages' }}
+  cancel-in-progress: false
+
+jobs:
+  deploy-docs:
+    timeout-minutes: 10
+    runs-on: ubuntu-latest
+    # env:
+    #   LEMONSQUEEZY_API_KEY: ${{ secrets.LEMONSQUEEZY_API_KEY }}
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'workflow_call' ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/master') ||
+      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success')
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+          clean: false
+          ref: ${{ github.ref_name }}
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.0"
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Build package
+        run: bun run --bun build
+
+      - name: Add robots.txt if not main repo
+        if: github.repository != 'saadeghi/daisyui'
+        run: |
+          echo 'User-agent: *
+          Disallow: /' > packages/docs/static/robots.txt
+
+      - name: Verify docs source
+        working-directory: packages/docs
+        run: bun run verify
+
+      - name: Build docs
+        working-directory: packages/docs
+        run: bun run --bun build
+
+      - name: Verify docs build
+        working-directory: packages/docs
+        run: bun run verify:build
+
+      - name: Deploy docs to github pages
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./packages/docs/build
+          cname: ${{ vars.CNAME }}
+          publish_branch: ${{ inputs.publish_branch || 'gh-pages' }}

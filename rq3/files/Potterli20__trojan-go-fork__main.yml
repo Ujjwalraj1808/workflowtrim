@@ -1,0 +1,77 @@
+name: make-release
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 0 * * */7"
+
+jobs:
+  make-release:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Setup Go 1.x.y
+        uses: actions/setup-go@main
+        with:
+          go-version: ^1.27
+
+      - name: Set variables
+        run: |
+          echo "RELEASE_NAME=Released on V$(date +%Y.%m.%d)" >> $GITHUB_ENV
+          echo "TAG_NAME=V$(date +%Y.%m.%d)" >> $GITHUB_ENV
+          echo "BUILD_DATE=$(date -u +'%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_ENV
+        shell: bash
+
+      - name: Checkout codebase
+        uses: actions/checkout@main
+        with:
+          fetch-depth: 100
+
+      - name: Verify Go version
+        run: |
+          go version
+          go env
+
+      - name: Generate changelog
+        run: |
+          PREV_TAG=$(git describe --tags --abbrev=0 HEAD~1 2>/dev/null || echo "initial")
+          echo "PREV_TAG=$PREV_TAG" >> $GITHUB_ENV
+          if [ "$PREV_TAG" = "initial" ]; then
+            CHANGELOG=$(git log --format='* %h | %s (%an)' -20)
+          else
+            CHANGELOG=$(git log --format='* %h | %s (%an)' "$PREV_TAG"..HEAD)
+          fi
+          echo "CHANGELOG<<EOF" >> $GITHUB_ENV
+          echo "$CHANGELOG" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+
+      - name: Get project dependencies & run
+        run: |
+          for i in {1..5}; do go mod download && break || sleep 15; done
+          make release -j$(nproc)
+
+      - name: List built files
+        run: ls -la trojan-go-*.zip
+
+      - name: Release
+        uses: svenstaro/upload-release-action@master
+        with:
+          repo_token: ${{ secrets.GITHUBTOKEN }}
+          tag: ${{ env.TAG_NAME }}
+          file: ./trojan-go-*.zip
+          file_glob: true
+          body: |
+            ## ${{ env.RELEASE_NAME }}
+
+            **Build Date:** ${{ env.BUILD_DATE }}
+
+            ### Changes since ${{ env.PREV_TAG }}:
+            ${{ env.CHANGELOG }}
+
+            ---
+
+            *Auto-generated release*
+
+      - name: Delete workflow runs
+        uses: GitRML/delete-workflow-runs@main
+        with:
+          retain_days: 0.1
+          keep_minimum_runs: 1

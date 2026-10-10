@@ -1,0 +1,208 @@
+name: Live Model Evaluation
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Run the deterministic replay or a billed protected adapter.
+        type: choice
+        options: [replay, live]
+        default: replay
+        required: true
+      configuration_id:
+        description: Configuration id from the selected configuration file.
+        type: string
+        default: replay-golden
+        required: true
+      repeats:
+        description: Full-corpus repetitions, bounded from 1 to 5.
+        type: number
+        default: 1
+        required: true
+      scope:
+        description: Evaluate the full corpus or only the canonical live-smoke subset.
+        type: choice
+        options: [full, smoke]
+        default: full
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: live-model-eval-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  guard:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Validate dispatch bounds
+        env:
+          CONFIGURATION_ID: ${{ inputs.configuration_id }}
+          GITHUB_REF_VALUE: ${{ github.ref }}
+          MODE: ${{ inputs.mode }}
+          REPEATS: ${{ inputs.repeats }}
+          SCOPE: ${{ inputs.scope }}
+        run: |
+          set -euo pipefail
+          test "$REPEATS" -ge 1
+          test "$REPEATS" -le 5
+          [[ "$SCOPE" == "full" || "$SCOPE" == "smoke" ]]
+          if [[ "$MODE" == "live" ]]; then
+            test "$GITHUB_REF_VALUE" = "refs/heads/main"
+            test "$CONFIGURATION_ID" != "replay-golden"
+          fi
+
+  replay:
+    if: inputs.mode == 'replay'
+    needs: guard
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7
+        with:
+          enable-cache: true
+          prune-cache: true
+          version-file: uv.toml
+      - run: uv sync --all-extras --frozen
+      - name: Run deterministic replay
+        env:
+          CONFIGURATION_ID: ${{ inputs.configuration_id }}
+          REPEATS: ${{ inputs.repeats }}
+          SCOPE: ${{ inputs.scope }}
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/live-model-eval
+          case_args=()
+          if [[ "$SCOPE" == "smoke" ]]; then
+            case_args+=(--case-tag live-smoke)
+          fi
+          uv run --all-extras python scripts/run_live_model_eval.py \
+            --configuration "$CONFIGURATION_ID" \
+            --repeats "$REPEATS" \
+            "${case_args[@]}" \
+            --source-revision "$GITHUB_SHA" \
+            --output artifacts/live-model-eval/evidence.json
+      - name: Upload sanitized replay evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: live-model-eval-replay-${{ github.run_id }}
+          path: artifacts/live-model-eval/evidence.json
+          if-no-files-found: error
+          retention-days: 7
+
+  live:
+    if: inputs.mode == 'live' && github.ref == 'refs/heads/main'
+    needs: guard
+    runs-on: ubuntu-24.04
+    timeout-minutes: 110
+    environment: live-model-evals
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7
+        with:
+          enable-cache: false
+          version-file: uv.toml
+      - run: uv sync --all-extras --frozen
+      - name: Install pinned OpenCode CLI
+        if: startsWith(inputs.configuration_id, 'opencode-cli-')
+        env:
+          OPENCODE_CLI_VERSION: "1.18.10"
+        run: |
+          set -euo pipefail
+          npm ci --prefix evals/live --ignore-scripts --no-audit --no-fund
+          test "$(evals/live/node_modules/opencode-linux-x64/bin/opencode --version)" = "$OPENCODE_CLI_VERSION"
+          echo "$GITHUB_WORKSPACE/evals/live/node_modules/opencode-linux-x64/bin" >> "$GITHUB_PATH"
+      - name: Run bounded billed evaluation
+        env:
+          CONFIGURATION_ID: ${{ inputs.configuration_id }}
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+          OPENAI_KEY: ${{ secrets.OPENAI_KEY }}
+          OPENCODE_ZEN_API_KEY: ${{ secrets.OPENCODE_ZEN_API_KEY }}
+          REPEATS: ${{ inputs.repeats }}
+          SCOPE: ${{ inputs.scope }}
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/live-model-eval
+          case_args=()
+          if [[ "$SCOPE" == "smoke" ]]; then
+            case_args+=(--case-tag live-smoke)
+            command_timeout="40m"
+          else
+            command_timeout="100m"
+          fi
+          python - "$CONFIGURATION_ID" "$GITHUB_SHA" <<'PY'
+          import json
+          import pathlib
+          import sys
+          pathlib.Path("artifacts/live-model-eval/status.json").write_text(
+              json.dumps(
+                  {
+                      "configuration_id": sys.argv[1],
+                      "source_revision": sys.argv[2],
+                      "state": "running",
+                      "runner_exit_code": None,
+                  },
+                  sort_keys=True,
+              ) + "\n",
+              encoding="utf-8",
+          )
+          PY
+          set +e
+          timeout --signal=TERM --kill-after=30s "$command_timeout" \
+            uv run --all-extras python scripts/run_live_model_eval.py \
+            --config evals/live/configurations.yaml \
+            --configuration "$CONFIGURATION_ID" \
+            --repeats "$REPEATS" \
+            "${case_args[@]}" \
+            --source-revision "$GITHUB_SHA" \
+            --output artifacts/live-model-eval/evidence.json
+          exit_code=$?
+          set -e
+          if [ "$exit_code" -ne 124 ] && [ "$exit_code" -ne 137 ]; then
+            python - "$CONFIGURATION_ID" "$GITHUB_SHA" "$exit_code" <<'PY'
+          import json
+          import pathlib
+          import sys
+          pathlib.Path("artifacts/live-model-eval/status.json").write_text(
+              json.dumps(
+                  {
+                      "configuration_id": sys.argv[1],
+                      "source_revision": sys.argv[2],
+                      "state": "completed",
+                      "runner_exit_code": int(sys.argv[3]),
+                  },
+                  sort_keys=True,
+              ) + "\n",
+              encoding="utf-8",
+          )
+          PY
+          fi
+      - name: Upload sanitized live evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: live-model-eval-${{ github.run_id }}
+          path: artifacts/live-model-eval
+          if-no-files-found: error
+          retention-days: 14
+      - name: Enforce live evaluation result
+        if: always()
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          import pathlib
+          status = json.loads(
+              pathlib.Path("artifacts/live-model-eval/status.json").read_text(encoding="utf-8")
+          )
+          if status.get("state") != "completed" or status.get("runner_exit_code") != 0:
+              raise SystemExit("live-model evaluation did not pass")
+          PY

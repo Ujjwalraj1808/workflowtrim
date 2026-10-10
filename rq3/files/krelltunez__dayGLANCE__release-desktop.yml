@@ -1,0 +1,108 @@
+name: Build and Release Desktop Apps
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      # One platform's failure must not cancel the others. A macOS signing
+      # break used to take the Windows and Linux builds down with it, leaving
+      # no artifacts at all to test with.
+      fail-fast: false
+      matrix:
+        include:
+          # Pinned, not macos-latest: that label moved to a newer image on
+          # 2026-09-07 and electron-builder's `security set-key-partition-list`
+          # started failing on it ("SecKeychainUnlock: the user name or
+          # passphrase you entered is not correct") with no change on our side.
+          - os: macos-15
+            artifact_glob: "dist-app/*.dmg dist-app/*-mac.zip"
+          - os: windows-latest
+            artifact_glob: "dist-app/*.exe"
+          - os: ubuntu-latest
+            artifact_glob: "dist-app/*.AppImage dist-app/*.deb"
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Decode provisioning profile
+        if: runner.os == 'macOS'
+        run: |
+          if [ -n "$MAC_PROVISIONING_PROFILE_BASE64" ]; then
+            echo "$MAC_PROVISIONING_PROFILE_BASE64" | base64 --decode > "$RUNNER_TEMP/dayglance.provisionprofile"
+            echo "MAC_PROVISIONING_PROFILE=$RUNNER_TEMP/dayglance.provisionprofile" >> $GITHUB_ENV
+          fi
+        env:
+          MAC_PROVISIONING_PROFILE_BASE64: ${{ secrets.MAC_PROVISIONING_PROFILE_BASE64 }}
+
+      - name: Build desktop app (macOS — signed + notarized)
+        if: runner.os == 'macOS'
+        run: npm run build:electron -- --publish never
+        env:
+          CSC_LINK: ${{ secrets.CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          MAC_PROVISIONING_PROFILE: ${{ env.MAC_PROVISIONING_PROFILE }}
+
+      - name: Build desktop app (Windows / Linux)
+        if: runner.os != 'macOS'
+        run: npm run build:electron -- --publish never
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-${{ matrix.os }}
+          path: |
+            dist-app/*.dmg
+            dist-app/*-mac.zip
+            dist-app/*.exe
+            dist-app/*.AppImage
+            dist-app/*.deb
+          if-no-files-found: ignore
+
+  release:
+    needs: build
+    # Tag pushes only. Without this, a workflow_dispatch run against a branch
+    # reaches action-gh-release with no tag and either fails or writes a
+    # release nobody asked for. Guarding it makes manual dispatch a safe
+    # build-only smoke test: artifacts get produced and can be downloaded,
+    # and no release is touched. That is the only way to exercise a packaging
+    # change before tagging, since ci.yml runs the web build and never
+    # electron-builder — so packaging bugs have historically had the release
+    # itself as their first real test.
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create draft release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          generate_release_notes: false
+          files: artifacts/**/*

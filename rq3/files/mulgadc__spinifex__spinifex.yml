@@ -1,0 +1,369 @@
+name: Build and Test
+
+on:
+  push:
+    branches:
+      - main
+      - dev
+    paths:
+      - "**/*.go"
+      - go.mod
+      - go.sum
+      - Makefile
+      - .github/workflows/spinifex.yml
+  pull_request:
+    branches:
+      - main
+      - dev
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build_and_test:
+    name: Build and Test
+    runs-on: ubuntu-26.04
+
+    steps:
+      - name: Checkout Spinifex
+        uses: actions/checkout@v7
+        with:
+          path: spinifex
+          fetch-depth: 2
+
+      - name: Resolve sibling refs
+        id: siblings
+        env:
+          BRANCH: ${{ github.head_ref || github.ref_name }}
+        run: bash .github/resolve-sibling-refs.sh
+        working-directory: spinifex
+
+      - name: Checkout Viperblock
+        uses: actions/checkout@v7
+        with:
+          repository: mulgadc/viperblock
+          ref: ${{ steps.siblings.outputs.viperblock }}
+          path: viperblock
+
+      - name: Checkout Predastore
+        uses: actions/checkout@v7
+        with:
+          repository: mulgadc/predastore
+          ref: ${{ steps.siblings.outputs.predastore }}
+          path: predastore
+
+      - name: Checkout Northstar
+        uses: actions/checkout@v7
+        with:
+          repository: mulgadc/northstar
+          ref: ${{ steps.siblings.outputs.northstar }}
+          path: northstar
+
+      - name: Checkout Bluebottle
+        uses: actions/checkout@v7
+        with:
+          repository: mulgadc/bluebottle
+          ref: ${{ steps.siblings.outputs.bluebottle }}
+          path: bluebottle
+
+      # setup-go's own cache only writes on a key miss, so it froze a snapshot at
+      # the last go.sum change and never refreshed it. Both caches are managed
+      # below instead.
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: "spinifex/go.mod"
+          cache: false
+
+      # Module contents follow the five go.sum files, so a content key is exact.
+      # setup-go hashed spinifex/go.sum alone, which left the sibling modules'
+      # dependencies out of the key and re-downloading on every run.
+      - name: Cache Go modules
+        uses: actions/cache@v6
+        with:
+          path: ~/go/pkg/mod
+          key: gomod-${{ hashFiles('spinifex/go.sum', 'viperblock/go.sum', 'predastore/go.sum', 'northstar/go.sum', 'bluebottle/go.sum') }}
+          restore-keys: gomod-
+
+      # Build artifacts follow source, so the key rolls per run and falls back to
+      # this job's newest entry. Keyed per job because -race, -covermode=atomic
+      # and plain builds produce disjoint entries and would evict each other.
+      # Restore runs everywhere; the matching save is gated to dev and main, so
+      # a PR reads the base branch's entry without spending a minute uploading
+      # one only that PR would ever read.
+      - name: Restore Go build cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ~/.cache/go-build
+          key: gobuild-${{ github.job }}-${{ github.run_id }}
+          restore-keys: gobuild-${{ github.job }}-
+
+      - name: Setup Go Workspace
+        run: go work init ./spinifex ./viperblock ./predastore ./northstar ./bluebottle
+
+      # The EBS provider contract suite needs a real implementation on each
+      # side of the boundary: qemu-img/qemu-nbd/qemu-io back qemunbdd, which
+      # shares no code with viperblock, and nbdkit plus viperblock's plugin
+      # back viperblockd, the provider production actually uses. Without them
+      # the suite runs against MemoryProvider alone. nbdkit-plugin-dev carries
+      # the headers and nbdkit.pc that cgo needs to build that plugin, and
+      # libnbd-bin supplies the third-party NBD client (nbdinfo/nbdcopy) that
+      # judges the published export by something outside this codebase.
+      - name: Install conformance tools
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends qemu-utils nbdkit nbdkit-plugin-dev libnbd-bin
+
+      - name: Build viperblock nbdkit plugin
+        run: make -C viperblock go_build_nbd
+
+      - name: Build Spinifex
+        run: make -C spinifex build
+
+      - name: Manifest check + drift lint
+        run: make -C spinifex manifest-check manifest-lint
+
+      - name: Run Tests with Coverage
+        env:
+          SPINIFEX_REQUIRE_CONFORMANCE_TOOLS: "1"
+          VIPERBLOCK_NBDKIT_PLUGIN: ${{ github.workspace }}/viperblock/lib/nbdkit-viperblock-plugin.so
+        run: make -C spinifex test-cover GOTESTFLAGS=-count=1
+
+      - name: Run Action Tests
+        run: make -C spinifex test-actions GOTESTFLAGS=-count=1
+
+      - name: Check Diff Coverage
+        run: cd spinifex && scripts/diff-coverage.sh coverage.out --base HEAD~1
+
+      # Compiled output stays valid whatever the tests said, and skipping the
+      # save on a red run would leave the next one rebuilding it, so this is
+      # gated on the branch rather than on success.
+      # Go bumps an entry's mtime when a run uses it, so this run's working set
+      # survives and objects superseded by later commits do not. Runs after the
+      # work, so it costs this job nothing and only shrinks what the next reads.
+      - name: Trim Go build cache
+        if: ${{ !cancelled() && (github.ref == 'refs/heads/dev' || github.ref == 'refs/heads/main') }}
+        run: |
+          C="$(go env GOCACHE)"
+          before=$(du -sm "$C" | cut -f1)
+          find "$C" -type f -mmin +240 -delete
+          echo "trimmed ${before}MB -> $(du -sm "$C" | cut -f1)MB"
+
+      - name: Save Go build cache
+        if: ${{ !cancelled() && (github.ref == 'refs/heads/dev' || github.ref == 'refs/heads/main') }}
+        uses: actions/cache/save@v6
+        with:
+          path: ~/.cache/go-build
+          key: gobuild-${{ github.job }}-${{ github.run_id }}
+
+  race_detection:
+    name: Race Detection
+    runs-on: ubuntu-26.04
+
+    steps:
+      - name: Checkout Spinifex
+        uses: actions/checkout@v7
+        with:
+          path: spinifex
+
+      - name: Resolve sibling refs
+        id: siblings
+        env:
+          BRANCH: ${{ github.head_ref || github.ref_name }}
+        run: bash .github/resolve-sibling-refs.sh
+        working-directory: spinifex
+
+      - name: Checkout Viperblock
+        uses: actions/checkout@v7
+        with:
+          repository: mulgadc/viperblock
+          ref: ${{ steps.siblings.outputs.viperblock }}
+          path: viperblock
+
+      - name: Checkout Predastore
+        uses: actions/checkout@v7
+        with:
+          repository: mulgadc/predastore
+          ref: ${{ steps.siblings.outputs.predastore }}
+          path: predastore
+
+      - name: Checkout Northstar
+        uses: actions/checkout@v7
+        with:
+          repository: mulgadc/northstar
+          ref: ${{ steps.siblings.outputs.northstar }}
+          path: northstar
+
+      - name: Checkout Bluebottle
+        uses: actions/checkout@v7
+        with:
+          repository: mulgadc/bluebottle
+          ref: ${{ steps.siblings.outputs.bluebottle }}
+          path: bluebottle
+
+      # setup-go's own cache only writes on a key miss, so it froze a snapshot at
+      # the last go.sum change and never refreshed it. Both caches are managed
+      # below instead.
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: "spinifex/go.mod"
+          cache: false
+
+      # Module contents follow the five go.sum files, so a content key is exact.
+      # setup-go hashed spinifex/go.sum alone, which left the sibling modules'
+      # dependencies out of the key and re-downloading on every run.
+      - name: Cache Go modules
+        uses: actions/cache@v6
+        with:
+          path: ~/go/pkg/mod
+          key: gomod-${{ hashFiles('spinifex/go.sum', 'viperblock/go.sum', 'predastore/go.sum', 'northstar/go.sum', 'bluebottle/go.sum') }}
+          restore-keys: gomod-
+
+      # Build artifacts follow source, so the key rolls per run and falls back to
+      # this job's newest entry. Keyed per job because -race, -covermode=atomic
+      # and plain builds produce disjoint entries and would evict each other.
+      # Restore runs everywhere; the matching save is gated to dev and main, so
+      # a PR reads the base branch's entry without spending a minute uploading
+      # one only that PR would ever read.
+      - name: Restore Go build cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ~/.cache/go-build
+          key: gobuild-${{ github.job }}-${{ github.run_id }}
+          restore-keys: gobuild-${{ github.job }}-
+
+      - name: Setup Go Workspace
+        run: go work init ./spinifex ./viperblock ./predastore ./northstar ./bluebottle
+
+      - name: Run Tests with Race Detector
+        run: make -C spinifex test-race GOTESTFLAGS=-count=1
+
+      # Go bumps an entry's mtime when a run uses it, so this run's working set
+      # survives and objects superseded by later commits do not. Runs after the
+      # work, so it costs this job nothing and only shrinks what the next reads.
+      - name: Trim Go build cache
+        if: ${{ !cancelled() && (github.ref == 'refs/heads/dev' || github.ref == 'refs/heads/main') }}
+        run: |
+          C="$(go env GOCACHE)"
+          before=$(du -sm "$C" | cut -f1)
+          find "$C" -type f -mmin +240 -delete
+          echo "trimmed ${before}MB -> $(du -sm "$C" | cut -f1)MB"
+
+      - name: Save Go build cache
+        if: ${{ !cancelled() && (github.ref == 'refs/heads/dev' || github.ref == 'refs/heads/main') }}
+        uses: actions/cache/save@v6
+        with:
+          path: ~/.cache/go-build
+          key: gobuild-${{ github.job }}-${{ github.run_id }}
+
+  lint_and_security:
+    name: Lint + Security + Integration
+    runs-on: ubuntu-26.04
+
+    steps:
+      - name: Checkout Spinifex
+        uses: actions/checkout@v7
+        with:
+          path: spinifex
+          fetch-depth: 2
+
+      - name: Resolve sibling refs
+        id: siblings
+        env:
+          BRANCH: ${{ github.head_ref || github.ref_name }}
+        run: bash .github/resolve-sibling-refs.sh
+        working-directory: spinifex
+
+      - name: Checkout Viperblock
+        uses: actions/checkout@v7
+        with:
+          repository: mulgadc/viperblock
+          ref: ${{ steps.siblings.outputs.viperblock }}
+          path: viperblock
+
+      - name: Checkout Predastore
+        uses: actions/checkout@v7
+        with:
+          repository: mulgadc/predastore
+          ref: ${{ steps.siblings.outputs.predastore }}
+          path: predastore
+
+      - name: Checkout Northstar
+        uses: actions/checkout@v7
+        with:
+          repository: mulgadc/northstar
+          ref: ${{ steps.siblings.outputs.northstar }}
+          path: northstar
+
+      - name: Checkout Bluebottle
+        uses: actions/checkout@v7
+        with:
+          repository: mulgadc/bluebottle
+          ref: ${{ steps.siblings.outputs.bluebottle }}
+          path: bluebottle
+
+      # setup-go's own cache only writes on a key miss, so it froze a snapshot at
+      # the last go.sum change and never refreshed it. Both caches are managed
+      # below instead.
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: "spinifex/go.mod"
+          cache: false
+
+      # Module contents follow the five go.sum files, so a content key is exact.
+      # setup-go hashed spinifex/go.sum alone, which left the sibling modules'
+      # dependencies out of the key and re-downloading on every run.
+      - name: Cache Go modules
+        uses: actions/cache@v6
+        with:
+          path: ~/go/pkg/mod
+          key: gomod-${{ hashFiles('spinifex/go.sum', 'viperblock/go.sum', 'predastore/go.sum', 'northstar/go.sum', 'bluebottle/go.sum') }}
+          restore-keys: gomod-
+
+      # Build artifacts follow source, so the key rolls per run and falls back to
+      # this job's newest entry. Keyed per job because -race, -covermode=atomic
+      # and plain builds produce disjoint entries and would evict each other.
+      # Restore runs everywhere; the matching save is gated to dev and main, so
+      # a PR reads the base branch's entry without spending a minute uploading
+      # one only that PR would ever read.
+      - name: Restore Go build cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ~/.cache/go-build
+          key: gobuild-${{ github.job }}-${{ github.run_id }}
+          restore-keys: gobuild-${{ github.job }}-
+
+      - name: Setup Go Workspace
+        run: go work init ./spinifex ./viperblock ./predastore ./northstar ./bluebottle
+
+      - name: Lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.13.0
+          working-directory: spinifex
+
+      - name: Govulncheck
+        run: make -C spinifex govulncheck
+
+      - name: Run Integration Tests
+        if: ${{ !cancelled() }}
+        run: make -C spinifex test-integration
+
+      # Go bumps an entry's mtime when a run uses it, so this run's working set
+      # survives and objects superseded by later commits do not. Runs after the
+      # work, so it costs this job nothing and only shrinks what the next reads.
+      - name: Trim Go build cache
+        if: ${{ !cancelled() && (github.ref == 'refs/heads/dev' || github.ref == 'refs/heads/main') }}
+        run: |
+          C="$(go env GOCACHE)"
+          before=$(du -sm "$C" | cut -f1)
+          find "$C" -type f -mmin +240 -delete
+          echo "trimmed ${before}MB -> $(du -sm "$C" | cut -f1)MB"
+
+      - name: Save Go build cache
+        if: ${{ !cancelled() && (github.ref == 'refs/heads/dev' || github.ref == 'refs/heads/main') }}
+        uses: actions/cache/save@v6
+        with:
+          path: ~/.cache/go-build
+          key: gobuild-${{ github.job }}-${{ github.run_id }}

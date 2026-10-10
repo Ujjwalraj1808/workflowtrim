@@ -1,0 +1,90 @@
+name: Update generated code
+
+on:
+    workflow_dispatch: ~
+    schedule:
+        - cron:  '0 8-18/4 * * 1-5'
+
+env:
+    GIT_AUTHOR_NAME: github-actions[bot]
+    GIT_COMMITTER_NAME: github-actions[bot]
+    GIT_AUTHOR_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+    GIT_COMMITTER_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+
+jobs:
+    check_templates:
+        name: Check if Cloud templates requires test updates
+        runs-on: ubuntu-latest
+        steps:
+            -
+                name: Checkout
+                uses: actions/checkout@v7
+            -
+                name: Set up Go
+                uses: actions/setup-go@v6
+                with:
+                    go-version-file: 'go.mod'
+            -
+                name: Test
+                run: go test -v ./...
+            -
+                name: Check Git status
+                id: git
+                run: git diff --exit-code
+    update:
+        name: Update generated code
+        runs-on: ubuntu-latest
+        steps:
+            -
+                name: Checkout
+                uses: actions/checkout@v7
+            -
+                name: Set up Go
+                uses: actions/setup-go@v6
+                with:
+                    go-version-file: 'go.mod'
+            -
+                name: Prepare, generate, and format code
+                run: |
+                    rm -rf ~/.platformsh/bin/
+                    go generate ./...
+            -
+                name: Check Git status
+                id: git
+                run: |
+                    {
+                        echo 'gitstatus<<EOF'
+                        git status --untracked-files=no --porcelain
+                        echo EOF
+                    } >> $GITHUB_OUTPUT
+            -
+                name: Test
+                if: steps.git.outputs.gitstatus != ''
+                run: go test -v ./...
+            -   name: Validate build
+                if: steps.git.outputs.gitstatus != ''
+                run: go run .
+
+            -
+                name: Commit the update for Upsun-related code
+                if: steps.git.outputs.gitstatus != ''
+                run: |
+                    git add local/upsun/commands.go
+                    git diff --staged --quiet || git commit -m "Update Upsun CLI commands"
+
+            -   name: Commit the update for Docker-related code
+                if: steps.git.outputs.gitstatus != ''
+                run: |
+                    git add envs/docker_version.go
+                    git diff --staged --quiet || git commit -m "Update Docker Client version"
+
+            -   name: Commit the update for PHP-related code
+                if: steps.git.outputs.gitstatus != ''
+                run: |
+                    git add commands/php_version.go
+                    git diff --staged --quiet || git commit -m "Update latest available PHP version"
+
+            -   name: Commit and push the updates
+                if: steps.git.outputs.gitstatus != ''
+                run: |
+                    git push

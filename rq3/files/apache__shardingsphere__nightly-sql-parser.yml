@@ -1,0 +1,95 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+name: Nightly - SQL parser loading from external cases
+
+on:
+  schedule:
+    - cron: '0 18 * * 1-5' # Once a day between Monday and Friday. UTC time
+  workflow_dispatch:
+
+concurrency:
+  group: nightly-sql-parser-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  MAVEN_OPTS: -Dhttp.keepAlive=false
+  RUNS_ON: ubuntu-latest
+
+jobs:
+  global-environment:
+    name: Import Global Environment
+    uses: ./.github/workflows/reusable-global-environment.yml
+
+  database-parse:
+    if: ${{ needs.global-environment.outputs.GLOBAL_JOB_ENABLED == 'true' }}
+    name: CI - SQL Parser
+    needs: global-environment
+    runs-on: ${{ needs.global-environment.outputs.GLOBAL_RUNS_ON }}
+    timeout-minutes: 90
+    strategy:
+      max-parallel: 15
+      fail-fast: false
+      matrix:
+        include:
+          - database: mysql
+            test: ExternalMySQLParserIT
+          - database: postgresql
+            test: ExternalPostgreSQLParserIT
+    steps:
+      - uses: actions/checkout@v6.0.1
+      - uses: ./.github/actions/setup-build-environment
+      - name: Build Project with Maven
+        run: ./mvnw -T1C -B -ntp clean install
+      - name: Clear Previous SQL Parser XML
+        run: rm -f test/it/parser/target/failsafe-reports/TEST-*${{ matrix.test }}.xml
+      - name: Run SQL Parser
+        id: sql-parser
+        run: |
+          mkdir -p "$RUNNER_TEMP/sql-parser-report-${{ matrix.database }}"
+          ./mvnw -nsu -B install -f test/it/parser/pom.xml -Pexternal-sql-parser-report \
+            -Dsql.parser.external.it.enabled=true -Dit.test=${{ matrix.test }} \
+            -Dsql.parser.external.it.report.path="$RUNNER_TEMP/sql-parser-report-${{ matrix.database }}/"
+      - name: Generate SQL Parser Report
+        if: ${{ !cancelled() && steps.sql-parser.outcome != 'skipped' }}
+        uses: mikepenz/action-junit-report@b7b80d7ac5b1da46d6aaff9fb57ad50d8453bcb3 # v6.6.0
+        with:
+          report_paths: 'test/it/parser/target/failsafe-reports/TEST-*${{ matrix.test }}.xml'
+          check_name: 'SQL Parser - ${{ matrix.database }}'
+          skip_annotations: true
+          detailed_summary: true
+          failed_summary_logs: true
+          include_skipped: false
+          truncate_stack_traces: false
+          require_tests: true
+          fail_on_parse_error: true
+      - uses: actions/upload-artifact@v6
+        if: ${{ !cancelled() && steps.sql-parser.outcome != 'skipped' }}
+        with:
+          name: sql-report-${{ matrix.database }}
+          path: ${{ runner.temp }}/sql-parser-report-${{ matrix.database }}/
+          if-no-files-found: error
+      - name: Upload SQL Parser XML
+        if: ${{ !cancelled() && steps.sql-parser.outcome != 'skipped' }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: sql-parser-xml-${{ matrix.database }}
+          path: test/it/parser/target/failsafe-reports/TEST-*${{ matrix.test }}.xml
+          if-no-files-found: error

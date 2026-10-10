@@ -1,0 +1,16 @@
+---
+name: enos-cloud
+
+on:
+  workflow_call:
+    inputs:
+      hcp-environment:
+        type: string
+      product-version:
+        type: string
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - run: exit 0

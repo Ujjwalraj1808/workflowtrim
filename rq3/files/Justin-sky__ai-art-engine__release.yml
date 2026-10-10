@@ -1,0 +1,716 @@
+# 多平台 Electron 自动构建 + 可选代码签名
+# - push tag v* → 构建并发布 GitHub Release
+# - workflow_dispatch → 仅构建 Artifact
+#
+# 签名（仓库 Settings → Secrets and variables → Actions）：
+#   Windows: WIN_CSC_LINK, WIN_CSC_KEY_PASSWORD
+#   macOS:   MAC_CSC_LINK, MAC_CSC_KEY_PASSWORD
+#   公证:    APPLE_ID, APPLE_APP_SPECIFIC_PASSWORD, APPLE_TEAM_ID
+# 未配置 Secrets 时仍可构建，产物为未签名包。
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # windows-latest 已迁移到 Visual Studio 2026，electron-builder 捆绑的
+          # node-gyp 无法识别（"Could not find any Visual Studio installation"），
+          # 固定 windows-2022（VS2022）确保 node-pty 等原生依赖可重建
+          - os: windows-2022
+            platform: win
+          - os: macos-latest
+            platform: mac
+          - os: ubuntu-latest
+            platform: linux
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Verify tag matches package.json version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          PKG="$(node -p "require('./package.json').version")"
+          echo "tag=$TAG package.json=$PKG"
+          if [ "$TAG" != "$PKG" ]; then
+            echo "::error::Git tag v$TAG must match package.json version $PKG"
+            exit 1
+          fi
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+
+      # node-pty 等原生依赖经 node-gyp 重建，依赖 Python distutils（3.12+ 已移除）
+      # v6 起基于 Node 24（v5 用已弃用的 Node 20，runner 会强制升级并告警）
+      - name: Set up Python 3.11 (node-gyp distutils)
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          # onnxruntime-node 的 postinstall 会从 CDN 拉预编译二进制，偶发超时会让整条腿在
+          # 装依赖阶段就挂掉（与代码无关；2026-09-13 的 6.1.1 首发就撞上一次，Linux 腿
+          # 因此直接失败）。npm 自带的重试只覆盖 registry 请求，管不到 postinstall 的
+          # 下载，这里对整步做有限次重试。
+          for attempt in 1 2 3; do
+            if npm ci; then break; fi
+            if [ "$attempt" = 3 ]; then
+              echo '::error::npm ci failed after 3 attempts'
+              exit 1
+            fi
+            echo "npm ci failed (attempt $attempt), retrying in 20s..."
+            sleep 20
+          done
+
+      # deb 打包依赖 fakeroot（app-builder 内部走 dpkg 兼容路径）；Ubuntu runner 多数已带，
+      # 显式安装一次避免镜像变更导致下游打包失败。
+      - name: Install Linux packaging tools
+        if: matrix.platform == 'linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq fakeroot
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Test
+        run: npm test
+
+      - name: Build app
+        run: npm run build
+
+      # 生成自包含 dsh 运行体（out/dsh-bundle），供 extraResources 打入 <resources>/dsh。
+      # 缺少此步会导致安装包无内置 dsh，用户首启走 npx 联网下载（1–2 分钟）。
+      - name: Bundle dsh runtime
+        run: npm run bundle:dsh
+
+      # 随包内置的本地视觉模型（YOLO detect / segment / pose + 人脸两段式 detect / landmark）
+      # **已随仓库提交**，正常检出里就有，所以这一步通常是空操作（打印 `= … already present`）。
+      # 保留它是作为恢复路径：检出被截断 / 误删时把文件拉回来，否则下一步 check:pack 会硬失败。
+      - name: Ensure bundled model files (recovery, normally a no-op)
+        run: npm run fetch:yolo-models
+
+      # 打包资源自检：上面那步若因网络等原因没落盘，这里直接失败，而不是让
+      # electron-builder 只打印一行 "file source doesn't exist" 后照常产出缺模型的安装包。
+      - name: Check pack resources
+        run: npm run check:pack
+
+      - name: Package (Windows)
+        if: matrix.platform == 'win'
+        env:
+          # 勿直接注入空 secret：空 WIN_CSC_LINK 会被当成证书路径
+          WIN_CSC_LINK_SECRET: ${{ secrets.WIN_CSC_LINK }}
+          WIN_CSC_KEY_PASSWORD_SECRET: ${{ secrets.WIN_CSC_KEY_PASSWORD }}
+        shell: bash
+        run: |
+          if [ -n "${WIN_CSC_LINK_SECRET}" ]; then
+            export WIN_CSC_LINK="${WIN_CSC_LINK_SECRET}"
+            export WIN_CSC_KEY_PASSWORD="${WIN_CSC_KEY_PASSWORD_SECRET}"
+            echo "Windows code signing enabled"
+          else
+            echo "Unsigned Windows build (no WIN_CSC_* secrets)"
+          fi
+          npx electron-builder --win --publish never
+
+      - name: Package (macOS)
+        if: matrix.platform == 'mac'
+        env:
+          # 勿直接注入空 CSC_LINK：electron-builder 会把空值当成路径 → "not a file"
+          MAC_CSC_LINK: ${{ secrets.MAC_CSC_LINK }}
+          MAC_CSC_KEY_PASSWORD: ${{ secrets.MAC_CSC_KEY_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          EXTRA_ARGS=()
+          if [ -n "${MAC_CSC_LINK}" ]; then
+            export CSC_LINK="${MAC_CSC_LINK}"
+            export CSC_KEY_PASSWORD="${MAC_CSC_KEY_PASSWORD}"
+            export CSC_IDENTITY_AUTO_DISCOVERY=true
+            if [ -n "${APPLE_ID}" ] && [ -n "${APPLE_APP_SPECIFIC_PASSWORD}" ] && [ -n "${APPLE_TEAM_ID}" ]; then
+              echo "Notarization enabled"
+              EXTRA_ARGS+=(--config.mac.notarize=true)
+            else
+              echo "Signing enabled; notarization skipped (need APPLE_* secrets)"
+            fi
+          else
+            export CSC_IDENTITY_AUTO_DISCOVERY=false
+            EXTRA_ARGS+=(--config.mac.identity=null)
+            # afterPack 钩子会对 .app 做 ad-hoc 签名（arm64 必需），否则 Apple Silicon 上
+            # 完全未签名的包会报「已损坏，无法打开」；对外正式分发仍需签名+公证。
+            echo "Ad-hoc signed macOS build (no MAC_CSC_* secrets)"
+          fi
+          # macos-latest 为 arm64；显式打 x64+arm64，供 Intel / Apple Silicon 分别下载
+          npx electron-builder --mac --x64 --arm64 --publish never "${EXTRA_ARGS[@]}"
+
+      - name: Package (Linux)
+        if: matrix.platform == 'linux'
+        run: npx electron-builder --linux --publish never
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: aiartengine-${{ matrix.platform }}-${{ github.sha }}
+          path: |
+            dist/*.exe
+            dist/*.dmg
+            dist/*.AppImage
+            dist/*.deb
+            dist/*.zip
+            dist/*.yml
+            dist/*.blockmap
+          if-no-files-found: warn
+          retention-days: 30
+
+      # ---- 静默安装 + 启动冒烟（产物先上传，冒烟失败时仍可下载分析）----
+      # 任一步失败 → build job 失败 → 依赖它的 release job 不执行，标签不会被发布。
+      - name: Smoke test — silent install & launch (Windows)
+        if: matrix.platform == 'win'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $setup = Get-ChildItem 'dist\*-Setup-*.exe' -ErrorAction Stop | Select-Object -First 1
+          Write-Host "SMOKE installing: $($setup.Name)"
+          $p = Start-Process -FilePath $setup.FullName -ArgumentList '/S' -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "NSIS silent install failed (exit code $($p.ExitCode))" }
+
+          # NSIS 默认 per-user 安装到 %LOCALAPPDATA%\Programs\<productName>，主程序 AIArtEngine.exe；
+          # oneClick 装完会默认自动拉起应用，先清理残余，再手动启动一次做存活检测。
+          $exe = Join-Path $env:LOCALAPPDATA 'Programs\AIArtEngine\AIArtEngine.exe'
+          if (-not (Test-Path $exe)) {
+            # 兜底 1：读 HKCU 卸载注册表 DisplayIcon（记录主程序绝对路径）
+            $icon = Get-ChildItem 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall' -ErrorAction SilentlyContinue |
+              ForEach-Object { Get-ItemProperty $_.PSPath } |
+              Where-Object { $_.DisplayName -eq 'AIArtEngine' -and $_.DisplayIcon } |
+              Select-Object -First 1 -ExpandProperty DisplayIcon
+            if ($icon) { $exe = ($icon -split ',')[0] }
+          }
+          if (-not (Test-Path $exe)) {
+            # 兜底 2：在安装目录内找主程序（排除卸载器）
+            $exe = Get-ChildItem (Join-Path $env:LOCALAPPDATA 'Programs\AIArtEngine') -Filter '*.exe' -ErrorAction SilentlyContinue |
+              Where-Object Name -notlike 'Uninstall*' | Select-Object -First 1 -ExpandProperty FullName
+          }
+          if (-not $exe -or -not (Test-Path $exe)) { throw "Installed app not found (last tried: $exe)" }
+          Write-Host "SMOKE app exe: $exe"
+
+          # 关闭装完自动拉起的实例并等待完全退出，避免单实例锁导致误判
+          Get-Process AIArtEngine -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          $deadline = (Get-Date).AddSeconds(15)
+          while ((Get-Process AIArtEngine -ErrorAction SilentlyContinue) -and (Get-Date) -lt $deadline) {
+            Start-Sleep -Milliseconds 500
+          }
+          if (Get-Process AIArtEngine -ErrorAction SilentlyContinue) { throw 'Auto-launched instance still running; abort smoke' }
+
+          # 就绪探活：主进程在首个窗口加载完成后写就绪文件（见 src/main/smokeReady.ts），
+          # 比固定 sleep 更能证明「UI 真的起来了」；同时监测进程是否提前退出。
+          # 主进程 stdout / stderr 落文件：启动期抛错（例如 asar 内 require 不到模块）时
+          # Electron 会把异常与堆栈写到 stderr，失败时回显出来，免得只看到「未就绪」。
+          $readyFile = Join-Path $env:RUNNER_TEMP 'aiartengine-ready-win.json'
+          $appLog = Join-Path $env:RUNNER_TEMP 'aiartengine-smoke-app.log'
+          $appErr = Join-Path $env:RUNNER_TEMP 'aiartengine-smoke-app.err.log'
+          function Show-AppOutput {
+            if (Test-Path $appLog) { Write-Host '--- app stdout ---'; Get-Content $appLog -Raw }
+            if (Test-Path $appErr) { Write-Host '--- app stderr ---'; Get-Content $appErr -Raw }
+          }
+          Remove-Item $readyFile -ErrorAction SilentlyContinue
+          $env:AIART_SMOKE_READY_FILE = $readyFile
+          $app = Start-Process -FilePath $exe -PassThru -RedirectStandardOutput $appLog -RedirectStandardError $appErr
+          $ready = $false
+          $deadline = (Get-Date).AddSeconds(60)
+          while ((Get-Date) -lt $deadline) {
+            $app.Refresh()
+            if ($app.HasExited) {
+              Show-AppOutput
+              throw "SMOKE_FAIL app exited early with code $($app.ExitCode)"
+            }
+            if (Test-Path $readyFile) { $ready = $true; break }
+            Start-Sleep -Milliseconds 500
+          }
+          if (-not $ready) {
+            Show-AppOutput
+            throw 'SMOKE_FAIL app did not reach ready state within 60s'
+          }
+          Write-Host "SMOKE_OK app ready: $(Get-Content $readyFile -Raw)"
+          Stop-Process -Id $app.Id -Force
+          Remove-Item Env:AIART_SMOKE_READY_FILE -ErrorAction SilentlyContinue
+
+      - name: Smoke test — mount dmg & launch (macOS)
+        if: matrix.platform == 'mac'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # 启动 + 就绪探活：主进程在首个窗口加载完成后写就绪文件（src/main/smokeReady.ts）。
+          # 比固定 sleep 更强：既能捕获「启动即崩」，也能捕获「窗口起不来」。
+          # 第 3 参 TIMEOUT 默认 60s。原生架构下 6.0.0 实测 dmg/zip 均数秒就绪，60s 足够；
+          # 但 arm64 runner 上跑 x64 产物要走 Rosetta 2，首次翻译整个 Electron 框架、
+          # 并逐个 dylib 过代码签名校验，冷启动远超原生，必须单独放宽（见下方 x64 分支）。
+          # 第 4 参 EXIT_TIMEOUT 默认 30s：就绪后等应用自行优雅退出的预算。原生腿 1s 内退完；
+          # Rosetta 腿整条链路都被翻译拖慢，同一个退出要按同样倍率放宽（见下方 x64 分支）。
+          launch_app_smoke() {
+            local APP="$1" LABEL="$2" TIMEOUT="${3:-60}" EXIT_TIMEOUT="${4:-30}"
+            local BIN="$APP/Contents/MacOS/AIArtEngine"
+            local READY="$RUNNER_TEMP/aiartengine-ready-$LABEL.json"
+            local LOG="$RUNNER_TEMP/aiartengine-smoke-$LABEL.log"
+            if [ ! -x "$BIN" ]; then
+              echo "SMOKE_FAIL[$LABEL] binary missing: $BIN" >&2
+              exit 1
+            fi
+            rm -f "$READY"
+            echo "SMOKE[$LABEL] launching (timeout ${TIMEOUT}s): $BIN"
+            local STARTED=$SECONDS
+            # AIART_SMOKE_EXIT_AFTER_READY=1：应用写完就绪标记后自行优雅退出。
+            # 与 Linux 腿同一套理由——由外部 kill 只能终结进程，主进程若因故没被带走会继续
+            # 持有 userData 单实例锁，后续 dmg / zip 冒烟启动同一应用时会直接 app.quit()
+            # （表现为「exited early (code 0)」）；顺便把优雅退出路径纳入冒烟。
+            AIART_SMOKE_READY_FILE="$READY" AIART_SMOKE_EXIT_AFTER_READY=1 "$BIN" >"$LOG" 2>&1 &
+            local PID=$!
+            local DEADLINE=$((SECONDS + TIMEOUT))
+            local REQUESTED=0
+            while [ "$SECONDS" -lt "$DEADLINE" ]; do
+              if ! kill -0 "$PID" 2>/dev/null; then
+                local RC=0
+                wait "$PID" 2>/dev/null || RC=$?
+                if [ -f "$READY" ]; then
+                  echo "SMOKE_OK[$LABEL] app became ready then exited itself in $((SECONDS - STARTED))s: $(cat "$READY")"
+                  return 0
+                fi
+                echo "SMOKE_FAIL[$LABEL] app exited early (code $RC)" >&2
+                cat "$LOG" >&2 || true
+                exit 1
+              fi
+              if [ -f "$READY" ] && [ "$REQUESTED" -eq 0 ]; then
+                REQUESTED=1
+                echo "SMOKE[$LABEL] ready after $((SECONDS - STARTED))s: $(cat "$READY")"
+                # 给优雅退出留预算；原生腿 1s 内退完，Rosetta 腿按第 4 参放宽
+                DEADLINE=$((SECONDS + EXIT_TIMEOUT))
+              fi
+              sleep 1
+            done
+            if [ -f "$READY" ]; then
+              echo "SMOKE_FAIL[$LABEL] app became ready but did not exit within ${EXIT_TIMEOUT}s（优雅退出路径有问题）" >&2
+              tail -n 80 "$LOG" >&2 || true
+              kill "$PID" 2>/dev/null || true
+              exit 1
+            fi
+            echo "SMOKE_FAIL[$LABEL] app did not reach ready state within ${TIMEOUT}s" >&2
+            tail -n 80 "$LOG" >&2 || true
+            exit 1
+          }
+
+          run_dmg_smoke() {
+            local DMG="$1" LABEL="$2" TIMEOUT="${3:-60}" EXIT_TIMEOUT="${4:-30}"
+            local MNT="$RUNNER_TEMP/aiartengine-dmg-$LABEL"
+            local OUT="$RUNNER_TEMP/aiartengine-dmg-out-$LABEL"
+            echo "SMOKE[$LABEL] dmg: $DMG"
+            rm -rf "$MNT" "$OUT"
+            mkdir -p "$MNT" "$OUT"
+            hdiutil attach "$DMG" -nobrowse -readonly -mountpoint "$MNT" >/dev/null
+            cp -R "$MNT"/*.app "$OUT/"
+            hdiutil detach "$MNT" >/dev/null
+            launch_app_smoke "$(ls -d "$OUT"/*.app | head -n1)" "$LABEL" "$TIMEOUT" "$EXIT_TIMEOUT"
+          }
+
+          # electron-updater 的增量/全量更新走 zip 通道：解包结构应与 dmg 内 .app 一致
+          run_zip_smoke() {
+            local ZIP="$1" LABEL="$2" TIMEOUT="${3:-60}" EXIT_TIMEOUT="${4:-30}"
+            local OUT="$RUNNER_TEMP/aiartengine-zip-out-$LABEL"
+            echo "SMOKE[$LABEL] zip: $ZIP"
+            rm -rf "$OUT"
+            mkdir -p "$OUT"
+            ditto -x -k "$ZIP" "$OUT"
+            launch_app_smoke "$(ls -d "$OUT"/*.app | head -n1)" "$LABEL" "$TIMEOUT" "$EXIT_TIMEOUT"
+          }
+
+          # arm64（本机架构）：产物必带，缺失即视为打包异常
+          ARM64_DMG="$(ls dist/*arm64*.dmg 2>/dev/null | head -n1 || true)"
+          if [ -z "$ARM64_DMG" ]; then
+            echo 'SMOKE_FAIL no arm64 .dmg found' >&2
+            exit 1
+          fi
+          run_dmg_smoke "$ARM64_DMG" 'dmg-arm64'
+
+          ARM64_ZIP="$(ls dist/*arm64*.zip 2>/dev/null | head -n1 || true)"
+          if [ -n "$ARM64_ZIP" ]; then
+            run_zip_smoke "$ARM64_ZIP" 'zip-arm64'
+          else
+            echo 'WARN: no arm64 .zip found, skipping updater-channel smoke'
+          fi
+
+          # Intel (x64) 包：macos-latest 为 arm64，需 Rosetta 2 才能执行；装不上则跳过并告警
+          if ! arch -x86_64 /usr/bin/true 2>/dev/null; then
+            echo 'SMOKE: Rosetta 2 unavailable, installing for x64 smoke'
+            sudo softwareupdate --install-rosetta --agree-to-license || echo 'WARN: Rosetta install failed'
+          fi
+          X64_DMG="$(ls dist/*x64*.dmg 2>/dev/null | head -n1 || true)"
+          if arch -x86_64 /usr/bin/true 2>/dev/null; then
+            if [ -n "$X64_DMG" ]; then
+              # 300s 而非 60s：6.0.0 实测 arm64 产物数秒就绪，而 x64 产物在 Rosetta 下
+              # 60s 内未就绪（进程存活、只是没启动完，故报 did not reach ready state）。
+              # 这是翻译 + 签名校验的一次性冷启动开销，不是应用缺陷；放宽只影响上限，
+              # 「启动即崩」仍由循环里的 kill -0 立刻抓到。
+              #
+              # 第 4 参 180s 而非默认 30s：6.9.0 实测这条腿就绪用了 146s（原生 4s，约 36×），
+              # 收尾同样被逐进程翻译拖慢 —— 原生腿 1s 退完，x64 腿在 30s 预算里报
+              # 「became ready but did not exit」。退出本身没问题（同一条 will-quit 路径，
+              # arm64 两条腿都秒退），差的只是 Rosetta 的量级，故按同样倍率放宽。
+              run_dmg_smoke "$X64_DMG" 'dmg-x64' 300 180
+            else
+              echo 'WARN: no x64 .dmg found, skipping Intel smoke'
+            fi
+          else
+            echo 'WARN: skipping x64 .dmg smoke (Rosetta unavailable)'
+          fi
+
+      - name: Smoke test — run AppImage (Linux)
+        if: matrix.platform == 'linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          IMG="$(ls dist/*.AppImage 2>/dev/null | head -n1 || true)"
+          [ -n "$IMG" ] || { echo 'SMOKE_FAIL no .AppImage found' >&2; exit 1; }
+          echo "SMOKE AppImage: $IMG"
+          chmod +x "$IMG"
+          # GitHub ubuntu runner 无 FUSE：APPIMAGE_EXTRACT_AND_RUN=1 强制解包运行；
+          # Electron 需系统 GUI 库与显示服务器，缺则先补（包名兼容 22.04/24.04 的 t64 迁移）。
+          sudo apt-get update -qq
+          if ! sudo apt-get install -y -qq xvfb libnss3 libnspr4 libatk1.0-0t64 libatk-bridge2.0-0t64 \
+              libcups2t64 libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1 \
+              libasound2t64 libpango-1.0-0t64 libcairo2 libgtk-3-0t64 libegl1 libgl1 libxss1 libxtst6 libnotify4; then
+            sudo apt-get install -y -qq xvfb libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 libcups2 \
+              libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1 libasound2 \
+              libpango-1.0-0 libcairo2 libgtk-3-0 libegl1 libgl1 libxss1 libxtst6 libnotify4 || \
+              echo 'WARN: apt GUI libs unavailable; proceeding and relying on preinstalled deps'
+          fi
+          # 就绪探活：主进程在首个窗口加载完成后写就绪文件（src/main/smokeReady.ts）。
+          # 启动 / 等待 / 收尾封装成函数，AppImage 与 deb 两条腿共用同一套语义。
+          #
+          # 收尾必须等到进程**真正退出**：命令是 `xvfb-run -a <bin>`，$! 拿到的是包装脚本，
+          # 直接 kill 它会让真正的应用进程变成孤儿 —— 它会继续持有 userData 的单实例锁，
+          # 后面的 deb 冒烟就会因抢不到锁而 app.quit()（表现为 exited early (code 0)，不是崩溃）。
+          # 单实例锁见 src/main/index.ts。
+          cat > "$RUNNER_TEMP/aiartengine-smoke-linux.sh" <<'SMOKE_EOF'
+          #!/usr/bin/env bash
+
+          # 收尾：找出本应用残留进程，SIGTERM 后轮询等它真正退出（最多 30s），再补 SIGKILL。
+          #
+          # 判据用的是「命令行里带 --user-data-dir=<本应用 userData>」——Electron 会给主进程与
+          # 所有子进程（gpu / utility / renderer）都加这个参数，比按二进制路径匹配可靠得多：
+          # AppImage 解包运行后命令行的可执行路径是 `/tmp/appimage_extracted_<hash>/aiartengine`，
+          # 与调用方给的 `.AppImage` 文件路径对不上 —— 实测（v6.8.0 release）就是这样
+          # 一个进程都没杀掉，残留实例继续持有单实例锁，下一条腿启动时抢不到锁而以 code 0 早退。
+          # userData 目录由产品名决定（app.getPath('userData')），与打包形态无关，两种腿都适用。
+          smoke_pids() {
+            local userdata="$1"
+            # 模式写成 `--user-data-di[r]=` 是刻意的：字符类把字面串打断，
+            # 这样 pgrep 自己的命令行不会匹配到自己的模式（否则会把自己也算成残留进程）。
+            # $PPID 是本函数所在 shell 的父进程（step 脚本），显式排除自身与父进程，避免自杀。
+            # 用 pgrep -f 而不是遍历 /proc：它内部处理「进程在枚举与读取之间退出」的竞态，
+            # 不会像手写遍历那样刷一屏 "No such file or directory"。
+            pgrep -f -- "--user-data-di[r]=$userdata" 2>/dev/null | grep -vx -e "$$" -e "$PPID" || true
+          }
+
+          # 僵尸态（Z）已死、等父进程回收，不算存活 —— 否则 k8s/CI 里会出现「等它退出等到超时」
+          smoke_alive() {
+            local state
+            state="$(ps -o stat= -p "$1" 2>/dev/null | tr -d '[:space:]')"
+            [ -n "$state" ] && [ "${state#Z}" = "$state" ]
+          }
+
+          # 等给定进程全部退出；返回 0 表示确认退出，1 表示超时仍有存活
+          smoke_wait_gone() {
+            local timeout="$1"
+            shift
+            local deadline=$((SECONDS + timeout)) pid
+            while [ "$SECONDS" -lt "$deadline" ]; do
+              local any=0
+              for pid in "$@"; do
+                if smoke_alive "$pid"; then any=1; fi
+              done
+              [ "$any" -eq 0 ] && return 0
+              sleep 0.5
+            done
+            return 1
+          }
+
+          # 进程组剩余成员（排除僵尸态）：组长退出后子进程可能被 reparent 但仍留在组内，
+          # 所以必须按组枚举，不能只看组长
+          smoke_group_pids() {
+            local pgid="$1"
+            ps -eo pgid=,pid=,stat= 2>/dev/null | awk -v g="$pgid" \
+              '$1 == g && $3 !~ /^Z/ { print $2 }' || true
+          }
+
+          smoke_wait_group_gone() {
+            local pgid="$1" timeout="$2"
+            local deadline=$((SECONDS + timeout))
+            while [ "$SECONDS" -lt "$deadline" ]; do
+              smoke_group_pids "$pgid" | grep -q . || return 0
+              sleep 0.5
+            done
+            return 1
+          }
+
+          # $1 userData；$2 日志前缀（可选）；$3 进程组 id（可选，优先按组整组收尾）
+          smoke_stop() {
+            local userdata="$1" label="${2:-cleanup}" pgid="${3:-}"
+            local pids=() pid
+
+            # 首选按进程组收尾：启动时用 setsid 让应用自成一组，-PGID 一次带走主进程与
+            # 全部子进程（gpu / utility / renderer）。只杀主进程会让子进程变成孤儿继续
+            # 持有 userData 单实例锁 —— 实测 v6.8.0 release 第三轮就是 gpu 与 utility
+            # 两个子进程活了下来，导致下一条腿的实例抢不到锁而以 code 0 早退。
+            if [ -n "$pgid" ]; then
+              if kill -TERM -- "-$pgid" 2>/dev/null; then
+                echo "SMOKE[$label] SIGTERM to process group $pgid"
+                if smoke_wait_group_gone "$pgid" 20; then
+                  return 0
+                fi
+                echo "SMOKE[$label] group $pgid still has members, sending SIGKILL" >&2
+                kill -KILL -- "-$pgid" 2>/dev/null || true
+                smoke_wait_group_gone "$pgid" 10 && return 0
+              fi
+            fi
+
+            # 兜底：按 userData 扫一遍漏网进程（进程组之外的残留、或未用 setsid 启动的情形）
+            while read -r pid; do
+              [ -n "$pid" ] && pids+=("$pid")
+            done < <(smoke_pids "$userdata")
+            if [ "${#pids[@]}" -eq 0 ]; then
+              echo "SMOKE[$label] no leftover process"
+              return 0
+            fi
+            echo "SMOKE[$label] leftover pids: ${pids[*]}"
+            kill -TERM "${pids[@]}" 2>/dev/null || true
+            if smoke_wait_gone 15 "${pids[@]}"; then
+              # 幂等补一轮：第一次枚举之后才 fork 出来的子进程（Electron 启动期很常见）
+              # 不在原列表里，再枚举一次确保没有漏网
+              local again=()
+              while read -r pid; do
+                [ -n "$pid" ] && again+=("$pid")
+              done < <(smoke_pids "$userdata")
+              if [ "${#again[@]}" -eq 0 ]; then
+                return 0
+              fi
+              echo "SMOKE[$label] new leftovers after settle, killing: ${again[*]}"
+              kill -TERM "${again[@]}" 2>/dev/null || true
+              smoke_wait_gone 15 "${again[@]}" || true
+              return 0
+            fi
+
+            echo "SMOKE[$label] still alive after SIGTERM, sending SIGKILL: ${pids[*]}" >&2
+            kill -KILL "${pids[@]}" 2>/dev/null || true
+            smoke_wait_gone 10 "${pids[@]}" && return 0
+            echo "SMOKE[$label] processes survived SIGKILL: ${pids[*]}" >&2
+            return 1
+          }
+
+          # 失败诊断：日志 + 本应用残留进程 + userData 单实例锁，一眼看出是不是锁没释放
+          smoke_dump() {
+            local log="$1" userdata="$2"
+            echo '--- app output ---' >&2
+            cat "$log" >&2 2>/dev/null || true
+            echo '--- leftover processes (by userData) ---' >&2
+            local pids
+            pids="$(smoke_pids "$userdata" | tr '\n' ' ')"
+            if [ -n "$pids" ]; then
+              ps -o pid=,args= -p $pids >&2 2>/dev/null || echo "(pids: $pids)" >&2
+            else
+              echo '(none)' >&2
+            fi
+            echo '--- userData singleton lock ---' >&2
+            ls -la "$userdata/Singleton"* >&2 2>/dev/null || echo '(no lock files)' >&2
+          }
+
+          # $1 二进制；$2 退出诊断前缀；$3 超时秒数（默认 60）；$4 环境变量前缀（默认空）
+          smoke_launch() {
+            local bin="$1" label="$2" timeout="${3:-60}" envprefix="${4:-}"
+            local ready="$RUNNER_TEMP/aiartengine-ready-$label.json"
+            local log="$RUNNER_TEMP/aiartengine-smoke-$label.log"
+            if [ ! -x "$bin" ]; then
+              echo "SMOKE_FAIL[$label] binary missing or not executable: $bin" >&2
+              return 1
+            fi
+            # 启动前先清干净：上一条腿（或上一轮）若有残留实例，它会持有单实例锁，
+            # 本次启动会直接 app.quit()，表现为「exited early (code 0)」而不是崩溃
+            smoke_stop "$USER_DATA" "pre-$label" || echo "WARN[$label] leftover process did not exit in time" >&2
+            rm -f "$ready" "$log"
+            local started=$SECONDS
+            # setsid --wait --fork：让应用自成进程组（PGID = $!），且 setsid 自身等应用结束再退出。
+            # --wait 不能省：setsid 默认 fork 后父进程立即退出，$! 会指向一个立刻变成僵尸的父进程，
+            # 而僵尸在本脚本里算「已退出」——会把正常启动误判成 early exit。
+            # AIART_SMOKE_EXIT_AFTER_READY=1 让应用写完就绪标记后自行优雅退出：
+            # 由外部 kill 只能终结进程，主进程若因故没被带走会继续持有单实例锁，
+            # 下一条腿启动时抢不到锁、以 code 0 静默早退（本 bug 的根源就在这里）。
+            AIART_SMOKE_READY_FILE="$ready" AIART_SMOKE_EXIT_AFTER_READY=1 \
+              setsid --wait --fork ${envprefix:+env $envprefix} xvfb-run -a "$bin" --no-sandbox >"$log" 2>&1 &
+            local pid=$!
+            local pgid="$pid"
+            local deadline=$((SECONDS + timeout))
+            local requested=0
+            while [ "$SECONDS" -lt "$deadline" ]; do
+              # 僵尸态视为已退出：xvfb-run 中途被其它因素收掉时，kill -0 会一直为真而白等
+              if ! smoke_alive "$pid"; then
+                local rc=0
+                wait "$pid" 2>/dev/null || rc=$?
+                if [ -f "$ready" ]; then
+                  echo "SMOKE_OK[$label] app became ready then exited itself in $((SECONDS - started))s: $(cat "$ready")"
+                  smoke_stop "$USER_DATA" "post-$label" "$pgid" || echo "WARN[$label] cleanup incomplete" >&2
+                  return 0
+                fi
+                echo "SMOKE_FAIL[$label] app exited early (code $rc)" >&2
+                smoke_dump "$log" "$USER_DATA"
+                smoke_stop "$USER_DATA" "post-$label" "$pgid" || true
+                return 1
+              fi
+              if [ -f "$ready" ] && [ "$requested" -eq 0 ]; then
+                requested=1
+                echo "SMOKE[$label] ready after $((SECONDS - started))s: $(cat "$ready")"
+                # 给优雅退出留一段预算（应用要收尾 MCP 服务与 dsh 常驻进程）
+                deadline=$((SECONDS + 25))
+              fi
+              sleep 1
+            done
+            if [ -f "$ready" ]; then
+              echo "SMOKE_FAIL[$label] app became ready but did not exit within 25s（优雅退出路径有问题）" >&2
+              smoke_dump "$log" "$USER_DATA"
+              smoke_stop "$USER_DATA" "post-$label" "$pgid" || true
+              return 1
+            fi
+            echo "SMOKE_FAIL[$label] app did not reach ready state within ${timeout}s" >&2
+            smoke_dump "$log" "$USER_DATA"
+            smoke_stop "$USER_DATA" "post-$label" "$pgid" || true
+            return 1
+          }
+          SMOKE_EOF
+          chmod +x "$RUNNER_TEMP/aiartengine-smoke-linux.sh"
+
+          # 本应用的 userData：Electron 由产品名推导（Linux 为 $XDG_CONFIG_HOME/<productName>，
+          # 默认 ~/.config/<productName>）。残留进程与单实例锁都按这个目录识别。
+          export USER_DATA="${XDG_CONFIG_HOME:-$HOME/.config}/aiartengine"
+
+          # AppImage 在无 FUSE 的 runner 上必须走解包运行
+          source "$RUNNER_TEMP/aiartengine-smoke-linux.sh"
+          smoke_launch "$IMG" appimage 60 'APPIMAGE_EXTRACT_AND_RUN=1'
+
+      # deb 走「真实安装 → 启动 → 卸载」全链路：这是 Fedora 之外的 Linux 桌面主路径，
+      # AppImage 免安装运行无法覆盖（安装目录、desktop 入口、依赖、卸载器）。
+      - name: Smoke test — install deb, launch & uninstall (Linux)
+        if: matrix.platform == 'linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          DEB="$(ls dist/*.deb 2>/dev/null | head -n1 || true)"
+          if [ -z "$DEB" ]; then
+            echo 'SMOKE_FAIL no .deb found' >&2
+            exit 1
+          fi
+          echo "SMOKE installing deb: $DEB"
+          # 用 apt 装本地 deb，由它一并解析依赖（t64 重命名已在 deb.depends 里做 OR 兼容）。
+          # 不再用 `dpkg -i || apt-get -f install`：前者在依赖缺失时必然失败，会把
+          # 「needrestart is being skipped since dpkg has failed」这类噪声打进日志，
+          # 让「安装到底成功没有」变得含糊——6.0.0 排障时就被它带偏过一次。
+          sudo apt-get install -y -qq ./"$DEB"
+
+          # 安装成败不看上一条命令的退出码，直接查 dpkg 记的包状态（权威判据）。
+          # 包名同时用来推导入口名：Linux 上 executableName 取的是 package.json name 的
+          # 小写形式（app-builder-lib/out/linuxPackager.js），productName 只决定 /opt 下的
+          # 安装目录名——两者大小写不同（aiartengine vs AIArtEngine），硬编码任一个都会踩坑。
+          PKG="$(dpkg-deb -f "$DEB" Package)"
+          STATUS="$(dpkg-query -W -f='${Status}' "$PKG" 2>/dev/null || true)"
+          if [ "$STATUS" != 'install ok installed' ]; then
+            echo "SMOKE_FAIL package not installed properly: $PKG -> '${STATUS:-<none>}'" >&2
+            exit 1
+          fi
+
+          # 优先用用户真正的入口：postinst 经 update-alternatives 建的 /usr/bin/<executable>；
+          # 取不到再按包名去 /opt 兜底（postinst 在无 update-alternatives 时退化成软链）。
+          BIN="/usr/bin/$PKG"
+          if [ ! -x "$BIN" ]; then
+            BIN="$(find /opt -maxdepth 3 -type f -perm -u+x 2>/dev/null | awk -v p="$PKG" 'tolower($NF) == tolower(p)' | head -n1 || true)"
+          fi
+          if [ -z "$BIN" ] || [ ! -x "$BIN" ]; then
+            echo "SMOKE_FAIL installed binary missing (expected /usr/bin/$PKG)" >&2
+            echo 'SMOKE: 列出 /opt 下的可执行文件，便于定位命名差异:' >&2
+            find /opt -maxdepth 3 -type f -perm -u+x 2>/dev/null | head -n 20 >&2 || true
+            exit 1
+          fi
+          echo "SMOKE installed binary: $BIN"
+
+          # 启动冒烟：复用 AppImage 步骤定义的 smoke_launch（含「等到进程真正退出」的收尾，
+          # 否则残留实例会持有单实例锁，导致下一条腿抢不到锁而以 code 0 早退）
+          export USER_DATA="${XDG_CONFIG_HOME:-$HOME/.config}/aiartengine"
+          source "$RUNNER_TEMP/aiartengine-smoke-linux.sh"
+          LAUNCH_OK=0
+          smoke_launch "$BIN" deb 60 || LAUNCH_OK=$?
+          if [ "$LAUNCH_OK" != 0 ]; then
+            echo 'SMOKE_WARN 启动冒烟失败，仍继续执行卸载冒烟（安装/卸载链路本身需要验证）' >&2
+          fi
+
+          # 卸载冒烟：安装包必须能被干净移除（用户卸载路径同样是交付质量的一部分）
+          echo "SMOKE removing package: $PKG"
+          sudo dpkg -r "$PKG"
+          if [ -e "$BIN" ]; then
+            echo "SMOKE_FAIL binary still present after removal: $BIN" >&2
+            exit 1
+          fi
+          echo 'SMOKE_OK deb uninstall clean'
+
+          # 启动冒烟失败不即时中断（要留给卸载冒烟跑），但**最终仍必须让这一步失败**：
+          # 否则「装得上 / 卸得掉」会掩盖「装完起不来」。
+          if [ "$LAUNCH_OK" != 0 ]; then
+            echo 'SMOKE_FAIL deb 启动冒烟未通过（详见上方 SMOKE_FAIL 与诊断输出）' >&2
+            exit 1
+          fi
+
+  release:
+    name: GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v7
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: List release assets
+        run: find release-assets -type f | sort
+
+      # v3 起基于 Node 24（v2 用已弃用的 Node 20，runner 会强制升级并告警）
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: AIArtEngine ${{ github.ref_name }}
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          generate_release_notes: true
+          files: |
+            release-assets/**
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

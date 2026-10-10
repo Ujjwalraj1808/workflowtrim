@@ -1,0 +1,30 @@
+name: Rust Lint
+on:
+  pull_request:
+    paths:
+      - 'rust/**'
+      - '.github/workflows/rust-lint.yaml'
+
+env:
+  SCCACHE_GHA_ENABLED: "true"
+  SCCACHE_CACHE_SIZE: "2G"
+  RUSTC_WRAPPER: "sccache"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+          toolchain: 1.96
+      - uses: mozilla-actions/sccache-action@v0.0.11
+      - name: Check formatting
+        working-directory: ./rust
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        if: ${{ always() }}
+        working-directory: ./rust
+        run: cargo clippy --no-deps --all-targets -- -W clippy::pedantic -D warnings

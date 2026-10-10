@@ -1,0 +1,708 @@
+# This workflow validates the complete product build and tests on Windows to catch platform-specific issues
+name: 🪟 Windows Build Validation
+
+on:
+  schedule:
+    # Runs every day at 12:00 AM IST (which is 18:30 UTC of the previous day)
+    - cron: '30 18 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+env:
+  GOFLAGS: "-mod=readonly"
+  PRODUCT_NAME: "ThunderID"
+  PRODUCT_NAME_LOWER: "thunderid"
+  NODE_VERSION: "lts/*"
+  PNPM_VERSION: "latest"
+
+jobs:
+  build-windows:
+    name: 🛠️ Build Product (Windows)
+    runs-on: windows-latest
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: ⚙️ Set up Go Environment
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: backend/go.mod
+          # No go.sum at the repository root, so the default lookup finds nothing.
+          cache-dependency-path: "**/go.sum"
+          cache: true
+
+      - name: ⚙️ Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: 📦 Install pnpm
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          run_install: false
+          version: ${{ env.PNPM_VERSION }}
+
+      - name: 🗄️ Get pnpm store directory
+        shell: pwsh
+        run: |
+          echo "STORE_PATH=$(pnpm store path --silent)" >> $env:GITHUB_ENV
+
+      - name: 🗄️ Setup pnpm cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.STORE_PATH }}
+          key: ${{ runner.os }}-pnpm-store-${{ hashFiles('**/pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-pnpm-store-
+
+      - name: 📦 Install SQLite3
+        shell: pwsh
+        run: |
+          choco install sqlite -y
+          # Add only the sqlite3 directory to PATH for subsequent steps
+          $sqlitePath = (Get-Command sqlite3 -ErrorAction SilentlyContinue).Source
+          if (-not $sqlitePath) {
+            # Refresh PATH from registry to find newly installed sqlite3
+            $machinePath = [System.Environment]::GetEnvironmentVariable("Path","Machine")
+            $userPath = [System.Environment]::GetEnvironmentVariable("Path","User")
+            $env:Path = "$machinePath;$userPath"
+            $sqlitePath = (Get-Command sqlite3 -ErrorAction SilentlyContinue).Source
+            if (-not $sqlitePath) {
+              Write-Host "❌ sqlite3 not found after PATH refresh. Installation may have failed."
+              exit 1
+            }
+          }
+          $sqliteDir = Split-Path -Parent $sqlitePath
+          echo "$sqliteDir" >> $env:GITHUB_PATH
+          sqlite3 --version
+
+      - name: 📦 Install Backend Dependencies
+        shell: pwsh
+        run: |
+          Set-Location backend
+          go mod download
+          Set-Location ../tests/integration
+          go mod download
+
+      - name: 🧹 Clean Previous Builds
+        shell: pwsh
+        run: ./build.ps1 clean
+
+      - name: 🔨 Build Frontend
+        shell: pwsh
+        run: ./build.ps1 build_frontend
+
+      - name: 🔨 Build Backend and Package
+        shell: pwsh
+        run: ./build.ps1 build_backend
+
+      - name: ✅ Verify Build Artifacts
+        shell: pwsh
+        run: |
+          $distPath = "target/dist"
+          if (Test-Path $distPath) {
+            $artifacts = Get-ChildItem -Path $distPath -Filter "$env:PRODUCT_NAME_LOWER-*.zip"
+            if ($artifacts.Count -gt 0) {
+              Write-Host "✅ Build artifacts found:"
+              $artifacts | ForEach-Object { Write-Host "  - $($_.Name)" }
+            } else {
+              Write-Host "❌ No distribution zip files found in $distPath"
+              exit 1
+            }
+          } else {
+            Write-Host "❌ Distribution directory not found: $distPath"
+            exit 1
+          }
+
+      # TODO: Re-enable frontend tests after E2E issues are resolved
+      # - name: 🧪 Run Console Tests
+      #   working-directory: frontend/apps/console
+      #   run: pnpm test:coverage
+
+      # - name: 🧪 Run Gate Tests
+      #   working-directory: frontend/apps/gate
+      #   run: pnpm test:coverage
+
+      - name: 📦 Upload Windows Distribution
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ env.PRODUCT_NAME_LOWER }}-windows-distribution-${{ github.run_id }}
+          path: target/dist/${{ env.PRODUCT_NAME_LOWER }}-*-win-*.zip
+          if-no-files-found: error
+
+  build-samples-windows:
+    name: 🛠️ Build Sample Apps (Windows)
+    runs-on: windows-latest
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: ⚙️ Set up Go Environment
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: backend/go.mod
+          # No go.sum at the repository root, so the default lookup finds nothing.
+          cache-dependency-path: "**/go.sum"
+
+      - name: ⚙️ Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 'lts/*'
+
+      - name: 📦 Package Sample Apps
+        shell: pwsh
+        run: |
+          ./build.ps1 package_samples
+
+      - name: 📦 Upload Built Sample App
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sample-app-react-sdk-windows-${{ github.run_id }}
+          path: target/dist/sample-app-react-sdk-*.zip
+          if-no-files-found: error
+
+  test-integration-windows:
+    name: 🧪 Integration Tests (SQLite)
+    needs: build-windows
+    runs-on: windows-latest
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: ⚙️ Set up Go Environment
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: backend/go.mod
+          # No go.sum at the repository root, so the default lookup finds nothing.
+          cache-dependency-path: "**/go.sum"
+          cache: true
+
+      - name: 📦 Install SQLite3
+        shell: pwsh
+        run: |
+          choco install sqlite -y
+          $sqlitePath = (Get-Command sqlite3 -ErrorAction SilentlyContinue).Source
+          if (-not $sqlitePath) {
+            $machinePath = [System.Environment]::GetEnvironmentVariable("Path","Machine")
+            $userPath = [System.Environment]::GetEnvironmentVariable("Path","User")
+            $env:Path = "$machinePath;$userPath"
+            $sqlitePath = (Get-Command sqlite3 -ErrorAction SilentlyContinue).Source
+            if (-not $sqlitePath) {
+              Write-Host "❌ sqlite3 not found after PATH refresh. Installation may have failed."
+              exit 1
+            }
+          }
+          $sqliteDir = Split-Path -Parent $sqlitePath
+          echo "$sqliteDir" >> $env:GITHUB_PATH
+          sqlite3 --version
+
+      - name: 📥 Download Built Distribution
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ env.PRODUCT_NAME_LOWER }}-windows-distribution-${{ github.run_id }}
+          path: target/dist/
+
+      - name: 📦 Install Dependencies
+        shell: pwsh
+        run: |
+          Set-Location backend
+          go mod download
+          Set-Location ../tests/integration
+          go mod download
+
+      - name: 📝 Configure Test Database (SQLite)
+        shell: pwsh
+        run: ./tests/integration/resources/scripts/setup-test-config.ps1 -DbType sqlite
+
+      - name: 🧪 Run Integration Tests (SQLite)
+        shell: pwsh
+        run: ./build.ps1 test_integration
+        env:
+          DB_TYPE: sqlite
+
+  test-e2e-windows:
+    name: 🎭 Playwright E2E Tests (Windows)
+    needs: [build-windows, build-samples-windows]
+    runs-on: windows-latest
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: ⚙️ Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 'lts/*'
+
+      - name: 📥 Download Built Distribution
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ env.PRODUCT_NAME_LOWER }}-windows-distribution-${{ github.run_id }}
+          path: target/dist/
+
+      - name: 📥 Download Built Sample App
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: sample-app-react-sdk-windows-${{ github.run_id }}
+          path: target/dist/
+
+      - name: 📂 Extract Server
+        shell: pwsh
+        run: |
+          New-Item -Path "tests/e2e/server" -ItemType Directory -Force | Out-Null
+          $zipFile = Get-ChildItem -Path "target/dist" -Filter "$env:PRODUCT_NAME_LOWER-*.zip" | Select-Object -First 1
+          if (-not $zipFile) {
+            Write-Host "❌ Distribution zip not found in target/dist"
+            Get-ChildItem -Path "target/dist"
+            exit 1
+          }
+          Write-Host "Extracting $($zipFile.FullName)..."
+          Expand-Archive -Path $zipFile.FullName -DestinationPath "tests/e2e/server" -Force
+
+          # Move contents from the extracted subfolder to server root
+          $extractedDir = Get-ChildItem -Path "tests/e2e/server" -Directory -Filter "$env:PRODUCT_NAME_LOWER-*" | Select-Object -First 1
+          if ($extractedDir) {
+            Get-ChildItem -Path $extractedDir.FullName -Force | Move-Item -Destination "tests/e2e/server" -Force
+            Remove-Item -Path $extractedDir.FullName -Recurse -Force
+          }
+
+      - name: 🚀 Run Setup
+        shell: pwsh
+        run: |
+          Set-Location "tests/e2e/server"
+          ./setup.ps1
+
+      - name: 🚀 Start Server
+        shell: bash
+        run: |
+          cd tests/e2e/server
+          ./${PRODUCT_NAME_LOWER}.exe > server.log 2>&1 &
+          echo "SERVER_PID=$!" >> $GITHUB_ENV
+          sleep 5
+
+          # Wait for server to be ready
+          echo "Waiting for server to be ready on https://localhost:8090..."
+          for i in $(seq 1 60); do
+            if curl -sk https://localhost:8090/health/liveness > /dev/null 2>&1; then
+              echo "Server is UP!"
+              break
+            fi
+            echo "Still waiting ($i/60)..."
+            sleep 2
+          done
+
+          # Verify server is running
+          if ! curl -sk https://localhost:8090/health/liveness > /dev/null 2>&1; then
+            echo "❌ Server failed to start within 2 minutes"
+            cat server.log || true
+            exit 1
+          fi
+          echo "Server started successfully!"
+
+      - name: 🔍 Extract Sample App ID
+        id: extract-app-id
+        shell: bash
+        run: |
+          echo "Fetching applications from server..."
+          response=$(curl -sk https://localhost:8090/applications)
+          sample_app_id=$(echo "$response" | jq -r '.applications[] | select(.name == "Sample App") | .id')
+
+          if [ -n "$sample_app_id" ] && [ "$sample_app_id" != "null" ]; then
+            echo "✅ Sample App ID extracted: $sample_app_id"
+            echo "sample_app_id=$sample_app_id" >> $GITHUB_OUTPUT
+          else
+            echo "❌ Sample App not found in applications list"
+            echo "Response: $response"
+            exit 1
+          fi
+
+      - name: 🔄 Restart Server with Security Enabled
+        shell: bash
+        run: |
+          echo "Stopping server..."
+          kill $SERVER_PID || true
+          sleep 5
+
+          cd tests/e2e/server
+          ./${PRODUCT_NAME_LOWER}.exe > server-secure.log 2>&1 &
+          echo "SERVER_PID=$!" >> $GITHUB_ENV
+          sleep 5
+
+          # Wait for server to be ready
+          echo "Waiting for server to be ready on https://localhost:8090..."
+          for i in $(seq 1 60); do
+            if curl -sk https://localhost:8090/health/liveness > /dev/null 2>&1; then
+              echo "Server is UP with security enabled!"
+              break
+            fi
+            echo "Still waiting ($i/60)..."
+            sleep 2
+          done
+
+          # Verify server is running
+          if ! curl -sk https://localhost:8090/health/liveness > /dev/null 2>&1; then
+            echo "❌ Server failed to restart within 2 minutes"
+            cat server-secure.log || true
+            exit 1
+          fi
+          echo "Server restarted successfully with security enabled!"
+
+      - name: 📂 Extract Sample App
+        shell: pwsh
+        run: |
+          New-Item -Path "tests/e2e/sample-app" -ItemType Directory -Force | Out-Null
+
+          $sampleZip = Get-ChildItem -Path "target/dist" -Filter "sample-app-react-sdk-*.zip" | Select-Object -First 1
+          if (-not $sampleZip) {
+            Write-Host "❌ Sample app zip not found in target/dist"
+            Get-ChildItem -Path "target/dist"
+            exit 1
+          }
+
+          Write-Host "Extracting $($sampleZip.Name)..."
+          Expand-Archive -Path $sampleZip.FullName -DestinationPath "tests/e2e/sample-app" -Force
+
+          # Move contents from extracted subfolder
+          $extractedDir = Get-ChildItem -Path "tests/e2e/sample-app" -Directory -Filter "sample-app-*" | Select-Object -First 1
+          if ($extractedDir) {
+            Get-ChildItem -Path $extractedDir.FullName -Force | Move-Item -Destination "tests/e2e/sample-app" -Force
+            Remove-Item -Path $extractedDir.FullName -Recurse -Force
+          }
+
+      - name: 📱 Start Sample App
+        shell: bash
+        run: |
+          cd tests/e2e/sample-app
+
+          echo "Installing dependencies..."
+          npm install
+
+          echo "Generating SSL certificates..."
+          openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+              -keyout server.key \
+              -out server.cert \
+              -subj "/O=ThunderID/OU=${{ env.PRODUCT_NAME }}/CN=localhost" \
+              > /dev/null 2>&1
+
+          echo "Starting Sample App..."
+          npm run dev > sample-app.log 2>&1 &
+
+          # Wait for sample app to be ready
+          echo "Waiting for sample app to be ready on https://localhost:3000..."
+          for i in $(seq 1 60); do
+            if curl -sk https://localhost:3000 > /dev/null 2>&1; then
+              echo "Sample App is UP!"
+              break
+            fi
+            echo "Still waiting ($i/60)..."
+            sleep 2
+          done
+
+          # Verify sample app is running
+          if ! curl -sk https://localhost:3000 > /dev/null 2>&1; then
+            echo "❌ Sample app failed to start within 2 minutes"
+            cat sample-app.log || true
+            exit 1
+          fi
+          echo "Sample App started successfully!"
+
+      - name: 📦 Install E2E Dependencies
+        working-directory: tests/e2e
+        run: pnpm i
+
+      - name: 🎭 Install Playwright Browsers
+        working-directory: tests/e2e
+        run: pnpm exec playwright install --with-deps
+        timeout-minutes: 15
+
+      - name: 🔍 Verify Services Before Tests
+        shell: pwsh
+        run: |
+          Write-Host "Checking server..."
+          $serverProcs = Get-Process -Name "$env:PRODUCT_NAME_LOWER" -ErrorAction SilentlyContinue
+          if ($serverProcs) {
+            Write-Host "✅ Server process running (PID: $($serverProcs.Id -join ', '))"
+          } else {
+            Write-Host "❌ Server process NOT found"
+            Write-Host "Server log:"
+            $logPath = "tests/e2e/server/server-secure.log"
+            if (Test-Path $logPath) { Get-Content $logPath } else { Write-Host "(no log)" }
+            $errPath = "tests/e2e/server/server-secure-err.log"
+            if (Test-Path $errPath) { Get-Content $errPath } else { Write-Host "(no error log)" }
+          }
+          try {
+            $response = Invoke-WebRequest -Uri "https://localhost:8090/health/liveness" -SkipCertificateCheck -TimeoutSec 5
+            Write-Host "✅ Server responding (status: $($response.StatusCode))"
+          } catch {
+            Write-Host "❌ Server not responding: $_"
+          }
+
+          Write-Host "Checking Sample App..."
+          try {
+            Invoke-WebRequest -Uri "https://localhost:3000" -SkipCertificateCheck -TimeoutSec 5 | Out-Null
+            Write-Host "✅ Sample App responding"
+          } catch {
+            Write-Host "❌ Sample App not responding: $_"
+            $appLog = "tests/e2e/sample-app/sample-app.log"
+            if (Test-Path $appLog) { Write-Host "App log:"; Get-Content $appLog }
+          }
+
+      - name: 🎭 Run Playwright Tests (Chromium)
+        working-directory: tests/e2e
+        run: pnpm exec playwright test --project=chromium
+        env:
+          NODE_TLS_REJECT_UNAUTHORIZED: '0'
+          BASE_URL: ${{ secrets.PLAYWRIGHT_BASE_URL || vars.PLAYWRIGHT_BASE_URL || 'https://localhost:8090' }}
+          ADMIN_USERNAME: ${{ secrets.PLAYWRIGHT_ADMIN_USERNAME || 'admin' }}
+          ADMIN_PASSWORD: ${{ secrets.PLAYWRIGHT_ADMIN_PASSWORD || 'admin' }}
+          TEST_USER_USERNAME: ${{ secrets.PLAYWRIGHT_TEST_USER_USERNAME || 'testuser' }}
+          TEST_USER_PASSWORD: ${{ secrets.PLAYWRIGHT_TEST_USER_PASSWORD || 'admin' }}
+          PLAYWRIGHT_WORKERS: ${{ vars.PLAYWRIGHT_WORKERS || 1 }}
+          DEBUG_AUTH: ${{ vars.PLAYWRIGHT_DEBUG_AUTH || 'false' }}
+          SAMPLE_APP_ID: ${{ steps.extract-app-id.outputs.sample_app_id }}
+          SAMPLE_APP_URL: 'https://localhost:3000'
+          SERVER_URL: 'https://localhost:8090'
+          AUTO_SETUP_MFA: ${{ vars.AUTO_SETUP_MFA || 'true' }}
+          MOCK_SMS_SERVER_PORT: ${{ vars.MOCK_SMS_SERVER_PORT || 8098 }}
+          SAMPLE_APP_USERNAME: ${{ secrets.SAMPLE_APP_USERNAME || 'e2e-test-user' }}
+          SAMPLE_APP_PASSWORD: ${{ secrets.SAMPLE_APP_PASSWORD || 'e2e-test-password' }}
+
+      - name: 📊 Upload Playwright Report
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ !cancelled() }}
+        with:
+          name: playwright-report-windows-${{ github.run_id }}
+          path: tests/e2e/playwright-report/
+          retention-days: 30
+
+  report-results:
+    name: 📊 Report Results
+    runs-on: ubuntu-latest
+    needs: [build-windows, build-samples-windows, test-integration-windows, test-e2e-windows]
+    if: always()
+    steps:
+      - name: 📊 Check Overall Status
+        id: check_status
+        run: |
+          BUILD_STATUS="${{ needs.build-windows.result }}"
+          SAMPLES_STATUS="${{ needs.build-samples-windows.result }}"
+          INTEGRATION_STATUS="${{ needs.test-integration-windows.result }}"
+          E2E_STATUS="${{ needs.test-e2e-windows.result }}"
+
+          echo "Build: $BUILD_STATUS"
+          echo "Sample Apps: $SAMPLES_STATUS"
+          echo "Integration Tests: $INTEGRATION_STATUS"
+          echo "E2E Tests: $E2E_STATUS"
+
+          if [ "$BUILD_STATUS" = "success" ] && [ "$SAMPLES_STATUS" = "success" ] && [ "$INTEGRATION_STATUS" = "success" ] && [ "$E2E_STATUS" = "success" ]; then
+            echo "status=success" >> $GITHUB_OUTPUT
+            echo "message=✅ All Windows build validations passed successfully!" >> $GITHUB_OUTPUT
+          elif [ "$BUILD_STATUS" = "cancelled" ] || [ "$SAMPLES_STATUS" = "cancelled" ] || [ "$INTEGRATION_STATUS" = "cancelled" ] || [ "$E2E_STATUS" = "cancelled" ]; then
+            echo "status=cancelled" >> $GITHUB_OUTPUT
+            echo "message=⚠️ Windows build validation was cancelled." >> $GITHUB_OUTPUT
+          elif [ "$BUILD_STATUS" = "skipped" ] || [ "$SAMPLES_STATUS" = "skipped" ] || [ "$INTEGRATION_STATUS" = "skipped" ] || [ "$E2E_STATUS" = "skipped" ]; then
+            echo "status=skipped" >> $GITHUB_OUTPUT
+            echo "message=⚠️ Some Windows build validation jobs were skipped." >> $GITHUB_OUTPUT
+          else
+            echo "status=failure" >> $GITHUB_OUTPUT
+            echo "message=❌ Some Windows build validations failed. Please check the workflow logs." >> $GITHUB_OUTPUT
+          fi
+
+      - name: 📝 Generate Summary
+        run: |
+          echo "# 🪟 Windows Build Validation Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Status:** ${{ steps.check_status.outputs.status }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Message:** ${{ steps.check_status.outputs.message }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Job Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- Build Product: ${{ needs.build-windows.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Build Sample Apps: ${{ needs.build-samples-windows.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Integration Tests (SQLite): ${{ needs.test-integration-windows.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Playwright E2E Tests: ${{ needs.test-e2e-windows.result }}" >> $GITHUB_STEP_SUMMARY
+
+      - name: 🔔 Notify on Failure
+        if: steps.check_status.outputs.status == 'failure'
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          BUILD_RESULT: ${{ needs.build-windows.result }}
+          SAMPLES_RESULT: ${{ needs.build-samples-windows.result }}
+          INTEGRATION_RESULT: ${{ needs.test-integration-windows.result }}
+          E2E_RESULT: ${{ needs.test-e2e-windows.result }}
+          WORKFLOW_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          BRANCH_NAME: ${{ github.ref_name }}
+          COMMIT_SHA: ${{ github.sha }}
+        with:
+          script: |
+            const issue_title = '🪟 Windows Build Validation Failed';
+            const issue_body = `## Windows Build Validation Failure
+
+            The nightly Windows build validation workflow has detected failures.
+
+            **Workflow Run:** ${process.env.WORKFLOW_URL}
+            **Branch:** ${process.env.BRANCH_NAME}
+            **Commit:** ${process.env.COMMIT_SHA}
+
+            ### Job Results
+            - Build Product: ${process.env.BUILD_RESULT}
+            - Build Sample Apps: ${process.env.SAMPLES_RESULT}
+            - Integration Tests (SQLite): ${process.env.INTEGRATION_RESULT}
+            - Playwright E2E Tests: ${process.env.E2E_RESULT}
+
+            Please investigate and fix the build issues.
+
+            ---
+            *This issue was automatically created by the Windows build validation workflow.*`;
+
+            const issues = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'windows-build-failure',
+              per_page: 1
+            });
+
+            if (issues.data.length === 0) {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: issue_title,
+                body: issue_body,
+                labels: ['windows-build-failure', 'bug']
+              });
+              console.log('Created new issue for Windows build failure');
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issues.data[0].number,
+                body: issue_body
+              });
+              console.log('Added comment to existing Windows build failure issue');
+            }
+
+      - name: 🔔 Send Google Chat Notification on Failure
+        if: steps.check_status.outputs.status == 'failure'
+        shell: bash
+        env:
+          GOOGLE_CHAT_WEBHOOK: ${{ secrets.GOOGLE_CHAT_WEBHOOK }}
+          WORKFLOW_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          BUILD_STATUS: ${{ needs.build-windows.result }}
+          SAMPLES_STATUS: ${{ needs.build-samples-windows.result }}
+          INTEGRATION_STATUS: ${{ needs.test-integration-windows.result }}
+          E2E_STATUS: ${{ needs.test-e2e-windows.result }}
+          BRANCH: ${{ github.ref_name }}
+          COMMIT: ${{ github.sha }}
+        run: |
+          if [ -z "$GOOGLE_CHAT_WEBHOOK" ]; then
+            echo "GOOGLE_CHAT_WEBHOOK secret is not set. Skipping Google Chat notification."
+            exit 0
+          fi
+
+          get_status_emoji() {
+            case "$1" in
+              success) echo "✅" ;;
+              failure) echo "❌" ;;
+              *) echo "⚠️" ;;
+            esac
+          }
+
+          BUILD_EMOJI=$(get_status_emoji "$BUILD_STATUS")
+          SAMPLES_EMOJI=$(get_status_emoji "$SAMPLES_STATUS")
+          INTEGRATION_EMOJI=$(get_status_emoji "$INTEGRATION_STATUS")
+          E2E_EMOJI=$(get_status_emoji "$E2E_STATUS")
+
+          jq -n \
+            --arg branch "$BRANCH" \
+            --arg build_status "$BUILD_EMOJI $BUILD_STATUS" \
+            --arg samples_status "$SAMPLES_EMOJI $SAMPLES_STATUS" \
+            --arg integration_status "$INTEGRATION_EMOJI $INTEGRATION_STATUS" \
+            --arg e2e_status "$E2E_EMOJI $E2E_STATUS" \
+            --arg commit "${COMMIT:0:8}" \
+            --arg workflow_url "$WORKFLOW_URL" \
+            --arg issues_url "${{ github.server_url }}/${{ github.repository }}/issues?q=is%3Aissue+is%3Aopen+label%3Awindows-build-failure" \
+            '{
+              "cards": [{
+                "header": {
+                  "title": "🪟 Windows Build Validation Failed",
+                  "subtitle": ("Branch: " + $branch),
+                  "imageUrl": "https://cdn-icons-png.flaticon.com/512/595/595067.png",
+                  "imageStyle": "AVATAR"
+                },
+                "sections": [
+                  {
+                    "header": "Job Results",
+                    "widgets": [
+                      {
+                        "keyValue": {
+                          "topLabel": "Build Product",
+                          "content": $build_status
+                        }
+                      },
+                      {
+                        "keyValue": {
+                          "topLabel": "Build Sample Apps",
+                          "content": $samples_status
+                        }
+                      },
+                      {
+                        "keyValue": {
+                          "topLabel": "Integration Tests (SQLite)",
+                          "content": $integration_status
+                        }
+                      },
+                      {
+                        "keyValue": {
+                          "topLabel": "Playwright E2E Tests",
+                          "content": $e2e_status
+                        }
+                      },
+                      {
+                        "keyValue": {
+                          "topLabel": "Commit",
+                          "content": $commit
+                        }
+                      }
+                    ]
+                  },
+                  {
+                    "widgets": [
+                      {
+                        "buttons": [
+                          {
+                            "textButton": {
+                              "text": "VIEW WORKFLOW RUN",
+                              "onClick": {
+                                "openLink": {
+                                  "url": $workflow_url
+                                }
+                              }
+                            }
+                          },
+                          {
+                            "textButton": {
+                              "text": "VIEW ISSUES",
+                              "onClick": {
+                                "openLink": {
+                                  "url": $issues_url
+                                }
+                              }
+                            }
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              }]
+            }' > payload.json
+
+          if curl -f -X POST -H "Content-Type: application/json" -d @payload.json "$GOOGLE_CHAT_WEBHOOK"; then
+            echo "✅ Google Chat notification sent successfully"
+          else
+            echo "⚠️ Failed to send Google Chat notification"
+          fi

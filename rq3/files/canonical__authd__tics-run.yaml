@@ -1,0 +1,157 @@
+name: TICS QA Analysis
+
+on:
+  schedule:
+    - cron: '0 0 * * 1' # Runs every Monday at midnight
+  workflow_dispatch:
+
+
+env:
+  DEBIAN_FRONTEND: noninteractive
+  build_dependencies: >-
+    clang-tools
+    clang
+    dotnet8
+    libfido2-dev
+    libglib2.0-dev
+    libpam-dev
+    libpwquality-dev
+    rustup
+
+jobs:
+  tics:
+    name: TIOBE TICS Framework
+    runs-on: [self-hosted, amd64, tiobe, noble]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - uses: canonical/desktop-engineering/gh-actions/common/dpkg-install-speedup@main
+      - name: Install dependencies
+        run: |
+          set -eu
+
+          sudo apt-get update
+          sudo apt-get install -y ${{ env.build_dependencies }}
+
+          go install honnef.co/go/tools/cmd/staticcheck@latest
+
+      - name: Update Rust version
+        run: |
+          rustup update stable
+
+      - uses: canonical/desktop-engineering/gh-actions/go/generate@main
+        with:
+          tools-directory: ./tools
+          token: ${{ github.token }}
+
+      - name: Fetch the QA runs to take coverage from
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+
+          # Name the workflows by file: two workflows claim the "authd QA &
+          # sanity checks" display name, so gh cannot resolve it by name.
+          # Take the newest run that still has a coverage artifact, whatever
+          # the workflow conclusion, within the 90-day retention window.
+          coverage_cutoff=$(date -u -d '90 days ago' +%Y-%m-%d)
+          newest_run_with_coverage() {
+            runs=$(gh run list --workflow "$1" --limit 1000 --created ">=$coverage_cutoff" -b main --json databaseId -q '.[].databaseId') || {
+              echo "Could not list runs for $1 on main" >&2
+              return 1
+            }
+            for run in $runs; do
+              has_coverage=$(gh api -X GET "repos/$GITHUB_REPOSITORY/actions/runs/$run/artifacts" \
+                -f name=coverage \
+                --jq 'any(.artifacts[]?; .expired | not)') || {
+                echo "Could not inspect artifacts for run $run" >&2
+                return 1
+              }
+              if [ "$has_coverage" = true ]; then
+                echo "$run"
+                return 0
+              fi
+            done
+            echo "No run of $1 on main since $coverage_cutoff has a coverage artifact left" >&2
+            return 1
+          }
+
+          # Assign before writing: echo "VAR=$(f)" discards the exit status of f,
+          # so set -e would never see a failure.
+          authd_id=$(newest_run_with_coverage qa.yaml)
+          brokers_id=$(newest_run_with_coverage brokers-qa.yaml)
+
+          printf 'LAST_AUTHD_QA_ID=%s\nLAST_BROKERS_QA_ID=%s\n' \
+            "$authd_id" "$brokers_id" >> "$GITHUB_ENV"
+
+      - name: Download coverage artifact from authd QA
+        uses: actions/download-artifact@v8
+        with:
+          github-token: ${{ github.token }}
+          # Name the artifact so it lands directly in path, not in a subdirectory
+          # named after it.
+          name: coverage
+          path: .artifacts/authd
+          run-id: ${{ env.LAST_AUTHD_QA_ID }}
+
+      - name: Download coverage artifact from brokers QA
+        uses: actions/download-artifact@v8
+        with:
+          github-token: ${{ github.token }}
+          name: coverage
+          path: .artifacts/brokers
+          run-id: ${{ env.LAST_BROKERS_QA_ID }}
+
+      - name: Merge coverage reports
+        run: |
+          set -eu
+
+          dotnet tool install -g dotnet-reportgenerator-globaltool
+
+          export PATH="$PATH:/home/ubuntu/.dotnet/tools"
+
+          mv .artifacts/authd/Cobertura.xml .artifacts/authd-coverage.xml
+          mv .artifacts/brokers/Cobertura.xml .artifacts/broker-coverage.xml
+
+          # TICS expects the coverage report to:
+          # - be in a directory named 'coverage' in the current working directory
+          mkdir -p coverage
+
+          # - have a single report named coverage.xml
+          reportgenerator -reports:.artifacts/*.xml -targetdir:coverage -reporttypes:Cobertura
+          mv coverage/Cobertura.xml coverage/coverage.xml
+
+      - name: Build artifacts
+        run: |
+          set -eu
+
+          # TICS needs to build the artifacts in order to run the analysis.
+          # Since it uses the GOTOOLCHAIN=local stanza, it's better if we prebuild it to make sure that the Go
+          # toolchain setup by the action is properly updated to the one we defined in go.mod. Prebuilding also
+          # helps to speed up the TICS analysis, as we would already have the build cache populated.
+          find pam -name '*.so' -print -delete
+          go build ./cmd/authd
+          go -C ./authd-oidc-brokers build -o authd-oidc ./cmd/authd-oidc
+          go -C ./authd-oidc-brokers build -tags=withgoogle -o authd-google ./cmd/authd-oidc
+
+          # We also need to build libhimmelblau when building the msentraid variant
+          git submodule update --init -- authd-oidc-brokers/third_party/libhimmelblau
+          cd ./authd-oidc-brokers
+          go generate --tags=withmsentraid ./internal/providers/msentraid/...
+          go build -tags=withmsentraid -o authd-msentraid ./cmd/authd-oidc
+
+      - name: Remove submodules before TICS analysis
+        run: git submodule deinit --force --all
+
+      - name: TICS Analysis
+        uses: tiobe/tics-github-action@v4
+        with:
+          mode: qserver
+          project: authd
+          branchdir: .
+          viewerUrl: https://canonical.tiobe.com/tiobeweb/TICS/api/cfg?name=GoProjects
+          ticsAuthToken: ${{ secrets.TICSAUTHTOKEN }}
+          installTics: true

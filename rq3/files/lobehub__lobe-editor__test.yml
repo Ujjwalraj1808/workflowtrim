@@ -1,0 +1,37 @@
+name: Test CI
+on:
+  pull_request:
+  push:
+    branches:
+      - '!master'
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+
+      - name: Install deps
+        run: pnpm install
+
+      - name: Test concurrent postinstall patching
+        run: node --test scripts/postinstall-lexical-patch.test.cjs
+
+      - name: CI
+        run: pnpm run ci
+
+      - name: Test and coverage
+        run: pnpm run test:coverage
+        env:
+          NODE_OPTIONS: --expose-gc
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v5

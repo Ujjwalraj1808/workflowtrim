@@ -1,0 +1,42 @@
+name: Accessibility audit
+
+# Builds the static export and runs axe-core (WCAG 2.1 A/AA) through Playwright on a representative set of
+# pages (scripts/a11y.ts). Serious and critical violations fail the job; the full report is uploaded.
+# Playwright and axe-core are installed for the run only (no package.json change).
+on:
+  pull_request:
+  schedule:
+    - cron: "17 5 * * 1" # Mondays 05:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: a11y-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  axe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - name: Install Playwright and axe-core for this run
+        run: |
+          npm install --no-save --no-package-lock playwright@1 axe-core@4
+          npx playwright install --with-deps chromium
+      - name: Run the audit
+        run: npx tsx scripts/a11y.ts --report a11y-report.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: a11y-report
+          path: a11y-report.json
+          retention-days: 30

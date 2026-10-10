@@ -1,0 +1,142 @@
+name: Development Client
+
+on:
+  workflow_dispatch: {}
+  # This task will fail due to migration to `expo-modules-core`.
+  # We temporary disable it.
+  # pull_request:
+  #   paths:
+  #     - .github/workflows/development-client.yml
+  #     - packages/expo-dev-*/**
+  # push:
+  #   branches: [main]
+  #   paths:
+  #     - .github/workflows/development-client.yml
+  #     - packages/expo-dev-*/**
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  android:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        ndk-version: [21.4.7075529]
+    steps:
+      - name: 👀 Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: ➕ Add `bin` to GITHUB_PATH
+        run: echo "$(pwd)/bin" >> $GITHUB_PATH
+      - name: 🔨 Install pnpm
+        uses: pnpm/setup@703c52620218391530e48b9e8870d5c0082e1b9b # v2.1.0
+        with:
+          install: false
+      - name: 🔨 Setup Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: 'pnpm'
+      - name: ♻️ Restore caches
+        uses: ./.github/actions/expo-caches
+        id: expo-caches
+        with:
+          ndk: 'true'
+          ndk-version: ${{ matrix.ndk-version }}
+      - name: 📦 Install node modules
+        run: pnpm install --frozen-lockfile
+        env:
+          TURBO_TOKEN: ${{ secrets.TURBO_TOKEN }}
+          TURBO_TEAM: expo
+      - name: Init new expo app
+        working-directory: ../
+        run: pnpm create expo-app ./development-client-android-test --yes
+      - name: Make pnpm resolve expo-dev-client dependencies locally
+        working-directory: ../development-client-android-test
+        run: |
+          node -e " \
+            const overrides = { \
+              'expo-dev-menu': 'file:${{ github.workspace }}/packages/expo-dev-menu', \
+              'expo-dev-menu-interface': 'file:${{ github.workspace }}/packages/expo-dev-menu-interface', \
+              'expo-dev-launcher': 'file:${{ github.workspace }}/packages/expo-dev-launcher', \
+              'expo-updates-interface': 'file:${{ github.workspace }}/packages/expo-updates-interface', \
+              'expo-updates': 'file:${{ github.workspace }}/packages/expo-updates', \
+              'expo-manifests': 'file:${{ github.workspace }}/packages/expo-manifests', \
+              'expo-json-utils': 'file:${{ github.workspace }}/packages/expo-json-utils', \
+            }; \
+            fs.appendFileSync('./pnpm-workspace.yaml', '\noverrides:\n' + Object.entries(overrides).map(([name, version]) => '  ' + JSON.stringify(name) + ': ' + JSON.stringify(version)).join('\n') + '\n');"
+      - name: Add dependencies
+        working-directory: ../development-client-android-test
+        run: pnpm add file:${{ github.workspace }}/packages/expo-dev-client
+      - name: Setup app.config.json
+        working-directory: ../development-client-android-test
+        run: echo "{\"name\":\"development-client-android-test\",\"plugins\":[\"expo-dev-client\"],\"android\":{\"package\":\"com.devclient.test\"},\"ios\":{\"bundleIdentifier\":\"com.devclient.test\"}}" > app.config.json
+      - name: Prebuild Android
+        working-directory: ../development-client-android-test
+        run: pnpm expo prebuild --platform android
+      - name: Bump `build tools`
+        working-directory: ../development-client-android-test
+        run: sed -i -e 's/buildToolsVersion\ =\ \"29\..\..\"/buildToolsVersion\ = \"30\.0\.3\"/' ./android/build.gradle
+      - name: Bump `android build tools`
+        working-directory: ../development-client-android-test
+        run: sed -i -e 's/com\.android\.tools\.build:gradle:3\..\../com\.android\.tools\.build:gradle:3\.5\.4/' ./android/build.gradle
+      - name: 🏗️ Build debug version
+        env:
+          ANDROID_NDK_HOME: /usr/local/lib/android/sdk/ndk/${{ matrix.ndk-version }}/
+        working-directory: ../development-client-android-test/android
+        run: ./gradlew assembleDebug
+
+  ios:
+    runs-on: macos-15
+    steps:
+      - name: 👀 Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: ➕ Add `bin` to GITHUB_PATH
+        run: echo "$(pwd)/bin" >> $GITHUB_PATH
+      - name: 🔨 Install pnpm
+        uses: pnpm/setup@703c52620218391530e48b9e8870d5c0082e1b9b # v2.1.0
+        with:
+          install: false
+      - name: 🔨 Setup Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: 'pnpm'
+      - name: ♻️ Restore caches
+        uses: ./.github/actions/expo-caches
+        id: expo-caches
+      - name: 📦 Install node modules
+        run: pnpm install --frozen-lockfile
+        env:
+          TURBO_TOKEN: ${{ secrets.TURBO_TOKEN }}
+          TURBO_TEAM: expo
+      - name: Init new expo app
+        working-directory: ../
+        run: pnpm create expo-app ./development-client-ios-test --yes
+      - name: Make pnpm resolve expo-dev-client dependencies locally
+        working-directory: ../development-client-ios-test
+        run: |
+          node -e " \
+            const overrides = { \
+              'expo-dev-menu': 'file:${{ github.workspace }}/packages/expo-dev-menu', \
+              'expo-dev-menu-interface': 'file:${{ github.workspace }}/packages/expo-dev-menu-interface', \
+              'expo-dev-launcher': 'file:${{ github.workspace }}/packages/expo-dev-launcher', \
+              'expo-updates-interface': 'file:${{ github.workspace }}/packages/expo-updates-interface', \
+              'expo-updates': 'file:${{ github.workspace }}/packages/expo-updates', \
+              'expo-manifests': 'file:${{ github.workspace }}/packages/expo-manifests', \
+              'expo-json-utils': 'file:${{ github.workspace }}/packages/expo-json-utils', \
+            }; \
+            fs.appendFileSync('./pnpm-workspace.yaml', '\noverrides:\n' + Object.entries(overrides).map(([name, version]) => '  ' + JSON.stringify(name) + ': ' + JSON.stringify(version)).join('\n') + '\n');"
+      - name: Add dependencies
+        working-directory: ../development-client-ios-test
+        run: pnpm add file:${{ github.workspace }}/packages/expo-dev-client
+      - name: Setup app.config.json
+        working-directory: ../development-client-ios-test
+        run: echo "{\"name\":\"development-client-ios-test\",\"plugins\":[\"expo-dev-client\"],\"android\":{\"package\":\"com.devclient.test\"},\"ios\":{\"bundleIdentifier\":\"com.devclient.test\"}}" > app.config.json
+      - name: Prebuild iOS
+        working-directory: ../development-client-ios-test
+        run: pnpm expo prebuild --platform ios
+      - name: 🏗️ Build debug version
+        working-directory: ../development-client-ios-test
+        run: xcodebuild -workspace ios/developmentclientiostest.xcworkspace -scheme developmentclientiostest -configuration debug -sdk iphonesimulator -arch x86_64

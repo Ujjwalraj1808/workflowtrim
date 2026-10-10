@@ -1,0 +1,275 @@
+name: Release DMtools AI Skill
+
+# ⚠️ DEPRECATED: This workflow is no longer used.
+# Skills are now released automatically with the main DMTools CLI release.
+# See .github/workflows/release.yml for the unified release process.
+# This workflow is kept for reference only.
+
+on:
+  # Automatic tag trigger disabled - unified release.yml now handles skill releases
+  # push:
+  #   tags:
+  #     - 'skill-v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release (e.g., 1.0.0)'
+        required: true
+        type: string
+      prerelease:
+        description: 'Is this a pre-release?'
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+    outputs:
+      version: ${{ steps.version.outputs.VERSION }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+          else
+            VERSION=${GITHUB_REF#refs/tags/skill-v}
+          fi
+          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
+          echo "Building version: $VERSION"
+
+      - name: Update version in metadata
+        run: |
+          VERSION="${{ steps.version.outputs.VERSION }}"
+
+          # Update version in SKILL.md metadata
+          if [ -f "dmtools-ai-docs/SKILL.md" ]; then
+            sed -i "s/version: .*/version: $VERSION/" dmtools-ai-docs/SKILL.md
+          fi
+
+      - name: Create skill package
+        run: |
+          VERSION="${{ steps.version.outputs.VERSION }}"
+          DIST_DIR="dist"
+          mkdir -p $DIST_DIR
+
+          # Create the single skill package
+          echo "📦 Creating DMtools Agent Skill package..."
+          cd dmtools-ai-docs
+
+          # Create ZIP archive (exclude install.sh - it's a separate release asset)
+          zip -r ../$DIST_DIR/dmtools-skill-v${VERSION}.zip . \
+            -x "*.git*" \
+            -x ".DS_Store" \
+            -x "node_modules/*" \
+            -x "*.swp" \
+            -x ".cursorrules" \
+            -x ".github/*" \
+            -x "install.sh"
+
+          # Create tarball for *nix systems (exclude install.sh - it's a separate release asset)
+          tar -czf ../$DIST_DIR/dmtools-skill-v${VERSION}.tar.gz \
+            --exclude='.git*' \
+            --exclude='.DS_Store' \
+            --exclude='node_modules' \
+            --exclude='.cursorrules' \
+            --exclude='.github' \
+            --exclude='install.sh' \
+            .
+
+          cd ..
+
+          # Copy install script
+          cp dmtools-ai-docs/install.sh $DIST_DIR/
+          chmod +x $DIST_DIR/install.sh
+
+          echo "✅ Skill package created:"
+          ls -lh $DIST_DIR/
+
+      - name: Generate checksums
+        run: |
+          cd dist
+          sha256sum *.zip *.tar.gz > checksums.sha256
+          cat checksums.sha256
+
+      - name: Create release notes
+        run: |
+          VERSION="${{ steps.version.outputs.VERSION }}"
+          cat > dist/release-notes.md << 'EOF'
+          # DMtools Agent Skill v$VERSION
+
+          DMTools agent skill for enterprise dark-factory orchestration across MCP tools, AI agents, and delivery workflows in Cursor, Claude, Codex, and other Agent Skills compatible systems.
+
+          ## 📦 Installation
+
+          ### Automatic Installation (Recommended)
+          ```bash
+          curl -fsSL https://github.com/${{ github.repository }}/releases/download/skill-v$VERSION/install.sh | bash
+          ```
+
+          ### Manual Installation
+
+          1. Download: `dmtools-skill-v$VERSION.zip`
+          2. Extract to one of these directories:
+             - `.cursor/skills/` (project-level Cursor)
+             - `.claude/skills/` (project-level Claude)
+             - `~/.cursor/skills/` (global Cursor)
+             - `~/.claude/skills/` (global Claude)
+             - `~/.codex/skills/` (global Codex)
+
+          ## 🎯 What's Included
+
+          - ✅ Complete DMtools documentation
+          - ✅ 67+ MCP tools reference
+          - ✅ JavaScript agent development guide
+          - ✅ Configuration guides for all integrations
+          - ✅ Test generation with Xray
+          - ✅ AI provider setup (Gemini, OpenAI, Claude)
+
+          ## 📚 Usage
+
+          Once installed:
+          - **Cursor**: Type `/dmtools` or mention DMtools in chat
+          - **Claude**: Type `/dmtools` or ask about DMtools
+          - **Other AI**: The skill loads automatically when relevant
+
+          ### Example Questions
+          - "How do I install DMtools?"
+          - "Help me configure Jira integration"
+          - "Create a JavaScript agent for test generation"
+          - "Show me how to use MCP tools"
+
+          ## 🔄 Updating
+
+           This standalone skill-release workflow is deprecated. For ongoing updates, use the maintained unified release installer:
+           ```bash
+           curl -fsSL https://github.com/${{ github.repository }}/releases/latest/download/skill-install.sh | bash
+           ```
+
+          ## 📝 Changelog
+
+          See [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/main/CHANGELOG.md) for changes.
+
+          ## 🐛 Support
+
+          Report issues at: https://github.com/${{ github.repository }}/issues
+
+          ---
+
+          **Agent Skills Standard**: This skill follows the [Agent Skills](https://agentskills.io) standard for cross-platform compatibility.
+          EOF
+
+          # Replace version placeholders
+          sed -i "s/\$VERSION/$VERSION/g" dist/release-notes.md
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ github.event_name == 'workflow_dispatch' && format('skill-v{0}', github.event.inputs.version) || github.ref_name }}
+          name: DMtools Agent Skill v${{ steps.version.outputs.VERSION }}
+          body_path: dist/release-notes.md
+          draft: false
+          prerelease: ${{ github.event.inputs.prerelease || false }}
+          files: |
+            dist/dmtools-skill-*.zip
+            dist/dmtools-skill-*.tar.gz
+            dist/install.sh
+            dist/checksums.sha256
+
+      - name: Update latest release pointer
+        if: github.event.inputs.prerelease != 'true'
+        run: |
+          # Create/update a 'latest' tag for easy access
+          git config user.name github-actions
+          git config user.email github-actions@github.com
+          git tag -fa skill-latest -m "Latest skill release"
+          git push origin skill-latest --force
+
+  publish-npm:
+    runs-on: ubuntu-latest
+    needs: build-and-release
+    if: github.event.inputs.prerelease != 'true'
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '18'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Prepare NPM package
+        run: |
+          VERSION="${{ needs.build-and-release.outputs.version }}"
+
+          # Create package.json for NPM
+          cat > dmtools-ai-docs/package.json << EOF
+          {
+            "name": "@dm.ai/agent-skill",
+            "version": "$VERSION",
+            "description": "DMTools agent skill for enterprise dark-factory orchestration with MCP tools, AI agents, and generative-ai-friendly delivery workflows",
+            "keywords": ["dmtools", "dark-factory", "delivery-automation", "workflow-orchestration", "mcp", "ai-agents", "generative-ai", "self-hosted", "cursor", "claude", "codex", "jira", "azure-devops", "github"],
+            "author": "DMtools Team",
+            "license": "Apache-2.0",
+            "repository": {
+              "type": "git",
+              "url": "https://github.com/${{ github.repository }}.git"
+            },
+            "bugs": {
+              "url": "https://github.com/${{ github.repository }}/issues"
+            },
+            "homepage": "https://github.com/${{ github.repository }}#readme",
+            "files": [
+              "SKILL.md",
+              "references/**/*",
+              "install.sh"
+            ],
+            "scripts": {
+              "postinstall": "echo 'DMtools Agent Skill installed. Add to your AI assistant skills directory.'"
+            }
+          }
+          EOF
+
+      - name: Publish to NPM
+        run: |
+          cd dmtools-ai-docs
+          npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        continue-on-error: true
+
+  notify:
+    runs-on: ubuntu-latest
+    needs: [build-and-release]
+    if: always()
+    permissions:
+      contents: read
+
+    steps:
+      - name: Send notification
+        run: |
+          VERSION="${{ needs.build-and-release.outputs.version || github.event.inputs.version }}"
+          STATUS="${{ needs.build-and-release.result }}"
+
+          if [ "$STATUS" = "success" ]; then
+            echo "✅ DMtools Agent Skill v$VERSION released successfully!"
+            echo "📦 Available at: https://github.com/${{ github.repository }}/releases/tag/skill-v$VERSION"
+            echo ""
+            echo "Install with:"
+            echo "curl -fsSL https://github.com/${{ github.repository }}/releases/download/skill-v$VERSION/install.sh | bash"
+          else
+            echo "❌ Release failed for version $VERSION"
+          fi

@@ -1,0 +1,44 @@
+name: Node
+
+on:
+  pull_request:
+  push:
+    branches-ignore: "dependabot/**"
+
+permissions:
+  contents: read # to fetch code (actions/checkout)
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    name: ${{ matrix.NPM_SCRIPT }} - ${{ matrix.NAME }} (${{ matrix.NODE_VERSION }})
+    strategy:
+      fail-fast: false
+      matrix:
+        NAME: ["Node"]
+        NODE_VERSION: [20.x, 22.x, 24.x]
+        NPM_SCRIPT: ["test:browserless"]
+        include:
+          - NAME: "Node"
+            NODE_VERSION: "24.x"
+            NPM_SCRIPT: "lint"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Use Node.js ${{ matrix.NODE_VERSION }}
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ matrix.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: '**/package-lock.json'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build all for linting
+        run: npm run build:all
+        if: contains(matrix.NPM_SCRIPT, 'lint')
+
+      - name: Run tests
+        run: npm run ${{ matrix.NPM_SCRIPT }}

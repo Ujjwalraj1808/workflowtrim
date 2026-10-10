@@ -1,0 +1,41 @@
+name: PR Workflow Approval Reminder
+
+# Every morning, list the open PRs whose CI waits for a maintainer to approve
+# it, grouped by their AI triage label, and post the list to Slack.
+on:
+  schedule:
+    - cron: "0 6 * * *"
+      timezone: "Europe/Zurich"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Print the message in the log instead of posting it.
+        type: boolean
+        default: false
+
+permissions: {}
+
+jobs:
+  remind:
+    # Forks also run schedules. Only the upstream repository posts to Slack.
+    if: github.repository == 'docling-project/docling'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+
+      - name: Post the reminder to Slack
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          SLACK_WEBHOOK_URL: ${{ secrets.PR_REMINDER_SLACK_WEBHOOK }}
+          DRY_RUN: ${{ inputs.dry_run && '--dry-run' || '' }}
+        run: |
+          python3 .github/scripts/pr_approval_reminder.py --repo "${REPO}" ${DRY_RUN}

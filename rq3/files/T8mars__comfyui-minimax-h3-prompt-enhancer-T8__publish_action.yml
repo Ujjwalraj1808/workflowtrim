@@ -1,0 +1,88 @@
+name: Publish to Comfy Registry
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - "pyproject.toml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: comfy-registry-publish
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Verify release candidate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out node source
+        uses: actions/checkout@v4
+        with:
+          path: _source
+      - name: Fetch frozen directional compatibility baseline
+        run: git -C _source fetch --no-tags --depth=1 origin bfaae3ce13a8bdf3d4907146c13cfc280a2b2c36 d1a8cf5c8e5477847b51f1fc0757ea6b5a00b8c8 c6ebe4540147908046917e92ec6d1bb7e5614714 20689b34b8d4239540bfea933052a9ae8d44a931 db1121b99730a570bff0c84cc854c0c6948eed77 62d5440fb8f04924efd1ff18db2490c856bb94c0 637036b0bd0ef4e966691983c20e82c2435761ea 3c3bbae97b32a4981866b73c0991c1adfd7130db d6ad140020f39da6182fe4dfd3e2ded11c5f5557
+      - name: Check out minimum supported ComfyUI
+        uses: actions/checkout@v4
+        with:
+          repository: Comfy-Org/ComfyUI
+          ref: v0.33.0
+          path: ComfyUI
+      - name: Place node under ComfyUI custom_nodes
+        shell: bash
+        run: |
+          mkdir -p ComfyUI/custom_nodes
+          cp -a _source ComfyUI/custom_nodes/comfyui-minimax-h3-prompt-enhancer-T8
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: pip
+          cache-dependency-path: |
+            _source/pyproject.toml
+            ComfyUI/requirements.txt
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install test dependencies
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu torch torchvision torchaudio
+          python -m pip install -r ComfyUI/requirements.txt
+          python -m pip install pyyaml
+      - name: Verify version is publishable
+        working-directory: _source
+        run: python tools/release.py --check-publish
+      - name: Verify release contents
+        working-directory: ComfyUI/custom_nodes/comfyui-minimax-h3-prompt-enhancer-T8
+        env:
+          T8_CONFIRM_PREVIEW_BUDGET: "1"
+        run: python tools/verify_repository.py
+      - name: Run unit and compatibility tests
+        working-directory: ComfyUI/custom_nodes/comfyui-minimax-h3-prompt-enhancer-T8
+        env:
+          PYTHONPATH: ${{ github.workspace }}/ComfyUI
+          T8_SOURCE_GIT_ROOT: ${{ github.workspace }}/_source
+        run: python -m unittest discover -s tests
+      - name: Run real-browser frontend contracts
+        working-directory: ComfyUI/custom_nodes/comfyui-minimax-h3-prompt-enhancer-T8
+        run: python tools/run_frontend_browser_tests.py
+
+  publish-node:
+    name: Publish custom node to Registry
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+      - name: Publish custom node
+        uses: Comfy-Org/publish-node-action@main
+        with:
+          personal_access_token: ${{ secrets.REGISTRY_ACCESS_TOKEN }}
+          skip_checkout: "true"

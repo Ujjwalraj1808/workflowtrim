@@ -1,0 +1,58 @@
+name: Build and Run Tests by Maven
+on:
+  pull_request:
+    types: [opened, reopened, synchronize]
+  push:
+    branches: [master, develop, bazel]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  java_build:
+    name: "maven-compile (${{ matrix.os }}, JDK-${{ matrix.jdk }})"
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # see https://docs.github.com/en/actions/using-github-hosted-runners/about-github-hosted-runners#supported-runners-and-hardware-resources
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        jdk: [8]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+        with:
+          submodules: true
+      - name: Set up JDK ${{ matrix.jdk }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ matrix.jdk }}
+          # See https://github.com/actions/setup-java?tab=readme-ov-file#supported-distributions
+          # AdoptOpenJDK got moved to Eclipse Temurin and won't be updated anymore.
+          distribution: "corretto"
+          cache: "maven"
+      - name: Build with Maven
+        shell: bash
+        run: |
+          JACOCO_FLAG=""
+          if [ "${{ matrix.os }}" != "ubuntu-latest" ]; then
+            JACOCO_FLAG="-Djacoco.skip=true"
+          fi
+          mvn -B package --file pom.xml $JACOCO_FLAG
+
+      - name: Upload Auth JVM crash logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jvm-crash-logs
+          path: /Users/runner/work/rocketmq/rocketmq/auth/hs_err_pid*.log
+          retention-days: 1
+
+      - name: Upload broker JVM crash logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jvm-crash-logs
+          path: /Users/runner/work/rocketmq/rocketmq/broker/hs_err_pid*.log
+          retention-days: 1

@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gates:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run validate
+      - run: npm run typecheck
+      - run: npm run lint
+      # Match the release gates: the first page render initializes the whole graph on the runner.
+      # Bound graph-heavy workers to the runner's memory; preserve every page-size assertion.
+      # Use the existing ship-chain wall-clock allowance.
+      - run: npx vitest run --maxWorkers=2 --testTimeout=600000 --hookTimeout=600000
+        env:
+          SLOW_TEST_MS: 600000
+      # Freshness gate: fails when critical stale records (approved products over 90 days, open trials
+      # over 120, cancer pages over 180, past calendar events over 30) exceed FRESHNESS_LIMIT. See /freshness/.
+      - name: Freshness SLAs
+        run: npx tsx scripts/freshness.ts --check
+        env:
+          FRESHNESS_LIMIT: 25
+
+  # A full export took 17m43s and tests took over 11 minutes: running both serially
+  # exceeded the 30-minute job window. Keep the limits and run independent work in parallel.
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+
+  # Preserve the existing required status, including when either dependency fails or is cancelled.
+  check:
+    needs: [gates, build]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Require validation, tests, freshness and the static build
+        env:
+          GATES_RESULT: ${{ needs.gates.result }}
+          BUILD_RESULT: ${{ needs.build.result }}
+        run: |
+          if [[ "$GATES_RESULT" != "success" || "$BUILD_RESULT" != "success" ]]; then
+            echo "Validation/test gates: $GATES_RESULT; static build: $BUILD_RESULT"
+            exit 1
+          fi

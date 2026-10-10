@@ -1,0 +1,28 @@
+name: code-checks
+
+on:
+  pull_request: {}
+  push:
+    branches:
+      - "**"
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  gosec:
+    uses: ckotzbauer/actions-toolkit/.github/workflows/toolkit-lint.yml@187b42cc2ca9bc9257d6e72bb1c1be730f1d0565 # 0.56.0
+    with:
+      install-go: true
+      lint-commands: |
+        make bootstrap-tools
+        make lintsec
+
+  golint:
+    uses: ckotzbauer/actions-toolkit/.github/workflows/toolkit-lint.yml@187b42cc2ca9bc9257d6e72bb1c1be730f1d0565 # 0.56.0
+    with:
+      install-go: true
+      lint-commands: |
+        make bootstrap-tools
+        make lint

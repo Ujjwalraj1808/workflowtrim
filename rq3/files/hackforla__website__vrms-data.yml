@@ -1,0 +1,38 @@
+name: Update VRMS data
+
+# Run this action every day at 2am Pacific (10 am UTC)
+on:
+  schedule:
+    - cron: '0 10 * * *'
+  workflow_dispatch:
+
+permissions:
+    contents: read
+
+jobs:
+  vrms_data:
+    runs-on: ubuntu-latest
+
+    if: github.repository == 'hackforla/website'
+
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        token: ${{ secrets.HACKFORLA_BOT_PA_TOKEN }}
+
+    # Use an action (`my-action`) in your repository
+    - name: Save vrms_data.json
+      run: curl --retry 7 --fail -o _data/external/vrms_data.json https://www.vrms.io/api/recurringevents
+    
+    - name: Filter vrms data
+      run: node github-actions/trigger-schedule/vrms-data/filter-vrms-data.js
+
+    - uses: stefanzweifel/git-auto-commit-action@v7.2.0
+      with:
+        # Optional glob pattern of files which should be added to the commit
+        file_pattern: _data/external/vrms_data.json
+
+        commit_message: Update meeting data
+
+        # Optional commit user and author settings
+        commit_author: GitHub Actions Bot <hackforla-bot@hackforla.org>

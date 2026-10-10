@@ -1,0 +1,172 @@
+name: Act
+
+on:
+  workflow_dispatch:
+    inputs:
+      test_focus:
+        description: focus for E2E tests
+        required: false
+        default: ""
+
+jobs:
+  e2e-test:
+    name: E2E Tests
+    runs-on: js-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: setup Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: "24"
+
+      - name: setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: go.mod
+
+      - name: install task
+        run: go install github.com/go-task/task/v3/cmd/task@latest
+
+      - name: install goreleaser
+        uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          install-only: true
+
+      - name: check docker access
+        run: docker version && docker ps -a
+
+      - name: build test binary
+        run: task cli:test:e2e:build
+
+      - name: generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
+        with:
+          client-id: ${{ secrets.DEVSY_GITHUB_APP_ID }}
+          private-key: ${{ secrets.DEVSY_GITHUB_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+
+      - name: run tests
+        env:
+          GH_USERNAME: ${{ github.repository_owner }}
+          GH_ACCESS_TOKEN: ${{ steps.app-token.outputs.token || github.token }}
+          GH_CREDENTIAL_USERNAME: x-access-token
+        run: |
+          GH_USERNAME="${GH_USERNAME}" \
+            GH_ACCESS_TOKEN="${GH_ACCESS_TOKEN}" \
+            GH_CREDENTIAL_USERNAME="${GH_CREDENTIAL_USERNAME}" \
+            KUBECONFIG="${KUBECONFIG:-$HOME/.kube/config}" \
+            PATH="${PATH}" \
+            GOROOT="${GOROOT}" \
+            ${{ github.event.inputs.test_focus == '' && 'task cli:test:e2e' || format('task cli:test:e2e:focus -- "{0}"', github.event.inputs.test_focus) }}
+
+  build-ui:
+    name: Build User Interface
+    runs-on: js-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: setup Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: "24"
+
+      - name: install dependencies
+        working-directory: ./desktop
+        run: npm ci
+
+      - name: check
+        working-directory: ./desktop
+        run: npm run check
+
+      - name: test
+        working-directory: ./desktop
+        run: npm run test
+
+  build-desktop:
+    name: Build Desktop App
+    runs-on: js-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: setup Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: "24"
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: go.mod
+
+      - name: build CLI binary
+        run: |
+          GOOS=linux GOARCH=amd64 go build -o desktop/resources/bin/devsy .
+          chmod +x desktop/resources/bin/devsy
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.14"
+
+      - name: install setuptools
+        run: pip install setuptools
+
+      - name: install dependencies
+        working-directory: ./desktop
+        run: npm ci
+
+      - name: install xvfb
+        run: sudo apt-get update && sudo apt-get install -y xvfb
+
+      - name: build and test
+        working-directory: ./desktop
+        run: |
+          npm run electron:build
+          xvfb-run npx playwright test
+
+      - name: package with electron-builder
+        working-directory: ./desktop
+        run: npx electron-builder --linux --config electron-builder.yml
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: upload desktop linux artifact for flatpak
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: devsy-flatpak
+          path: desktop/release/*.deb
+
+  build-flatpak:
+    name: Build Flatpak
+    runs-on: js-latest
+    needs: [build-desktop]
+    container:
+      image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-48@sha256:50fea670968fd3ec4aeeb3a91d9d807d0af6eab3c3b44c33d4c40c311832c8fa
+      options: --privileged
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: download desktop linux artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: devsy-flatpak
+          path: desktop/flatpak/
+
+      - name: find and rename .deb file
+        working-directory: desktop/flatpak
+        run: |
+          DEB=$(find . -maxdepth 1 -name '*.deb' -print -quit)
+          if [ -n "$DEB" ]; then
+            mv "$DEB" devsy-desktop.deb
+          else
+            echo "No .deb file found"
+            exit 1
+          fi
+
+      - uses: flatpak/flatpak-github-actions/flatpak-builder@79327416609af08178ad73b352877e51450790b3 # v6
+        with:
+          bundle: Devsy.flatpak
+          manifest-path: desktop/flatpak/sh.devsy.app.yml
+          upload-artifact: false

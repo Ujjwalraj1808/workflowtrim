@@ -1,0 +1,423 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      phase:
+        description: Build a draft guest first, then publish after committing its manifest pin
+        required: true
+        type: choice
+        options:
+          - signing-check
+          - prepare
+          - publish
+      release_tag:
+        description: Release tag, for example v0.0.12-preview or v1.0.0
+        required: true
+        type: string
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  guard:
+    timeout-minutes: 10
+    name: Validate request
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require the default branch and a release tag
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          test "$GITHUB_REF" = refs/heads/master
+          [[ "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-preview)?$ ]]
+
+  prepare:
+    name: Build guest draft
+    if: inputs.phase == 'prepare'
+    needs: guard
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    environment: release
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ inputs.release_tag }}
+      ARTIFACT_DIR: ${{ github.workspace }}/guest-release
+    steps:
+      - name: Check out source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Reject an existing release
+        shell: bash
+        run: |
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "Release $RELEASE_TAG already exists" >&2
+            exit 1
+          fi
+
+      - name: Check runner capacity
+        run: |
+          test "$(df --output=avail -B1G "$RUNNER_TEMP" | tail -1)" -ge 14
+          test -e /dev/kvm
+          sudo chmod 666 /dev/kvm
+          df -h "$RUNNER_TEMP" /var/lib/docker
+
+      - name: Install headless QEMU
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends qemu-system-x86
+
+      - name: Build locked guest image
+        run: scripts/release/build-guest.sh --output "$ARTIFACT_DIR"
+
+      - name: Add and verify the locked runtime
+        run: scripts/release/prepare-assets.sh "$ARTIFACT_DIR"
+
+      - name: Add the Try Omarchy importer
+        run: |
+          python3 -m unittest discover -s migrate/tests -t migrate
+          python3 migrate/build.py --version "$RELEASE_TAG" --output "$ARTIFACT_DIR/importer"
+          for name in try-omarchy-import.pyz try-omarchy-import.sh; do
+            if grep -qE "[[:space:]]${name}$" "$ARTIFACT_DIR/SHA256SUMS"; then
+              echo "$name is already present in SHA256SUMS" >&2
+              exit 1
+            fi
+            mv "$ARTIFACT_DIR/importer/$name" "$ARTIFACT_DIR/$name"
+            (cd "$ARTIFACT_DIR" && sha256sum "$name") >>"$ARTIFACT_DIR/SHA256SUMS"
+          done
+          rmdir "$ARTIFACT_DIR/importer"
+          (cd "$ARTIFACT_DIR" && sha256sum --check SHA256SUMS)
+
+      - name: Smoke-test instant first boot
+        run: scripts/release/smoke-guest.py "$ARTIFACT_DIR"
+
+      - name: Remove unpacked release input
+        run: rm -- "$ARTIFACT_DIR/rootfs.ext4"
+
+      - name: Check release asset sizes
+        run: python3 scripts/release/check-asset-sizes.py "$ARTIFACT_DIR"
+
+      - name: Create draft release
+        run: |
+          gh release create "$RELEASE_TAG" \
+            --draft \
+            --target "$GITHUB_SHA" \
+            --title "$RELEASE_TAG" \
+            --notes "Guest assets prepared by the release workflow."
+
+      - name: Upload authenticated guest assets
+        run: |
+          gh release upload "$RELEASE_TAG" \
+            "$ARTIFACT_DIR/SHA256SUMS" \
+            "$ARTIFACT_DIR/build-spec.json" \
+            "$ARTIFACT_DIR/guest-manifest.json" \
+            "$ARTIFACT_DIR/initramfs-linux.img" \
+            "$ARTIFACT_DIR/LICENSE.omarchy" \
+            "$ARTIFACT_DIR/packages.lock.txt" \
+            "$ARTIFACT_DIR/provenance.json" \
+            "$ARTIFACT_DIR/rootfs.ext4.zst" \
+            "$ARTIFACT_DIR/try-omarchy-import.pyz" \
+            "$ARTIFACT_DIR/try-omarchy-import.sh" \
+            "$ARTIFACT_DIR/vmlinuz-linux" \
+            "$ARTIFACT_DIR/winq-emu-alpha10-portable.zip" \
+            "$ARTIFACT_DIR/winq-emu-alpha10-source.zip"
+
+      - name: Record manifest pin
+        shell: bash
+        run: |
+          digest=$(sha256sum "$ARTIFACT_DIR/SHA256SUMS" | cut -d' ' -f1)
+          {
+            echo "## Draft guest ready"
+            echo
+            echo "Update app/manifest.go and its fixture before running the publish phase."
+            echo
+            echo "SHA256SUMS: \`$digest\`"
+          } >>"$GITHUB_STEP_SUMMARY"
+
+  signing-check:
+    name: Verify Azure signing
+    if: inputs.phase == 'signing-check'
+    needs: guard
+    runs-on: windows-2025
+    timeout-minutes: 20
+    environment: release
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      RELEASE_TAG: ${{ inputs.release_tag }}
+      # Keep the redirected legacy URL for the first release after transfer so
+      # v0.0.7 can authenticate and install its bridge update.
+      UPDATE_RELEASE_REPOSITORY: tsouth89/try-omarchy-windows
+      TRYOMARCHY_UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: app/go.mod
+          cache-dependency-path: app/go.sum
+
+      - name: Validate test release pin
+        run: python scripts/release/validate-pin.py $env:RELEASE_TAG
+
+      - name: Build optimized launcher
+        working-directory: app
+        shell: pwsh
+        run: go build -trimpath -ldflags '-H windowsgui -s -w' -o TryOmarchy.exe .
+
+      - name: Sign in to Azure with OIDC
+        uses: azure/login@7ddb5af1ef8758cf1353cf3b42f940aee27ba21c # v3
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Sign launcher
+        uses: Azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2
+        with:
+          endpoint: ${{ vars.AZURE_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ vars.AZURE_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ vars.AZURE_SIGNING_PROFILE }}
+          files: ${{ github.workspace }}\app\TryOmarchy.exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      - name: Verify signature
+        shell: pwsh
+        run: |
+          $signature = Get-AuthenticodeSignature app/TryOmarchy.exe
+          if ($signature.Status -ne 'Valid') {
+            throw "Authenticode verification failed: $($signature.StatusMessage)"
+          }
+
+      - name: Verify update signing key
+        shell: pwsh
+        run: |
+          $manifestHash = (Get-FileHash "app/testdata/SHA256SUMS.$env:RELEASE_TAG" -Algorithm SHA256).Hash.ToLowerInvariant()
+          go -C app run ./cmd/sign-update `
+            -version $env:RELEASE_TAG `
+            -release "https://github.com/$env:UPDATE_RELEASE_REPOSITORY/releases/download/$env:RELEASE_TAG" `
+            -manifest-sha256 $manifestHash `
+            -launcher TryOmarchy.exe `
+            -output "test-update.json"
+
+      - name: Package signed test launcher
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash app/TryOmarchy.exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  TryOmarchy.exe" | Set-Content app/TryOmarchy.exe.sha256 -Encoding ascii
+
+      - name: Upload signed test launcher
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: TryOmarchy-signing-check-${{ github.sha }}
+          path: |
+            app/TryOmarchy.exe
+            app/TryOmarchy.exe.sha256
+            app/test-update.json
+            app/test-update.json.sig
+          retention-days: 3
+          if-no-files-found: error
+
+  publish:
+    name: Sign and publish
+    if: inputs.phase == 'publish'
+    needs: guard
+    runs-on: windows-2025
+    timeout-minutes: 45
+    environment: release
+    permissions:
+      contents: write
+      id-token: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ inputs.release_tag }}
+      LEGACY_UPDATE_BRIDGE_TAG: ${{ vars.LEGACY_UPDATE_BRIDGE_TAG }}
+      AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+      AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      # Change this to omacom/omarchy-win after the bridge release is public.
+      UPDATE_RELEASE_REPOSITORY: tsouth89/try-omarchy-windows
+      TRYOMARCHY_UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: app/go.mod
+          cache-dependency-path: app/go.sum
+
+      - name: Validate source pin and draft payloads
+        shell: pwsh
+        run: |
+          python scripts/release/validate-pin.py $env:RELEASE_TAG
+          New-Item -ItemType Directory -Force release-manifest | Out-Null
+          gh release download $env:RELEASE_TAG -p SHA256SUMS -D release-manifest --clobber
+          $fixture = "app/testdata/SHA256SUMS.$env:RELEASE_TAG"
+          if ((Get-FileHash $fixture -Algorithm SHA256).Hash -ne
+              (Get-FileHash release-manifest/SHA256SUMS -Algorithm SHA256).Hash) {
+            throw 'Draft release manifest does not match the signed source pin'
+          }
+          $draft = gh release view $env:RELEASE_TAG --json isDraft --jq .isDraft
+          if ($draft -ne 'true') { throw "Release $env:RELEASE_TAG is not a draft" }
+          $assets = @(
+            'build-spec.json',
+            'guest-manifest.json',
+            'initramfs-linux.img',
+            'LICENSE.omarchy',
+            'packages.lock.txt',
+            'provenance.json',
+            'rootfs.ext4.zst',
+            'try-omarchy-import.pyz',
+            'try-omarchy-import.sh',
+            'vmlinuz-linux',
+            'winq-emu-alpha10-portable.zip',
+            'winq-emu-alpha10-source.zip'
+          )
+          foreach ($asset in $assets) {
+            gh release download $env:RELEASE_TAG -p $asset -D release-manifest --clobber
+          }
+          python scripts/release/verify-release-assets.py `
+            release-manifest/SHA256SUMS release-manifest $assets
+
+      - name: Test launcher
+        working-directory: app
+        shell: pwsh
+        run: |
+          go test -race ./...
+          go vet -unsafeptr=false ./...
+
+      - name: Build optimized launcher
+        working-directory: app
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force ../release | Out-Null
+          go build -trimpath -ldflags '-H windowsgui -s -w' -o ../release/TryOmarchy.exe .
+
+      - name: Sign in to Azure with OIDC
+        uses: azure/login@7ddb5af1ef8758cf1353cf3b42f940aee27ba21c # v3
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Sign launcher
+        uses: Azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2
+        with:
+          endpoint: ${{ vars.AZURE_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ vars.AZURE_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ vars.AZURE_SIGNING_PROFILE }}
+          files: ${{ github.workspace }}\release\TryOmarchy.exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      - name: Verify signature and write checksum
+        shell: pwsh
+        run: |
+          $exe = 'release/TryOmarchy.exe'
+          $signature = Get-AuthenticodeSignature $exe
+          if ($signature.Status -ne 'Valid') {
+            throw "Authenticode verification failed: $($signature.StatusMessage)"
+          }
+          $hash = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  TryOmarchy.exe" | Set-Content release/TryOmarchy.exe.sha256 -Encoding ascii
+
+      - name: Sign authenticated update metadata
+        shell: pwsh
+        run: |
+          $manifestHash = (Get-FileHash "app/testdata/SHA256SUMS.$env:RELEASE_TAG" -Algorithm SHA256).Hash.ToLowerInvariant()
+          go -C app run ./cmd/sign-update `
+            -version $env:RELEASE_TAG `
+            -release "https://github.com/$env:UPDATE_RELEASE_REPOSITORY/releases/download/$env:RELEASE_TAG" `
+            -manifest-sha256 $manifestHash `
+            -launcher ../release/TryOmarchy.exe `
+            -output ../release/update.json
+
+      - name: Prepare current and legacy update feeds
+        shell: pwsh
+        run: |
+          Copy-Item release/update.json release/update-v2.json
+          Copy-Item release/update.json.sig release/update-v2.json.sig
+          if ($env:RELEASE_TAG -notlike '*-preview') {
+            if ($env:LEGACY_UPDATE_BRIDGE_TAG -notmatch '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-preview$') {
+              throw 'Set LEGACY_UPDATE_BRIDGE_TAG to a tested, published bridge preview before releasing stable builds'
+            }
+            $bridgeDraft = gh release view $env:LEGACY_UPDATE_BRIDGE_TAG --json isDraft --jq .isDraft
+            if ($LASTEXITCODE -ne 0 -or $bridgeDraft -ne 'false') { throw 'The bridge must be public' }
+            $newerThanBridge = python scripts/release/release-order.py $env:RELEASE_TAG $env:LEGACY_UPDATE_BRIDGE_TAG
+            if ($LASTEXITCODE -ne 0 -or $newerThanBridge -ne 'true') { throw 'Stable must be newer than the bridge' }
+            New-Item -ItemType Directory -Force bridge-metadata | Out-Null
+            gh release download $env:LEGACY_UPDATE_BRIDGE_TAG -p update-v2.json -p update-v2.json.sig -D bridge-metadata
+            if ($LASTEXITCODE -ne 0) { throw 'Could not download bridge metadata' }
+            go -C app run ./cmd/sign-update -verify-bridge ../bridge-metadata/update-v2.json -version $env:LEGACY_UPDATE_BRIDGE_TAG
+            if ($LASTEXITCODE -ne 0) { throw 'Bridge metadata verification failed' }
+            Copy-Item bridge-metadata/update-v2.json release/update.json
+            Copy-Item bridge-metadata/update-v2.json.sig release/update.json.sig
+          }
+
+      - name: Upload launcher and release notes
+        shell: pwsh
+        run: |
+          python scripts/release/release-notes.py $env:RELEASE_TAG --output release-notes.md
+          if ($LASTEXITCODE -ne 0) { throw 'Release note generation failed' }
+          if (!(Test-Path release-notes.md) -or [string]::IsNullOrWhiteSpace((Get-Content release-notes.md -Raw -Encoding utf8))) {
+            throw 'Release notes are empty'
+          }
+          gh release upload $env:RELEASE_TAG `
+            release/TryOmarchy.exe `
+            release/TryOmarchy.exe.sha256 `
+            release/update.json `
+            release/update.json.sig `
+            release/update-v2.json `
+            release/update-v2.json.sig `
+            --clobber
+          if ($LASTEXITCODE -ne 0) { throw 'Release asset upload failed' }
+          gh release edit $env:RELEASE_TAG --target $env:GITHUB_SHA --title $env:RELEASE_TAG --notes-file release-notes.md
+          if ($LASTEXITCODE -ne 0) { throw 'Release note upload failed' }
+
+      - name: Publish without changing Latest
+        shell: pwsh
+        run: gh release edit $env:RELEASE_TAG --draft=false --prerelease=false --latest=false
+
+      - name: Verify public tagged assets
+        shell: pwsh
+        run: |
+          scripts/release/verify-public.ps1 -Tag $env:RELEASE_TAG
+          scripts/release/verify-public.ps1 -Tag $env:RELEASE_TAG -Repository tsouth89/try-omarchy-windows
+
+      - name: Promote newer releases without replacing stable with preview
+        id: promote
+        shell: pwsh
+        run: |
+          $latest = gh release view --json tagName --jq .tagName
+          if ($LASTEXITCODE -ne 0) { throw 'Could not determine the current Latest release' }
+          $promote = python scripts/release/release-order.py $env:RELEASE_TAG $latest
+          if ($LASTEXITCODE -ne 0) { throw 'Could not compare release versions' }
+          if ($promote -eq 'true') {
+            gh release edit $env:RELEASE_TAG --latest
+            if ($LASTEXITCODE -ne 0) { throw 'Could not promote the release' }
+            'latest=true' >> $env:GITHUB_OUTPUT
+          } elseif ($env:RELEASE_TAG -like '*-preview') {
+            gh release edit $env:RELEASE_TAG --prerelease=true --latest=false
+            if ($LASTEXITCODE -ne 0) { throw 'Could not mark the preview release' }
+          }
+
+      - name: Verify public Latest download
+        if: steps.promote.outputs.latest == 'true'
+        shell: pwsh
+        run: |
+          scripts/release/verify-public.ps1 -Tag $env:RELEASE_TAG -Latest
+          scripts/release/verify-public.ps1 -Tag $env:RELEASE_TAG -Latest -Repository tsouth89/try-omarchy-windows

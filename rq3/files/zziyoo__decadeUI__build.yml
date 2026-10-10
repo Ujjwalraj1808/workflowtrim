@@ -1,0 +1,65 @@
+name: build
+
+on:
+    push:
+        branches: [main]
+
+permissions:
+    contents: write # 允许 Actions 推送代码到仓库
+
+jobs:
+    build:
+        runs-on: ubuntu-latest
+
+        steps:
+            - name: Checkout repository
+              uses: actions/checkout@v4
+
+            - name: Install pnpm
+              uses: pnpm/action-setup@v4
+              with:
+                  version: 9
+                  run_install: false
+
+            - name: Install Node.js
+              uses: actions/setup-node@v4
+              with:
+                  node-version: 20
+                  cache: "pnpm"
+
+            - name: Install dependencies
+              run: pnpm install --no-frozen-lockfile
+
+            - name: Run Build
+              run: pnpm build
+
+            - name: Deploy dist to branch
+              env:
+                  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+              run: |
+                  git config --global user.name "github-actions[bot]"
+                  git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+                  # 打包输出在 dist 目录
+                  if [ ! -d "dist" ]; then
+                    echo "错误: 打包输出目录不存在"
+                    exit 1
+                  fi
+
+                  # 临时保存打包结果
+                  mkdir -p /tmp/dist
+                  cp -r dist/* /tmp/dist/
+
+                  # 切换到打包分支
+                  git fetch origin
+                  git checkout --orphan build-output
+                  git reset --hard
+                  rm -rf *
+
+                  # 复制打包结果
+                  cp -r /tmp/dist/* .
+
+                  # 提交并推送
+                  git add .
+                  git commit -m "Deploy dist from $GITHUB_SHA"
+                  git push -f origin build-output

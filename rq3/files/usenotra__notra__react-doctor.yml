@@ -1,0 +1,69 @@
+# React Doctor — finds security, performance, correctness, accessibility,
+# bundle-size, and architecture issues in React codebases.
+#
+# Docs: https://www.react.doctor/ci
+# Source: https://github.com/millionco/react-doctor
+
+name: React Doctor
+
+on:
+  # Scans the PR's changed files and posts a sticky summary comment listing only the new issues introduced relative to the merge base of the target branch.
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  # Scans `main` on every push to track the health-score trend and catch regressions that slipped past PR review.
+  push:
+    branches: ["main"]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+  statuses: write
+
+# Cancels any in-flight scan for the same PR (or branch, on push) the moment a new commit arrives, so reviewers only ever see the latest run.
+concurrency:
+  group: react-doctor-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  react-doctor:
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Check out React Doctor action
+        uses: actions/checkout@v7
+        with:
+          repository: millionco/react-doctor
+          ref: v2
+          path: .github/actions/react-doctor
+          persist-credentials: false
+          sparse-checkout: |
+            action.yml
+            scripts
+          sparse-checkout-cone-mode: false
+
+      - name: Preserve full history for React Doctor
+        # v2's depth=1 fetch re-shallows the checkout and breaks PR merge bases.
+        # Remove this workaround when the upstream action preserves full history.
+        run: sed -i 's/fetch --no-tags --depth=1 origin/fetch --no-tags origin/' .github/actions/react-doctor/action.yml
+
+      - uses: ./.github/actions/react-doctor
+        with:
+          # Findings stay advisory; checkout/baseline failures must not look clean.
+          blocking: none
+          scope: changed
+          project: "*"
+          version: latest
+          node-version: "24"
+
+      - name: Verify React Doctor baseline history
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          test "$(git rev-parse --is-shallow-repository)" = false
+          git merge-base "$BASE_SHA" "$HEAD_SHA" > /dev/null

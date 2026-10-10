@@ -1,0 +1,73 @@
+name: create-release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version"
+        required: true
+
+permissions:
+  actions: read
+  contents: write
+  id-token: write
+  packages: write
+  pull-requests: write
+
+jobs:
+  release:
+    uses: ckotzbauer/actions-toolkit/.github/workflows/toolkit-release-goreleaser.yml@187b42cc2ca9bc9257d6e72bb1c1be730f1d0565 # 0.56.0
+    with:
+      version: ${{ github.event.inputs.version }}
+      docker-platforms: linux/amd64,linux/arm64
+      docker-tags: |
+        ghcr.io/ckotzbauer/sbom-operator:${{ github.event.inputs.version }}
+        ghcr.io/ckotzbauer/sbom-operator:latest
+      cosign-repository: ghcr.io/ckotzbauer/sbom-operator-metadata
+    secrets:
+      token: ${{ secrets.GITHUB_TOKEN }}
+      pat: ${{ secrets.REPO_ACCESS }}
+      ghcr-password: ${{ secrets.GHCR_PASSWORD }}
+
+  job-image-vcn:
+    uses: ckotzbauer/sbom-operator/.github/workflows/release-job-image.yml@91ebeac6a891b0f2810d1f79aedb9799c89f57d2 # main
+    needs: [release]
+    with:
+      version: ${{ github.event.inputs.version }}
+      job-image: vcn
+      docker-platforms: linux/amd64
+      docker-tags: |
+        ghcr.io/ckotzbauer/sbom-operator/vcn:${{ github.event.inputs.version }}
+        ghcr.io/ckotzbauer/sbom-operator/vcn:latest
+      cosign-repository: ghcr.io/ckotzbauer/sbom-operator-metadata
+    secrets:
+      token: ${{ secrets.GITHUB_TOKEN }}
+      pat: ${{ secrets.REPO_ACCESS }}
+      ghcr-password: ${{ secrets.GHCR_PASSWORD }}
+
+  get-digest:
+    needs: [job-image-vcn]
+    runs-on: ubuntu-latest
+    outputs:
+      digest: ${{ steps.digest.outputs.digest }}
+    steps:
+      - name: Setup Crane
+        uses: imjasonh/setup-crane@feee3b6bb0d4c68370f256a4502498c9227e5c6b # v0.7
+
+      - name: Get image digest
+        id: digest
+        env:
+          GHCR_PASSWORD: ${{ secrets.GHCR_PASSWORD }}
+        run: |
+          crane auth login ghcr.io -u ${{ github.actor }} -p "${GHCR_PASSWORD}"
+          DIGEST=$(crane digest "ghcr.io/ckotzbauer/sbom-operator:${{ github.event.inputs.version }}")
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+
+  bump-chart:
+    needs: [get-digest]
+    uses: ckotzbauer/helm-charts/.github/workflows/bump-chart.yaml@1c4b8739342fb9a2d012b4ed107b33c7031b9341 # main
+    with:
+      chart: sbom-operator
+      app-version: ${{ github.event.inputs.version }}
+      image-digest: ${{ needs.get-digest.outputs.digest }}
+    secrets: inherit

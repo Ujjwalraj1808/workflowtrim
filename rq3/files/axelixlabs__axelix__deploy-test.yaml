@@ -1,0 +1,225 @@
+name: Build / Deploy to Testing Env
+
+on:
+  workflow_dispatch:
+    inputs:
+      helm_chart_branch:
+        description: 'Helm chart branch name'
+        required: false
+        type: string
+        default: 'main'
+  push:
+    branches: [ master ]
+    paths:
+      # CI/CD configuration
+      - '.github/**'
+
+      # Application modules
+      - 'axelix-enterprise' # Tracks changes to the Git submodule pointer (gitlink)
+      - 'common/**'
+      - 'master/**'
+      - 'master-oss/**'
+      - 'plugins/**'
+      - 'sbs/**'
+
+      # Playground projects
+      - 'playgrounds/**'
+
+      # Core Gradle build configuration
+      - 'buildSrc/**'
+      - 'gradle/**'
+      - 'build.gradle.kts'
+      - 'settings.gradle.kts'
+      - 'gradle.properties'
+      - 'gradlew'
+      - 'gradlew.bat'
+      - 'Makefile'
+
+      # Code quality, formatting, and license configurations
+      - 'pmd.ruleset.xml'
+      - '.editorconfig'
+      - 'LICENSE'
+      - 'LICENSE_HEADER'
+
+jobs:
+  build-deploy-source:
+    runs-on: ubuntu-latest
+    env:
+      CLOUD_CONTAINER_REGISTRY_TOKEN: ${{ secrets.CLOUD_CONTAINER_REGISTRY_TOKEN }}
+      CLOUD_CONTAINER_REGISTRY_URL: ${{ vars.CLOUD_CONTAINER_REGISTRY_URL }}
+      IMAGE_REPOSITORY: ${{ vars.CLOUD_CONTAINER_REGISTRY_URL }}/${{ vars.CR_MASTER_REPOSITORY }}
+      IMAGE_NAME: axelix
+      # Use branch from workflow_dispatch input if provided, otherwise default to 'main'
+      HELM_CHART_BRANCH: ${{ github.event.inputs.helm_chart_branch || 'main' }}
+
+      # OIDC Related settings
+      AXELIX_MASTER_AUTH_OPTIONS_OAUTH2_ENABLED: true
+      AXELIX_MASTER_AUTH_OPTIONS_OAUTH2_ISSUER_URI: ${{ secrets.OIDC_GOOGLE_ISSUER_URL }}
+      AXELIX_MASTER_AUTH_OPTIONS_OAUTH2_CLIENT_ID: ${{ secrets.OIDC_GOOGLE_CLIENT_ID }}
+      AXELIX_MASTER_AUTH_OPTIONS_OAUTH2_CLIENT_SECRET: ${{ secrets.OIDC_GOOGLE_CLIENT_SECRET }}
+      AXELIX_MASTER_AUTH_OPTIONS_OAUTH2_BASE_URL: ${{ secrets.OIDC_GOOGLE_REDIRECT_URL }}
+    steps:
+      # Initial checkout without submodules so that the local bitwarden action is available.
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Loading Secrets
+        uses: ./.github/actions/bitwarden
+        with:
+          bw-access-token: ${{ secrets.BW_ACCESS_TOKEN }}
+
+      # Java 25 will be installed at this step.
+      - name: Build Backend
+        id: build-backend
+        uses: ./.github/actions/build-master
+        with:
+          gradle-cache-encryption-key: ${{ env.SANDBOX_GRADLE_CACHE_ENCRYPTION_KEY }}
+
+      - name: Set up Docker
+        uses: docker/setup-docker-action@v5
+
+      - name: Read Gradle Properties file
+        uses: ./.github/actions/read-axelix-version
+        id: gradleProperties
+        with:
+          file: gradle.properties
+
+      # TODO remove --provenance=false
+      - name: Build Docker Image
+        run: |
+          docker build --provenance=false --tag $IMAGE_REPOSITORY/$IMAGE_NAME:${{ steps.gradleProperties.outputs.version }} --file master-oss/Dockerfile master-oss
+
+      - name: Docker login to Cloud CR
+        run: echo $CLOUD_CONTAINER_REGISTRY_TOKEN | docker login --username oauth --password-stdin $CLOUD_CONTAINER_REGISTRY_URL
+
+      - name: Docker push to Cloud CR
+        run: docker push $IMAGE_REPOSITORY/$IMAGE_NAME:${{ steps.gradleProperties.outputs.version }}
+
+      - name: Docker logout
+        run: docker logout
+
+      - name: Checkout helm-charts repository
+        uses: actions/checkout@v7
+        with:
+          repository: axelixlabs/helm-charts
+          ref: ${{ env.HELM_CHART_BRANCH }}
+          path: helm-charts
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Helm
+        uses: azure/setup-helm@v5.0.1
+        with:
+          version: v3.14.0
+
+      - name: Deploy master to K8S
+        working-directory: helm-charts/charts/axelix
+        run: |
+          mkdir -p ~/.kube
+          touch ~/.kube/config
+          echo "$SANDBOX_KUBE_CONFIG" > ~/.kube/config
+          chmod 600 ~/.kube/config
+          helm upgrade \
+            --set image.pullPolicy=Always \
+            --set image.name=$IMAGE_REPOSITORY/$IMAGE_NAME \
+            --set image.ref=${{ steps.gradleProperties.outputs.version }} \
+            --set axelix.master.auth.jwt.signingKey=${{ env.SANDBOX_JWT_SIGNING_KEY }} \
+            --set axelix.master.auth.jwt.algorithm=HMAC512 \
+            --set axelix.master.auth.cookie.secure=false \
+            --set axelix.master.auth.options.oauth2.enabled=${{ env.AXELIX_MASTER_AUTH_OPTIONS_OAUTH2_ENABLED }} \
+            --set axelix.master.auth.options.oauth2.issuerUri=${{ env.AXELIX_MASTER_AUTH_OPTIONS_OAUTH2_ISSUER_URI }} \
+            --set axelix.master.auth.options.oauth2.baseUrl=${{ env.AXELIX_MASTER_AUTH_OPTIONS_OAUTH2_BASE_URL }}  \
+            --set axelix.master.auth.options.oauth2.clientId=${{ env.AXELIX_MASTER_AUTH_OPTIONS_OAUTH2_CLIENT_ID }} \
+            --set axelix.master.auth.options.oauth2.clientSecret=${{ env.AXELIX_MASTER_AUTH_OPTIONS_OAUTH2_CLIENT_SECRET }} \
+            --set axelix.master.auth.options.local.enabled=true \
+            --set axelix.master.discovery.selfRegistration.enabled=true \
+            --install axelix-master . \
+            -f values.yaml
+
+      # Set up Extra JDKs for Playgrounds
+      - name: Set up JDK 17 for Playgrounds
+        uses: actions/setup-java@v5.6.0
+        id: setup-java-17
+        with:
+          java-version: '17'
+          distribution: 'liberica'
+
+      - name: Set up JDK 21 for Playgrounds
+        uses: actions/setup-java@v5.6.0
+        id: setup-java-21
+        with:
+          java-version: '21'
+          distribution: 'liberica'
+          
+      - name: Build Playgrounds
+        env:
+          JAVA_17_HOME: ${{ steps.setup-java-17.outputs.path }}
+          JAVA_21_HOME: ${{ steps.setup-java-21.outputs.path }}
+          JAVA_25_HOME: ${{ steps.build-backend.outputs.java-25-home }}
+        run: |
+          make build-playground BUILD_SB2="true" BUILD_SB3="true" BUILD_SB4="true"
+
+      - name: Deploy Playground Spring Petclinic Maven SB 2
+        env:
+          APP_NAME: spring-petclinic-maven-sb-2
+        uses: ./.github/actions/deploy-playground
+        with:
+          working-directory: playgrounds/${{ env.APP_NAME }}
+          cr-url: ${{ env.CLOUD_CONTAINER_REGISTRY_URL }}
+          cr-repository-path: ${{ env.IMAGE_REPOSITORY }}
+          image-tag: playgrounds:${{ env.APP_NAME }}-2.7.18-SNAPSHOT
+          helm-release: ${{ env.APP_NAME }}
+
+      - name: Deploy Playground Notification Service Gradle SB 2
+        env:
+          APP_NAME: notification-service-gradle-sb-2
+        uses: ./.github/actions/deploy-playground
+        with:
+          working-directory: playgrounds/${{ env.APP_NAME }}
+          cr-url: ${{ env.CLOUD_CONTAINER_REGISTRY_URL }}
+          cr-repository-path: ${{ env.IMAGE_REPOSITORY }}
+          image-tag: playgrounds:${{ env.APP_NAME }}-0.0.2-SNAPSHOT
+          helm-release: ${{ env.APP_NAME }}
+
+      - name: Deploy Playground Feature Service Maven SB 3
+        env:
+          APP_NAME: feature-service-maven-sb-3
+        uses: ./.github/actions/deploy-playground
+        with:
+          working-directory: playgrounds/${{ env.APP_NAME }}
+          cr-url: ${{ env.CLOUD_CONTAINER_REGISTRY_URL }}
+          cr-repository-path: ${{ env.IMAGE_REPOSITORY }}
+          image-tag: playgrounds:${{ env.APP_NAME }}-0.0.2-SNAPSHOT
+          helm-release: ${{ env.APP_NAME }}
+
+      - name: Deploy Playground Spring Petclinic Gradle SB 3
+        env:
+          APP_NAME: spring-petclinic-gradle-sb-3
+        uses: ./.github/actions/deploy-playground
+        with:
+          working-directory: playgrounds/${{ env.APP_NAME }}
+          cr-url: ${{ env.CLOUD_CONTAINER_REGISTRY_URL }}
+          cr-repository-path: ${{ env.IMAGE_REPOSITORY }}
+          image-tag: playgrounds:${{ env.APP_NAME }}-3.5.0-SNAPSHOT
+          helm-release: ${{ env.APP_NAME }}
+
+      - name: Deploy Playground Spring Petclinic Maven SB 4
+        env:
+          APP_NAME: spring-petclinic-maven-sb-4
+        uses: ./.github/actions/deploy-playground
+        with:
+          working-directory: playgrounds/${{ env.APP_NAME }}
+          cr-url: ${{ env.CLOUD_CONTAINER_REGISTRY_URL }}
+          cr-repository-path: ${{ env.IMAGE_REPOSITORY }}
+          image-tag: playgrounds:${{ env.APP_NAME }}-4.0.7-SNAPSHOT
+          helm-release: ${{ env.APP_NAME }}
+
+      - name: Deploy Playground Api Gateway Gradle SB 4 (no database)
+        env:
+          APP_NAME: api-gateway-gradle-sb-4
+        uses: ./.github/actions/deploy-playground
+        with:
+          working-directory: playgrounds/${{ env.APP_NAME }}
+          cr-url: ${{ env.CLOUD_CONTAINER_REGISTRY_URL }}
+          cr-repository-path: ${{ env.IMAGE_REPOSITORY }}
+          image-tag: playgrounds:${{ env.APP_NAME }}-1.2.0-SNAPSHOT
+          helm-release: ${{ env.APP_NAME }}

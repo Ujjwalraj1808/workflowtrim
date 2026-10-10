@@ -1,0 +1,65 @@
+name: Backport
+on:
+  workflow_call:
+    inputs:
+      branch_name:
+        description: 'Target branch (e.g. release-2.7)'
+        required: true
+        type: string
+      pr_number:
+        description: 'PR number to backport'
+        required: true
+        type: number
+      dry_run:
+        description: 'Dry run mode'
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  backport:
+    name: Backport to ${{ inputs.branch_name }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify PR is merged and target branch exists
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          BRANCH_NAME: ${{ inputs.branch_name }}
+          API_URL: ${{ github.api_url }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          pr_data=$(curl -sSf \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "${API_URL}/repos/${REPO}/pulls/${PR_NUMBER}")
+
+          if [[ "$(echo "$pr_data" | jq -r '.merged')" != "true" ]]; then
+            echo "::error::PR #${PR_NUMBER} is not merged. Aborting."
+            exit 1
+          fi
+
+          if ! git ls-remote --exit-code --heads origin "$BRANCH_NAME" >/dev/null 2>&1; then
+            echo "::error::Target branch '${BRANCH_NAME}' does not exist"
+            exit 1
+          fi
+
+      - name: Perform backport
+        uses: kiegroup/git-backporting@v4.8.5
+        with:
+          target-branch: ${{ inputs.branch_name }}
+          pull-request: ${{ github.server_url }}/${{ github.repository }}/pull/${{ inputs.pr_number }}
+          no-squash: true
+          auth: ${{ secrets.GITHUB_TOKEN }}
+          dry-run: ${{ inputs.dry_run }}

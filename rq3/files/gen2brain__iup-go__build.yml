@@ -1,0 +1,743 @@
+on: [push, pull_request]
+name: Build
+env:
+  CGO_CFLAGS: -Werror
+  CGO_CXXFLAGS: -Werror
+jobs:
+  linux-gtk3:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    - name: Install Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: stable
+    - name: Install dependencies
+      run: sudo apt-get update -y && sudo apt-get install -y libgtk-3-dev
+    - name: Build
+      run: go build
+      working-directory: iup
+
+  linux-gtk3-ctrl:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    - name: Install Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: stable
+    - name: Install dependencies
+      run: sudo apt-get update -y && sudo apt-get install -y libgtk-3-dev
+    - name: Build
+      run: go build -tags ctrl
+      working-directory: iup
+
+  linux-gtk3-plot:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    - name: Install Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: stable
+    - name: Install dependencies
+      run: sudo apt-get update -y && sudo apt-get install -y libgtk-3-dev
+    - name: Build
+      run: go build -tags plot
+      working-directory: iup
+
+  linux-gtk3-examples:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    - name: Install Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: stable
+    - name: Install dependencies
+      run: sudo apt-get update -y && sudo apt-get install -y libgtk-3-dev libgl1-mesa-dev
+    - name: Build examples
+      run: go build -tags ctrl,plot,web,gl,media ./...
+      working-directory: examples
+
+  linux-gtk4:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    - name: Install Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: stable
+    - name: Install dependencies
+      run: sudo apt-get update -y && sudo apt-get install -y libgtk-4-dev
+    - name: Build
+      run: go build -tags gtk4
+      working-directory: iup
+
+  linux-gtk2:
+    runs-on: ubuntu-latest
+    env:
+      CGO_CFLAGS: ""
+      CGO_CXXFLAGS: ""
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    - name: Install Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: stable
+    - name: Install dependencies
+      run: sudo apt-get update -y && sudo apt-get install -y libgtk2.0-dev
+    - name: Build
+      run: go build -tags gtk2
+      working-directory: iup
+
+  linux-qt6:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    - name: Install Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: stable
+    - name: Install dependencies
+      run: sudo apt-get update -y && sudo apt-get install -y qt6-base-dev
+    - name: Build
+      run: go build -tags qt
+      working-directory: iup
+
+  linux-qt5:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    - name: Install Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: stable
+    - name: Install dependencies
+      run: sudo apt-get update -y && sudo apt-get install -y qtbase5-dev
+    - name: Build
+      run: go build -tags qt,qt5
+      working-directory: iup
+
+  linux-qml:
+    runs-on: ubuntu-latest
+    container: debian:trixie
+    steps:
+    - name: Install dependencies
+      run: apt-get update -y && apt-get install -y --no-install-recommends ca-certificates git gcc g++ pkg-config libx11-dev qt6-base-dev qt6-declarative-dev
+    - name: Checkout code
+      uses: actions/checkout@v4
+    - name: Install Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: stable
+    - name: Build
+      run: go build -tags qml
+      working-directory: iup
+
+  linux-motif:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    - name: Install Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: stable
+    - name: Install dependencies
+      run: sudo apt-get update -y && sudo apt-get install -y libmotif-dev libxmu-dev libxpm-dev
+    - name: Build
+      run: go build -tags motif
+      working-directory: iup
+
+  linux-motif-gl:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    - name: Install Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: stable
+    - name: Install dependencies
+      run: sudo apt-get update -y && sudo apt-get install -y libmotif-dev libxmu-dev libxpm-dev libgl1-mesa-dev
+    - name: Build
+      run: go build -tags motif,gl
+      working-directory: iup
+
+  linux-efl:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    - name: Install Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: stable
+    - name: Install dependencies
+      run: sudo apt-get update -y && sudo apt-get install -y libefl-all-dev
+    - name: Build
+      run: go build -tags efl
+      working-directory: iup
+
+  linux-efl-gl:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    - name: Install Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: stable
+    - name: Install dependencies
+      run: sudo apt-get update -y && sudo apt-get install -y libefl-all-dev libgl1-mesa-dev
+    - name: Build
+      run: go build -tags efl,gl
+      working-directory: iup
+
+  linux-fltk:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    - name: Install Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: stable
+    - name: Install dependencies
+      run: |
+        sudo apt-get update -y
+        sudo apt-get install -y cmake libx11-dev libxft-dev libxext-dev libxrender-dev libxcursor-dev libxfixes-dev libxinerama-dev libpng-dev libjpeg-dev zlib1g-dev libwayland-dev wayland-protocols libxkbcommon-dev libdecor-0-dev libpango1.0-dev libcairo2-dev
+    - name: Build FLTK
+      run: |
+        git clone --depth 1 --branch release-1.4.4 https://github.com/fltk/fltk.git /tmp/fltk-src
+        cmake -S /tmp/fltk-src -B /tmp/fltk-build \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DFLTK_BUILD_FLUID=OFF \
+          -DFLTK_BUILD_FLTK_OPTIONS=OFF \
+          -DFLTK_BUILD_TEST=OFF \
+          -DFLTK_BUILD_EXAMPLES=OFF \
+          -DFLTK_BUILD_FORMS=OFF \
+          -DFLTK_BUILD_GL=OFF
+        cmake --build /tmp/fltk-build --parallel
+        sudo cmake --install /tmp/fltk-build
+    - name: Build
+      run: go build -tags fltk
+      working-directory: iup
+
+  linux-gtk3-gl:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    - name: Install Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: stable
+    - name: Install dependencies
+      run: sudo apt-get update -y && sudo apt-get install -y libgtk-3-dev libgl1-mesa-dev
+    - name: Build
+      run: go build -tags gl
+      working-directory: iup
+
+  linux-gtk4-gl:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    - name: Install Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: stable
+    - name: Install dependencies
+      run: sudo apt-get update -y && sudo apt-get install -y libgtk-4-dev libgl1-mesa-dev
+    - name: Build
+      run: go build -tags gtk4,gl
+      working-directory: iup
+
+  linux-gtk3-web:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    - name: Install Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: stable
+    - name: Install dependencies
+      run: sudo apt-get update -y && sudo apt-get install -y libgtk-3-dev
+    - name: Build
+      run: go build -tags web
+      working-directory: iup
+
+  linux-gtk3-media:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    - name: Install Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: stable
+    - name: Install dependencies
+      run: sudo apt-get update -y && sudo apt-get install -y libgtk-3-dev
+    - name: Build
+      run: go build -tags media
+      working-directory: iup
+
+  linux-gtk4-web:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    - name: Install Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: stable
+    - name: Install dependencies
+      run: sudo apt-get update -y && sudo apt-get install -y libgtk-4-dev
+    - name: Build
+      run: go build -tags gtk4,web
+      working-directory: iup
+
+  linux-qt6-web:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    - name: Install Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: stable
+    - name: Install dependencies
+      run: sudo apt-get update -y && sudo apt-get install -y qt6-base-dev qt6-webengine-dev
+    - name: Build
+      run: go build -tags qt,web
+      working-directory: iup
+
+  linux-qml-web:
+    runs-on: ubuntu-latest
+    container: debian:trixie
+    steps:
+    - name: Install dependencies
+      run: apt-get update -y && apt-get install -y --no-install-recommends ca-certificates git gcc g++ pkg-config libx11-dev qt6-base-dev qt6-declarative-dev qt6-webengine-dev
+    - name: Checkout code
+      uses: actions/checkout@v4
+    - name: Install Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: stable
+    - name: Build
+      run: go build -tags qml,web
+      working-directory: iup
+
+  macos-cocoa:
+    runs-on: macos-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    - name: Install Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: stable
+    - name: Build
+      run: go build
+      working-directory: iup
+
+  macos-cocoa-web:
+    runs-on: macos-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    - name: Install Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: stable
+    - name: Build
+      run: go build -tags web
+      working-directory: iup
+
+  macos-cocoa-media:
+    runs-on: macos-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    - name: Install Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: stable
+    - name: Build
+      run: go build -tags media
+      working-directory: iup
+
+  macos-gtk3:
+    runs-on: macos-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    - name: Install Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: stable
+    - name: Install dependencies
+      run: brew install gtk+3
+    - name: Build
+      run: go build -tags gtk3
+      working-directory: iup
+
+  macos-gtk4:
+    runs-on: macos-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    - name: Install Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: stable
+    - name: Install dependencies
+      run: brew install gtk4
+    - name: Build
+      run: go build -tags gtk4
+      working-directory: iup
+
+  macos-qt6:
+    runs-on: macos-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    - name: Install Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: stable
+    - name: Install dependencies
+      run: brew install qt
+    - name: Build
+      run: go build -tags qt
+      working-directory: iup
+
+  windows-winui:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    - name: Install Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: stable
+    - name: Install llvm-mingw
+      run: |
+        cd "$RUNNER_TEMP"
+        curl -L -o llvm-mingw.zip https://github.com/mstorsjo/llvm-mingw/releases/download/20251216/llvm-mingw-20251216-ucrt-x86_64.zip
+        unzip -q llvm-mingw.zip
+        echo "$RUNNER_TEMP/llvm-mingw-20251216-ucrt-x86_64/bin" >> $GITHUB_PATH
+    - name: Build
+      env:
+        CC: x86_64-w64-mingw32-clang
+        CXX: x86_64-w64-mingw32-clang++
+        CGO_ENABLED: "1"
+      run: go build -tags winui
+      working-directory: iup
+
+  windows-win32:
+    runs-on: windows-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    - name: Install Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: stable
+    - name: Build
+      run: go build
+      working-directory: iup
+
+  windows-win32-gl:
+    runs-on: windows-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    - name: Install Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: stable
+    - name: Build
+      run: go build -tags gl
+      working-directory: iup
+
+  windows-win32-web:
+    runs-on: windows-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    - name: Install Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: stable
+    - name: Build
+      run: go build -tags web
+      working-directory: iup
+
+  windows-win32-media:
+    runs-on: windows-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    - name: Install Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: stable
+    - name: Build
+      run: go build -tags media
+      working-directory: iup
+
+  windows-gtk3:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+    - name: Setup MSYS2
+      uses: msys2/setup-msys2@v2
+      with:
+        msystem: MINGW64
+        install: mingw-w64-x86_64-go mingw-w64-x86_64-gcc mingw-w64-x86_64-pkg-config mingw-w64-x86_64-gtk3
+    - name: Checkout code
+      uses: actions/checkout@v4
+    - name: Build
+      run: go build -tags gtk3
+      working-directory: iup
+
+  windows-gtk4:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+    - name: Setup MSYS2
+      uses: msys2/setup-msys2@v2
+      with:
+        msystem: MINGW64
+        install: mingw-w64-x86_64-go mingw-w64-x86_64-gcc mingw-w64-x86_64-pkg-config mingw-w64-x86_64-gtk4
+    - name: Checkout code
+      uses: actions/checkout@v4
+    - name: Build
+      run: go build -tags gtk4
+      working-directory: iup
+
+  windows-qt6:
+    runs-on: windows-latest
+    env:
+      CGO_CFLAGS: ""
+      CGO_CXXFLAGS: ""
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+    - name: Setup MSYS2
+      uses: msys2/setup-msys2@v2
+      with:
+        msystem: MINGW64
+        install: mingw-w64-x86_64-go mingw-w64-x86_64-gcc mingw-w64-x86_64-pkg-config mingw-w64-x86_64-qt6-base
+    - name: Checkout code
+      uses: actions/checkout@v4
+    - name: Build
+      run: go build -tags qt
+      working-directory: iup
+
+  windows-cmake:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+    - name: Setup MSYS2
+      uses: msys2/setup-msys2@v2
+      with:
+        msystem: MINGW64
+        install: mingw-w64-x86_64-gcc mingw-w64-x86_64-cmake mingw-w64-x86_64-ninja
+    - name: Checkout code
+      uses: actions/checkout@v4
+    - name: CMake Win32
+      run: |
+        cmake -S iup/external -B build/win32 -G Ninja -DBUILD_SHARED_LIBS=ON -DIUP_BACKEND=win32 -DIUP_BUILD_GL=ON -DIUP_BUILD_WEB=ON -DIUP_BUILD_CTRL=ON -DIUP_BUILD_PLOT=ON -DIUP_BUILD_MEDIA=ON -DCMAKE_COMPILE_WARNING_AS_ERROR=ON
+        cmake --build build/win32 --parallel
+
+  windows-msvc:
+    runs-on: windows-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    - name: Setup MSVC
+      uses: ilammy/msvc-dev-cmd@v1
+      with:
+        arch: x64
+    - name: CMake WinUI
+      run: |
+        cmake --preset winui-full -G Ninja -DCMAKE_COMPILE_WARNING_AS_ERROR=ON
+        cmake --build build/winui-full --parallel
+      working-directory: iup/external
+    - name: CMake WinUI shared
+      run: |
+        cmake -S . -B build/winui-shared -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON -DIUP_BACKEND=winui -DIUP_BUILD_GL=ON -DIUP_BUILD_WEB=ON -DIUP_BUILD_CTRL=ON -DIUP_BUILD_PLOT=ON -DIUP_BUILD_MEDIA=ON -DCMAKE_COMPILE_WARNING_AS_ERROR=ON
+        cmake --build build/winui-shared --parallel
+      working-directory: iup/external
+    - name: CMake Win32
+      run: |
+        cmake --preset win32-full -G Ninja -DCMAKE_COMPILE_WARNING_AS_ERROR=ON
+        cmake --build build/win32-full --parallel
+      working-directory: iup/external
+    - name: CMake Win32 shared
+      run: |
+        cmake -S . -B build/win32-shared -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON -DIUP_BACKEND=win32 -DIUP_BUILD_GL=ON -DIUP_BUILD_WEB=ON -DIUP_BUILD_CTRL=ON -DIUP_BUILD_PLOT=ON -DIUP_BUILD_MEDIA=ON -DCMAKE_COMPILE_WARNING_AS_ERROR=ON
+        cmake --build build/win32-shared --parallel
+      working-directory: iup/external
+
+  linux-android:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    - name: Install Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: stable
+    - name: Install NDK
+      id: setup-ndk
+      uses: nttld/setup-ndk@v1
+      with:
+        ndk-version: r27c
+        local-cache: false
+    - name: Build
+      env:
+        CGO_ENABLED: "1"
+        GOOS: android
+        GOARCH: arm64
+        PKG_CONFIG: "true"
+      run: |
+        NDK_BIN="${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin"
+        CC="$NDK_BIN/aarch64-linux-android22-clang" \
+        CXX="$NDK_BIN/aarch64-linux-android22-clang++" \
+          go build
+      working-directory: iup
+
+  macos-ios:
+    runs-on: macos-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    - name: Install Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: stable
+    - name: Build
+      env:
+        CGO_ENABLED: "1"
+        GOOS: ios
+        GOARCH: arm64
+      run: |
+        SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+        CC="$(xcrun --sdk iphoneos --find clang)"
+        CXX="$(xcrun --sdk iphoneos --find clang++)"
+        export CC CXX
+        IOS_FLAGS="-isysroot $SDK -arch arm64 -miphoneos-version-min=15.0"
+        export CGO_CFLAGS="$IOS_FLAGS"
+        export CGO_CXXFLAGS="$IOS_FLAGS"
+        export CGO_LDFLAGS="$IOS_FLAGS"
+        go build
+      working-directory: iup
+
+  linux-wasm:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    - name: Install Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: stable
+    - name: Install dependencies
+      run: sudo apt-get update -y && sudo apt-get install -y cmake
+    - name: Install Emscripten
+      uses: mymindstorm/setup-emsdk@v14
+      with:
+        version: latest
+    - name: Build
+      run: GOOS=js GOARCH=wasm go build
+      working-directory: iup
+    - name: CMake Wasm
+      run: |
+        emcmake cmake -S iup/external -B build/wasm -DIUP_BACKEND=wasm -DIUP_BUILD_GL=ON -DIUP_BUILD_WEB=ON -DIUP_BUILD_CTRL=ON -DIUP_BUILD_PLOT=ON -DIUP_BUILD_MEDIA=ON
+        cmake --build build/wasm --parallel
+
+  linux-cmake:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    - name: Install dependencies
+      run: |
+        sudo apt-get update -y
+        sudo apt-get install -y cmake libgtk-3-dev libgtk-4-dev qt6-base-dev qt6-base-private-dev qt6-webengine-dev libmotif-dev libxmu-dev libxpm-dev libefl-all-dev libx11-dev libxft-dev libxext-dev libxrender-dev libxcursor-dev libxfixes-dev libxinerama-dev libpng-dev libjpeg-dev zlib1g-dev libwayland-dev wayland-protocols libxkbcommon-dev libdecor-0-dev libpango1.0-dev libcairo2-dev libgl1-mesa-dev libegl1-mesa-dev
+    - name: Build FLTK
+      run: |
+        git clone --depth 1 --branch release-1.4.4 https://github.com/fltk/fltk.git /tmp/fltk-src
+        cmake -S /tmp/fltk-src -B /tmp/fltk-build \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+          -DFLTK_BUILD_FLUID=OFF \
+          -DFLTK_BUILD_FLTK_OPTIONS=OFF \
+          -DFLTK_BUILD_TEST=OFF \
+          -DFLTK_BUILD_EXAMPLES=OFF \
+          -DFLTK_BUILD_FORMS=OFF \
+          -DFLTK_BUILD_GL=OFF
+        cmake --build /tmp/fltk-build --parallel
+        sudo cmake --install /tmp/fltk-build
+    - name: CMake GTK3
+      run: |
+        cmake -S iup/external -B build/gtk3 -DBUILD_SHARED_LIBS=ON -DIUP_BACKEND=gtk3 -DIUP_BUILD_GL=ON -DIUP_BUILD_WEB=ON -DIUP_BUILD_CTRL=ON -DIUP_BUILD_PLOT=ON -DIUP_BUILD_MEDIA=ON -DCMAKE_COMPILE_WARNING_AS_ERROR=ON
+        cmake --build build/gtk3 --parallel
+    - name: CMake GTK4
+      run: |
+        cmake -S iup/external -B build/gtk4 -DBUILD_SHARED_LIBS=ON -DIUP_BACKEND=gtk4 -DIUP_BUILD_GL=ON -DIUP_BUILD_WEB=ON -DIUP_BUILD_CTRL=ON -DIUP_BUILD_PLOT=ON -DIUP_BUILD_MEDIA=ON -DCMAKE_COMPILE_WARNING_AS_ERROR=ON
+        cmake --build build/gtk4 --parallel
+    - name: CMake Qt6
+      run: |
+        cmake -S iup/external -B build/qt6 -DBUILD_SHARED_LIBS=ON -DIUP_BACKEND=qt6 -DIUP_BUILD_WEB=ON -DIUP_BUILD_CTRL=ON -DIUP_BUILD_PLOT=ON -DIUP_BUILD_MEDIA=ON -DCMAKE_COMPILE_WARNING_AS_ERROR=ON
+        cmake --build build/qt6 --parallel
+    - name: CMake FLTK
+      run: |
+        cmake -S iup/external -B build/fltk -DBUILD_SHARED_LIBS=ON -DIUP_BACKEND=fltk -DIUP_BUILD_GL=ON -DIUP_BUILD_CTRL=ON -DIUP_BUILD_PLOT=ON -DIUP_BUILD_MEDIA=ON -DCMAKE_COMPILE_WARNING_AS_ERROR=ON
+        cmake --build build/fltk --parallel
+    - name: CMake EFL
+      run: |
+        sudo mkdir -p /usr/include/ector-1
+        cmake -S iup/external -B build/efl -DBUILD_SHARED_LIBS=ON -DIUP_BACKEND=efl -DIUP_BUILD_GL=ON -DIUP_BUILD_CTRL=ON -DIUP_BUILD_PLOT=ON -DIUP_BUILD_MEDIA=ON -DCMAKE_COMPILE_WARNING_AS_ERROR=ON
+        cmake --build build/efl --parallel
+    - name: CMake Motif
+      run: |
+        cmake -S iup/external -B build/motif -DBUILD_SHARED_LIBS=ON -DIUP_BACKEND=motif -DIUP_BUILD_GL=ON -DIUP_BUILD_CTRL=ON -DIUP_BUILD_PLOT=ON -DIUP_BUILD_MEDIA=ON -DCMAKE_COMPILE_WARNING_AS_ERROR=ON
+        cmake --build build/motif --parallel
+
+  linux-cmake-qml:
+    runs-on: ubuntu-latest
+    container: debian:trixie
+    steps:
+    - name: Install dependencies
+      run: apt-get update -y && apt-get install -y --no-install-recommends ca-certificates git cmake make gcc g++ pkg-config libx11-dev libwayland-dev libgl-dev libegl-dev qt6-base-dev qt6-declarative-dev qt6-webengine-dev
+    - name: Checkout code
+      uses: actions/checkout@v4
+    - name: CMake QML
+      run: |
+        cmake -S iup/external -B build/qml -DBUILD_SHARED_LIBS=ON -DIUP_BACKEND=qml -DIUP_BUILD_GL=ON -DIUP_BUILD_WEB=ON -DIUP_BUILD_CTRL=ON -DIUP_BUILD_PLOT=ON -DIUP_BUILD_MEDIA=ON -DCMAKE_COMPILE_WARNING_AS_ERROR=ON
+        cmake --build build/qml --parallel

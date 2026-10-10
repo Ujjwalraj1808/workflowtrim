@@ -1,0 +1,93 @@
+---
+name: Rerun affected workflows in long lived branches on push
+
+on:
+  push:
+    branches:
+      - main
+      - candlepin-*-HOTFIX
+      - feature/*
+
+jobs:
+  rerun-workflows:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mask secrets
+        shell: bash
+        run: |
+          echo "::add-mask::${{ secrets.GITHUB_TOKEN }}"
+
+      - name: Get PR info
+        uses: 8BitJonny/gh-get-current-pr@4056877062a1f3b624d5d4c2bedefa9cf51435c9
+        id: PR
+        with:
+          github-token: ${{ github.token }}
+
+      - name: Rerun workflows
+        if: ${{ !contains(steps.PR.outputs.pr_labels, 'skip CI') }}
+        shell: bash
+        run: |
+          base_branch="${GITHUB_REF#refs/heads/}"
+          if [[ $base_branch == "main" ]] || [[ $base_branch == "feature/"* ]]; then
+            pr_workflows=("checkstyle.yml" "spec_tests.yml" "unit_tests.yml" "validate_translations.yml")
+          else
+            pr_workflows=("pr_verification.yml")
+          fi
+          
+          # List affected PRs exclude dependabots, weblate and draft PRs
+          pr_head_shas=$(gh api \
+          -H "Accept: application/vnd.github+json" \
+          /repos/candlepin/candlepin/pulls | \
+          jq --arg base "$base_branch" -r '.[] | select(.base.ref == $base and .draft == false and .user.login != "weblate" and .user.login != "dependabot[bot]") | .head.sha')
+          
+          # Iterate over the array elements using a for loop
+            for workflow in "${pr_workflows[@]}"; do
+              # List runners id for PR verification
+              for head_sha in $pr_head_shas; do
+                runner_id=$(gh api \
+                -H "Accept: application/vnd.github+json" \
+                /repos/candlepin/candlepin/actions/workflows/$workflow/runs?head_sha=$head_sha | \
+                jq -r '.workflow_runs[] | .id')
+                runner_ids+=($runner_id)
+              done
+            done
+          
+          # Cancel running workflows
+          for id in "${runner_ids[@]}"; do
+            # Get status of running workflow
+            status=$(gh api \
+            -H "Accept: application/vnd.github+json" \
+            /repos/candlepin/candlepin/actions/runs/$id | \
+            jq -r '.status')
+          
+            # Cancel workflow if it in progress or in queue
+            if [ "$status" = "in_progress" ] || [ "$status" = "queued" ]; then
+              cancelled_ids+=($id)
+              gh api \
+              --method POST \
+              -H "Accept: application/vnd.github+json" \
+              /repos/candlepin/candlepin/actions/runs/$id/cancel
+            fi
+          done
+          
+          # We need to wait here because canceling workflows take some time
+          for id in "${cancelled_ids[@]}"; do
+            while : ; do
+              sleep 2 # We sleep here so we don't overwhelm the GH API
+              status=$(gh api \
+              -H "Accept: application/vnd.github+json" \
+              /repos/candlepin/candlepin/actions/runs/$id | \
+              jq -r '.status')
+              [[ $status = "completed" ]] && break
+            done
+          done
+          
+          # Rerun workflows
+          for id in "${runner_ids[@]}"; do 
+            gh api \
+            --method POST \
+            -H "Accept: application/vnd.github+json" \
+            /repos/candlepin/candlepin/actions/runs/$id/rerun
+          done
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

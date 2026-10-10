@@ -1,0 +1,63 @@
+name: Intent Model Pipeline
+
+# ──────────────────────────────────────────────────────────────
+# 공시 Q&A 라우팅 모델(intentModel) 빌드 → 회귀게이트 검증 → PASS 시에만 HF 업로드.
+#
+# 트리거: SSOT(curatedQuestions/intentSpec) push · 수동 · 주 1회 cron.
+# 게이트: buildIntentModel.py 의 verify 가 baseline(라우팅·섹션도달) 하락 시 exit 1
+#   → 다음 업로드 step 자동 스킵(나쁜 모델이 prod 로 새지 않음).
+# verify 의 panel 데이터는 readWide(ensurePanelFromHf) 가 HF 에서 자동 다운로드 — 별도 seed 불필요.
+# 프론트(queryCanon)는 dart/queries/intentModel.json 을 라이브 fetch → 모델 갱신이 프론트 재배포 0.
+# ──────────────────────────────────────────────────────────────
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - '.github/scripts/queries/curatedQuestions.json'
+      - '.github/scripts/queries/intentSpec.json'
+      - '.github/scripts/queries/heldoutB.json'
+      - '.github/scripts/queries/buildIntentModel.py'
+  workflow_dispatch:
+  schedule:
+    - cron: '0 20 * * 0'   # UTC 20:00 일요일 = KST 05:00 월요일 (다른 HF 푸시 cron 과 시간 분리)
+
+concurrency:
+  group: hf-intentmodel-push
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  build-verify-upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Smoke import
+        run: uv run python -c "import dartlab; print('dartlab', getattr(dartlab, '__version__', 'dev'))"
+
+      # build(intentModel.json + 번들) → verify(heldoutB 일반화 + 회귀게이트). 게이트 FAIL = exit 1 = 업로드 스킵.
+      # verify 의 panel 은 readWide(ensurePanelFromHf) 가 HF 에서 자동 다운로드.
+      - name: Build + verify + regression gate
+        run: uv run python -X utf8 .github/scripts/queries/buildIntentModel.py all 005930 035720 051910
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+
+      # 게이트 PASS(앞 step 성공) 시에만 HF 업로드 → 프론트가 라이브로 fetch.
+      - name: Upload intentModel to HF
+        run: uv run python -X utf8 .github/scripts/queries/uploadIntentModel.py
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}

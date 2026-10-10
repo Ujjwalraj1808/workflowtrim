@@ -1,0 +1,65 @@
+name: Release Live Docker
+on:
+  repository_dispatch:
+    types: 'release-nightly-docker'
+  workflow_dispatch:
+  schedule:
+    # Every day at the start of the day
+    - cron:  '0 0 * * *'
+
+jobs:
+  publish:
+    name: Build and Push Docker Image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Set up Chalk
+        uses: crashappsec/setup-chalk-action@main
+        with:
+          password: ${{ secrets.CHALK_PASSWORD }}
+          public_key: ${{ secrets.CHALK_PUBLIC_KEY }}
+          private_key: ${{ secrets.CHALK_PRIVATE_KEY }}
+      -
+        name: Set up QEMU
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+      -
+        name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      -
+        name: Login to DockerHub
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          username: zapbot
+          password: ${{ secrets.ZAPBOT_DOCKER_TOKEN }}
+      -
+        name: Login to GitHub Container Registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      -
+        name: Build and push Docker image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: docker
+          file: docker/Dockerfile-live
+          platforms: linux/amd64,linux/arm64
+          push: true
+          provenance: false
+          tags: |
+            ghcr.io/zaproxy/zaproxy:nightly
+            zaproxy/zap-nightly:latest
+          secrets: |
+            webswing_url=${{ secrets.WEBSWING_URL }}
+          annotations: |
+            index:org.opencontainers.image.source=https://github.com/zaproxy/zaproxy
+            index:org.opencontainers.image.description=The nightly Docker image for the world’s most widely used web app scanner.
+            index:org.opencontainers.image.licenses=Apache-2.0
+      - name: "Publicise the release"
+        uses: myConsciousness/bluesky-post@2d132869a6a51dea18183a26984a09f67744417e # v6.0.1
+        if: ${{ ! cancelled() }}
+        with:
+          text: "The 'Nightly' @zaproxy.org #Docker image has just been updated https://hub.docker.com/r/zaproxy/zap-nightly"  
+          identifier: ${{ secrets.BLUESKY_ZAPBOT_IDENTIFIER }}
+          password: ${{ secrets.BLUESKY_ZAPBOT_PASSWORD }}

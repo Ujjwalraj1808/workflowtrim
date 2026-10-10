@@ -1,0 +1,243 @@
+name: "0: Release"
+
+# Build the standalone `0` binary natively on each target OS and publish all
+# four (+ checksums) to the GitHub Release. Native builds avoid `bun --compile`
+# cross-compilation, which cannot resolve @opentui/core's per-platform native
+# packages from a single host. Each binary is smoke-tested on its own runner
+# before it ships. Desktop is development-only alpha and is never a release asset.
+#
+# Trigger: pushing a `v*` tag, or manually via workflow_dispatch with the tag.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Git tag or commit to build (e.g. v0.22.4)"
+        required: true
+      npm_only:
+        description: "Publish only npm from the existing tag; leave native assets unchanged"
+        type: boolean
+        default: false
+      dry_run:
+        description: "Build and smoke every native binary without publishing"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    if: ${{ !inputs.npm_only }}
+    name: build ${{ matrix.asset }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            asset: 0-darwin-arm64
+          - os: ubuntu-latest
+            asset: 0-linux-x64
+          - os: ubuntu-24.04-arm
+            asset: 0-linux-arm64
+          - os: windows-latest
+            asset: 0-windows-x64.exe
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
+      ZERO_BUILD_RELEASE_CHANNEL: ${{ inputs.dry_run && 'dev' || 'beta' }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+      - uses: actions/setup-node@v5
+        with:
+          # The vendored native parser preserves its grammar ABI while building
+          # with the C++20 standard required by our supported Node 24 runtime.
+          node-version: 24
+          # Hosted runners do not expose pnpm until the next `corepack enable`
+          # step. Disable setup-node's pre-Corepack cache probe.
+          package-manager-cache: false
+      - run: corepack enable
+      # Keep the compiler pinned while the bundled OpenTUI/native-addon surface
+      # is validated. `bun-compile.sh` stages tree-sitter's runtime-discovered
+      # N-API addons so their direct requires are embedded in the executable.
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.14"
+      - name: Install dependencies
+        # No --ignore-scripts: the native addon (tree-sitter) must build so the
+        # compiled binary has a .node to load at runtime (arm64 has no prebuilt).
+        run: pnpm install --no-frozen-lockfile
+      - name: Build CLI dependency closure and dashboard
+        # The compiled CLI embeds the Vite dashboard assets. The dashboard is
+        # not a CLI dependency, so build it explicitly before bun-compile
+        # generates the embedded asset manifest.
+        run: |
+          pnpm --filter "@0/cli..." build
+          pnpm --filter @0/dashboard build
+      - name: Compile native binary
+        shell: bash
+        run: bash scripts/bun-compile.sh "" "dist-bin/${{ matrix.asset }}"
+      - name: Smoke the binary
+        shell: bash
+        run: |
+          # Move the build tree's node_modules away before launch. A compiled
+          # executable must not depend on a native addon that happens to exist in
+          # the checkout used to produce it.
+          smoke_dir="$(mktemp -d)"
+          mv node_modules node_modules.release-build
+          trap 'mv node_modules.release-build node_modules; rm -rf "$smoke_dir"' EXIT
+          cp "dist-bin/${{ matrix.asset }}" "$smoke_dir/0"
+          (
+            cd "$smoke_dir"
+            ./0 --version
+            ./0 --help | grep -q "security research harness"
+            # Run the dashboard from the same empty directory. This must use
+            # the manifest embedded by bun-compile, not workspace assets.
+            ./0 dashboard --db-path dashboard.db --port 48123 --no-open --ready-json > dashboard.log 2>&1 &
+            dashboard_pid=$!
+            cleanup_dashboard() {
+              kill "$dashboard_pid" >/dev/null 2>&1 || true
+              wait "$dashboard_pid" >/dev/null 2>&1 || true
+            }
+            trap cleanup_dashboard EXIT
+            node --input-type=module -e '
+              import { readFileSync } from "node:fs";
+              const deadline = Date.now() + 10_000;
+              while (Date.now() < deadline) {
+                try {
+                  if (readFileSync("dashboard.log", "utf8").includes("ZERO_DASHBOARD_READY")) process.exit(0);
+                } catch {}
+                await new Promise((resolve) => setTimeout(resolve, 100));
+              }
+              throw new Error(`Dashboard did not become ready:\n${readFileSync("dashboard.log", "utf8")}`);
+            '
+            node --input-type=module -e '
+              const response = await fetch("http://127.0.0.1:48123/findings");
+              const html = await response.text();
+              if (!response.ok || !html.includes("/assets/")) {
+                throw new Error(`Embedded dashboard did not serve its HTML (${response.status}).`);
+              }
+            '
+          )
+      - name: Smoke standalone plugin execution
+        run: node scripts/smoke-plugin-runtime.mjs "dist-bin/${{ matrix.asset }}"
+      - name: Smoke standalone web setup and persistence
+        run: node scripts/smoke-web-setup.mjs "dist-bin/${{ matrix.asset }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist-bin/${{ matrix.asset }}
+          if-no-files-found: error
+          retention-days: 1
+
+  release:
+    name: publish release
+    needs: build
+    if: ${{ !inputs.dry_run }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist-bin
+          merge-multiple: true
+      # Keep an explicit CLI allowlist so unrelated workflow artifacts
+      # cannot enter the release.
+      - name: Generate CLI checksums
+        run: |
+          cd dist-bin
+          sha256sum 0-darwin-arm64 0-linux-x64 0-linux-arm64 0-windows-x64.exe > checksums.txt
+          cat checksums.txt
+      - name: Create / update the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          assets=(
+            dist-bin/0-darwin-arm64
+            dist-bin/0-linux-x64
+            dist-bin/0-linux-arm64
+            dist-bin/0-windows-x64.exe
+            dist-bin/checksums.txt
+          )
+          if gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            gh release upload "$TAG" "${assets[@]}" --repo "${{ github.repository }}" --clobber
+          else
+            gh release create "$TAG" "${assets[@]}" \
+              --repo "${{ github.repository }}" \
+              --title "0 $TAG" \
+              --notes "Automated multi-platform release. See docs/CHANGELOG.md for changes." \
+              --verify-tag
+          fi
+
+  publish-npm:
+    name: publish npm
+    needs: release
+    if: ${{ !cancelled() && !inputs.dry_run && (needs.release.result == 'success' || (github.event_name == 'workflow_dispatch' && inputs.npm_only)) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
+      ZERO_BUILD_RELEASE_CHANNEL: "beta"
+      RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: refs/tags/${{ github.event.inputs.tag || github.ref_name }}
+      # Keep the artifact pinned to its immutable tag while allowing a manual
+      # recovery to use corrected release checks from the workflow revision.
+      - name: Check out the release smoke harness
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          path: release-checks
+          sparse-checkout: scripts
+          persist-credentials: false
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+      - run: corepack enable
+      - name: Verify package versions match the release tag
+        run: |
+          node --input-type=module -e '
+            import { readFileSync } from "node:fs";
+            for (const file of ["package.json", "packages/cli/package.json"]) {
+              const pkg = JSON.parse(readFileSync(file, "utf8"));
+              if (`v${pkg.version}` !== process.env.RELEASE_TAG) {
+                throw new Error(`${file} does not match ${process.env.RELEASE_TAG}`);
+              }
+            }
+          '
+      - run: pnpm install --frozen-lockfile
+      - name: Build the published CLI package
+        run: pnpm build
+      # The published npm identity (0sec-cli, bins 0 + 0sec -> 0.js) comes straight from
+      # the root package.json via scripts/bundle-cli.mjs — no publish-time
+      # rewrite. Scoped packages require --access public on publish.
+      - name: Install runtime dependencies and smoke the bundle
+        run: |
+          npm --prefix dist ci --omit=dev --no-audit --no-fund
+          node dist/0.js --version
+          bash release-checks/scripts/smoke-cli.sh "node $PWD/dist/0.js"
+          node scripts/smoke-plugin-runtime.mjs dist/0.js
+          node scripts/smoke-web-setup.mjs dist/0.js
+      - name: Smoke an installed package
+        run: |
+          mkdir -p "$RUNNER_TEMP/npm-pack" "$RUNNER_TEMP/npm-smoke"
+          npm pack ./dist --pack-destination "$RUNNER_TEMP/npm-pack"
+          npm install --prefix "$RUNNER_TEMP/npm-smoke" "$RUNNER_TEMP"/npm-pack/*.tgz --omit=dev --no-audit --no-fund
+          "$RUNNER_TEMP/npm-smoke/node_modules/.bin/0" --version
+          node scripts/smoke-plugin-runtime.mjs "$RUNNER_TEMP/npm-smoke/node_modules/.bin/0"
+      - name: Publish npm package
+        working-directory: dist
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

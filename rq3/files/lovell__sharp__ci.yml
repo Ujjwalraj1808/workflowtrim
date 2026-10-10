@@ -1,0 +1,414 @@
+# SPDX-FileCopyrightText: 2013 Lovell Fuller and others
+# SPDX-License-Identifier: Apache-2.0
+
+name: CI
+on:
+  - push
+  - pull_request
+permissions: {}
+jobs:
+  lint:
+    permissions:
+      contents: read
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+      - run: npm install --ignore-scripts
+      - run: npm run build:dist
+      - run: npm run lint-cpp
+      - run: npm run lint-js
+      - run: npm run lint-types
+      - run: npm run lint-publish
+  build-native:
+    permissions:
+      contents: read
+    needs: lint
+    name: "build-${{ matrix.platform }} [Node.js ${{ matrix.nodejs_version_major }}] ${{ matrix.package && '[package]' }}"
+    runs-on: ${{ matrix.os }}
+    container: ${{ matrix.container }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-26.04
+            container: rockylinux/rockylinux:8-ubi-init
+            nodejs_arch: x64
+            nodejs_version: "^20.9.0"
+            nodejs_version_major: 20
+            platform: linux-x64
+          - os: ubuntu-26.04
+            container: rockylinux/rockylinux:8-ubi-init
+            nodejs_arch: x64
+            nodejs_version: "^22"
+            nodejs_version_major: 22
+            platform: linux-x64
+            package: true
+          - os: ubuntu-26.04
+            container: rockylinux/rockylinux:8-ubi-init
+            nodejs_arch: x64
+            nodejs_version: "^24"
+            nodejs_version_major: 24
+            platform: linux-x64
+          - os: ubuntu-26.04
+            container: node:20-alpine3.20
+            nodejs_version_major: 20
+            platform: linuxmusl-x64
+          - os: ubuntu-26.04
+            container: node:22-alpine3.20
+            nodejs_version_major: 22
+            platform: linuxmusl-x64
+            package: true
+          - os: ubuntu-26.04
+            container: node:24-alpine3.22
+            nodejs_version_major: 24
+            platform: linuxmusl-x64
+          - os: ubuntu-26.04-arm
+            container: rockylinux/rockylinux:8-ubi-init
+            nodejs_arch: arm64
+            nodejs_version: "^20.9.0"
+            nodejs_version_major: 20
+            platform: linux-arm64
+          - os: ubuntu-26.04-arm
+            container: rockylinux/rockylinux:8-ubi-init
+            nodejs_arch: arm64
+            nodejs_version: "^22"
+            nodejs_version_major: 22
+            platform: linux-arm64
+            package: true
+          - os: ubuntu-26.04-arm
+            container: rockylinux/rockylinux:8-ubi-init
+            nodejs_arch: arm64
+            nodejs_version: "^24"
+            nodejs_version_major: 24
+            platform: linux-arm64
+          - os: macos-15-intel
+            nodejs_arch: x64
+            nodejs_version: "^20.9.0"
+            nodejs_version_major: 20
+            platform: darwin-x64
+          - os: macos-15-intel
+            nodejs_arch: x64
+            nodejs_version: "^22"
+            nodejs_version_major: 22
+            platform: darwin-x64
+            package: true
+          - os: macos-15-intel
+            nodejs_arch: x64
+            nodejs_version: "^24"
+            nodejs_version_major: 24
+            platform: darwin-x64
+          - os: macos-15
+            nodejs_arch: arm64
+            nodejs_version: "^20.9.0"
+            nodejs_version_major: 20
+            platform: darwin-arm64
+          - os: macos-15
+            nodejs_arch: arm64
+            nodejs_version: "^22"
+            nodejs_version_major: 22
+            platform: darwin-arm64
+            package: true
+          - os: macos-15
+            nodejs_arch: arm64
+            nodejs_version: "^24"
+            nodejs_version_major: 24
+            platform: darwin-arm64
+          - os: windows-2022
+            nodejs_arch: x86
+            nodejs_version: "^20.9.0"
+            nodejs_version_major: 20
+            platform: win32-ia32
+            package: true
+          - os: windows-2022
+            nodejs_arch: x64
+            nodejs_version: "^20.9.0"
+            nodejs_version_major: 20
+            platform: win32-x64
+          - os: windows-2022
+            nodejs_arch: x64
+            nodejs_version: "^22"
+            nodejs_version_major: 22
+            platform: win32-x64
+            package: true
+          - os: windows-2022
+            nodejs_arch: x64
+            nodejs_version: "^24"
+            nodejs_version_major: 24
+            platform: win32-x64
+          - os: windows-11-arm
+            nodejs_arch: arm64
+            nodejs_version: "^20.9.0"
+            nodejs_version_major: 20
+            platform: win32-arm64
+          - os: windows-11-arm
+            nodejs_arch: arm64
+            nodejs_version: "^22"
+            nodejs_version_major: 22
+            platform: win32-arm64
+            package: true
+          - os: windows-11-arm
+            nodejs_arch: arm64
+            nodejs_version: "^24"
+            nodejs_version_major: 24
+            platform: win32-arm64
+    steps:
+      - name: Dependencies (Rocky Linux glibc)
+        if: contains(matrix.container, 'rockylinux')
+        run: |
+          dnf install -y gcc-toolset-14-gcc-c++ make git python3.12 fontconfig
+          echo "/opt/rh/gcc-toolset-14/root/usr/bin" >> $GITHUB_PATH
+      - name: Dependencies (Linux musl)
+        if: contains(matrix.container, 'alpine')
+        run: apk add build-base git python3 fontconfig --update-cache
+      - name: Dependencies (Python - macOS, Windows)
+        if: contains(matrix.os, 'macos') || contains(matrix.os, 'windows')
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Dependencies (Node.js)
+        if: "!contains(matrix.platform, 'linuxmusl')"
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ matrix.nodejs_version }}
+          architecture: ${{ matrix.nodejs_arch }}
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: npm install
+      - run: npm run build:dist
+      - run: npm run build
+      - run: npm run test-unit
+      - if: matrix.package
+        run: |
+          npm run package-from-local-build
+          npm run lint-publish -- npm/${{ matrix.platform }}
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: matrix.package
+        with:
+          name: ${{ matrix.platform }}
+          path: npm/${{ matrix.platform }}
+          retention-days: 1
+          if-no-files-found: error
+  build-linuxmusl-arm64:
+    permissions:
+      contents: read
+    needs: lint
+    name: "build-linuxmusl-arm64 [Node.js ${{ matrix.nodejs_version_major }}] ${{ matrix.package && '[package]' }}"
+    runs-on: ubuntu-26.04-arm
+    container:
+      image: ${{ matrix.container }}
+      volumes:
+        - /opt:/opt:rw,rshared
+        - /opt:/__e/node24:ro,rshared
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - container: node:20-alpine3.20
+          nodejs_version_major: 20
+        - container: node:22-alpine3.20
+          nodejs_version_major: 22
+          package: true
+        - container: node:24-alpine3.22
+          nodejs_version_major: 24
+    steps:
+      - name: Allow Linux musl containers on ARM64 runners # https://github.com/actions/runner/issues/801#issuecomment-2394425757
+        shell: sh
+        run: |
+          sed -i "/^ID=/s/alpine/NotpineForGHA/" /etc/os-release
+          apk add nodejs --update-cache
+          mkdir /opt/bin
+          ln -s /usr/bin/node /opt/bin/node
+      - name: Dependencies
+        run: apk add build-base git python3 fontconfig --update-cache
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: npm install
+      - run: npm run build:dist && npm run build
+      - run: npm run test-unit
+      - if: matrix.package
+        run: |
+          npm run package-from-local-build
+          npm run lint-publish -- npm/linuxmusl-arm64
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: matrix.package
+        with:
+          name: linuxmusl-arm64
+          path: npm/linuxmusl-arm64
+          retention-days: 1
+          if-no-files-found: error
+  build-qemu:
+    permissions:
+      contents: read
+    needs: lint
+    name: "build-${{ matrix.platform }} [Node.js ${{ matrix.nodejs_version_major }}] [package]"
+    runs-on: ubuntu-26.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-arm
+            base_image: "--platform=linux/arm/v7 arm32v7/debian:bookworm"
+            compiler_flags: "-marm -mcpu=arm1176jzf-s -mfpu=vfp -mfloat-abi=hard"
+            nodejs_arch: armv6l
+            nodejs_hostname: unofficial-builds.nodejs.org
+            nodejs_version: "22.22.3"
+            nodejs_version_major: 22
+          - platform: linux-s390x
+            base_image: "--platform=linux/s390x s390x/debian:bookworm"
+            nodejs_arch: s390x
+            nodejs_hostname: nodejs.org
+            nodejs_version: "22.22.3"
+            nodejs_version_major: 22
+          - platform: linux-ppc64
+            base_image: "--platform=linux/ppc64le ppc64le/debian:bookworm"
+            nodejs_arch: ppc64le
+            nodejs_hostname: nodejs.org
+            nodejs_version: "22.22.3"
+            nodejs_version_major: 22
+          - platform: linux-riscv64
+            base_image: "--platform=linux/riscv64 riscv64/debian:trixie"
+            compiler_flags: "-march=rv64gc"
+            nodejs_arch: riscv64
+            nodejs_hostname: unofficial-builds.nodejs.org
+            nodejs_version: "22.22.3"
+            nodejs_version_major: 22
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: uraimo/run-on-arch-action@fa1f3e7de95534497266c7265950b5188355fbfb # v3.2.1
+        with:
+          arch: none
+          distro: none
+          base_image: ${{ matrix.base_image }}
+          env: |
+            CFLAGS: "${{ matrix.compiler_flags }}"
+            CXXFLAGS: "${{ matrix.compiler_flags }}"
+          run: |
+            apt-get update
+            apt-get install -y curl g++ git libatomic1 make python3 xz-utils
+            mkdir /opt/nodejs
+            curl --silent https://${{ matrix.nodejs_hostname }}/download/release/v${{ matrix.nodejs_version}}/node-v${{ matrix.nodejs_version}}-linux-${{ matrix.nodejs_arch }}.tar.xz | tar xJC /opt/nodejs --strip-components=1
+            export PATH=$PATH:/opt/nodejs/bin
+            npm install
+            npm run build:dist
+            npm run build
+            node --test test/unit/io.js test/unit/raw.js
+            npm run package-from-local-build
+            npm run lint-publish -- npm/${{ matrix.platform }}
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ matrix.platform }}
+          path: npm/${{ matrix.platform }}
+          retention-days: 1
+          if-no-files-found: error
+  build-emscripten:
+    permissions:
+      contents: read
+    needs: lint
+    name: "build-wasm32 [package]"
+    runs-on: ubuntu-26.04
+    container: "emscripten/emsdk:6.0.10"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Dependencies
+        run: apt-get update && apt-get install -y pkg-config
+      - name: Dependencies (Node.js)
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+      - run: npm install
+      - run: npx patch-package
+      - run: npm run build:dist && emmake npm run build
+      - name: Verify emscripten versions match
+        run: |
+          EMSCRIPTEN_VERSION_LIBVIPS=$(node -p "require('@img/sharp-libvips-dev-wasm32/versions').emscripten")
+          EMSCRIPTEN_VERSION_SHARP=$(emcc -dumpversion)
+          echo "libvips built with emscripten $EMSCRIPTEN_VERSION_LIBVIPS"
+          echo "sharp built with emscripten $EMSCRIPTEN_VERSION_SHARP"
+          test "$EMSCRIPTEN_VERSION_LIBVIPS" = "$EMSCRIPTEN_VERSION_SHARP"
+      - run: emmake npm run test-unit
+      - run: emmake npm run package-from-local-build
+      - run: npm run lint-publish -- npm/wasm32
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: wasm32
+          path: npm/wasm32
+          retention-days: 1
+          if-no-files-found: error
+  build-asan:
+    permissions:
+      contents: read
+    needs: lint
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "26"
+      - run: npm install --ignore-scripts
+      - run: npm run build:dist
+      - run: npm run build
+        env:
+          CFLAGS: "-fsanitize=address"
+          LDFLAGS: "-fsanitize=address"
+      - run: npm run test-unit
+        env:
+          LSAN_OPTIONS: "detect_leaks=1:suppressions=test/leak/asan.supp"
+          LD_PRELOAD: "/usr/lib/x86_64-linux-gnu/libasan.so.8"
+  release:
+    permissions:
+      contents: write
+      id-token: write
+    runs-on: ubuntu-26.04
+    needs:
+      - build-native
+      - build-linuxmusl-arm64
+      - build-qemu
+      - build-emscripten
+      - build-asan
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: npm
+      - name: Create npm workspace tarball
+        run: tar -vcaf npm-workspace.tar.xz --directory npm --exclude=from-local-build.js .
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+      - name: Populate distribution directory
+        run: npm run build:dist
+      - name: Populate WebAssembly wrapper packages
+        run: npm run package-wasm-wrappers
+      - name: Create release notes
+        run: npm run package-release-notes
+      - name: Create GitHub release for tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create \
+            --notes-file release-notes.md \
+            ${{ contains(github.ref, '-rc') && '--prerelease --latest=false' || '' }} \
+            ${GITHUB_REF_NAME} \
+            npm-workspace.tar.xz
+      - name: Publish platform-specific npm packages
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: cd npm && npm publish --workspaces --tag=${{ contains(github.ref, '-rc') && 'next' || 'latest' }}
+      - name: Publish sharp npm package
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: npm publish --tag=${{ contains(github.ref, '-rc') && 'next' || 'latest' }}

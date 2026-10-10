@@ -1,0 +1,189 @@
+name: Linux package
+
+on:
+  workflow_call:
+    inputs:
+      release_tag:
+        type: string
+        required: true
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-package-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ASTRLINK_CI_NO_REMOTE_MODELS: "1"
+  ASTRLINK_CI_SYNTHETIC_MODELS_ONLY: "1"
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  TAURI_UPDATER_PUBLIC_KEY: ${{ vars.TAURI_UPDATER_PUBLIC_KEY }}
+
+jobs:
+  package:
+    name: Build Linux x64 and verify on Debian 12
+    # Keep the build host older than the minimum supported runtime distribution.
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+        working-directory: apps/desktop
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev libayatana-appindicator3-dev \
+            librsvg2-dev patchelf build-essential libfuse2
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: core/go.mod
+          cache-dependency-path: |
+            core/go.mod
+            core/go.sum
+            convo/go.mod
+            contracts/go.mod
+            contracts/go.sum
+      # Never restore a cached Bun binary into a job that holds release secrets.
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.3.14
+          no-cache: true
+      - name: Configure Bun cache
+        run: echo "BUN_INSTALL_CACHE_DIR=$RUNNER_TEMP/bun-cache" >> "$GITHUB_ENV"
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ runner.temp }}/bun-cache
+          key: bun-packages-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('apps/desktop/bun.lock') }}
+          restore-keys: bun-packages-v1-${{ runner.os }}-${{ runner.arch }}-
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: astrlink-native
+          env-vars: ImageOS ImageVersion MACOSX_DEPLOYMENT_TARGET
+          # Restore main's cache only; a release-profile cache on a tag ref is
+          # unreachable from later tags and evicts main's entries.
+          save-if: false
+          workspaces: |
+            apps/desktop/src-tauri
+            apps/privacy-worker
+            apps/classifier-worker
+          cache-directories: apps/privacy-worker/target/onnxruntime
+      - name: Install frontend dependencies
+        run: bun install --frozen-lockfile
+      - name: Stamp release version
+        if: inputs.release_tag != ''
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: bun scripts/release-updates.mjs stamp "$RELEASE_TAG"
+      - name: Validate update signing configuration
+        if: inputs.release_tag != ''
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: bun scripts/release-updates.mjs preflight
+      - name: Check frontend and Core in parallel
+        run: |
+          (bun run branding:sync && bun run typecheck && bun run test) &
+          frontend_pid=$!
+          (cd ../../core && go test ./...) &
+          core_pid=$!
+          check_status=0
+          wait "$frontend_pid" || check_status=1
+          wait "$core_pid" || check_status=1
+          exit "$check_status"
+      - name: Reject production model artifacts
+        run: bun ../../scripts/check-no-production-models.mjs
+      - name: Stage Core and worker sidecars
+        run: bun run sidecar:build
+      - name: Build Debian package and AppImage
+        run: bun run tauri build --ci --bundles deb,appimage
+      - name: Extract and verify AppImage
+        run: |
+          image=$(realpath src-tauri/target/release/bundle/appimage/*.AppImage)
+          scan_dir="$RUNNER_TEMP/astrlink-appimage-scan"
+          mkdir -p "$scan_dir"
+          (cd "$scan_dir" && "$image" --appimage-extract > /dev/null)
+          bun ../../scripts/check-no-production-models.mjs --packaged "$scan_dir/squashfs-root"
+          mkdir -p "$RUNNER_TEMP/astrlink-appimage-smoke"
+          docker run --rm \
+            --volume "$GITHUB_WORKSPACE:/workspace:ro" \
+            --volume "$scan_dir/squashfs-root:/appimage:ro" \
+            --volume "$RUNNER_TEMP/astrlink-appimage-smoke:/smoke" \
+            --env DEBIAN_FRONTEND=noninteractive \
+            debian:12-slim bash -euc '
+              apt-get update
+              apt-get install -y --no-install-recommends python3 binutils ca-certificates \
+                /workspace/apps/desktop/src-tauri/target/release/bundle/deb/*.deb
+              python3 /workspace/apps/desktop/scripts/verify-unix-package.py \
+                --platform linux --arch x86_64 --root /appimage --logs /smoke
+            '
+      - name: Inspect Debian package contents and dependencies
+        run: |
+          shopt -s nullglob
+          packages=(src-tauri/target/release/bundle/deb/*.deb)
+          test "${#packages[@]}" -eq 1
+          test "$(dpkg-deb --field "${packages[0]}" Architecture)" = amd64
+          dependencies="$(dpkg-deb --field "${packages[0]}" Depends)"
+          for dependency in 'libc6 (>= 2.36)' 'libstdc++6 (>= 12)' 'libgcc-s1'; do
+            if [[ "$dependencies" != *"$dependency"* ]]; then
+              echo "Missing package dependency: $dependency" >&2
+              exit 1
+            fi
+          done
+          scan_dir="$RUNNER_TEMP/astrlink-package-scan"
+          mkdir -p "$scan_dir"
+          dpkg-deb -x "${packages[0]}" "$scan_dir"
+          bun ../../scripts/check-no-production-models.mjs --packaged "$scan_dir"
+      - name: Install and verify on Debian 12
+        run: |
+          mkdir -p "$RUNNER_TEMP/astrlink-smoke"
+          docker run --rm \
+            --volume "$GITHUB_WORKSPACE:/workspace:ro" \
+            --volume "$RUNNER_TEMP/astrlink-smoke:/smoke" \
+            --env DEBIAN_FRONTEND=noninteractive \
+            --env ASTRLINK_CI_NO_REMOTE_MODELS=1 \
+            --env ASTRLINK_CI_SYNTHETIC_MODELS_ONLY=1 \
+            debian:12-slim bash -euc '
+              apt-get update
+              apt-get install -y --no-install-recommends python3 binutils ca-certificates \
+                /workspace/apps/desktop/src-tauri/target/release/bundle/deb/*.deb
+              python3 /workspace/apps/desktop/scripts/verify-unix-package.py \
+                --platform linux --arch x86_64 --root / --logs /smoke
+            '
+      - name: Prepare downloads and checksums
+        run: |
+          mkdir -p package
+          cp src-tauri/target/release/bundle/deb/*.deb src-tauri/target/release/bundle/appimage/*.AppImage package/
+          cd package
+          sha256sum ./*.deb ./*.AppImage > SHA256SUMS
+      - name: Sign and verify AppImage update
+        if: inputs.release_tag != ''
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: bun scripts/release-updates.mjs stage linux-x86_64 "$RELEASE_TAG"
+      - name: Upload checked Linux package
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: AstrLink-Linux-x86_64
+          path: apps/desktop/package/*
+          if-no-files-found: error
+          retention-days: 14
+      - name: Upload startup diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: Linux-x86_64-smoke-diagnostics
+          path: ${{ runner.temp }}/astrlink-smoke/*
+          if-no-files-found: ignore
+          retention-days: 7

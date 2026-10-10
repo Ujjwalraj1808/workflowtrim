@@ -1,0 +1,77 @@
+# Heavy publication starts only after CI completed on the exact main commit.
+# Release PR maintenance lives in release-please.yml and never waits for builds.
+name: Release
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+concurrency:
+  group: release-desktop-${{ github.repository }}
+  cancel-in-progress: false
+permissions:
+  contents: write
+  actions: write
+  pull-requests: write
+jobs:
+  candidate:
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 2
+      - name: Resolve verified release commit and draft
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          SOURCE_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          VERSION=$(jq -r .version package.json)
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || exit 1
+          TAG="v$VERSION"
+          PR=$(gh api "repos/$GH_REPO/commits/$SOURCE_SHA/pulls" --jq \
+            ".[] | select(.merged_at != null and .merge_commit_sha == \"$SOURCE_SHA\" and (.head.ref | startswith(\"release-please--\"))) | .number" | head -1)
+          SUBJECT=$(git log -1 --format=%s)
+          EXISTING=$(git ls-remote --tags origin "refs/tags/$TAG" "refs/tags/$TAG^{}")
+          if [ -z "$EXISTING" ]; then
+            # Ordinary green development commits do not become releases.
+            if [ -z "$PR" ] && [[ ! "$SUBJECT" =~ ^chore\(main\):\ release\ $VERSION ]]; then
+              echo 'No release commit; CI is green.'
+              exit 0
+            fi
+            gh api "repos/$GH_REPO/git/refs" -f ref="refs/tags/$TAG" -f sha="$SOURCE_SHA"
+          else
+            git fetch --no-tags origin "refs/tags/$TAG"
+            TAG_SHA=$(git rev-parse 'FETCH_HEAD^{commit}')
+            if [ "$TAG_SHA" != "$SOURCE_SHA" ]; then
+              echo "Version $TAG belongs to $TAG_SHA; this push does not restart that candidate."
+              exit 0
+            fi
+          fi
+          STATE=$(gh api "repos/$GH_REPO/releases?per_page=100" --jq \
+            ".[] | select(.tag_name == \"$TAG\") | if .draft then \"draft\" else \"published\" end")
+          if [ "$STATE" = published ]; then exit 0; fi
+          if [ -z "$STATE" ]; then
+            gh release create "$TAG" --verify-tag --draft --title "$TAG" --generate-notes
+          fi
+          if [ -n "$PR" ]; then
+            gh pr edit "$PR" --remove-label 'autorelease: pending' --add-label 'autorelease: tagged'
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+  release:
+    needs: candidate
+    if: needs.candidate.outputs.tag != ''
+    uses: ./.github/workflows/reusable-release-pipeline.yml
+    with:
+      tag_name: ${{ needs.candidate.outputs.tag }}
+    secrets: inherit

@@ -1,0 +1,243 @@
+name: E2E Bare-Metal
+
+on:
+  # Mirrors the suite selection of workflow_call so a baseline capture can be
+  # driven by hand. A dispatch run sees only the inputs declared here, so
+  # omitting these would silently fall back to the correctness set.
+  workflow_dispatch:
+    inputs:
+      suites:
+        description: "Space-separated e2e suites to run on the node. Default is the correctness set; a performance run names its own so its numbers come off an otherwise idle cell"
+        required: false
+        type: string
+        default: "single cert lb"
+      suite-env:
+        description: "Extra environment for the suite invocation, e.g. SPINIFEX_DISKPERF_REPS=3"
+        required: false
+        type: string
+        default: ""
+      cell:
+        description: "Nightly cell number this run reports as. Names the artifact bundle and the ES dimension, so two callers of this workflow stay distinguishable in the sink"
+        required: false
+        type: string
+        default: "20"
+  workflow_call:
+    inputs:
+      ref:
+        description: "spinifex ref to checkout/test (default: triggering ref)"
+        required: false
+        type: string
+        default: ""
+      otel-attrs:
+        description: "OTEL_RESOURCE_ATTRIBUTES value for this run, e.g. ci.run_id=123,ci.cell=20 (caller-specific, so it's an input rather than a workflow-level default)"
+        required: false
+        type: string
+        default: ""
+      suites:
+        description: "Space-separated e2e suites to run on the node. Default is the correctness set; a performance caller names its own so its numbers come off an otherwise idle cell"
+        required: false
+        type: string
+        default: "single cert lb"
+      suite-env:
+        description: "Extra environment for the suite invocation, e.g. SPINIFEX_DISKPERF_REPS=3"
+        required: false
+        type: string
+        default: ""
+      cell:
+        description: "Nightly cell number this run reports as. Names the artifact bundle and the ES dimension, so two callers of this workflow stay distinguishable in the sink"
+        required: false
+        type: string
+        default: "20"
+
+permissions:
+  contents: read
+  statuses: write
+
+env:
+  GIT_BRANCH: ${{ github.ref_name }}
+  SPINIFEX_OTLP_ENDPOINT: ${{ vars.SPINIFEX_OTLP_ENDPOINT || 'http://192.168.1.13:8200' }}
+
+jobs:
+  e2e_baremetal:
+    name: Bare-Metal Single-Node E2E
+    runs-on: [self-hosted, ci-baremetal]
+    timeout-minutes: 240
+    concurrency:
+      group: e2e-baremetal-cluster
+      cancel-in-progress: false
+    env:
+      BM_ISO_CACHE: /var/cache/spinifex-iso-builder
+      BM_CELL: ${{ inputs.cell || '20' }}
+      ARTIFACT_DIR: /tmp/spinifex-e2e-nightly-cell-${{ inputs.cell || '20' }}-${{ github.run_id }}
+      SPINIFEX_OTEL_ATTRS: ${{ inputs.otel-attrs || format('ci.run_id={0},ci.workflow={1},ci.cell={2},ci.matrix=baremetal/pxe/real-hw', github.run_id, github.workflow, inputs.cell || '20') }}
+    steps:
+      - name: Clean Workspace
+        run: |
+          sudo umount -R -l "${BM_ISO_CACHE}/rootfs" 2>/dev/null || true
+          if [ ! -c /dev/null ]; then sudo rm -f /dev/null; sudo mknod -m 666 /dev/null c 1 3; fi
+          sudo rm -rf --one-file-system "$GITHUB_WORKSPACE"/*
+
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - uses: actions/create-github-app-token@v3
+        id: app-token
+        with:
+          client-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          repositories: mulga
+
+      - uses: actions/checkout@v7
+        with:
+          repository: mulgadc/mulga
+          token: ${{ steps.app-token.outputs.token }}
+          sparse-checkout: |
+            scripts/iso-builder
+            scripts/baremetal
+          path: mulga
+
+      - name: Install SSH Key
+        run: |
+          echo "${{ secrets.BM_SSH_PRIVATE_KEY }}" > "${RUNNER_TEMP}/bm-ci"
+          chmod 0600 "${RUNNER_TEMP}/bm-ci"
+          ssh-keygen -y -f "${RUNNER_TEMP}/bm-ci" > "${RUNNER_TEMP}/bm-ci.pub"
+
+      - name: Build Artifacts
+        env:
+          # The node runs pre-built binaries, so a suite absent here cannot be
+          # selected later. Same list as the run step for that reason.
+          BM_SUITES: ${{ inputs.suites || 'single cert lb' }}
+        run: |
+          mulga/scripts/baremetal/bm-build-artifacts.sh \
+            "$GITHUB_WORKSPACE" \
+            "${RUNNER_TEMP}/spinifex-tests.tar" \
+            "${RUNNER_TEMP}/bm-bins"
+
+      - name: Build PXE Artifacts
+        run: |
+          sudo make -C mulga/scripts/iso-builder \
+            build-rootfs build-squashfs build-initramfs \
+            CACHE="${BM_ISO_CACHE}" \
+            SPINIFEX_BIN="${RUNNER_TEMP}/bm-bins/spx" \
+            INSTALLER_BIN="${RUNNER_TEMP}/bm-bins/spinifex-installer" \
+            SPINIFEX_SRC="${GITHUB_WORKSPACE}" \
+            VIPERBLOCK_SRC="${RUNNER_TEMP}/bm-bins/viperblock" \
+            VERSION="$(cd "$GITHUB_WORKSPACE" && git describe --tags --always --exclude '*-dev' 2>/dev/null || echo dev)"
+
+      - name: Write ePDU credentials
+        run: |
+          install -m 0600 /dev/null "${RUNNER_TEMP}/epdu.env"
+          cat >> "${RUNNER_TEMP}/epdu.env" <<EOF
+          EPDU_HOST=192.168.1.63
+          EPDU_SNMP_USER=ci-bmpower
+          EPDU_SNMP_SEC_LEVEL=authPriv
+          EPDU_SNMP_AUTH_PROTO=MD5
+          EPDU_SNMP_AUTH_PASS=${{ secrets.BM_EPDU_AUTH_PASS }}
+          EPDU_SNMP_PRIV_PROTO=DES
+          EPDU_SNMP_PRIV_PASS=${{ secrets.BM_EPDU_PRIV_PASS }}
+          EOF
+
+      - name: Cache VM images
+        run: |
+          UBUNTU_IMG="${BM_ISO_CACHE}/ubuntu-26.04-cloudimg-amd64.img"
+          if [ ! -f "$UBUNTU_IMG" ]; then
+            echo "Downloading Ubuntu 26.04 cloud image..."
+            sudo curl -fsSL -o "$UBUNTU_IMG" \
+              "https://cloud-images.ubuntu.com/resolute/current/resolute-server-cloudimg-amd64.img"
+            echo "  Downloaded $(du -h "$UBUNTU_IMG" | cut -f1)"
+          else
+            echo "Ubuntu 26.04 cloud image cached ($(du -h "$UBUNTU_IMG" | cut -f1))"
+          fi
+
+      - name: Install go-junit-report on runner
+        run: go install github.com/jstemmer/go-junit-report/v2@latest
+
+      # The eks suite's CreateCluster boots a control-plane VM from the eks-node
+      # AMI. Built here because libguestfs needs source and network, which the
+      # runner has and the PXE-booted node does not; bm-bootstrap.sh imports it.
+      - name: Build eks-node AMI (libguestfs, runner)
+        if: contains(inputs.suites, 'eks')
+        run: |
+          set -euo pipefail
+          # direct backend = no libvirt. Set here rather than in the script:
+          # it has to be in the environment the build itself runs in.
+          export LIBGUESTFS_BACKEND=direct
+          # spinifex is the workspace root here, unlike the nightly where it is
+          # checked out into a subdirectory.
+          "${GITHUB_WORKSPACE}/.github/scripts/ensure-libguestfs.sh"
+          make build-eks-node-image
+
+      - name: Run Bare-Metal E2E
+        env:
+          BM_CI_PASSWORD: ${{ secrets.BM_CI_PASSWORD }}
+          BM_SSH_KEY: ${{ runner.temp }}/bm-ci
+          BM_EPDU_ENV: ${{ runner.temp }}/epdu.env
+          BM_UBUNTU_IMAGE: ${{ env.BM_ISO_CACHE }}/ubuntu-26.04-cloudimg-amd64.img
+          SPX_EXTERNAL_POOL: ${{ env.SPINIFEX_CI_POOL }}
+          BM_SUITES: ${{ inputs.suites || 'single cert lb' }}
+          BM_SUITE_ENV: ${{ inputs.suite-env }}
+          # Empty unless the eks build above ran, and bm-bootstrap.sh skips the
+          # import when unset, so the other suites are unaffected.
+          BM_EKS_IMAGE: ${{ contains(inputs.suites, 'eks') && '/tmp/eks-node-image-build/eks-node-alpine.raw' || '' }}
+          BM_EKS_MANIFEST: ${{ contains(inputs.suites, 'eks') && format('{0}/scripts/images/eks-node/manifest.conf', github.workspace) || '' }}
+        run: |
+          mkdir -p "${ARTIFACT_DIR}"
+          set -o pipefail
+          . "${GITHUB_WORKSPACE}/.github/scripts/suite-sets.sh"
+          BM_TEST_TIMEOUT=""
+          for suite in ${BM_SUITES}; do
+            tmo="$(e2e_suite_timeout "${suite}")"
+            if [ -z "${BM_TEST_TIMEOUT}" ] || [ "${tmo%m}" -gt "${BM_TEST_TIMEOUT%m}" ]; then
+              BM_TEST_TIMEOUT="${tmo}"
+            fi
+          done
+          export BM_TEST_TIMEOUT
+          echo "suites=${BM_SUITES} test-timeout=${BM_TEST_TIMEOUT}"
+          sudo -E mulga/scripts/baremetal/run-baremetal-e2e.sh \
+            --vmlinuz   "${BM_ISO_CACHE}/vmlinuz" \
+            --initrd    "${BM_ISO_CACHE}/initrd.img" \
+            --squashfs  "${BM_ISO_CACHE}/spinifex.squashfs" \
+            --tests-tar "${RUNNER_TEMP}/spinifex-tests.tar" \
+            2>&1 | tee "${ARTIFACT_DIR}/test-baremetal.log"
+
+      - name: Generate JUnit report
+        if: always()
+        run: |
+          # suite-output.log, not test-baremetal.log. The harness streams the
+          # full suite output to the first and a grep-filtered summary to its
+          # stdout, and that filter anchors --- PASS at column 0, so every
+          # indented subtest result is dropped. Parsed from the filtered log,
+          # go-junit-report saw a === RUN with no result and emitted
+          # <error message="No test result found"> — 17 of 39 testcases on a
+          # green cell-28, 93 of 120 on cell-20.
+          LOG="${ARTIFACT_DIR}/suite-output.log"
+          [ -s "$LOG" ] || LOG="${ARTIFACT_DIR}/test-baremetal.log"
+          [ -f "$LOG" ] || exit 0
+          go-junit-report -in "$LOG" -out "${ARTIFACT_DIR}/junit-baremetal.xml" || true
+
+      # Tolerated on failure: the sink being unreachable must not turn a
+      # green test run red.
+      - name: Ship test results to Elasticsearch
+        if: always()
+        continue-on-error: true
+        uses: ./.github/actions/junit-to-es
+        with:
+          junit-glob: ${{ env.ARTIFACT_DIR }}/junit-*.xml
+          cell: ${{ env.BM_CELL }}
+
+      - name: Analyze e2e failures
+        if: always()
+        uses: ./.github/actions/e2e-analyze
+        with:
+          junit-glob: ${{ env.ARTIFACT_DIR }}/junit-*.xml
+          log-dir: ${{ env.ARTIFACT_DIR }}
+          title: "E2E failure analysis (cell ${{ env.BM_CELL }})"
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: e2e-artifacts-cell-${{ env.BM_CELL }}-${{ github.run_id }}
+          path: ${{ env.ARTIFACT_DIR }}
+          if-no-files-found: warn
+          retention-days: 14

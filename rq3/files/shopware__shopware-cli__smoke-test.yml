@@ -1,0 +1,168 @@
+name: Smoke Test
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # ratchet:step-security/harden-runner@v2.21.1
+        with:
+          egress-policy: audit
+
+      - name: Checkout Repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # ratchet:actions/checkout@v7.0.1
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # ratchet:actions/setup-go@v7.0.0
+        with:
+          go-version: '1.27'
+          cache: true
+          check-latest: true
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 # ratchet:shivammathur/setup-php@2.37.2
+        with:
+          php-version: '8.2'
+
+      - name: Compile shopware-cli
+        run: go build
+
+      - name: Move to usr/bin
+        run: mv shopware-cli /usr/local/bin/
+
+      - name: Checkout Plugin
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # ratchet:actions/checkout@v7.0.1
+        with:
+          repository: 'FriendsOfShopware/FroshTools'
+          ref: '75e2013752fd4db7535e4b72b3e3e8d57e531002'
+          path: 'plugin'
+
+      - name: Create Shopware
+        run: shopware-cli project create shopware 6.5.7.3 --no-audit
+
+      - name: Build asset of Plugin
+        run: shopware-cli extension package plugin
+
+      - name: Build asset of Plugin without Git
+        run: shopware-cli extension package plugin --disable-git --release
+
+      - name: Validate Plugin
+        run: shopware-cli extension validate FroshTools.zip --only builtin
+
+      - name: Get Changelog
+        run: shopware-cli extension get-changelog FroshTools.zip
+
+      - name: Build asset against custom PROJECT_ROOT
+        env:
+          SHOPWARE_PROJECT_ROOT: ${{ github.workspace }}/shopware
+        run: |
+          mv plugin/.shopware-extension.yml plugin/.shopware-extension-disable.yml
+          shopware-cli extension build plugin
+          mv plugin/.shopware-extension-disable.yml plugin/.shopware-extension.yml
+
+      - name: Install a Storefront Plugin
+        working-directory: shopware
+        run: |
+          composer require 'frosh/platform-filter-search:*' --no-interaction --no-scripts
+          rm -rf vendor
+
+      - name: Setup the project
+        uses: shopwareLabs/build-project-action@88233d3fdb6b4b6ad7085c45210085c51b727d82 # ratchet:shopwareLabs/build-project-action@main
+        with:
+          path: shopware
+
+  docker-project:
+    name: Docker project create and dev
+    runs-on: ubuntu-latest
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # ratchet:step-security/harden-runner@v2.21.1
+        with:
+          egress-policy: audit
+
+      - name: Checkout Repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # ratchet:actions/checkout@v7.0.1
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # ratchet:actions/setup-go@v7.0.0
+        with:
+          go-version: '1.27'
+          cache: true
+          check-latest: true
+
+      - name: Compile shopware-cli
+        run: go build
+
+      - name: Move to usr/bin
+        run: mv shopware-cli /usr/local/bin/
+
+      # A Docker project gets its PHP from the image, so no PHP is set up here:
+      # needing one on the runner would mean the executor picked the wrong type.
+      - name: Create Docker project
+        run: shopware-cli project create --docker --no-audit shopware-docker
+
+      # The top-level url is deprecated and, while set, used to override
+      # environments.local — which is what selects the executor.
+      - name: Project config targets environments.local only
+        working-directory: shopware-docker
+        run: |
+          cat .config/shopware-project.yml
+          grep -q 'type: docker' .config/shopware-project.yml
+          # A top-level url sits at column 0; the environment one is indented.
+          if grep -q '^url:' .config/shopware-project.yml; then
+            echo "::error::project create wrote a deprecated top-level url"
+            exit 1
+          fi
+
+      - name: Commands do not warn about deprecated config keys
+        working-directory: shopware-docker
+        run: |
+          shopware-cli project dev status 2>&1 | tee status.log || true
+          if grep -qi 'deprecated top-level' status.log; then
+            echo "::error::a freshly created project warns about deprecated config keys"
+            exit 1
+          fi
+
+      - name: Start the development environment
+        working-directory: shopware-docker
+        run: shopware-cli project dev start
+
+      - name: Development environment reports up
+        working-directory: shopware-docker
+        run: shopware-cli project dev status
+
+      - name: Shop responds over HTTP
+        working-directory: shopware-docker
+        run: |
+          for i in $(seq 1 30); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 http://127.0.0.1:8000/admin || true)
+            echo "attempt $i: HTTP $code"
+            case "$code" in
+              200|301|302) exit 0 ;;
+            esac
+            sleep 5
+          done
+          echo "::error::shop did not respond on http://127.0.0.1:8000/admin"
+          docker compose ps
+          docker compose logs --tail=100 web
+          exit 1
+
+      - name: Stop the development environment
+        working-directory: shopware-docker
+        run: shopware-cli project dev stop --remove-data
+
+      - name: Development environment reports down
+        working-directory: shopware-docker
+        run: |
+          if shopware-cli project dev status; then
+            echo "::error::dev status must exit non-zero after stop"
+            exit 1
+          fi

@@ -1,0 +1,93 @@
+name: Update RuleSet
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - "Her"
+    paths:
+      - "RuleSet/AdRules/**"
+      - "RuleSet/Advertising.list"
+      - "RuleSet/AdRule.list"
+      - "RuleSet/GlobalRule.list"
+      - "RuleSet/Global.list"
+      - "RuleSet/Domestic.list"
+      - "RuleSet/AdRules/ByPass.list"
+  schedule:
+    - cron: "0 */24 * * *"
+
+jobs:
+  Update:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest]
+        node-version: [20]
+
+    steps:
+      - name: Fetch repository
+        uses: actions/checkout@v7
+
+      - name: Use Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v7
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      - name: Cache node modules
+        uses: actions/cache@v6
+        with:
+          path: node_modules
+          key: ${{ runner.OS }}-build-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.OS }}-build-${{ env.cache-name }}-
+            ${{ runner.OS }}-build-
+            ${{ runner.OS }}-
+
+      - name: npm install, update
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          retry() {
+            local max_attempts="$1"
+            local delay_seconds="$2"
+            shift 2
+
+            local attempt=1
+            until "$@"; do
+              local exit_code=$?
+
+              if [[ "$attempt" -ge "$max_attempts" ]]; then
+                echo "[error] Command failed after ${attempt} attempts: $*"
+                return "$exit_code"
+              fi
+
+              echo "[warn] Attempt ${attempt}/${max_attempts} failed (exit ${exit_code}): $*"
+              echo "[info] Retrying in ${delay_seconds}s..."
+              sleep "$delay_seconds"
+              attempt=$((attempt + 1))
+            done
+          }
+
+          npm install
+          retry 3 20 npm run update-adrules
+          retry 3 10 npm run update-rulesets
+
+      - name: Import GPG key
+        id: import_gpg
+        uses: crazy-max/ghaction-import-gpg@v7
+        with:
+          gpg_private_key: ${{ secrets.GPG_PRIVATE_KEY }}
+          passphrase: ${{ secrets.PASSPHRASE }}
+          git_user_signingkey: true
+          git_commit_gpgsign: true
+
+      - name: commit, push
+        uses: EndBug/add-and-commit@v11
+        with:
+          add: "-A"
+          author_name: 春夏
+          author_email: git@aapls.com
+          message: "Update RuleSet"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,92 @@
+# CI Build & Vitest Unit Tests (ship smaller name for CI badge)
+name: Universal Build & Unit Tests
+on:
+  # Trigger the workflow on push or pull request,
+  # but only for the master branch on Push and any branches on PR
+  push:
+    branches:
+      - master
+      - next
+  pull_request:
+    branches:
+      - '**'
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  run:
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [24]
+        platform:
+          - ubuntu-latest
+
+    name: '${{matrix.platform}} / Node ${{ matrix.node }}'
+    runs-on: ${{matrix.platform}}
+    timeout-minutes: 30
+    if: ${{ !startsWith(github.event.head_commit.message, 'docs:') }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+
+      - name: Install pnpm
+        uses: pnpm/setup@fbda4c85fc2e1e08721cd8763afea8f48d60f024 # v3
+        with:
+          install: false
+
+      - name: Set NodeJS
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: ${{ matrix.node }}
+          cache: 'pnpm'
+
+      - run: node --version
+      - run: pnpm --version
+
+      - name: Run pnpm install dependencies
+        run: pnpm install
+
+      - name: Build Slickgrid-Universal packages (excludes frameworks)
+        run: pnpm build:universal
+
+      - name: Run Vitest unit tests
+        if: ${{ !contains(github.event.head_commit.message, 'chore(release)') }}
+        run: pnpm test:coverage
+
+      - name: Upload test results to Codecov
+        if: ${{ !cancelled() && !contains(github.event.head_commit.message, 'chore(release)') }}
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          report_type: test_results
+          files: ./test-report.junit.xml
+
+      - name: Upload Vitest coverage to Codecov
+        if: ${{ !contains(github.event.head_commit.message, 'chore(release)') }}
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+        with:
+          files: ./test/vitest-coverage/clover.xml,./test/vitest-coverage/coverage-final.json
+          disable_search: true
+          fail_ci_if_error: true
+          flags: universal
+          token: ${{ secrets.CODECOV_TOKEN }}
+
+      - name: Retry Codecov upload when 1st try failed
+        if: ${{ failure() && !contains(github.event.head_commit.message, 'chore(release)') }}
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: ./test/vitest-coverage/clover.xml,./test/vitest-coverage/coverage-final.json
+          disable_search: true
+          fail_ci_if_error: true
+          flags: universal
+          verbose: true

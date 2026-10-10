@@ -1,0 +1,87 @@
+name: JavaScript Module Taint
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - modules/helpers/ubs_core/analyzers/taint_js.py
+      - modules/helpers/ubs_core/js_modules.py
+      - modules/helpers/ubs_core/js_scan.py
+      - modules/helpers/ubs_core/cli.py
+      - modules/helpers/type_narrowing_ts.js
+      - modules/contract.json
+      - modules/ubs-js.sh
+      - ubs
+      - test-suite/quality/test_taint_js_modules.py
+      - test-suite/quality/test_taint_js_commonjs.py
+      - test-suite/quality/test_taint_js_heap.py
+      - .github/workflows/javascript-modules.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  module-regressions:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+      UBS_NO_AUTO_UPDATE: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Verify the committed runtime and complete integrity chain
+        run: |
+          ./scripts/verify_checksums.sh
+          ./scripts/verify_sha256sums.sh
+          python3 scripts/update_checksums.py
+          git diff --exit-code
+      - name: Install scanner dependencies and independent TypeScript test oracle
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq ripgrep rsync shellcheck
+          npm install --global @ast-grep/cli typescript@5.8.3
+      - name: Test cross-file findings, compiler semantics, cache and parallel scans
+        run: |
+          command -v ast-grep
+          command -v node
+          command -v tsc
+          python3 - <<'PY'
+          import importlib.util
+          import unittest
+          for path in ('test-suite/quality/test_taint_js_modules.py', 'test-suite/quality/test_taint_js_commonjs.py', 'test-suite/quality/test_taint_js_heap.py'):
+              spec = importlib.util.spec_from_file_location('regressions', path)
+              module = importlib.util.module_from_spec(spec)
+              spec.loader.exec_module(module)
+              result = unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromModule(module))
+              assert result.wasSuccessful() and not result.skipped, (path, result.failures, result.errors, result.skipped)
+              print('JS_MODULES_TEST_PASS', path, result.testsRun, flush=True)
+          PY
+      - name: Verify existing production taint and JavaScript suites
+        run: |
+          python3 test-suite/js/test_taint_domains.py
+          python3 test-suite/js/test_taint_scopes.py
+          python3 test-suite/js/test_taint_effects.py
+          python3 -m unittest discover -s test-suite/quality -p '*js*.py' -v
+          shellcheck -S warning ubs modules/ubs-*.sh scripts/new-module.sh
+          for file in ubs modules/ubs-*.sh modules/lib/ubs-common.sh scripts/new-module.sh; do bash -n "$file"; done
+      - name: Verify deterministic integrity after scanner execution
+        run: |
+          python3 scripts/update_checksums.py
+          ./scripts/verify_checksums.sh
+          ./scripts/verify_sha256sums.sh
+          git diff --exit-code
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: javascript-modules-validation
+          path: |
+            test-suite/artifacts/javascript-modules/
+            test-suite/artifacts/javascript-commonjs/
+            test-suite/artifacts/javascript-heap/
+          retention-days: 3

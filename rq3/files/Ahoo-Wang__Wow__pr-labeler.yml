@@ -1,0 +1,92 @@
+#
+# Copyright [2021-present] [ahoo wang <ahoowang@qq.com> (https://github.com/Ahoo-Wang)].
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#      http://www.apache.org/licenses/LICENSE-2.0
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+name: Pull Request Labeler
+on:
+  pull_request_target:
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
+      # A retitled PR may gain a breaking `!`.
+      - edited
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  label:
+    name: Label Pull Request
+    permissions:
+      contents: read
+      pull-requests: write
+    runs-on: ubuntu-latest
+    steps:
+      - name: Apply labels
+        uses: actions/labeler@b8dd2d9be0f68b860e7dae5dae7d772984eacd6d # v6
+        with:
+          sync-labels: false
+
+  # actions/labeler cannot match titles, so this job labels from them. The title
+  # type picks the release-notes label (feat -> enhancement, fix -> bug, perf ->
+  # performance, docs -> documentation, other types -> maintenance, a `deps`
+  # scope -> dependencies; .github/scripts/title-label.mjs). A Conventional Commit title with `!`
+  # (`type(scope)!: …`), or a description that declares a break (a BREAKING
+  # CHANGE footer, the template's breaking box ticked, a `## Breaking` section
+  # that is not "None."), gets `breaking-change`: release notes list it first,
+  # and release admission keeps it out of a patch release and requires the
+  # x.Y.0 notes to name it. A `## Behaviour changes` section adds no label.
+  # So does a diff that removes or changes a line of a Kotlin ABI dump
+  # (`**/api/*.api`), an API report (`typescript/*/test/api/*.api.md`) or a
+  # surface list (`typescript/*/test/surface/*.txt`); additions do not. The
+  # script reads the diff from the REST API with this job's token, so the
+  # PR's code is still never checked out.
+  breaking:
+    name: Label From Title and Diff
+    # After the path labeler: actions/labeler writes the PR's label set, and
+    # run in parallel it could drop `breaking-change` added a moment earlier
+    # (seen on #3941). `always()` keeps the breaking check independent of the
+    # path labeler's result.
+    needs: label
+    if: ${{ always() }}
+    permissions:
+      contents: read
+      pull-requests: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # pull_request_target checks out the base branch: the script that runs
+      # with the write token is the reviewed one, never the PR's.
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+
+      # The title and the description are untrusted input: they reach the
+      # scripts only through env.
+      - name: Label the title type
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: node .github/scripts/title-label.mjs
+
+      - name: Label a breaking change
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: node .github/scripts/breaking-label.mjs

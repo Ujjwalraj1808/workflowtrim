@@ -1,0 +1,134 @@
+name: GH Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release (e.g. v0.1.0)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      # The tag reaches the scripts as an environment variable, never by
+      # `${{ }}` interpolation into `run:` — a tag name is a valid git ref
+      # even when it contains quotes or semicolons.
+      TAG: ${{ github.event.inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Refuse non-skill tags
+        # Bare v<major>.<minor>.<patch> tags are reserved for the skill: the
+        # update check in references/setup.md recognizes skill releases by
+        # exactly that pattern, so every other artifact released from this
+        # repository must carry a prefix (lint-v<version>, lint-latest, ...).
+        run: |
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::'$TAG' is not a skill release tag (expected v<major>.<minor>.<patch>)"
+            exit 1
+          fi
+
+      - name: Refuse a tag that does not match the checked-out versions
+        # The tag is the only input this workflow gets, and `latest` moves
+        # on it. Everything else on the commit — the skill's own version,
+        # the plugin manifests, this repository's context-schema, the
+        # linter the release checklist publishes first — has to say the
+        # same version, or `latest` would point at a skill that reports a
+        # different version than its release name.
+        run: |
+          WANT="${TAG#v}"
+          fail=0
+          check() {  # check <label> <found>
+            if [ "$2" = "$WANT" ]; then
+              echo "ok   $1: $2"
+            else
+              echo "::error::$1 is '$2', tag says '$WANT'"
+              fail=1
+            fi
+          }
+          check "SKILL.md metadata.version" \
+            "$(grep -oP '(?<=version: ")[0-9]+\.[0-9]+\.[0-9]+' skills/keep-the-why/SKILL.md | head -1)"
+          check "plugin.json version" \
+            "$(grep -oP '(?<="version": ")[0-9]+\.[0-9]+\.[0-9]+' plugin.json | head -1)"
+          check ".claude-plugin/plugin.json version" \
+            "$(grep -oP '(?<="version": ")[0-9]+\.[0-9]+\.[0-9]+' .claude-plugin/plugin.json | head -1)"
+          check ".codex-plugin/plugin.json version" \
+            "$(grep -oP '(?<="version": ")[0-9]+\.[0-9]+\.[0-9]+' .codex-plugin/plugin.json | head -1)"
+          check ".cursor-plugin/plugin.json version" \
+            "$(grep -oP '(?<="version": ")[0-9]+\.[0-9]+\.[0-9]+' .cursor-plugin/plugin.json | head -1)"
+          check "package.json version" \
+            "$(grep -oP '(?<="version": ")[0-9]+\.[0-9]+\.[0-9]+' package.json | head -1)"
+          check "llms.txt Version" \
+            "$(grep -oP '(?<=^Version: )[0-9]+\.[0-9]+\.[0-9]+' llms.txt | head -1)"
+          check ".keep-the-why context-schema" \
+            "$(grep -oP '(?<=- context-schema: )[0-9]+\.[0-9]+\.[0-9]+' .keep-the-why | head -1)"
+          check "lint SUPPORTED_SCHEMA" \
+            "$(grep -oP '(?<=SUPPORTED_SCHEMA = \()[0-9]+, [0-9]+, [0-9]+' lint/ktw_lint/__init__.py | tr -d ' ' | tr ',' '.')"
+          check "CHANGELOG section" \
+            "$(grep -oP '(?<=^## \[)[0-9]+\.[0-9]+\.[0-9]+(?=\])' CHANGELOG.md | head -1)"
+          if ! python3 -c "import urllib.request,json,sys; v=json.load(urllib.request.urlopen('https://pypi.org/pypi/keep-the-why-lint/json'))['releases']; sys.exit(0 if any(r.startswith('$WANT.') for r in v) else 1)"; then
+            echo "::error::no keep-the-why-lint $WANT.x on PyPI — the release checklist publishes the linter first"
+            fail=1
+          fi
+          exit $fail
+
+      - name: Package skill
+        run: |
+          cd skills/keep-the-why
+          zip -r "${GITHUB_WORKSPACE}/keep-the-why-skill.zip" .
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$TAG" keep-the-why-skill.zip \
+            --title "$TAG" \
+            --generate-notes
+
+      - name: Move latest tag
+        run: |
+          git tag -f latest "$TAG"
+          git push origin latest --force
+
+  npm:
+    # The same skill directory as an npm package, `keep-the-why`, for
+    # `pi install npm:keep-the-why` and the pi.dev package catalog (the
+    # `pi-package` keyword). Trusted publishing: npm trusts this workflow
+    # file through the OIDC token, no npm token is stored anywhere; the
+    # publish also carries provenance for the tag's commit. The version is
+    # *staged*, not released: it goes live only once the maintainer approves
+    # it with 2FA (`npm stage approve`, or on npmjs.com) — the trusted
+    # publisher is deliberately not allowed to publish directly, so a run
+    # nobody asked for cannot put a version in front of installs.
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Stage on npm
+        # `npm stage` needs a current npm; the runner's Node 24 may ship an
+        # older one, so npm updates itself first (npm's own trusted-publishing
+        # recipe does the same).
+        run: |
+          npm install -g npm@latest
+          npm --version
+          npm stage publish . --access public --provenance

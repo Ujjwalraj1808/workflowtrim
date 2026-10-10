@@ -1,0 +1,31 @@
+name: "PR Changelog Check"
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, edited, labeled, unlabeled]
+
+permissions:
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: pr-changelog-check-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  check-changelog:
+    name: "Check PR changelog"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+          cache-dependency-path: go.sum
+      - name: "Validate changelog section"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: go run ./scripts/changelog validate-pr-section

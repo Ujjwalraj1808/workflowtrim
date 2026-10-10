@@ -1,0 +1,77 @@
+name: test-ci-bootstrap
+
+# cancel existing runs of the same workflow on the same ref
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - enos/ci/**
+      - .github/workflows/test-ci-bootstrap.yml
+  push:
+    branches:
+      - main
+    paths:
+      - enos/ci/**
+      - .github/workflows/test-ci-bootstrap.yml
+
+jobs:
+  bootstrap-ci:
+    runs-on: ${{ github.repository == 'hashicorp/vault' && 'ubuntu-latest' || fromJSON('["self-hosted","ubuntu-22.04-x64"]') }}
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      TF_WORKSPACE: "${{ github.event.repository.name }}-ci-enos-bootstrap"
+      TF_VAR_repository: ${{ github.event.repository.name }}
+      TF_VAR_aws_ssh_public_key: ${{ secrets.SSH_KEY_PUBLIC_CI }}
+      TF_TOKEN_app_terraform_io: ${{ secrets.TF_API_TOKEN }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_wrapper: false
+      - if: github.repository != 'hashicorp/vault'
+        id: vault-auth
+        name: Vault Authenticate
+        run: vault-auth
+      - if: github.repository != 'hashicorp/vault'
+        id: vault-secrets
+        name: Fetch Vault Secrets
+        uses: hashicorp/vault-action@892a26828f195e65540a40b4768ae4571f51ebfc # v4.0.0
+        with:
+          url: ${{ steps.vault-auth.outputs.addr }}
+          caCertificate: ${{ steps.vault-auth.outputs.ca_certificate }}
+          token: ${{ steps.vault-auth.outputs.token }}
+          secrets: |
+            kv/data/github/${{ github.repository }}/aws access-key-id_070182026 | AWS_ACCESS_KEY_ID_CI_070182026;
+            kv/data/github/${{ github.repository }}/aws secret-access-key_070182026 | AWS_SECRET_ACCESS_KEY_CI_070182026;
+            kv/data/github/${{ github.repository }}/aws role-arn | AWS_ROLE_ARN_CI;
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@cbe3b392738ccf3f987d68400dafcf4b0624a56c # v6.2.4
+        with:
+          aws-access-key-id: ${{ github.repository == 'hashicorp/vault' && secrets.AWS_ACCESS_KEY_ID_CI_070182026 || steps.vault-secrets.outputs.AWS_ACCESS_KEY_ID_CI_070182026 }}
+          aws-secret-access-key: ${{ github.repository == 'hashicorp/vault' && secrets.AWS_SECRET_ACCESS_KEY_CI_070182026 || steps.vault-secrets.outputs.AWS_SECRET_ACCESS_KEY_CI_070182026 }}
+          aws-region: us-east-1
+          role-to-assume: ${{ github.repository == 'hashicorp/vault' && secrets.AWS_ROLE_ARN_CI || steps.vault-secrets.outputs.AWS_ROLE_ARN_CI }}
+          role-skip-session-tagging: true
+          role-duration-seconds: 3600
+      - name: Init Terraform
+        id: tf_init
+        run: |
+          terraform -chdir=enos/ci/bootstrap init -input=false
+      - name: Plan Terraform
+        id: tf_plan
+        run: |
+          terraform -chdir=enos/ci/bootstrap plan
+      - name: Apply Terraform
+        if: ${{ github.ref == 'refs/heads/main' }}
+        id: tf_apply
+        run: |
+          terraform -chdir=enos/ci/bootstrap apply -auto-approve

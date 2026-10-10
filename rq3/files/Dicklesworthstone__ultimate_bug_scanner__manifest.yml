@@ -1,0 +1,21 @@
+name: UBS Manifest (retired)
+
+# Retired 2026-09-02 (bead H1): the manifest now runs as four deterministic
+# shards in ci.yml (job `manifest`) on every push/PR, and in full through
+# run_all.sh in test-suite.yml on main pushes and nightly. This file stays as a
+# manual no-op because the repository never deletes workflow files without
+# maintainer approval.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  noop:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Point at the consolidated workflow
+        run: echo "The manifest suite runs in ci.yml (job manifest, 4 shards) and test-suite.yml (full run on main + nightly)."

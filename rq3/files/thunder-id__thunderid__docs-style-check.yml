@@ -1,0 +1,61 @@
+name: 🥒 Docs Lint (Changed Files Only)
+
+on:
+  pull_request:
+    paths:
+      - '**/*.md'
+      - '**/*.mdx'
+  merge_group:
+
+jobs:
+  docs-lint:
+    name: Docs lint
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: 🔧 Install Vale
+        run: |
+          gh release download --repo errata-ai/vale --pattern 'vale_*_Linux_64-bit.tar.gz' --dir /tmp --clobber
+          tar -xzf /tmp/vale_*_Linux_64-bit.tar.gz -C /tmp vale
+          sudo mv /tmp/vale /usr/local/bin/vale
+          vale sync
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: 🔍 Get changed markdown files
+        id: changed-files
+        run: |
+          # Determine base ref depending on event type
+          if [ "${{ github.event_name }}" = "merge_group" ]; then
+            # merge_group.base_ref is a full ref like refs/heads/main — strip the prefix
+            BASE_REF="${{ github.event.merge_group.base_ref }}"
+            BASE_REF="${BASE_REF#refs/heads/}"
+          else
+            BASE_REF="${{ github.base_ref }}"
+          fi
+          FILES=$(git diff --name-only --diff-filter=ACMR "origin/${BASE_REF}...HEAD" -- '*.md' '*.mdx' ':!.agent/skills/**')
+          echo "base_ref=origin/${BASE_REF}" >> "$GITHUB_OUTPUT"
+          if [ -z "$FILES" ]; then
+            echo "No markdown files changed."
+            echo "has_files=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Changed markdown files:"
+            echo "$FILES"
+            echo "has_files=true" >> "$GITHUB_OUTPUT"
+            printf '%s\n' "$FILES" > /tmp/changed-docs.txt
+          fi
+
+      - name: 🔍 Run docs-lint
+        if: steps.changed-files.outputs.has_files == 'true'
+        env:
+          DOCS_LINT_BASE_REF: ${{ steps.changed-files.outputs.base_ref }}
+        run: |
+          mapfile -t FILES < /tmp/changed-docs.txt
+          ./scripts/docs-lint.sh "${FILES[@]}"

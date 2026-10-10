@@ -1,0 +1,90 @@
+# Nightly deep gate: the long/quarantined suites plus the exhaustive fuzz
+# matrices, with date-rotated seeds so every night explores new paths while
+# the fixed in-repo seeds remain the reproducible regression corpus.
+# Failures here are minimized into directed tests in the per-push gate.
+#
+# One job per suite, all run to completion. As a chain of steps on one runner
+# the first red step ended the run, so a night reported at most one suite's
+# first finding and hid everything after it — the workflow was red for a month
+# without ever saying how much was wrong. Now every suite reports every night,
+# in parallel, and the run takes as long as its slowest suite.
+name: Nightly
+
+on:
+  schedule:
+    - cron: '30 6 * * *'
+  workflow_dispatch:
+    inputs:
+      seed:
+        # The rotated seed is the run's date, so a red night could not be
+        # re-run once the day had passed: the next dispatch walked new paths.
+        description: 'Fuzz seed to replay, e.g. 20260925 (default: today, UTC)'
+        required: false
+        default: ''
+
+env:
+  # Bare Xvfb has no compositor; suites that read pixels via CDP
+  # Page.captureScreenshot gate on this (see ci.yml for the details).
+  CI_NO_WINDOW_MANAGER: "1"
+  # Rotated fuzz seeds: exported by the "Rotate fuzz seeds" step per job.
+  CROSS_FUZZ_SEEDS: "12"
+  CROSS_FUZZ_STEPS: "40"
+
+jobs:
+  suite:
+    name: ${{ matrix.suite.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      # Every suite runs whatever the others found; that is the whole point.
+      fail-fast: false
+      matrix:
+        suite:
+          - name: Long suites
+            script: test:long
+          - name: Exhaustive formatting matrix
+            script: test:formatting:exhaustive
+          - name: Exhaustive paste fuzz
+            script: test:paste:exhaustive
+          # The per-push gate runs this suite's first two seeds; the remaining
+          # three only ever ran on a developer's machine, where the suite
+          # could not finish inside its budget and so ran nowhere at all.
+          - name: Deep stateful formatting toggles
+            script: test:formatting:deep
+          # Its LIST_FUZZ_SEED was rotated below for weeks without the suite
+          # ever being run; the two bugs its fixed seed finds are fixed.
+          - name: Exhaustive list-editing fuzz
+            script: test:lists:exhaustive
+          # Agents through every door — CLI, desktop editor, hosted mirror —
+          # with a person editing alongside: the fixed seed plus tonight's,
+          # walked far longer than the per-push gate walks them.
+          - name: Agent collaboration fuzz
+            script: test:agents:fuzz
+          # test:interactions:exhaustive is deliberately absent: the suite
+          # skips itself under CI_NO_WINDOW_MANAGER, so on this runner the
+          # step ran nothing while looking like coverage. Bring it back with a
+          # window manager in the Xvfb session, not by listing it here.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install system dependencies (Electron + ffmpeg)
+        uses: ./.github/actions/electron-system-deps
+      - run: npm ci
+      - name: Configure Electron's SUID sandbox helper
+        run: |
+          sudo chown root:root node_modules/electron/dist/chrome-sandbox
+          sudo chmod 4755 node_modules/electron/dist/chrome-sandbox
+      - name: Rotate fuzz seeds by date
+        env:
+          SEED_INPUT: ${{ inputs.seed }}
+        run: |
+          SEED="${SEED_INPUT:-$(date -u +%Y%m%d)}"
+          case "$SEED" in *[!0-9]*|'') echo "::error::seed must be digits: $SEED"; exit 1;; esac
+          echo "FUZZ_SEED=$SEED" >> "$GITHUB_ENV"
+          echo "LIST_FUZZ_SEED=$SEED" >> "$GITHUB_ENV"
+          echo "Rotated fuzz seed: $SEED"
+      - name: ${{ matrix.suite.name }}
+        run: xvfb-run -a --server-args="-screen 0 2560x1440x24" npm run ${{ matrix.suite.script }}

@@ -1,0 +1,54 @@
+# SPDX-FileCopyrightText: 2026 Edward Kmett
+# SPDX-License-Identifier: UPL-1.0 AND BSD-3-Clause
+
+name: Automation checks
+on:
+  workflow_call:
+    inputs:
+      cadence:
+        type: string
+        required: true
+      expected_sha:
+        type: string
+        required: true
+permissions:
+  contents: read
+  actions: read
+jobs:
+  automation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          submodules: true
+          persist-credentials: false
+      - name: Check dispatched revision
+        env:
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+      - name: Validate cadence
+        env:
+          CI_CADENCE: ${{ inputs.cadence }}
+        run: |
+          case "$CI_CADENCE" in commit|hourly|nightly) ;; *) exit 1 ;; esac
+      - name: Stop commit checks when Hourly is failing
+        if: inputs.cadence == 'commit'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/hourly_health.py
+      - name: Test merge decisions and race handling
+        run: python3 -m unittest discover -s .github/scripts -p 'test_*.py'
+      - name: Lint CI and merge workflows
+        shell: bash
+        run: |
+          curl --fail --location --silent --show-error --retry 3 --retry-delay 2 --retry-max-time 30 \
+            https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz \
+            --output "$RUNNER_TEMP/actionlint.tar.gz"
+          echo "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  $RUNNER_TEMP/actionlint.tar.gz" | sha256sum --check
+          tar -xzf "$RUNNER_TEMP/actionlint.tar.gz" -C "$RUNNER_TEMP" actionlint
+          # GitHub supports queue: max; the pinned linter does not yet know this key.
+          "$RUNNER_TEMP/actionlint" -ignore '^unexpected key "queue" for "concurrency" section\.'

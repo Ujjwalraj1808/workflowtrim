@@ -1,0 +1,32 @@
+name: "Packages preview release"
+on:
+  push:
+    paths:
+      - "ui/packages/**"
+    branches:
+      - main
+  pull_request:
+    paths:
+      - "ui/packages/**"
+    branches:
+      - main
+jobs:
+  packages-preview-release:
+    runs-on: ubuntu-latest
+    if: github.repository == 'halo-dev/halo'
+    steps:
+      - uses: actions/checkout@v6
+      - name: Setup Environment
+        uses: ./.github/actions/setup-env
+
+      - name: Install Dependencies
+        working-directory: ui
+        run: vp install --frozen-lockfile
+
+      - name: Build Packages
+        working-directory: ui
+        run: vp run build:packages
+
+      - name: Release
+        working-directory: ui
+        run: vp dlx pkg-pr-new publish --compact --pnpm './packages/*'

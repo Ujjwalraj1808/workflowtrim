@@ -1,0 +1,25 @@
+name: Python Lint
+on:
+  pull_request:
+    paths:
+      - 'python/**'
+      - '.github/workflows/python-lint.yaml'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+      - name: Python build
+        run: pip install ".[dev]"
+        working-directory: ./python
+      - name: Ruff check
+        run: ruff check
+        working-directory: ./python
+      - name: Ruff format check
+        run: ruff format --check
+        working-directory: ./python

@@ -1,0 +1,90 @@
+name: Naver News Sync
+
+# ──────────────────────────────────────────────────────────────
+# 네이버 뉴스 forward-only archive cron (private — 언론사 저작권).
+#
+# 네이버 검색 API 일별 fan-out (KR 시총상위 + 매크로 키워드, 제목+스니펫) →
+# `data/news/private/naver/KR/{YYYY}-{MM}-{DD}.parquet` upsert →
+# private HF push (`eddmpython/dartlab-news-private/news/private/naver/...`).
+#
+# ⚠ 공개 dartlab-data 에 절대 안 감 — 결과는 언론사 저작권이라 비공개 캐시 전용.
+# 서버사이드 read / 라이브 표시는 의도된 용도. 공개 재배포만 금지.
+#
+# 자격증명: secrets NAVER_CLIENT_ID / NAVER_CLIENT_SECRET (X-Naver-Client-*).
+# 미설정이면 syncNaverNews 가 무해 종료(rc=0, 업로드 0) → green-noop (배선 자체는 안전).
+#
+# concurrency group `hf-naver-push` — private repo 라 공개 news (`hf-news-push`) 와
+# 별도 버킷. rate 보호는 naverNews concurrency=4 + asyncio.Semaphore.
+# ──────────────────────────────────────────────────────────────
+
+on:
+  schedule:
+    - cron: '30 9 * * *'  # UTC 09:30 = KST 18:30 (장 마감 후 그날 KR 뉴스 — 08:00 news / 11:20 gov 사이 빈 구간)
+  workflow_dispatch:
+    inputs:
+      max_queries:
+        description: '쿼리 상한 (smoke 테스트용)'
+        default: '50'
+        type: string
+      naver_pages:
+        description: '네이버 쿼리당 start 페이징 깊이 (1=일별 증분 최근100, 10=백필 최대1000). ⚠ 종목×pages ≤ 일쿼터 25k'
+        default: '1'
+        type: string
+      naver_days:
+        description: '네이버 lookback 윈도우 (1=일별 cutoff, 0=백필 cutoff 없음)'
+        default: '1'
+        type: string
+      gdelt_years:
+        description: 'GDELT DOC 과거 질의 연도 수 (1=올해 증분, 5=과거 backfill). ⚠ 한국어 커버리지 사실상 0 — 비권장'
+        default: '1'
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hf-naver-push
+  cancel-in-progress: false
+
+jobs:
+  sync-naver-kr:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90  # 전체 상장사(~2,800) 네이버 fanout + GDELT DOC 질의(전 종목) — 옛 30 으론 부족
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Smoke import
+        run: uv run python -c "import dartlab; print('dartlab', getattr(dartlab, '__version__', 'dev'))"
+
+      # 통합 진입점(dartlab.pipeline naverNews) — syncNaverNews(--once, --max-queries) +
+      # bulkUploadHf(newsNaver --since 86400, private repo) 를 동형 호출. bulkUploadHf 는
+      # env>.env 토큰 해석. NAVER 키 미설정 시 fetch 0 → green-noop.
+      - name: Fetch naver headlines (KR) + private HF push
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          NAVER_CLIENT_ID: ${{ secrets.NAVER_CLIENT_ID }}
+          NAVER_CLIENT_SECRET: ${{ secrets.NAVER_CLIENT_SECRET }}
+          NAVER_MAX_QUERIES: ${{ github.event.inputs.max_queries || '5000' }}
+          NAVER_PAGES: ${{ github.event.inputs.naver_pages || '1' }}
+          NAVER_DAYS: ${{ github.event.inputs.naver_days || '1' }}
+        run: uv run python -X utf8 -m dartlab.pipeline naverNews
+
+      # 종목별 뉴스 인덱스(두 트랙) — naver recent.parquet + gdelt DOC archive(올해 증분) → byCompany/{code}.json.
+      # CF 워커 /news?code= 가 read 토큰으로 byCompany json 을 서버사이드 read → 터미널 우측패널·이벤트레일 표시.
+      # 과거 deep backfill 은 workflow_dispatch 로 gdelt_years=5 지정. HF_TOKEN 미설정 시 build 만(push skip).
+      - name: Build per-company news index (naver + gdelt) + private HF push
+        if: ${{ always() }}
+        continue-on-error: true
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: uv run python -X utf8 .github/scripts/sync/buildNaverCompanyNews.py --gdelt-years ${{ github.event.inputs.gdelt_years || '1' }}

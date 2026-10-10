@@ -1,0 +1,42 @@
+name: Rust Cache
+on:
+  workflow_dispatch: # Allow manual running to refresh/check cache
+  schedule: # Planned execution once per day
+    - cron: "0 1 * * *"
+  pull_request:
+    paths:
+      - '.github/workflows/rust-cache.yaml'
+  push:
+    branches:
+      - develop
+
+env:
+  RUST_BUILD_IMAGE: "ghcr.io/gchq/sleeper-rust-builder-sccache:latest"
+  SCCACHE_GHA_ENABLED: "true"
+  SCCACHE_CACHE_SIZE: "2G"
+  SCCACHE_LOG: "trace"
+  RUSTC_WRAPPER: "sccache"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+         toolchain: 1.96
+      - uses: mozilla-actions/sccache-action@v0.0.11
+      - name: Build without Docker
+        working-directory: ./rust
+        run: cargo build --verbose
+      - name: Build x86_64
+        working-directory: ./rust
+        run: ./build-in-docker.sh x86_64 --release --verbose
+      - name: Build aarch64
+        working-directory: ./rust
+        run: ./build-in-docker.sh aarch64 --release --verbose
+      - name: Check native library version linking for x86_64
+        run: ./rust/check-native-lib.sh rust/target/x86_64-unknown-linux-gnu/release/libsleeper_df.so x86_64
+      - name: Check native library version linking for aarch64
+        run: ./rust/check-native-lib.sh rust/target/aarch64-unknown-linux-gnu/release/libsleeper_df.so aarch64

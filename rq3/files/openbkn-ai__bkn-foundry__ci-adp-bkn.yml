@@ -1,0 +1,49 @@
+name: ci-adp-bkn
+
+# Compile and unit-test gate for PRs touching adp/bkn.
+
+on:
+  pull_request:
+    paths:
+      - 'adp/bkn/**'
+      - '.github/workflows/ci-adp-bkn.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-adp-bkn-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  bkn-backend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: adp/bkn/bkn-backend/server
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: adp/bkn/bkn-backend/server/go.mod
+      - run: go build ./...
+      - name: Run BKN backend unit tests
+        env:
+          I18N_MODE_UT: "true"
+        run: go test -count=1 -gcflags="all=-l" ./...
+
+  ontology-query:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: adp/bkn/ontology-query/server
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: adp/bkn/ontology-query/server/go.mod
+      - run: go build ./...
+      - name: Run ontology query unit tests
+        env:
+          I18N_MODE_UT: "true"
+        run: go test -count=1 -gcflags="all=-l" ./...

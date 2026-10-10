@@ -1,0 +1,93 @@
+name: Run Tests
+
+on:
+  workflow_call:
+  workflow_dispatch:
+  push:
+    branches: [ main, release/*, bugfix/* ]
+  pull_request:
+    branches: [ main, release/*, bugfix/* ]
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - "CODEOWNERS"
+      - "LICENSE"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  CodeQL:
+    uses: eclipse-edc/.github/.github/workflows/codeql-analysis.yml@main
+    secrets: inherit
+
+  Checkstyle:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: eclipse-edc/.github/.github/actions/setup-build@main
+      - name: Run Checkstyle
+        run: ./gradlew checkstyleMain checkstyleTest checkstyleTestFixtures
+
+  Javadoc:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: eclipse-edc/.github/.github/actions/setup-build@main
+      - name: Run Javadoc
+        run: ./gradlew javadoc
+
+  Unit-Tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: eclipse-edc/.github/.github/actions/setup-build@main
+      - name: Run unit tests
+        run: ./gradlew test
+
+  Postgresql-Integration-Tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: eclipse-edc/.github/.github/actions/setup-build@main
+      - name: Postgresql Tests
+        run: ./gradlew test -DincludeTags="PostgresqlIntegrationTest"
+
+  End-To-End-Tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: eclipse-edc/.github/.github/actions/setup-build@main
+      - name: End to End Integration Tests
+        run: ./gradlew test -DincludeTags="EndToEndTest"
+
+  Component-Tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: eclipse-edc/.github/.github/actions/setup-build@main
+      - name: Component Tests
+        run: ./gradlew test -DincludeTags="ComponentTest"
+
+  API-Tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: eclipse-edc/.github/.github/actions/setup-build@main
+      - name: Component Tests
+        run: ./gradlew test -DincludeTags="ApiTest"
+
+  Tck-Tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: eclipse-edc/.github/.github/actions/setup-build@main
+      - name: TCK Tests
+        run: ./gradlew compileJava test -DincludeTags="TckTest" -PverboseTest=true
+
+  Verify-OpenApi:
+    if: github.event_name == 'pull_request'
+    uses: eclipse-edc/.github/.github/workflows/verify-openapi.yml@main
+    secrets: inherit
+

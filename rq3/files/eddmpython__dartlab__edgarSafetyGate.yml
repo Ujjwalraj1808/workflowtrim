@@ -1,0 +1,124 @@
+name: EDGAR Safety Gate (PR-E7b prerequisite)
+
+# plan delegated-prancing-tower PR-E7c — 안전 게이트 자동 측정.
+# tests/audit/sectionsParityEdgar.py 가 5 baseline ticker 의 옛/신 parity 를 weekly 측정.
+# 4 주 연속 0 violations + D.1 회귀 0 + viewer Playwright 0 + sync 14 일 무사고 통과 시
+# 운영자가 GitHub Actions repo secrets 에 DARTLAB_EDGAR_DOCS_DEPRECATED=1 등록 → 1 회 sync
+# → docs.parquet path 자동 skip (PR-E7b 게이트 활성).
+#
+# 본 workflow 는 측정만 — 자동 폐기 안 함. 4 주 연속 통과 결과를 GitHub issue 코멘트
+# 로 게시 (별 step), 운영자가 그 신호를 보고 명시 결정.
+
+on:
+  schedule:
+    - cron: '0 6 * * 1'   # 매주 월요일 UTC 06:00 — edgarSync weekly (Sun 03:00) 후 3 시간
+  workflow_dispatch:
+    inputs:
+      tickers:
+        description: '측정 ticker (comma-separated). 빈 값이면 5 baseline.'
+        default: ''
+        type: string
+      strict:
+        description: 'violations 1 개라도 있으면 exit 1 (CI 차단)'
+        default: 'true'
+        type: string
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  measureParity:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: uv sync
+
+      # ── 옛/신 artifact 다운로드 (HF 에서 read-only) ──
+      - name: Download EDGAR docs + sections from HF (5 baseline)
+        run: |
+          uv run python -X utf8 -c "
+          import os
+          os.environ.setdefault('DARTLAB_DATA_DIR', '${{ github.workspace }}/data')
+          from huggingface_hub import snapshot_download
+          baseline = ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'NVDA']
+          for t in baseline:
+              try:
+                  snapshot_download(
+                      repo_id='eddmpython/dartlab-data',
+                      repo_type='dataset',
+                      allow_patterns=[f'edgar/docs/{t}.parquet', f'edgar/sections/{t}/*.parquet'],
+                      local_dir='${{ github.workspace }}/data',
+                  )
+                  print(f'{t} download ok')
+              except Exception as exc:
+                  print(f'{t} download fail: {exc}')
+          "
+
+      # ── parity 측정 ──
+      - name: Run sectionsParityEdgar audit
+        id: parity
+        run: |
+          TICKERS="${{ github.event.inputs.tickers }}"
+          STRICT_FLAG=""
+          if [ "${{ github.event.inputs.strict }}" != "false" ]; then
+              STRICT_FLAG="--strict"
+          fi
+          if [ -n "$TICKERS" ]; then
+              uv run python -X utf8 tests/audit/sectionsParityEdgar.py \
+                  --tickers "$TICKERS" \
+                  --json parity.json \
+                  $STRICT_FLAG \
+                  | tee parity.log
+          else
+              uv run python -X utf8 tests/audit/sectionsParityEdgar.py \
+                  --json parity.json \
+                  $STRICT_FLAG \
+                  | tee parity.log
+          fi
+        env:
+          DARTLAB_DATA_DIR: ${{ github.workspace }}/data
+        continue-on-error: true
+
+      # ── 결과를 GitHub step summary 에 게시 ──
+      - name: Publish gate status to summary
+        if: always()
+        run: |
+          echo "## EDGAR Safety Gate Status (PR-E7 prerequisite)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "측정 일시: $(date -u +%Y-%m-%dT%H:%M:%SZ)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### parity.log" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          cat parity.log >> $GITHUB_STEP_SUMMARY || echo "(parity.log 없음)" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 게이트 결과" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ steps.parity.outcome }}" = "success" ]; then
+              echo "✅ 본 주 측정 통과 (0 violations). 4 주 연속 통과 누적 시 운영자 결정 시점 도래." >> $GITHUB_STEP_SUMMARY
+          else
+              echo "❌ 본 주 측정 미통과. 4 주 카운터 reset." >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "PR-E7b 의 ``DARTLAB_EDGAR_DOCS_DEPRECATED=1`` 등록은 본 측정 4 주 연속 0 violations 통과 후만 진행." >> $GITHUB_STEP_SUMMARY
+          fi
+
+      # ── 결과 artifact 보존 (4 주 카운터 추적용) ──
+      - name: Upload parity.json artifact
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: edgar-parity-${{ github.run_id }}
+          path: |
+            parity.json
+            parity.log
+          retention-days: 30

@@ -1,0 +1,39 @@
+name: check
+on:
+  workflow_dispatch:
+  pull_request:
+    types: [opened, synchronize, reopened]
+permissions:
+  contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Get list of changed files
+        id: files
+        run: |
+          git fetch origin master:master
+          ANY_CHANGED=false
+          ALL_CHANGED_FILES=$(git diff --diff-filter=ACMRT --name-only master -- streams/ | tr '\n' ' ')
+          if [ -n "${ALL_CHANGED_FILES}" ]; then
+            ANY_CHANGED=true
+          fi
+          echo "all_changed_files=$ALL_CHANGED_FILES" >> "$GITHUB_OUTPUT"
+          echo "any_changed=$ANY_CHANGED" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        if: steps.files.outputs.any_changed == 'true'
+        with:
+          node-version: 22
+          cache: 'npm'
+      - name: Install dependencies
+        if: steps.files.outputs.any_changed == 'true'
+        run: npm install
+      - name: Validate changed files
+        if: steps.files.outputs.any_changed == 'true'
+        run: |
+          npm run playlist:lint -- ${{ steps.files.outputs.all_changed_files }}
+          npm run playlist:validate -- --log-level=error ${{ steps.files.outputs.all_changed_files }}

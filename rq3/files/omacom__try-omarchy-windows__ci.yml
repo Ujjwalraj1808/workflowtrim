@@ -1,0 +1,153 @@
+name: CI
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_guest:
+        description: Build and boot the complete guest candidate
+        type: boolean
+        default: false
+  pull_request:
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  launcher:
+    timeout-minutes: 20
+    name: Launcher
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: app/go.mod
+          cache-dependency-path: app/go.sum
+
+      - name: Test release helpers
+        run: |
+          python3 -m py_compile scripts/release/*.py runtime-build/*.py
+          python3 -m unittest discover -s scripts/release -p 'test_*.py'
+          python3 -m unittest discover -s scripts/gpu -p 'test_*.py'
+          python3 -m unittest discover -s scripts/shell-canary -p 'test_*.py'
+          bash -n scripts/shell-canary/run.sh
+          python3 -m py_compile scripts/gpu/blender/smoke.py
+          bash -n scripts/gpu/blender/build-arch.sh
+          python3 runtime-build/validate-lock.py
+          bash -n runtime-build/*.sh
+
+      - name: Test launcher
+        working-directory: app
+        run: go test -race ./...
+
+      - name: Vet launcher
+        working-directory: app
+        run: |
+          go vet ./...
+          # Win32 callbacks and COM APIs pass pointers through uintptr by contract.
+          GOOS=windows GOARCH=amd64 go vet -unsafeptr=false ./...
+
+      - name: Build Windows launcher
+        working-directory: app
+        run: GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "-H windowsgui -s -w" -o ../TryOmarchy.exe .
+
+      - name: Validate current release pin
+        run: scripts/release/validate-pin.py --require-public "$(sed -n 's/.*releases\/download\/\([^\"]*\).*/\1/p' app/manifest.go)"
+
+  windows-launcher:
+    timeout-minutes: 20
+    name: Windows launcher
+    runs-on: windows-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: app/go.mod
+          cache-dependency-path: app/go.sum
+
+      - name: Test public release verification
+        shell: pwsh
+        run: scripts/release/test-verify-public.ps1
+
+      - name: Test launcher on Windows
+        working-directory: app
+        run: go test ./...
+
+  importer:
+    timeout-minutes: 20
+    name: Importer
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Test the Try Omarchy importer
+        run: |
+          python3 -m py_compile migrate/build.py migrate/omarchy_import/*.py
+          python3 -W error::ResourceWarning -m unittest discover -s migrate/tests -t migrate
+
+      - name: Build the importer release files
+        run: |
+          python3 migrate/build.py --version v0.0.0-ci --output "$RUNNER_TEMP/importer"
+          bash -n "$RUNNER_TEMP/importer/try-omarchy-import.sh"
+          "$RUNNER_TEMP/importer/try-omarchy-import.pyz" --version
+
+  guest-contract:
+    timeout-minutes: 20
+    name: Guest contract
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Apply guest patches and run contract tests
+        run: scripts/release/build-guest.sh --contract-only
+
+  guest-candidate:
+    name: Guest image candidate
+    if: github.event_name == 'workflow_dispatch' && inputs.build_guest
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      ARTIFACT_DIR: ${{ github.workspace }}/guest-candidate
+    steps:
+      - name: Check out source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Prepare guest smoke runner
+        run: |
+          test "$(df --output=avail -B1G "$RUNNER_TEMP" | tail -1)" -ge 14
+          test -e /dev/kvm
+          sudo chmod 666 /dev/kvm
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends qemu-system-x86
+
+      - name: Build locked guest image
+        run: scripts/release/build-guest.sh --output "$ARTIFACT_DIR"
+
+      - name: Boot the complete guest candidate
+        run: scripts/release/smoke-guest.py "$ARTIFACT_DIR"
+
+      - name: Remove unpacked test input
+        run: rm -- "$ARTIFACT_DIR/rootfs.ext4"
+
+      - name: Retain guest candidate
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: guest-candidate
+          path: guest-candidate/
+          compression-level: 0
+          retention-days: 7
+          if-no-files-found: error

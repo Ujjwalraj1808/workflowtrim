@@ -1,0 +1,327 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Rust quality gate for the parser workspace. Runs without the (gitignored,
+  # redistribution-prohibited) sample files: the sample-dependent parser tests
+  # skip themselves when the fixtures are absent.
+  rust:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Format check
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # The legacy Office readers are feature-gated per format (no feature
+      # builds nothing), so the workspace defaults above do not compile them.
+      # Lint and test each reader alone and all together.
+      - name: Legacy reader clippy (per feature)
+        run: |
+          for features in direct-doc direct-xls direct-ppt inspection; do
+            cargo clippy -p legacy-office-converter --all-targets --features "$features" -- -D warnings
+          done
+          cargo clippy -p legacy-office-converter --all-targets --all-features -- -D warnings
+
+      # The cargo-fuzz harness is an intentionally independent workspace, so
+      # the root workspace checks above do not format, lint, or compile it.
+      - name: Fuzz target format check
+        run: cargo fmt --manifest-path fuzz/Cargo.toml -- --check
+
+      # Keep every target buildable and its separate lockfile synchronized on
+      # ordinary PRs, before the long scheduled fuzz run discovers API drift.
+      - name: Fuzz target clippy
+        run: cargo clippy --manifest-path fuzz/Cargo.toml --bins --locked -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace
+
+      - name: Legacy reader tests (per feature)
+        run: |
+          for features in direct-doc direct-xls direct-ppt; do
+            cargo test -p legacy-office-converter --features "$features"
+          done
+          cargo test -p legacy-office-converter --all-features
+
+  # RB8 — dependency vulnerability audit. Report-only for now
+  # (continue-on-error): one known advisory already exists at introduction —
+  # RUSTSEC-2026-0190 (anyhow < 1.0.103 unsound `Error::downcast_mut`), pulled
+  # in only by the non-shipped ooxml-mcp-server crate, not the wasm parsers or
+  # the npm package. Starting non-blocking surfaces advisories in the CI log
+  # without gating the whole repo on a transitive dev-tool issue; flip to
+  # blocking (drop continue-on-error) once the backlog is at zero.
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      # Scans Cargo.lock against the RustSec advisory DB. Default level fails on
+      # vulnerabilities but only warns on unmaintained/unsound advisories.
+      - name: cargo audit
+        run: cargo audit
+
+      - uses: pnpm/action-setup@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # Audit only production deps (the shipped surface); --audit-level high
+      # ignores low/moderate advisories in the (large) dev toolchain.
+      - name: pnpm audit (prod)
+        run: pnpm audit --prod --audit-level high
+
+  typecheck:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - uses: pnpm/action-setup@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+          cache: 'pnpm'
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            packages/pptx/parser
+            packages/xlsx/parser
+            packages/docx/parser
+            packages/legacy-converter/parser
+
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # ast-grep lint runs on source only (no WASM needed) — fail fast.
+      - name: ast-grep rule tests
+        run: pnpm lint:test
+
+      - name: Lint
+        run: |
+          pnpm test:resource-policy
+          pnpm check:resource-policy
+          pnpm lint
+
+      - name: DOCX layout boundary tests
+        run: |
+          pnpm test:docx-boundaries
+          pnpm test:docx-compatibility
+          pnpm test:docx-public-api
+          node scripts/check-docx-layout-boundaries.mjs --final
+          pnpm check:docx-compatibility
+
+      - name: Core legacy boundary
+        run: |
+          node --test scripts/check-core-legacy-boundary.test.mjs
+          pnpm check:core-legacy-boundary
+          node --test scripts/check-model-source-lazy-graph.test.mjs
+          node --test scripts/check-model-source-lazy-runtime.test.mjs
+          node --test scripts/check-model-source-ooxml-path.test.mjs
+          pnpm check:model-source-ooxml-path
+
+      # The WASM parsers are git-ignored build output; the TypeScript packages
+      # import their generated .d.ts/.js, so typecheck requires building them first.
+      - name: Build WASM
+        run: pnpm build:wasm
+
+      # Unit tests. Most cover pure-logic modules, but the packages/node canvas
+      # probes dynamically import the WASM parsers (built above) and skia-canvas,
+      # so they run AFTER Build WASM. This also includes the redistributable DOCX
+      # synthetic conformance corpus. OOXML_REQUIRE_SKIA=1 turns a missing binding
+      # from a silent skip into a hard failure, guaranteeing the probes execute.
+      - name: Unit tests
+        run: pnpm test
+        env:
+          OOXML_REQUIRE_SKIA: '1'
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - name: Build packages
+        run: pnpm build:packages:ci
+
+      - name: DOCX package build ownership
+        run: pnpm test:docx-package-build
+
+      - name: Public API compatibility
+        run: |
+          pnpm build
+          pnpm check:model-source-lazy-graph --packages
+          pnpm check:model-source-lazy-runtime
+          pnpm check:production-render-workers
+          pnpm check:optional-chart-ex
+          pnpm check:optional-tiff
+          pnpm check:optional-legacy-doc
+          pnpm check:optional-legacy-ppt
+          pnpm check:optional-legacy-xls
+          pnpm check:legacy-wasm-exports
+          pnpm check:public-type-exports
+          pnpm check:public-api:built
+
+  # Rendering smoke: boots Storybook, drives the Layouts stories in a real
+  # Chrome, and asserts every canvas receives ink. The only CI job that
+  # exercises the full parse -> render pipeline in a browser.
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: pnpm/action-setup@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+          cache: 'pnpm'
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            packages/pptx/parser
+            packages/xlsx/parser
+            packages/docx/parser
+            packages/legacy-converter/parser
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Build WASM
+        run: pnpm build:wasm
+      # ubuntu-latest ships Google Chrome (the `channel: 'chrome'` browser the
+      # smoke config uses), so install only when it is genuinely absent. The
+      # unconditional `playwright install chrome --with-deps` stalled >30min
+      # twice in a row (apt/CDN hang inside --with-deps); the guard skips that
+      # network path entirely and the step timeout bounds the fallback.
+      - name: Install Playwright Chrome (only if missing)
+        timeout-minutes: 5
+        run: |
+          if command -v google-chrome >/dev/null 2>&1; then
+            echo "Google Chrome preinstalled: $(google-chrome --version)"
+          else
+            pnpm exec playwright install chrome --with-deps
+          fi
+      # webkit + firefox back the multi-engine smoke projects. The ink assertion
+      # (canvasHasInk) is font-independent, so it is stable across engines and
+      # catches engine-specific pipeline breakage a Chrome-only run would miss.
+      # Chrome is handled by the guarded step above (system Google Chrome), so we
+      # install only the two bundled engines here.
+      #
+      # `playwright install --with-deps` bundled the apt-based OS dependency
+      # install and the browser binary download into one step; the apt install
+      # against the Azure mirror is what intermittently stalls past a short
+      # timeout, and it isn't cacheable across runs. Split the two so the
+      # (cacheable) browser binaries can be restored from cache and skip the
+      # download entirely on a hit, while the apt step keeps its own generous
+      # timeout to absorb mirror slowness.
+      - name: Resolve Playwright version
+        id: playwright-version
+        run: |
+          version=$(grep -m1 "^  '@playwright/test@" pnpm-lock.yaml | sed -E "s/^  '@playwright\/test@([^']+)':$/\1/")
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Playwright browsers
+        id: playwright-cache
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-${{ steps.playwright-version.outputs.version }}
+          restore-keys: |
+            ${{ runner.os }}-playwright-
+
+      - name: Install WebKit + Firefox OS dependencies
+        timeout-minutes: 15
+        run: pnpm exec playwright install-deps webkit firefox
+
+      - name: Install Playwright WebKit + Firefox
+        timeout-minutes: 15
+        run: pnpm exec playwright install webkit firefox
+      - name: Smoke tests
+        run: pnpm smoke
+
+      - name: Build public site
+        run: pnpm --filter @silurus/ooxml-site build
+
+      - name: Public site runtime smoke
+        run: pnpm test:site-runtime
+
+      - name: Published render-worker smoke
+        run: |
+          # This job validates runtime assets, not declarations. Declaration
+          # compatibility has its own clean-build job; avoiding a second
+          # rolldown-plugin-dts invocation also keeps this browser job focused.
+          pnpm build:runtime
+          pnpm check:model-source-lazy-graph
+          pnpm check:model-source-lazy-runtime
+          pnpm check:production-render-workers
+          pnpm test:production-render-workers
+
+      # Worker/main pixel-equivalence: each package renders demo/sample-1 on the
+      # main thread and in a Web Worker (OffscreenCanvas) and asserts the two
+      # canvases match (<=0.5% pixel diff). This is a same-machine relative
+      # comparison — it guards the worker render path, NOT font portability — and
+      # uses only the committed demo sample, so it is CI-safe (the private-sample
+      # VRT in each package's visual.spec.ts stays local-only). Reuses the same
+      # Google Chrome the smoke job already relies on.
+      - name: Worker-equivalence tests
+        run: pnpm vrt:worker
+
+      # Public synthetic fixtures cover semantic retained geometry in every
+      # browser engine and compare the shipped main/worker modes exactly within
+      # each engine. Native-shaped text coordinates are intentionally not
+      # compared between engines.
+      - name: DOCX synthetic conformance (all browser engines)
+        run: pnpm --filter @silurus/ooxml-docx conformance

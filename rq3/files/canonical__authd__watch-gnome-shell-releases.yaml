@@ -1,0 +1,23 @@
+name: Watch gnome-shell releases
+
+on:
+  schedule:
+    - cron: '13 */6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  watch:
+    name: Check Ubuntu gnome-shell releases
+    if: github.repository == 'canonical/authd'
+    runs-on: ubuntu-26.04 # ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Notify about new releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: ./.github/scripts/watch-gnome-shell-releases.sh

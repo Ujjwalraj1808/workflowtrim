@@ -1,0 +1,143 @@
+# This workflow will build a Java project with Maven
+# For more information see: https://docs.github.com/en/actions/automating-builds-and-tests/building-and-testing-java-with-maven
+
+name: Database Tests
+
+env:
+  JDK_VERSION: 25
+  PROFILES: frankframework,ci,skip-console-frontend
+  USE_PROPRIETARY: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.owner.login == 'frankframework') && github.actor != 'dependabot[bot]' }}
+  BRANCH_NAME: ${{ github.head_ref || github.ref_name }}
+  PR_NUMBER: ${{ github.event.number || '' }}
+  MAVEN_GOALS: test
+
+on:
+  push:
+    branches:
+      - master
+      - '[0-9]+.[0-9]+-release'
+      - 'release/[0-9]+.[0-9]+'
+    paths-ignore:
+      - "**.md"
+      - "**.yml"
+      - "**.txt"
+      - "**.png"
+      - "**.toml"
+      - "**.js"
+      - "**.ts"
+      - ".github/**"
+      - "!.github/workflows/database-tests.yml"
+      - "docker/**"
+      - "aws/**"
+      - "filesystem/**"
+      - "larva/**"
+      - "ladybug/**"
+      - "messaging/**"
+      - "test/**"
+      - "example/**"
+  pull_request:
+    branches:
+      - master
+      - '[0-9]+.[0-9]+-release'
+      - 'release/[0-9]+.[0-9]+'
+    paths-ignore:
+      - "**.md"
+      - "**.yml"
+      - "**.txt"
+      - "**.png"
+      - "**.toml"
+      - "**.js"
+      - "**.ts"
+      - ".github/**"
+      - "!.github/workflows/database-tests.yml"
+      - "docker/**"
+      - "aws/**"
+      - "filesystem/**"
+      - "larva/**"
+      - "ladybug/**"
+      - "messaging/**"
+      - "test/**"
+      - "example/**"
+
+jobs:
+  run-database-tests:
+    name: Database Tests
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        db: [ 'postgresql', 'mariadb', 'mysql', 'mssqlserver', 'oracle'] # DB2 container fails to start so postponing for future, 'db2' ]
+
+    services:
+      database:
+        image: ghcr.io/frankframework/dbms/${{ matrix.db }}:latest
+        # Map all ports so that the database can be accessed from the host machine.
+        ports:
+          - 5432:5432 # PostgreSQL
+          - 3306:3306 # MariaDB
+          - 3307:3307 # MySQL          
+          - 1433:1433 # MSSQL Server
+          - 1521:1521 # Oracle
+        #  - 50000:50000 # DB2
+        credentials:
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+#      with:
+#        # Number of commits to fetch. 0 indicates all history for all branches and tags.
+#        # Required for SonarCloud
+#        fetch-depth: 0
+
+    - name: Load Maven Dependency Cache
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+      with:
+        path: |
+          ~/.m2/repository
+        key: maven-dependency-cache-${{ hashFiles('**/pom.xml') }}
+        restore-keys: |
+          maven-dependency-cache-
+
+    - name: Set up JDK ${{ env.JDK_VERSION }}
+      uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6
+      with:
+        distribution: 'temurin'
+        java-version: ${{ env.JDK_VERSION }}
+
+    - name: Create Maven settings.xml file
+      if: ${{ env.USE_PROPRIETARY == 'true' }}
+      uses: s4u/maven-settings-action@894661b3ddae382f1ae8edbeab60987e08cf0788 # v4.0.0
+      with:
+        servers: '[{"id": "proprietary", "username": "${{ secrets.CI_USER }}", "password": "${{ secrets.CI_PASS }}"}]'
+
+    - name: Update Maven profiles
+      if: ${{ env.USE_PROPRIETARY == 'true' }}
+      run: |
+        echo "PROFILES=${{ env.PROFILES }},proprietary" >> $GITHUB_ENV
+
+      # Use Maven Wrapper, so we can build with an older version of Maven, see PR #4579.
+    - name: Build with Maven
+      env:
+        CI_SERVICE: GITHUB
+        TZ: Europe/Amsterdam
+        JAVA_OPTS: "-Xms1G -XX:+UseParallelGC"
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} # SonarCloud
+        SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }} # SonarCloud
+      # Tests with proprietary dependencies don't work for some reason. Build only core and the modules that Core depends on. If JDBC is moved to another modules that module should be built as well.
+      run: ./mvnw -B -V -T1 ${{env.MAVEN_GOALS}} -P${{env.PROFILES}} -pl core -am -Dgroups=database
+
+    - name: Store Test Results
+      if: failure()
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+      with:
+        name: database-${{ matrix.db }}_Surefire
+        path: ${{ github.workspace }}/*/target/surefire-reports/*
+
+    - name: Print commit sha
+      shell: bash
+      env:
+        COMMIT_SHA: ${{ github.event.pull_request.head.sha }}
+      run: |
+        echo "sha: $COMMIT_SHA"

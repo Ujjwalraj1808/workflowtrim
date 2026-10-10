@@ -1,0 +1,638 @@
+name: Test
+
+# Runs lint + tests on every PR and on every push to main. Mirrors
+# the matter-server / music-assistant pattern: one ``lint`` job that
+# runs the same pre-commit hooks contributors run locally, plus a
+# ``test`` matrix across the supported Python versions. The catalog
+# smoke test (``script/check_catalog.py``) runs alongside lint so a
+# bad sync result fails CI even when no one ran the full sync.
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_call:
+    # Lets release.yml run the full lint + test matrix as a
+    # preflight against the branch it's about to release from.
+    inputs:
+      ref:
+        description: "Git ref to check out (defaults to main)."
+        required: false
+        type: string
+        default: main
+
+jobs:
+  lint:
+    name: Lint + smoke checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code from GitHub
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Set up Python 3.14 + cached venv
+        id: python
+        # ``[esphome]`` is needed so the catalog smoke test below
+        # can construct a ``ComponentCatalog`` against the same
+        # esphome version the dashboard ships with.
+        # ``-c esphome-constraints.txt``
+        # pins esphome to the version the committed catalog was generated
+        # against; the ``sync-boards`` pre-commit hook below re-stamps
+        # boards.index.json from the installed esphome, so an unpinned
+        # "latest" would red this job on every esphome release until the
+        # catalog is re-synced. The sync workflows bump that pin.
+        uses: ./.github/actions/restore-or-build-venv
+        with:
+          python-version: "3.14"
+          install-args: -c esphome-constraints.txt -e .[esphome,test]
+
+      - name: Put the venv on PATH
+        # Subsequent ``pre-commit`` / ``python script/...`` steps then
+        # work without a ``uv run`` prefix.
+        run: echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
+
+      - name: Cache pre-commit hook envs
+        # Keyed on the python version + ``.pre-commit-config.yaml``
+        # hash so any hook bump invalidates automatically. Mirrors
+        # what ``pre-commit/action`` does internally — inlined here
+        # because that action's transitive ``actions/cache@v4``
+        # reference isn't SHA-pinned, which the org policy blocks
+        # ("all actions must be pinned to a full-length commit SHA").
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: ~/.cache/pre-commit
+          key: pre-commit|py${{ steps.python.outputs.python-version }}|${{ hashFiles('.pre-commit-config.yaml') }}
+
+      - name: Run pre-commit (ruff lint + format, codespell, yaml/json checks)
+        # On a cache hit the per-hook envs (ruff, codespell, …) are
+        # already on disk, so the previously-30s init phase drops
+        # to a near-instant restore. ``no-commit-to-branch`` is a
+        # local-only guard; CI runs on branches by definition, so
+        # skip it the same way matter-server does.
+        run: SKIP=no-commit-to-branch pre-commit run --all-files --show-diff-on-failure --color=always
+
+      - name: Validate board / component manifests
+        run: python script/validate_definitions.py
+
+      - name: Verify board catalog is in sync with manifests
+        # Catches PRs that bypass the pre-commit hook — the diff
+        # fails the build if the committed JSON doesn't match what
+        # the script regenerates from the YAMLs. esphome is pinned
+        # (esphome-constraints.txt), so the regenerated esphome_version
+        # stamp matches the committed catalog rather than drifting.
+        run: |
+          python script/sync_boards.py
+          # ``git diff --exit-code`` only sees tracked modifications and would
+          # miss a newly generated *untracked* body file (a manifest added
+          # without regenerating), so gate on porcelain status (tracked +
+          # untracked) and surface the drift for debugging.
+          paths="esphome_device_builder/definitions/boards.index.json \
+            esphome_device_builder/definitions/board_bodies/ \
+            esphome_device_builder/definitions/featured_components.index.json"
+          if [ -n "$(git status --porcelain -- $paths)" ]; then
+            git status --porcelain -- $paths
+            git diff -- $paths
+            # || true everywhere: this branch runs under bash -e, and a
+            # no-match grep must not eat the ::error guidance below.
+            pin=$(grep -oE 'esphome==[A-Za-z0-9.]+' esphome-constraints.txt | head -n1 || true)
+            if [ -n "$pin" ]; then
+              install="uv pip install '$pin'"
+            else
+              install="uv pip install -c esphome-constraints.txt esphome"
+            fi
+            ids=$(git status --porcelain -- esphome_device_builder/definitions/board_bodies/ \
+              | grep 'board_bodies/' | sed -E 's|.*board_bodies/(.+)\.json.*|\1|' | sort -u || true)
+            if [ "$(echo "$ids" | grep -c .)" = "1" ]; then
+              fix="python script/update_board.py $ids"
+            else
+              fix="python script/sync_boards.py"
+            fi
+            echo "::error::Board catalog is out of sync with manifests. Fix locally: $install && $fix — then commit the regenerated files (see definitions/README.md)."
+            exit 1
+          fi
+
+      - name: Smoke-test component catalog
+        run: python script/check_catalog.py
+
+      - name: Type-check (mypy)
+        # Mypy is configured strict in ``pyproject.toml``
+        # (``disallow_untyped_defs``, ``disallow_incomplete_defs``,
+        # ``warn_return_any``). Hard gate — a typing regression
+        # blocks the PR. Started life as advisory (#481) while the
+        # 24-error baseline got walked down to zero across PRs
+        # #483-#492; flipped on once the standing count hit zero.
+        run: mypy esphome_device_builder
+
+      - name: Check import time against budget
+        # ``device_builder`` import cost lands on dashboard startup,
+        # which is painfully slow on low-power hosts (HA Green). Fails
+        # the build if a fresh eager import (e.g. an ``esphome.components.*``
+        # module) pushes the measured time past the budget + margin.
+        run: python script/check_import_time.py --check --har importtime.har
+
+      - name: Upload import-time waterfall
+        # Keep the HAR so a regression can be inspected as a waterfall.
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: import-time-waterfall
+          path: importtime.har
+          retention-days: 14
+
+  test:
+    name: Pytest (${{ matrix.os }} / Python ${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Linux only runs on 3.12 (the oldest supported Python) — the
+        # ``test-esphome-channels`` job below already covers 3.14 on
+        # Linux against beta and dev esphome, which is a strict
+        # superset of "stable esphome on 3.14 / Linux". Windows and
+        # macOS only run on the newest Python — enough to catch
+        # OS-specific regressions without paying for extra runs on
+        # slower runners.
+        include:
+          - os: ubuntu-latest
+            python-version: "3.12"
+          - os: windows-latest
+            python-version: "3.14"
+          - os: macos-latest
+            python-version: "3.14"
+    steps:
+      - name: Check out code from GitHub
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Set up Python ${{ matrix.python-version }} + cached venv
+        # Astral-managed Python (PGO + LTO + BOLT + mimalloc, plus
+        # the PEP 744 tail-call interpreter on 3.14+) shortens the
+        # suite end-to-end. The benchmarks job below stays on stock
+        # CPython so CodSpeed's callgrind instruction counts remain
+        # comparable against the historical baseline. The venv is
+        # uv-discovered; pytest runs via ``uv run``, cross-platform
+        # without per-shell activate scripts.
+        uses: ./.github/actions/restore-or-build-venv
+        with:
+          python-version: ${{ matrix.python-version }}
+          install-args: -c esphome-constraints.txt -e .[esphome,test]
+
+      - name: Move TEMP to the work disk (Windows)
+        # The default ``%TEMP%`` sits on the slow OS disk; pytest's
+        # ``tmp_path`` lives under it.
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          echo "TEMP=$RUNNER_TEMP" >> "$GITHUB_ENV"
+          echo "TMP=$RUNNER_TEMP" >> "$GITHUB_ENV"
+
+      - name: Run pytest
+        # ``uv run --no-sync`` uses the .venv created above as-is.
+        # Without ``--no-sync``, ``uv run`` re-locks the project
+        # universally (every Python / platform ``requires-python``
+        # admits), so a transitive-pin conflict on an environment we
+        # never test — esphome 2026.7.0's esptool/cryptography clash
+        # on Intel macOS — fails the job even though the venv it
+        # actually runs in installed cleanly. Single-line —
+        # Windows runners default to PowerShell, which doesn't accept
+        # bash-style ``\`` line continuation. ``-n auto`` runs the
+        # suite under pytest-xdist with one worker per logical CPU;
+        # pytest-cov auto-merges the per-worker ``.coverage`` files
+        # at the end so the xml report still reflects the whole
+        # suite. ``--maxfail=5`` keeps CI snappy when something
+        # fundamental is broken; ``-q`` keeps the log readable
+        # without ``-vv``. The ``benchmarks/`` subtree is excluded —
+        # it's CodSpeed-driven, runs in a separate job, and its
+        # assertions only check chunk counts (not behaviour).
+        # Two-layer hang protection:
+        # * ``--timeout=120`` (pytest-timeout plugin) faults any
+        #   individual test that wedges for more than 2 minutes,
+        #   surfacing the offending test name + traceback in the log.
+        # * ``timeout-minutes: 5`` is the outer hard cap — if the
+        #   plugin can't recover (deadlocked event loop, stuck
+        #   subprocess), the runner kills the step. Healthy runs land
+        #   at ~1-2 minutes; without the cap a single hung worker
+        #   burns the runner's full 6h budget.
+        timeout-minutes: 5
+        run: uv run --no-sync pytest -q -n auto --maxfail=5 --durations=10 --timeout=120 --ignore=tests/benchmarks --ignore=tests/real_compile --ignore=tests/e2e --cov=esphome_device_builder --cov-report=xml --cov-report=term
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5  # v7.1.1
+        with:
+          files: ./coverage.xml
+          flags: py${{ matrix.python-version }}
+          fail_ci_if_error: false
+
+  test-esphome-channels:
+    name: Pytest (esphome ${{ matrix.channel }} / ${{ matrix.os }} / Python ${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    # Probes the dashboard against the next two esphome release
+    # channels on a single Linux 3.14 runner. The ``test`` matrix
+    # above already covers stable (it's what ``pip install
+    # -e '.[esphome]'`` resolves to), so this job focuses on the
+    # forward-looking channels: ``beta`` is a strict gate so we catch
+    # incompatibilities before they ship to users, and ``dev`` is
+    # advisory (allow-failure) because ESPHome's main-branch nightly
+    # can break mid-day — we want the signal without a permanent red
+    # on every device-builder PR.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - channel: beta
+            os: ubuntu-latest
+            python-version: "3.14"
+            # ``--prerelease=allow`` opts into pre-release versions
+            # (uv's flag — pip's ``--pre`` doesn't apply here).
+            # ``--upgrade`` makes uv pick the highest one even if a
+            # stable is already installed transitively.
+            install: uv pip install --upgrade --prerelease=allow esphome
+            allow_failure: false
+          - channel: dev
+            os: ubuntu-latest
+            python-version: "3.14"
+            # The ``dev`` branch is ESPHome's nightly working copy;
+            # it can break at any time and we want the signal but
+            # not the gate.
+            install: uv pip install --upgrade git+https://github.com/esphome/esphome.git@dev
+            allow_failure: true
+    # Job-level ``continue-on-error`` decides whether a failure of
+    # this matrix entry fails the whole workflow. ``dev`` opts into
+    # advisory-only via the matrix flag; stable + beta stay strict.
+    continue-on-error: ${{ matrix.allow_failure }}
+    steps:
+      - name: Check out code from GitHub
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Set up Python ${{ matrix.python-version }} + cached venv
+        # The channel install below mutates the venv after the
+        # composite has already saved it, so the beta/dev esphome
+        # never lands in the shared base-key cache.
+        uses: ./.github/actions/restore-or-build-venv
+        with:
+          python-version: ${{ matrix.python-version }}
+          install-args: -c esphome-constraints.txt -e .[esphome,test]
+
+      - name: Install esphome (${{ matrix.channel }} channel)
+        run: ${{ matrix.install }}
+
+      - name: Show installed esphome version
+        # Logs the resolved version so a failure tied to a specific
+        # release is greppable in the workflow log without re-running.
+        run: uv pip show esphome | grep -E '^(Name|Version):'
+
+      - name: Run pytest
+        # ``uv run --no-sync`` uses the .venv created above as-is
+        # (no universal re-lock; see the OS-axis job). It also can't
+        # touch the channel-specific esphome installed above. ``-n auto``
+        # runs under pytest-xdist for the same speedup the OS-axis
+        # matrix gets. No ``--cov`` here — the merged coverage report
+        # comes from the OS-axis ``test`` job; this run is purely a
+        # "does the suite still pass against upstream X" probe.
+        # ``--timeout=120`` (per-test) + ``timeout-minutes: 5``
+        # (outer hard cap) match the OS-axis job — hangs against
+        # upstream beta/dev are exactly the case this protects
+        # against.
+        timeout-minutes: 5
+        run: uv run --no-sync pytest -q -n auto --maxfail=5 --durations=10 --timeout=120 --ignore=tests/benchmarks --ignore=tests/real_compile --ignore=tests/e2e
+
+  e2e:
+    name: E2E (esphome ${{ matrix.channel }})
+    runs-on: ubuntu-latest
+    # The remote-build offload e2e suite (``tests/e2e/``) stands up
+    # two real controllers over a live peer-link wire. It's split off
+    # the unit matrix so it can't slow the unit run or conflate signal
+    # (an e2e flake reading as a unit failure) as the suite grows.
+    # ``stable`` is a strict gate; ``dev`` is advisory because
+    # ESPHome's nightly can break mid-day — we want the signal without
+    # a permanent red on every device-builder PR.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - channel: stable
+            # No extra install — the ``[esphome]`` extra resolves the
+            # stable release the dashboard ships with.
+            install: ""
+            allow_failure: false
+          - channel: dev
+            install: uv pip install --upgrade git+https://github.com/esphome/esphome.git@dev
+            allow_failure: true
+    continue-on-error: ${{ matrix.allow_failure }}
+    steps:
+      - name: Check out code from GitHub
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Set up Python 3.14 + cached venv
+        uses: ./.github/actions/restore-or-build-venv
+        with:
+          python-version: "3.14"
+          install-args: -c esphome-constraints.txt -e .[esphome,test]
+
+      - name: Install esphome (${{ matrix.channel }} channel)
+        if: matrix.install != ''
+        run: ${{ matrix.install }}
+
+      - name: Show installed esphome version
+        run: uv pip show esphome | grep -E '^(Name|Version):'
+
+      - name: Run e2e tests
+        # The slow real-compile tests live under ``tests/e2e/slow/`` and
+        # run in their own per-toolchain jobs below; this job covers the
+        # fast wire-level e2e suite. ``--timeout=120`` is plenty for it.
+        timeout-minutes: 10
+        run: >-
+          uv run --no-sync pytest -q -n auto tests/e2e --maxfail=5 --durations=10 --timeout=120 --no-cov
+          --ignore=tests/e2e/slow
+
+  e2e-mqtt:
+    name: E2E MQTT discovery (mosquitto)
+    runs-on: ubuntu-latest
+    # The MQTT discovery e2e (tests/e2e/slow/mqtt/) drives real paho
+    # clients against a real mosquitto broker; the test self-skips
+    # wherever the broker isn't installed, so this is the one job that
+    # installs it. Linux only — the broker path is platform-independent.
+    steps:
+      - name: Check out code from GitHub
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Set up Python 3.14 + cached venv
+        uses: ./.github/actions/restore-or-build-venv
+        with:
+          python-version: "3.14"
+          install-args: -c esphome-constraints.txt -e .[esphome,test]
+
+      - name: Install mosquitto (cached)
+        # Cache-hit restores skip ``apt-get update`` entirely, so an apt
+        # mirror outage can't hang the job; the timeout bounds the
+        # cold-cache install path.
+        timeout-minutes: 10
+        uses: awalsh128/cache-apt-pkgs-action@553a35bb8ebd9fcabcb1c9451aa4c98e1b4ca8a9  # v1.6.3
+        with:
+          packages: mosquitto
+          version: 1.0
+
+      - name: Run MQTT discovery e2e
+        timeout-minutes: 5
+        run: uv run --no-sync pytest -q tests/e2e/slow/mqtt --durations=10 --timeout=120 --no-cov
+
+  e2e-mcp-sdk:
+    name: E2E MCP SDK interop (esphome stable)
+    runs-on: ubuntu-latest
+    # Drives the official ``mcp`` SDK client (the line Home Assistant ships)
+    # against the MCP server. Lives under tests/e2e/slow/ so the unit matrix,
+    # the channel matrix and the esphome repo's device-builder run all skip it,
+    # and the SDK comes from its own extra so no other venv installs it.
+    steps:
+      - name: Check out code from GitHub
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Set up Python 3.14 + cached venv
+        uses: ./.github/actions/restore-or-build-venv
+        with:
+          python-version: "3.14"
+          install-args: -c esphome-constraints.txt -e .[esphome,test,mcp-interop]
+
+      - name: Verify the MCP SDK is installed
+        run: uv run --no-sync python -c "import mcp; print(mcp.__file__)"
+      - name: Run MCP SDK interop e2e
+        timeout-minutes: 5
+        run: uv run --no-sync pytest -q tests/e2e/slow/mcp --durations=10 --timeout=120 --no-cov
+
+  e2e-libretiny:
+    name: E2E LibreTiny (esphome stable)
+    runs-on: ubuntu-latest
+    # The LibreTiny e2e (tests/e2e/slow/libretiny/) runs a real bk7231n
+    # compile that clones the LibreTiny SDK from source (minutes on a cold
+    # runner). Split onto its own runner so it can't slow the fast e2e
+    # matrix. Stable only -- the ``[esphome]`` extra resolves the release
+    # the dashboard ships with.
+    steps:
+      - name: Check out code from GitHub
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Set up Python 3.14 + cached venv
+        uses: ./.github/actions/restore-or-build-venv
+        with:
+          python-version: "3.14"
+          install-args: -c esphome-constraints.txt -e .[esphome,test]
+
+      - name: Show installed esphome version
+        run: uv pip show esphome | grep -E '^(Name|Version):'
+
+      - name: Cache PlatformIO core + per-platform toolchains
+        # The LibreTiny compile clones the LibreTiny SDK from source on a
+        # cold runner. Cache ``~/.platformio`` so the SDK download is reused.
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: ~/.platformio
+          key: pio-e2e-libretiny-${{ runner.os }}-${{ hashFiles('tests/e2e/slow/libretiny/test_libretiny_compile_download.py') }}
+          restore-keys: |
+            pio-e2e-libretiny-${{ runner.os }}-
+
+      - name: Run LibreTiny e2e
+        # 20 min outer cap: a cold LibreTiny SDK clone plus compile runs
+        # minutes. The test's own ``@pytest.mark.timeout(600)`` caps it.
+        timeout-minutes: 20
+        run: uv run --no-sync pytest -q tests/e2e/slow/libretiny --durations=10 --timeout=600 --no-cov
+
+  e2e-native-idf:
+    name: E2E native ESP-IDF (esphome dev)
+    runs-on: ubuntu-latest
+    # The native ESP-IDF toolchain (esphome 2026.5.0+) is new and its cold
+    # compile installs the full IDF toolchain (minutes). It runs on its own
+    # runner, dev channel only and advisory (``continue-on-error``): it must
+    # neither slow the main e2e matrix nor gate a PR on an esphome nightly
+    # break. Fold it into the stable matrix once the toolchain has settled.
+    continue-on-error: true
+    steps:
+      - name: Check out code from GitHub
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Set up Python 3.14 + cached venv
+        uses: ./.github/actions/restore-or-build-venv
+        with:
+          python-version: "3.14"
+          install-args: -c esphome-constraints.txt -e .[esphome,test]
+
+      - name: Install esphome (dev channel)
+        run: uv pip install --upgrade git+https://github.com/esphome/esphome.git@dev
+
+      - name: Show installed esphome version
+        run: uv pip show esphome | grep -E '^(Name|Version):'
+
+      - name: Cache ESP-IDF toolchain
+        # Native IDF does NOT use PlatformIO; its toolchain installs under
+        # ``ESPHOME_ESP_IDF_PREFIX`` (set on the run step). Without the cache
+        # a cold IDF install + toolchain download runs on every PR. The
+        # installed IDF version is pinned by ``esphome@dev`` (reinstalled
+        # each run), not by the test file -- so use a rolling ``run_id`` key
+        # that saves a fresh cache every run (picking up dev IDF bumps) and
+        # ``restore-keys`` to warm from the most recent prior cache.
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: ~/.cache/esphome-idf
+          key: e2e-espidf-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            e2e-espidf-${{ runner.os }}-
+
+      - name: Cache ccache objects
+        # Same rolling shape as the toolchain cache above: restored from
+        # the newest prior entry on every run, saved fresh each run, so
+        # repeat compiles hit across runs. Small (~0.1-0.3 GB) next to
+        # the toolchain entry.
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: ~/.cache/esphome-ccache
+          key: e2e-espidf-ccache-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            e2e-espidf-ccache-${{ runner.os }}-
+
+      - name: Install ccache (cached)
+        # esphome's native-IDF build enables ccache whenever the binary is
+        # on PATH (``espidf/framework.py``'s ``_ccache_env``) and respects
+        # a pre-set CCACHE_DIR, so the run step below points it at the
+        # dedicated cached dir instead of the default inside the prefix.
+        timeout-minutes: 10
+        uses: awalsh128/cache-apt-pkgs-action@553a35bb8ebd9fcabcb1c9451aa4c98e1b4ca8a9  # v1.6.3
+        with:
+          packages: ccache
+          version: 1.0
+
+      - name: Run native ESP-IDF e2e
+        # A cold native-IDF compile installs the IDF toolchain then runs
+        # ninja; the test's own ``@pytest.mark.timeout(900)`` caps it.
+        # esphome ``expanduser()``s ESPHOME_ESP_IDF_PREFIX, so ``~`` matches
+        # the cache path above.
+        timeout-minutes: 25
+        env:
+          ESPHOME_ESP_IDF_PREFIX: ~/.cache/esphome-idf
+        # CCACHE_DIR is set in the shell, not step env: ccache does not
+        # expanduser a ``~`` (only ESPHOME_ESP_IDF_PREFIX gets that
+        # treatment, from esphome itself).
+        run: CCACHE_DIR="$HOME/.cache/esphome-ccache" uv run --no-sync pytest -q tests/e2e/slow/esp32 --durations=10 --timeout=900 --no-cov
+
+      - name: Print ccache statistics
+        if: always()
+        run: CCACHE_DIR="$HOME/.cache/esphome-ccache" ccache -s
+
+  e2e-boards:
+    name: E2E board create validation (esphome stable)
+    runs-on: ubuntu-latest
+    # Validates that every catalog board generates a config esphome accepts
+    # (the create path). Real ``esphome config`` per board, each in its own
+    # forked worker. Stable esphome only -- it checks the committed catalog
+    # against the version the dashboard ships.
+    steps:
+      - name: Check out code from GitHub
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Set up Python 3.14 + cached venv
+        uses: ./.github/actions/restore-or-build-venv
+        with:
+          python-version: "3.14"
+          install-args: -c esphome-constraints.txt -e .[esphome,test]
+
+      - name: Show installed esphome version
+        run: uv pip show esphome | grep -E '^(Name|Version):'
+
+      - name: Validate every board's generated config
+        # No ``-n auto``: the test forks a worker per board, and forking a
+        # multi-threaded xdist worker risks a deadlock. The test's own pool
+        # provides the parallelism; its ``@pytest.mark.timeout`` caps it.
+        timeout-minutes: 10
+        run: uv run --no-sync pytest -q tests/e2e/slow/boards --durations=10 --timeout=600 --no-cov
+
+  benchmarks:
+    name: Run benchmarks (CodSpeed)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Benchmarks only run on PRs to ``main`` and pushes to ``main`` —
+    # ``workflow_call`` runs (release preflight) skip them since
+    # CodSpeed's instrumentation harness adds non-trivial wallclock
+    # to the matrix and the comparison only makes sense against the
+    # historical baseline CodSpeed already has.
+    if: github.event_name != 'workflow_call'
+    steps:
+      - name: Check out code from GitHub
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Set up Python
+        # Stock CPython, held at 3.13: a version bump resets every
+        # CodSpeed baseline at once, so it moves deliberately and alone.
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: "3.13"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
+        with:
+          # Keep in sync with setup-uv-python's uv-version default.
+          version: "0.11.29"
+          enable-cache: true
+
+      - name: Install package + test deps
+        run: uv pip install --system -e '.[esphome,test]'
+
+      - name: Install libc6-dbg
+        # The CodSpeed runner installs this itself with a plain apt-get call
+        # that has no timeout, so a slow apt mirror hangs the job until
+        # timeout-minutes kills it. Installing it here with a bounded retry
+        # also lets the runner find it already present after restoring
+        # valgrind from its cache and skip apt entirely.
+        run: |
+          for attempt in 1 2 3; do
+            if timeout 300 sudo apt-get update \
+              && timeout 300 sudo DEBIAN_FRONTEND=noninteractive \
+                apt-get install -y libc6-dbg
+            then
+              exit 0
+            fi
+            echo "apt-get attempt ${attempt} failed, retrying"
+            sudo dpkg --configure -a || true
+            sleep 10
+          done
+          exit 1
+
+      - name: Run benchmarks
+        # ``simulation`` is the new name for what used to be called
+        # ``instrumentation`` — same callgrind-based runner under
+        # the hood, just renamed. The action prints a deprecation
+        # warning when you ask for ``instrumentation`` explicitly.
+        #
+        # ``--timeout=600`` overrides the 10s per-test default set
+        # in ``pyproject.toml``. CodSpeed's callgrind instrumentation
+        # multiplies each benchmark's wallclock by 10-50x, so a
+        # microbenchmark that runs in 50ms outside the harness can
+        # legitimately take a few minutes here. 10 minutes covers
+        # worst-case (the catalog-load benchmark, which exercises
+        # every BoardCatalogEntry's nested dataclass deserialisation)
+        # with ~5x headroom over the observed 3-5 minute floor.
+        uses: CodSpeedHQ/action@c4fd08a3a159bd0cc208da1e0edf32b8c47d75e5  # v5.4.0
+        with:
+          mode: simulation
+          # ``--durations 10`` prints the 10 slowest benchmark wall
+          # times at the end of the run so a regression in any
+          # single bench is visible in the CI log without having
+          # to dig into the CodSpeed dashboard.
+          run: pytest tests/benchmarks --codspeed --no-cov --timeout=600 --durations 10

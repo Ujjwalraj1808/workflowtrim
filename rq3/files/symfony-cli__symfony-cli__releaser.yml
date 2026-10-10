@@ -1,0 +1,152 @@
+name: Release
+
+on:
+    pull_request:
+    push:
+
+permissions:
+    contents: write
+    id-token: write
+    packages: write
+
+jobs:
+    lint:
+        name: Lint
+        runs-on: ubuntu-latest
+        # Only on pull requests: only-new-issues needs the PR base to diff
+        # against, and reports every pre-existing issue on push events.
+        if: ${{ github.event_name == 'pull_request' }}
+        steps:
+            - uses: actions/checkout@v7
+            -
+                name: Set up Go
+                uses: actions/setup-go@v7
+                with:
+                    go-version-file: 'go.mod'
+            - name: golangci-lint
+              uses: golangci/golangci-lint-action@v9
+              with:
+                  only-new-issues: true
+
+    releaser:
+        name: Release
+        runs-on: ubuntu-latest
+        env:
+            # We need to set DOCKER_CLI_EXPERIMENTAL=enabled for the docker manifest commands to work
+            DOCKER_CLI_EXPERIMENTAL: "enabled"
+        steps:
+            -
+                name: Checkout
+                uses: actions/checkout@v7
+                with:
+                    fetch-depth: 0
+
+            # We need QEMU to use buildx and be able to build ARM Docker images
+            -   name: Set up QEMU
+                uses: docker/setup-qemu-action@v4
+
+            -   name: Set up Docker Buildx
+                uses: docker/setup-buildx-action@v4
+                with:
+                    driver: docker-container
+
+            -   name: Login into Github Docker Registry
+                run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+                if: startsWith(github.ref, 'refs/tags/v')
+
+            -
+                name: Set up Go
+                uses: actions/setup-go@v7
+                with:
+                    go-version-file: 'go.mod'
+            -
+                name: Set AUTOUPDATE_CHANNEL on tags
+                run: echo "AUTOUPDATE_CHANNEL=stable" >> $GITHUB_ENV
+                if: startsWith(github.ref, 'refs/tags/v')
+            -
+                name: Prepare
+                run: go generate ./...
+            -
+                name: Check Git status
+                id: git
+                run: |
+                    RESULT=$(git status --untracked-files=no --porcelain)
+                    echo "gitstatus=$RESULT" >> $GITHUB_OUTPUT
+            -
+                name: Check if go prepare updated generated Go code
+                if: steps.git.outputs.gitstatus != '' && startsWith(github.ref, 'refs/tags/v')
+                run: |
+                    echo '"go generate" changed some Go generated code, run "symfony cloud:self-update" then "go generate ./" locally and make a Pull Request with the changes'
+                    git diff
+                    exit 1
+            -
+                name: Test
+                run: go test -v ./...
+            -   name: Validate build
+                run: go run .
+            -
+                name: Set up cosign
+                uses: sigstore/cosign-installer@v4.1.2
+            -
+                name: Install Cloudsmith CLI
+                if: startsWith(github.ref, 'refs/tags/v')
+                run: pip install --upgrade cloudsmith-cli
+            -
+                name: Check release credentials
+                if: startsWith(github.ref, 'refs/tags/v')
+                env:
+                    GH_TOKEN: ${{ secrets.GH_PAT }}
+                    CLOUDSMITH_API_KEY: ${{ secrets.CLOUDSMITH_API_KEY }}
+                run: |
+                    test "$(gh api repos/symfony-cli/homebrew-tap --jq '.permissions.push')" = true
+                    cloudsmith whoami > /dev/null
+            -
+                name: Run GoReleaser for snapshot
+                uses: goreleaser/goreleaser-action@v7
+                # only for PRs and push on branches
+                if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+                with:
+                    version: '~> v2'
+                    args: release --clean --snapshot --skip=publish,sign
+                env:
+                    GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+            -
+                name: Run GoReleaser
+                uses: goreleaser/goreleaser-action@v7
+                # only for tags
+                if: startsWith(github.ref, 'refs/tags/v')
+                with:
+                    version: '~> v2'
+                    args: release --clean
+                env:
+                    GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+                    TAP_GITHUB_TOKEN: ${{ secrets.GH_PAT }}
+            -
+                name: Archive binaries
+                uses: actions/upload-artifact@v7
+                with:
+                    retention-days: 5
+                    name: binaries
+                    path: dist
+            -
+                name: Archive Linux binary
+                uses: actions/upload-artifact@v7
+                with:
+                    retention-days: 5
+                    name: linux-binary
+                    path: dist/symfony-cli_linux_amd64.tar.gz
+            -
+                name: Cloudsmith Uploads
+                env:
+                    CLOUDSMITH_API_KEY: ${{ secrets.CLOUDSMITH_API_KEY }}
+                if: startsWith(github.ref, 'refs/tags/v')
+                run: |
+                    for filename in dist/*.deb; do
+                        cloudsmith push deb symfony/stable/any-distro/any-version $filename
+                    done
+                    for filename in dist/*.rpm; do
+                        cloudsmith push rpm symfony/stable/any-distro/any-version $filename
+                    done
+                    for filename in dist/*.apk; do
+                        cloudsmith push alpine symfony/stable/alpine/any-version $filename
+                    done

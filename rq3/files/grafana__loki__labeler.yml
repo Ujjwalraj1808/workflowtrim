@@ -1,0 +1,29 @@
+name: "Pull Request Labeler"
+on:
+- pull_request
+
+permissions:
+  contents: read
+
+jobs:
+  triage:
+    # Only runs on the public grafana/loki repo: the loki-gh-app token broker isn't available elsewhere.
+    # We don't run the triaging for PRs from forks because those can't use the loki-gh-app token broker.
+    # We don't use GitHub actions app (secrets.GITHUB_TOKEN) because PRs created by the bot don't trigger CI.
+    if: ${{ github.repository == 'grafana/loki' && ! github.event.pull_request.head.repo.fork }}
+
+    runs-on: ubuntu-x64-small
+    permissions:
+      contents: read
+      pull-requests: write
+      id-token: write
+    steps:
+    - name: Generate GitHub App Token
+      id: app-token
+      uses: grafana/shared-workflows/actions/create-github-app-token@46f48da11e78ebdba7a8747ae456b11062fac83e # create-github-app-token/v0.3.1
+      with:
+        github_app: loki-gh-app
+
+    - uses: actions/labeler@b8dd2d9be0f68b860e7dae5dae7d772984eacd6d # v6.2.0
+      with:
+        repo-token: "${{ steps.app-token.outputs.token }}"

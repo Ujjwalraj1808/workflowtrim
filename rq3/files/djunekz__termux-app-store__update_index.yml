@@ -1,0 +1,171 @@
+name: Update Index
+
+permissions:
+  contents: write
+
+on:
+  push:
+    paths:
+      - 'packages/*/build.sh'
+      - 'tools/build.py'
+  workflow_dispatch:
+  schedule:
+    - cron: '0 0 * * *'
+
+jobs:
+  generate-index:
+    runs-on: ubuntu-latest
+    if: github.repository == 'djunekz/termux-app-store'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          ref: ${{ github.ref }}
+          token: ${{ secrets.PAT_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v7.0.0
+        with:
+          python-version: '3.14'
+
+      - name: Generate index.json
+        run: |
+          echo "Running build.py to generate index.json..."
+          python3 tools/build.py
+
+      - name: Check for changes
+        id: check_changes
+        run: |
+          if git diff --quiet tools/index.json; then
+            echo "changed=false" >> $GITHUB_OUTPUT
+            echo "No changes detected in index.json"
+          else
+            echo "changed=true" >> $GITHUB_OUTPUT
+            echo "Changes detected in index.json"
+          fi
+
+      - name: Detect changed packages
+        id: detect_pkgs
+        if: steps.check_changes.outputs.changed == 'true'
+        run: |
+          CHANGED=$(python3 - << 'PYEOF'
+          import json, subprocess
+
+          try:
+              old_raw = subprocess.check_output(
+                  ['git', 'show', 'HEAD:tools/index.json'],
+                  stderr=subprocess.DEVNULL
+              ).decode()
+              old = {p['package']: p.get('version', '') for p in json.loads(old_raw).get('packages', [])}
+          except Exception:
+              old = {}
+
+          with open('tools/index.json') as f:
+              new_data = json.load(f)
+          new = {p['package']: p.get('version', '') for p in new_data.get('packages', [])}
+
+          changed = [pkg for pkg, ver in new.items() if old.get(pkg, '') != ver]
+          print(' '.join(changed))
+          PYEOF
+          )
+
+          echo "changed_packages=$CHANGED" >> $GITHUB_OUTPUT
+
+          if [[ -n "$CHANGED" ]]; then
+            echo "Changed packages: $CHANGED"
+          else
+            echo "No package version changes detected"
+          fi
+
+      - name: Commit and push changes
+        if: steps.check_changes.outputs.changed == 'true'
+        run: |
+          git config --local user.email "258516621+termux-app-store@users.noreply.github.com"
+          git config --local user.name "Termux App Store"
+          git remote set-url origin https://x-access-token:${{ secrets.PAT_TOKEN }}@github.com/djunekz/termux-app-store.git
+          git add tools/index.json
+          git commit -m "chore: update index.json"
+
+          MAX_RETRIES=3
+          RETRY=0
+          while [ $RETRY -lt $MAX_RETRIES ]; do
+            if git push origin ${{ github.ref_name }}; then
+              echo "✅ Push successful"
+              break
+            fi
+            RETRY=$((RETRY + 1))
+            echo "Push failed, retry $RETRY/$MAX_RETRIES — pulling rebase..."
+            if [ $RETRY -lt $MAX_RETRIES ]; then
+              git pull --rebase origin ${{ github.ref_name }}
+              sleep 3
+            fi
+          done
+
+          if [ $RETRY -eq $MAX_RETRIES ]; then
+            echo "❌ Push failed after $MAX_RETRIES attempts"
+            exit 1
+          fi
+
+      - name: Trigger build-packages-debs
+        if: steps.check_changes.outputs.changed == 'true'
+        run: |
+          CHANGED_PKGS="${{ steps.detect_pkgs.outputs.changed_packages }}"
+
+          if [[ -z "$CHANGED_PKGS" ]]; then
+            echo "No package version changes — skipping build trigger"
+            exit 0
+          fi
+
+          echo "Triggering build for changed packages: $CHANGED_PKGS"
+
+          PKG_COUNT=$(echo "$CHANGED_PKGS" | wc -w)
+
+          if [[ "$PKG_COUNT" -eq 1 ]]; then
+            PAYLOAD=$(printf '{"ref":"master","inputs":{"package":"%s","force":"false"}}' "$CHANGED_PKGS")
+          else
+            PAYLOAD='{"ref":"master","inputs":{"package":"","force":"false"}}'
+          fi
+
+          HTTP_STATUS=$(curl -s -o /tmp/trigger_response.json -w "%{http_code}" \
+            -X POST \
+            -H "Authorization: token ${{ secrets.PAT_TOKEN }}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/build-packages-debs.yml/dispatches" \
+            -d "$PAYLOAD")
+
+          if [[ "$HTTP_STATUS" == "204" ]]; then
+            echo "✅ build-packages-debs triggered successfully"
+            echo "   Packages: $CHANGED_PKGS"
+          else
+            echo "⚠️  Trigger returned HTTP $HTTP_STATUS"
+            cat /tmp/trigger_response.json || true
+          fi
+
+      - name: Summary
+        run: |
+          echo "## Index Generation Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ "${{ steps.check_changes.outputs.changed }}" = "true" ]; then
+            echo "✅ index.json updated successfully" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+
+            PACKAGE_COUNT=$(jq '.total' tools/index.json 2>/dev/null || echo "?")
+            echo "### Package Count" >> $GITHUB_STEP_SUMMARY
+            echo "Total packages: **$PACKAGE_COUNT**" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+
+            CHANGED="${{ steps.detect_pkgs.outputs.changed_packages }}"
+            if [[ -n "$CHANGED" ]]; then
+              echo "### Changed Packages" >> $GITHUB_STEP_SUMMARY
+              for pkg in $CHANGED; do
+                echo "- \`$pkg\`" >> $GITHUB_STEP_SUMMARY
+              done
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "🚀 build-packages-debs workflow triggered" >> $GITHUB_STEP_SUMMARY
+            fi
+          else
+            echo "ℹ️ No changes detected in index.json" >> $GITHUB_STEP_SUMMARY
+          fi

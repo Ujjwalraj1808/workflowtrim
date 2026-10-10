@@ -1,0 +1,324 @@
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: go.mod
+
+      - name: Run tests
+        run: go test -v -race -coverprofile=coverage.txt ./...
+
+      - name: Upload coverage reports to Codecov
+        if: >
+          !startsWith(github.head_ref, 'renovate/') &&
+          !startsWith(github.head_ref, 'releaser-pleaser--')
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7
+        with:
+          flags: unit
+          token: ${{ secrets.CODECOV_TOKEN }}
+
+  integration:
+    runs-on: ubuntu-latest
+
+    permissions:
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: go.mod
+
+      - uses: hetznercloud/tps-action@5bfcef547f41c44aa626d0474c0491a1dbda792a # main
+
+      - name: Run tests
+        run: go test -v -tags integration -race -coverpkg=./... -coverprofile=coverage.txt ./test/integration
+
+      - name: Upload coverage reports to Codecov
+        if: >
+          !startsWith(github.head_ref, 'renovate/') &&
+          !startsWith(github.head_ref, 'releaser-pleaser--')
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7
+        with:
+          flags: integration
+          token: ${{ secrets.CODECOV_TOKEN }}
+
+  kubernetes:
+    name: kubernetes ${{ matrix.k3s }}
+    runs-on: ubuntu-latest
+
+    permissions:
+      id-token: write
+
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref }}-${{ matrix.k3s }}
+      cancel-in-progress: true
+
+    strategy:
+      fail-fast: false # Continue tests matrix if a flaky run occur.
+      matrix:
+        include:
+          - k3s: v1.34
+            k8s-test: v1.34.1
+          - k3s: v1.35
+            k8s-test: v1.35.1
+          - k3s: v1.36
+            k8s-test: v1.36.0
+          - k3s: v1.37
+            k8s-test: v1.37.1
+
+    env:
+      K3S_CHANNEL: ${{ matrix.k3s }}
+      K8S_TEST_VERSION: ${{ matrix.k8s-test }}
+      ENV: gha-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.k3s }}
+
+      # These ginkgo flags were only added in 2.17+2.18, which is available in Kubernetes v1.31+
+      # Can be simplified once we no longer test <1.31.
+      GINKGO_EXTRA_ARGS: ${{ (matrix.k3s != 'v1.29' && matrix.k3s != 'v1.30') && '--silence-skips --github-output' || '' }}
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: go.mod
+
+      - uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4 # v2
+        with:
+          tofu_version: v1.13.1 # renovate: datasource=github-releases depName=opentofu/opentofu
+          tofu_wrapper: false
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+
+      - uses: yokawasa/action-setup-kube-tools@b16d49b2c459d33cf9d4c300a220ef0bcdbc730a # v0.14.0
+        with:
+          setup-tools: |
+            helm
+            kubectl
+            skaffold
+          helm: v4.3.0 # renovate: datasource=github-releases depName=helm/helm
+          kubectl: v1.37.1 # renovate: datasource=github-releases depName=kubernetes/kubernetes
+          skaffold: v2.25.0 # renovate: datasource=github-releases depName=GoogleContainerTools/skaffold
+
+      - name: Setup k3sup
+        env:
+          K3SUP_VERSION: 0.13.13 # renovate: datasource=github-releases depName=alexellis/k3sup
+        run: |
+          curl https://github.com/alexellis/k3sup/releases/download/$K3SUP_VERSION/k3sup -sSL -o /usr/local/bin/k3sup
+          chmod +x /usr/local/bin/k3sup
+
+      - name: Setup k8s test binaries
+        run: make -C test/e2e/kubernetes bin
+
+      - uses: hetznercloud/tps-action@5bfcef547f41c44aa626d0474c0491a1dbda792a # main
+
+      - name: Setup environment
+        run: make -C dev up
+
+      - name: Run skaffold
+        run: |
+          source dev/files/env.sh
+          skaffold run
+
+      - name: Check XFS config file existence
+        run: |
+          DOCKER_IMAGE_ID=$(docker images --format "{{.ID}} {{.CreatedAt}}" localhost:30666/docker_io_hetznercloud_hcloud-csi-driver | sort -k2 -r | head -n1 | awk '{print $1}')
+          docker run --rm -i --entrypoint test $DOCKER_IMAGE_ID -f /usr/share/xfsprogs/mkfs/lts_4.19.conf
+
+      - name: Run parallel tests
+        run: |
+          source dev/files/env.sh
+          make -C test/e2e/kubernetes parallel
+
+      - name: Run serial tests
+        run: |
+          source dev/files/env.sh
+          make -C test/e2e/kubernetes serial
+
+      - name: Get code coverage
+        run: |
+          source dev/files/env.sh
+          bash hack/get-coverage-from-k8s.sh
+
+      - name: Upload controller coverage reports to Codecov
+        if: >
+          !startsWith(github.head_ref, 'renovate/') &&
+          !startsWith(github.head_ref, 'releaser-pleaser--')
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: ./coverage/controller/coverage.txt
+          flags: e2e-controller
+
+      - name: Upload node coverage reports to Codecov
+        if: >
+          !startsWith(github.head_ref, 'renovate/') &&
+          !startsWith(github.head_ref, 'releaser-pleaser--')
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: ./coverage/node/coverage.txt
+          flags: e2e-node
+
+      - name: Dump logs & events
+        if: always()
+        continue-on-error: true
+        run: |
+          source dev/files/env.sh
+          mkdir -p debug-logs
+
+          echo "::group::hcloud-csi.log"
+          kubectl logs \
+            --namespace kube-system \
+            --selector app.kubernetes.io/name=hcloud-csi \
+            --all-containers \
+            --prefix=true \
+            --tail=-1 \
+            | tee debug-logs/hcloud-csi.log
+          echo "::endgroup::"
+
+          echo "::group::events.yaml"
+          kubectl get events \
+            --all-namespaces \
+            --sort-by=.firstTimestamp \
+            --output yaml \
+            | tee debug-logs/events.yaml
+          echo "::endgroup::"
+
+      - name: Cleanup
+        if: always()
+        continue-on-error: true
+        run: make -C dev down
+
+      - name: Persist debug artifacts
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: debug-logs-k8s-${{ env.ENV }}
+          path: debug-logs/
+
+  nomad:
+    name: nomad ${{ matrix.nomad }}
+    runs-on: ubuntu-latest
+
+    permissions:
+      id-token: write
+
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref }}-${{ matrix.nomad }}
+      cancel-in-progress: true
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - nomad: 2.0.7 # renovate: datasource=github-releases depName=hashicorp/nomad extractVersion=v(?<version>.+)
+            consul: 2.0.4 # renovate: datasource=github-releases depName=hashicorp/consul extractVersion=v(?<version>.+)
+
+    env:
+      TF_VAR_nomad_version: ${{ matrix.nomad }}
+      TF_VAR_consul_version: ${{ matrix.consul }}
+      ENV: gha-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.nomad }}
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: go.mod
+
+      - uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4 # v2
+        with:
+          tofu_version: v1.13.1 # renovate: datasource=github-releases depName=opentofu/opentofu
+          tofu_wrapper: false
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+
+      - uses: yokawasa/action-setup-kube-tools@b16d49b2c459d33cf9d4c300a220ef0bcdbc730a # v0.14.0
+        with:
+          setup-tools: |
+            skaffold
+          skaffold: v2.25.0 # renovate: datasource=github-releases depName=GoogleContainerTools/skaffold
+
+      - uses: hashicorp/setup-nomad@6e88df50dd00f3737f04fddde2bf2bd446e313dd # main
+        id: setup
+        with:
+          version: ${{ matrix.nomad }}
+
+      # used for generating the certificates
+      - name: setup consul binary
+        run: |
+          curl -o consul.zip https://releases.hashicorp.com/consul/${{ matrix.consul }}/consul_${{ matrix.consul }}_linux_amd64.zip
+          unzip consul.zip
+          mv consul /usr/local/bin/
+
+      - uses: hetznercloud/tps-action@5bfcef547f41c44aa626d0474c0491a1dbda792a # main
+
+      - name: Setup environment
+        run: make -C nomad/dev up
+
+      - name: Run skaffold
+        run: |
+          source nomad/dev/files/env.sh
+          skaffold -f nomad/skaffold.yaml build
+
+      - name: Run tests
+        run: |
+          source nomad/dev/files/env.sh
+          go test -v -tags e2e ./test/e2e/nomad/...
+
+      - name: Dump logs & events
+        if: always()
+        continue-on-error: true
+        run: |
+          source nomad/dev/files/env.sh
+          mkdir -p debug-logs
+
+          fetch_job_info () {
+            # Fetch all allocations from a job
+            ALLOC_IDS=$(nomad job allocs -json "$1" | jq -r ".[].ID")
+
+            # Fetch logs of each allocation and dump them in a file
+            for ALLOC_ID in $ALLOC_IDS; do
+                echo "::group::hcloud-csi.log::$1::$ALLOC_ID"
+                nomad alloc logs "$ALLOC_ID" | tee "debug-logs/$1-$ALLOC_ID.log"
+                echo "::endgroup::"
+            done
+
+            # Fetch events of each allocation and dump them in a file
+            for ALLOC_ID in $ALLOC_IDS; do
+                echo "::group::events.json::$1::$ALLOC_ID"
+                nomad alloc status -json $ALLOC_ID \
+                  | jq -r ".TaskStates.plugin.Events" \
+                  | tee "debug-logs/$1-$ALLOC_ID.json"
+                echo "::endgroup::"
+            done
+          }
+
+          fetch_job_info hcloud-csi-controller
+          fetch_job_info hcloud-csi-node
+
+      - name: Cleanup
+        if: always()
+        continue-on-error: true
+        run: make -C nomad/dev down
+
+      - name: Persist debug artifacts
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: debug-logs-nomad-${{ env.ENV }}
+          path: debug-logs/

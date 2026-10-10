@@ -1,0 +1,93 @@
+name: CodeQL
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "37 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  changes:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    permissions:
+      pull-requests: read
+    outputs:
+      docs_only: ${{ steps.check.outputs.docs_only }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d
+        id: filter
+        with:
+          filters: |
+            code:
+              - 'src/**'
+              - 'tests/**'
+              - 'scripts/**'
+              - 'packages/**'
+              - 'fuzz/**'
+              - 'evals/**'
+              - 'performance/**'
+              - '*.py'
+              - '*.js'
+              - '*.ts'
+              - '*.mjs'
+              - '*.cjs'
+      - name: Compute docs_only flag
+        id: check
+        shell: bash
+        run: |
+          if [[ "${{ steps.filter.outputs.code }}" == 'false' ]]; then
+            echo 'docs_only=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'docs_only=false' >> "$GITHUB_OUTPUT"
+          fi
+
+  analyze:
+    needs: [changes]
+    if: >-
+      always() &&
+      (github.repository_owner == 'oaslananka' || github.repository_owner == 'oaslananka-ops')
+    name: analyze (${{ matrix.language }})
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        include:
+          - language: python
+            build-mode: none
+          - language: javascript-typescript
+            build-mode: none
+    steps:
+      - name: Skip CodeQL for docs-only PR
+        if: needs.changes.outputs.docs_only == 'true'
+        run: |
+          echo "::notice::Skipping CodeQL analysis — docs-only PR detected (no code changes)"
+          echo "skip_ci=true" >> "$GITHUB_ENV"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        if: env.skip_ci != 'true'
+        with:
+          persist-credentials: false
+      - uses: github/codeql-action/init@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2
+        if: env.skip_ci != 'true'
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+      - uses: github/codeql-action/analyze@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2
+        if: env.skip_ci != 'true'

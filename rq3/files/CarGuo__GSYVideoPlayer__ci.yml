@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - master
+      - dev
+    paths-ignore:
+      - '.idea/**'
+      - '.gitattributes'
+      - '.github/**.json'
+      - '.gitignore'
+      - '.gitmodules'
+      - '**.md'
+      - '**/*.txt'
+      - '**/*.png'
+      - '**/*.jpg'
+      - 'LICENSE'
+      - 'NOTICE'
+  pull_request:
+    paths-ignore:
+      - '.idea/**'
+      - '.gitattributes'
+      - '.github/**.json'
+      - '.gitignore'
+      - '.gitmodules'
+      - '**.md'
+      - '**/*.txt'
+      - '**/*.png'
+      - '**/*.jpg'
+      - 'LICENSE'
+      - 'NOTICE'
+
+jobs:
+  publish:
+    name: Publish to MavenLocal
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/setup-java@v3
+        with:
+          distribution: 'zulu'
+          java-version: 21
+      - uses: gradle/gradle-build-action@v2
+        with:
+          arguments: publishToMavenLocal verifyCastDependencyIsolation
+
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/setup-java@v3
+        with:
+          distribution: 'zulu'
+          java-version: 21
+      # 14.0.0: Shared callback/timeout changes require the existing session regressions.
+      - name: Check RTSP session lifecycle
+        run: python3 tests/rtsp-session/run_host_tests.py
+      - uses: gradle/gradle-build-action@v2
+        with:
+          # 13.2.1: Release/R8 is required because jUPnP binds local services via reflection.
+          # 14.0.0: Compose buffering regressions must also run before a release.
+          arguments: app:assembleDebug app:assembleRelease gsyVideoPlayer-java:test gsyVideoPlayer-cast:test gsyVideoPlayer-compose:test

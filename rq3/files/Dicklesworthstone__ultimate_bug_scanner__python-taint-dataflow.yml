@@ -1,0 +1,48 @@
+name: Python Taint Dataflow
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - modules/helpers/ubs_core/analyzers/taint_py.py
+      - test-suite/quality/test_taint_python_dataflow.py
+      - test-suite/quality/test_taint_python_summaries.py
+      - test-suite/quality/test_taint_python_expressions.py
+      - .github/workflows/python-taint-dataflow.yml
+  workflow_dispatch:
+
+# Validate the checked-in source, never reinstall an older preparation candidate.
+permissions:
+  contents: read
+
+jobs:
+  source-regressions:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Record exact source for reproducing failures
+        run: |
+          git rev-parse HEAD > "$RUNNER_TEMP/taint-source-head.txt"
+          git ls-files -s > "$RUNNER_TEMP/taint-source-index.txt"
+          git ls-files -z | tar --null -T - -czf "$RUNNER_TEMP/taint-source-snapshot.tar.gz"
+      - name: Check the actual committed analyzer
+        run: |
+          python3 -m unittest discover -s test-suite/quality -p 'test_taint_python_*.py' -v
+          PYTHONPATH=modules/helpers python3 - <<'PY'
+          from ubs_core.analyzers.taint_py import SELF_TESTS
+          for name, test in SELF_TESTS:
+              test()
+              print('LEGACY_SELFTEST_PASS', name)
+          PY
+      - name: Preserve exact reproduction source
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-taint-source-${{ github.sha }}
+          path: ${{ runner.temp }}/taint-source-*
+          retention-days: 3

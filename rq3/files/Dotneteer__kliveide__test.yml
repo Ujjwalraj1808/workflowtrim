@@ -1,0 +1,45 @@
+name: Test
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22.x
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Check ZX Spectrum 48K WASM artifact size
+        run: npm run check:sp48-wasm-size
+
+      # The .wasm cores are build outputs (git-ignored), so a fresh checkout has none. The WASM-core
+      # tests (e.g. test/zxnext-hw/) load them from src/emu/machines/*/wasm/dist/ and fail with
+      # ENOENT without this step. Same freestanding clang --target=wasm32 toolchain as the sp48 step.
+      - name: Build all WASM machine cores
+        run: npm run build:all-wasm
+
+      # Fails only on type errors that are not in build/type-errors-baseline.json, so the existing
+      # backlog does not block CI while it is being paid down. See scripts/check-types.cjs.
+      - name: Type-check
+        run: npm run build:check
+
+      # Headroom for the test workers' heap: the Klive BASIC suites compile and run many programs.
+      # Every tier, the end-to-end ones included: `npm test` skips an e2e tier whose inputs are
+      # unchanged since it last passed *on that machine*, and CI has no such record to trust.
+      - name: Run unit, component and end-to-end tests
+        run: npm run test:all
+        env:
+          NODE_OPTIONS: --max-old-space-size=4096

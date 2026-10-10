@@ -1,0 +1,21 @@
+name: Backport Bot
+on:
+  issues:
+    types: [labeled]
+  pull_request:
+    types: [labeled]
+  push:
+    branches:
+      - '*.x'
+jobs:
+  backport-issue:
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create Backport Issue
+        uses: spring-io/backport-bot@v0.0.3
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,20 @@
+name: Lint Commit Messages
+on:
+  pull_request:
+    branches: [ main ]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  commitlint:
+    # History-import PRs replay upstream commits whose messages predate this
+    # repo's Conventional Commits policy and cannot be rewritten without
+    # destroying the imported history. Label such a PR `skip-commitlint` to
+    # bypass this check; normal PRs are unaffected.
+    if: ${{ !contains(github.event.pull_request.labels.*.name, 'skip-commitlint') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: wagoid/commitlint-github-action@v6

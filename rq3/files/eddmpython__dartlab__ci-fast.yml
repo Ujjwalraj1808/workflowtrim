@@ -1,0 +1,96 @@
+name: CI Fast
+
+# Tier 1 — PR / push 즉시 피드백 게이트 (목표 ≤ 3분).
+# 모든 게이트 명령은 tests/run.py 의 GATES dict SSOT. 본 파일은 matrix 디스패치만.
+# 신규 게이트 추가: tests/run.py 의 GATES + 본 파일 matrix.include 양쪽 동시 수정
+# (tests/audit/test_runEntrypoint.py 가 drift 차단).
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+concurrency:
+  group: ci-fast-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ matrix.timeout || 20 }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - gate: format
+          - gate: lint
+            fetch-depth: 2
+          - gate: architecture-l0-l15
+          - gate: typecheck
+          - gate: smoke
+            artifact_name: product-smoke-quick
+            artifact_path: product-smoke-quick.json
+          - gate: test-fast
+            timeout: 30
+          - gate: wheel-smoke
+          - gate: quality-gate
+          - gate: security
+            artifact_name: pip-audit-report
+            artifact_path: audit-report.txt
+          - gate: deps-check
+          - gate: notebooks
+          - gate: snapshot-regression
+            timeout: 5
+          - gate: schema-drift
+            timeout: 5
+          - gate: eval-rule
+            timeout: 5
+          - gate: mutation-smoke
+            timeout: 5
+          - gate: test-coverage-gate
+            fetch-depth: 0
+            timeout: 5
+            artifact_name: test-coverage-gate
+            artifact_path: coverage-gate-report.json
+          - gate: dart-panel-only
+            timeout: 5
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: ${{ matrix.fetch-depth || 1 }}
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            pyproject.toml
+            uv.lock
+      # T13-5 — pip wheel cache (의존 설치 시간 단축, 평균 30-60 percent)
+      - name: Cache pip wheels
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/pip
+          key: pip-wheels-${{ runner.os }}-py3.12-${{ hashFiles('pyproject.toml', 'uv.lock') }}
+          restore-keys: |
+            pip-wheels-${{ runner.os }}-py3.12-
+      # T13-5 — HF dataset cache (smoke / test-fast gate 가 fixture 다운로드 시 hit)
+      - name: Cache HuggingFace dataset
+        if: ${{ matrix.gate == 'smoke' || matrix.gate == 'test-fast' || matrix.gate == 'schema-drift' }}
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/huggingface
+          key: hf-${{ runner.os }}-${{ hashFiles('src/dartlab/core/data/version.json') }}-v1
+          restore-keys: |
+            hf-${{ runner.os }}-
+      - name: Run ${{ matrix.gate }}
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: python -X utf8 tests/run.py gate ${{ matrix.gate }}
+      - name: Upload artifact
+        if: ${{ always() && matrix.artifact_name }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.artifact_path }}
+          retention-days: 30

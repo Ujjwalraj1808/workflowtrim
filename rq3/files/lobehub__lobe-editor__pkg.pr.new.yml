@@ -1,0 +1,42 @@
+name: Pkg Pr New CI
+on:
+  pull_request:
+  push:
+    branches:
+      - '!master'
+
+jobs:
+  release:
+    name: Release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+
+      - name: Install deps
+        run: pnpm install
+
+      - name: CI
+        run: pnpm run ci
+
+      - name: Test
+        run: pnpm run test
+
+      - name: Build
+        run: pnpm run build
+
+      - name: Verify node identity package entries
+        run: pnpm run verify:node-identity-package
+
+      - name: Disable git hooks in CI
+        run: git config core.hooksPath /dev/null
+
+      - name: Release
+        run: pnpm dlx pkg-pr-new publish --comment=update

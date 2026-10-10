@@ -1,0 +1,12 @@
+name: Dependency Check Nightly
+on:
+  workflow_dispatch: # Allow manual running to refresh/check cache
+  schedule:
+    - cron: '0 2 * * *'
+
+jobs:
+  check:
+    uses: ./.github/workflows/dependency-check.yaml
+    with:
+      failOnCacheMiss: false
+      writeCache: true

@@ -1,0 +1,85 @@
+name: keep-the-why-lint (package)
+
+# CI for the linter package developed under lint/ and the root action.yml.
+# Linting this repository's own context/ the way a consumer does lives in
+# ktw-lint.yml; validating the skill itself lives in validate-skill.yml.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Read-only token: nothing here writes to the repository.
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: tests (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Run test suite
+        working-directory: lint
+        run: python -m unittest discover -s tests -v
+
+      - name: Build and install the package
+        working-directory: lint
+        run: |
+          python -m pip install --quiet build
+          python -m build
+          python -m pip install --quiet dist/*.whl
+          ktw-lint --version
+
+  dogfood:
+    name: lint this repo from source (--strict)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      # From source, not via action.yml: the action installs the released
+      # PyPI version (that's what ktw-lint.yml exercises), which would test
+      # yesterday's linter against today's context/, not the code in this PR.
+      - name: Lint this repository's own context/
+        run: PYTHONPATH=lint python -m ktw_lint . --strict
+
+      - name: Linter's supported schema must not lag behind the skill version
+        run: |
+          SKILL=$(grep -oP '(?<=version: ")[0-9]+\.[0-9]+\.[0-9]+' skills/keep-the-why/SKILL.md | head -1)
+          LINT=$(PYTHONPATH=lint python -c "import ktw_lint; print('.'.join(map(str, ktw_lint.SUPPORTED_SCHEMA)))")
+          echo "skill $SKILL / linter supports $LINT"
+          if [ "$LINT" != "$SKILL" ]; then
+            echo "::warning::linter SUPPORTED_SCHEMA ($LINT) differs from the skill version ($SKILL) — fine if this release has no structural change, otherwise add the gate and bump lint/ktw_lint/__init__.py"
+          fi
+
+  action-smoke:
+    name: root action.yml (this PR's action, latest linter from PyPI)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Exercises the action.yml in this PR — ktw-lint.yml uses the released
+      # @lint-latest action, so a change to action.yml would otherwise go
+      # untested until the next linter publish moves that tag.
+      # version: latest, explicitly — the action's own default installs the
+      # version in lint/ktw_lint/__init__.py, which on a PR that bumps it is
+      # not on PyPI yet.
+      - name: Run the root action against this repository
+        uses: ./
+        with:
+          path: "."
+          strict: "false"
+          version: "latest"

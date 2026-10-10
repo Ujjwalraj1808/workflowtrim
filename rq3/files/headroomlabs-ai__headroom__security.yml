@@ -1,0 +1,179 @@
+name: Security
+
+# Security gate: dependency vulnerability scanning (SCA), static analysis
+# (CodeQL/SAST), and secret scanning. Runs on every PR to main, on push to
+# main, weekly (to catch newly-disclosed CVEs without a code change), and on
+# demand. Each job is an independent required check.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Mondays 06:00 UTC — surface CVEs disclosed since the last commit.
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  # ---- SCA: dependency vulnerability scan -------------------------------
+  # Audits the PRODUCTION dependency set ([all]) exported from uv.lock. The
+  # `benchmark` extra is intentionally excluded from [all] (it pulls lm-eval's
+  # sqlitedict/nltk, which carry unpatchable upstream High CVEs and are never
+  # installed in production), so this gate fails only on actionable findings.
+  dependency-audit:
+    name: Dependency audit (pip-audit)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.2.0
+
+      - name: Export production dependency set from uv.lock
+        run: |
+          uv export --frozen --no-dev --no-emit-project --no-hashes \
+            --extra all --format requirements-txt > requirements-prod.txt
+          echo "Production dependencies audited:"
+          wc -l requirements-prod.txt
+
+      - name: Audit dependencies (pip-audit)
+        uses: pypa/gh-action-pip-audit@v1.1.0
+        with:
+          inputs: requirements-prod.txt
+
+  # ---- SCA: Rust dependency advisories -----------------------------------
+  # `cargo audit` reads Cargo.lock only (no build, about a minute), so it runs
+  # unconditionally: every PR, every push to main, and the weekly schedule
+  # above. It used to live in rust.yml behind the `rust-changes` path filter;
+  # pushes that touched no Rust path reported it `skipped`, and rust.yml's own
+  # schedule stopped firing after 2026-09-08, so no advisory scan ran for three
+  # weeks. Blocking: an accepted advisory goes in .cargo/audit.toml with a
+  # written reason.
+  cargo-audit:
+    name: Rust advisories (cargo audit)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install cargo-audit + cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit,cargo-deny
+
+      - name: cargo audit (blocking; exceptions in .cargo/audit.toml)
+        run: cargo audit
+
+      # Licence allow-list from deny.toml. Advisory decisions stay with
+      # cargo-audit above, so there is one place that decides what is accepted.
+      - name: cargo deny check licenses
+        continue-on-error: true
+        run: cargo deny check licenses
+
+  # Audit every maintained npm lock, including development dependencies.
+  # Lockfile audits do not install packages or execute their lifecycle scripts.
+  npm-audit:
+    name: npm audit (${{ matrix.directory }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        directory:
+          - docs
+          - sdk/typescript
+          - plugins/openclaw
+          - plugins/opencode
+          - e2e/wrap/tools
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ">=24.16.0 <25"
+      - name: Audit locked dependencies at every severity
+        working-directory: ${{ matrix.directory }}
+        run: npm audit --package-lock-only --audit-level=low
+
+  # ---- SAST: CodeQL static analysis ------------------------------------
+  codeql:
+    name: CodeQL (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [python, javascript-typescript, actions]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v4
+        with:
+          languages: ${{ matrix.language }}
+          queries: security-extended
+          # Test code never ships. Its alerts were all test idioms (asserting a
+          # URL appears in output, a fake server binding 0.0.0.0), so scanning
+          # it only buried the real findings.
+          config: |
+            paths-ignore:
+              - tests
+
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@v4
+        with:
+          category: "/language:${{ matrix.language }}"
+
+  # ---- Secret scanning -------------------------------------------------
+  # Uses the gitleaks BINARY (MIT-licensed, no key) instead of
+  # gitleaks-action, which requires a paid GITLEAKS_LICENSE for organization
+  # repos. On PRs we scan only the PR's commits so pre-existing history can't
+  # block a PR; on push/schedule we scan the working tree. Config + allowlist
+  # live in .gitleaks.toml at the repo root (auto-loaded).
+  secret-scan:
+    name: Secret scan (gitleaks)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Install gitleaks
+        run: |
+          version=8.18.4
+          curl -sSfL \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${version}/gitleaks_${version}_linux_x64.tar.gz" \
+            -o /tmp/gitleaks.tar.gz
+          tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks
+          sudo install /tmp/gitleaks /usr/local/bin/gitleaks
+          gitleaks version
+
+      - name: Scan for secrets
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if [ -n "$BASE_SHA" ]; then
+            echo "Scanning PR commits ${BASE_SHA}..HEAD"
+            gitleaks detect --source . --log-opts="${BASE_SHA}..HEAD" --redact --no-banner
+          else
+            echo "Scanning working tree"
+            gitleaks detect --source . --no-git --redact --no-banner
+          fi

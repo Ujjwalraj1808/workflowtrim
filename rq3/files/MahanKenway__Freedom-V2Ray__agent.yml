@@ -1,0 +1,423 @@
+name: GitClaw Agent
+
+on:
+  issues:
+    types: [opened, edited]
+  issue_comment:
+    types: [created, edited]
+
+jobs:
+  agent:
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      contents: read
+      actions: write
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup jq
+        run: sudo apt-get install -y jq
+
+      - name: Process Issue (Smart Bot)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          ISSUE_BODY: ${{ github.event.issue.body }}
+          ISSUE_USER: ${{ github.event.issue.user.login }}
+        run: |
+          BODY_LOWER=$(echo "$ISSUE_BODY" | tr '[:upper:]' '[:lower:]')
+          
+          # ============================================
+          # خواندن اطلاعات کانفیگ‌ها
+          # ============================================
+          CONFIG_COUNT=0
+          LAST_UPDATE="نامشخص"
+          ISP_LIST=""
+          PROTOCOLS=""
+          
+          if [ -f "configs/all_configs.json" ]; then
+            CONFIG_COUNT=$(cat configs/all_configs.json | jq '. | length')
+            LAST_UPDATE=$(date -r configs/all_configs.json '+%Y-%m-%d %H:%M' 2>/dev/null || echo "نامشخص")
+            
+            # استخراج ISP ها
+            ISP_LIST=$(cat configs/all_configs.json | jq -r '[.[].isp // empty] | unique | join(", ")' 2>/dev/null || echo "")
+            
+            # استخراج پروتکل‌ها
+            PROTOCOLS=$(cat configs/all_configs.json | jq -r '[.[].protocol // empty] | unique | join(", ")' 2>/dev/null || echo "")
+          fi
+          
+          # ============================================
+          # تابع ارسال پاسخ
+          # ============================================
+          send_response() {
+            curl -s -X POST \
+              -H "Authorization: token $GITHUB_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "{\"body\":\"$1\"}" \
+              https://api.github.com/repos/${{ github.repository }}/issues/$ISSUE_NUMBER/comments
+          }
+          
+          # ============================================
+          # تابع trigger collector
+          # ============================================
+          trigger_collector() {
+            curl -s -X POST \
+              -H "Authorization: token $GITHUB_TOKEN" \
+              -H "Accept: application/vnd.github.v3+json" \
+              https://api.github.com/repos/${{ github.repository }}/actions/workflows/collector.yml/dispatches \
+              -d '{"ref":"main"}'
+          }
+          
+          # ============================================
+          # پردازش دستورات
+          # ============================================
+          
+          # 🎯 آپدیت و جمع‌آوری
+          if [[ "$BODY_LOWER" == *"/update"* ]] || [[ "$BODY_LOWER" == *"آپدیت"* ]] || [[ "$BODY_LOWER" == *"بروزرسانی"* ]] || [[ "$BODY_LOWER" == *"refresh"* ]]; then
+            trigger_collector
+            RESPONSE="🚀 **آپدیت شروع شد!**
+            
+⏱️ **زمان تقریبی:** 2-3 دقیقه
+🔍 در حال جمع‌آوری از منابع مختلف...
+📊 تست پینگ و اعتبارسنجی کانفیگ‌ها
+
+📌 **وضعیت فعلی:** $CONFIG_COUNT کانفیگ
+🕐 **آخرین آپدیت:** $LAST_UPDATE
+
+💡 **نکته:** می‌تونی وضعیت رو توی تب **Actions** چک کنی!
+⏳ وقتی تموم شد، یه کامنت جدید می‌ذارم (اگه تغییری باشه)"
+
+          # 📊 وضعیت و آمار
+          elif [[ "$BODY_LOWER" == *"/status"* ]] || [[ "$BODY_LOWER" == *"وضعیت"* ]] || [[ "$BODY_LOWER" == *"آمار"* ]] || [[ "$BODY_LOWER" == *"تعداد"* ]]; then
+            if [ $CONFIG_COUNT -eq 0 ]; then
+              RESPONSE="❌ **هنوز کانفیگی نداریم!**
+              
+🆕 برای شروع جمع‌آوری بنویس:
+• **آپدیت**
+• **/update**
+• **شروع**
+
+⏱️ Collector هر ۲ ساعت خودکار هم اجرا می‌شه!"
+            else
+              RESPONSE="📊 **آمار کامل کانفیگ‌ها**
+              
+✅ **تعداد کل:** $CONFIG_COUNT کانفیگ
+🕐 **آخرین آپدیت:** $LAST_UPDATE
+
+📡 **ISP ها:** ${ISP_LIST:-نامشخص}
+🔌 **پروتکل‌ها:** ${PROTOCOLS:-نامشخص}
+
+💾 **محل ذخیره:** \`configs/all_configs.json\`
+🔗 **لینک سابسکریپشن:** توی README یا پوشه configs/
+
+🔄 برای آپدیت جدید بنویس: **آپدیت**"
+            fi
+
+          # 👋 سلام و خوش‌آمد
+          elif [[ "$BODY_LOWER" == *"سلام"* ]] || [[ "$BODY_LOWER" == *"درود"* ]] || [[ "$BODY_LOWER" == *"هی"* ]] || [[ "$BODY_LOWER" == *"hello"* ]] || [[ "$BODY_LOWER" == *"hi"* ]]; then
+            HOUR=$(date +%H)
+            if [ $HOUR -ge 5 ] && [ $HOUR -lt 12 ]; then
+              GREETING="صبح بخیر"
+            elif [ $HOUR -ge 12 ] && [ $HOUR -lt 17 ]; then
+              GREETING="ظهر بخیر"
+            elif [ $HOUR -ge 17 ] && [ $HOUR -lt 21 ]; then
+              GREETING="عصر بخیر"
+            else
+              GREETING="شب بخیر"
+            fi
+            
+            RESPONSE="👋 $GREETING **$ISSUE_USER** عزیز!
+            
+🤖 من **GitClaw-V2Ray** هستم، ربات هوشمند مدیریت کانفیگ!
+
+📌 **وضعیت فعلی:** $CONFIG_COUNT کانفیگ موجود
+
+💡 **چیکار می‌تونم برات انجام بدم؟**
+• 🔄 **آپدیت** → جمع‌آوری کانفیگ جدید
+• 📊 **وضعیت** → آمار کامل
+• 📖 **راهنما** → لیست دستورات
+• 🔍 **جستجو** → پیدا کردن کانفیگ خاص
+
+چی نیاز داری؟ 😊"
+
+          # 📖 راهنما
+          elif [[ "$BODY_LOWER" == *"/help"* ]] || [[ "$BODY_LOWER" == *"راهنما"* ]] || [[ "$BODY_LOWER" == *"کمک"* ]] || [[ "$BODY_LOWER" == *"دستورات"* ]] || [[ "$BODY_LOWER" == *"راهنمایی"* ]]; then
+            RESPONSE="📚 **راهنمای جامع GitClaw-V2Ray**
+            
+🎯 **دستورات اصلی:**
+\`/update\` , \`آپدیت\` , \`بروزرسانی\` → شروع جمع‌آوری
+\`/status\` , \`وضعیت\` , \`آمار\` → تعداد و اطلاعات کانفیگ‌ها
+\`/search\` , \`جستجو\` → جستجو در کانفیگ‌ها (به زودی)
+\`/isp\` , \`اپراتور\` → فیلتر بر اساس ISP
+\`/protocol\` , \`پروتکل\` → فیلتر بر اساس پروتکل
+\`/best\` , \`بهترین\` → کانفیگ‌های با بهترین پینگ
+\`/random\` , \`تصادفی\` → چند کانفیگ تصادفی
+\`/logs\` , \`لاگ\` → مشاهده لاگ‌های اخیر
+\`/time\` , \`زمان\` → زمان‌بندی اجرا
+\`/about\` , \`درباره\` → اطلاعات ربات
+\`/help\` , \`راهنما\` → همین پیام
+
+⏰ **زمان‌بندی:**
+• Collector هر **۲ ساعت** خودکار اجرا می‌شه
+• می‌تونی هر وقت خواستی دستی اجرا کنی
+
+💡 **نکته:** من هوش مصنوعی ندارم ولی سریع و رایگانم! 🚀"
+
+          # 🔍 جستجو در کانفیگ‌ها
+          elif [[ "$BODY_LOWER" == *"/search"* ]] || [[ "$BODY_LOWER" == *"جستجو"* ]] || [[ "$BODY_LOWER" == *"پیدا کن"* ]]; then
+            # استخراج کلمه جستجو
+            SEARCH_TERM=$(echo "$ISSUE_BODY" | sed 's/.*جستجو//; s/.*search//; s/^[[:space:]]*//' | head -c 50)
+            
+            if [ -f "configs/all_configs.json" ] && [ -n "$SEARCH_TERM" ]; then
+              RESULTS=$(cat configs/all_configs.json | jq --arg term "$SEARCH_TERM" '[.[] | select(.server | contains($term))] | length' 2>/dev/null || echo "0")
+              
+              if [ "$RESULTS" -gt 0 ]; then
+                RESPONSE="🔍 **نتایج جستجو برای:** \`$SEARCH_TERM\`
+                
+✅ **$RESULTS** کانفیگ پیدا شد!
+
+📁 جزئیات توی فایل \`configs/all_configs.json\` قابل مشاهده است.
+
+💡 **نکته:** برای جستجوی دقیق‌تر، از دستور \`/isp\` یا \`/protocol\` استفاده کن."
+              else
+                RESPONSE="❌ **نتیجه‌ای پیدا نشد!**
+                
+🔍 عبارت: \`$SEARCH_TERM\`
+
+💡 **پیشنهاد:**
+• اشتباه تایپی نداری؟
+• با \`/isp\` بر اساس اپراتور جستجو کن
+• با \`/protocol\` بر اساس پروتکل جستجو کن"
+              fi
+            else
+              RESPONSE="🔍 **راهنمای جستجو**
+              
+برای جستجو بنویس:
+\`جستجو [کلمه کلیدی]\`
+
+مثال:
+• \`جستجو ایرانسل\`
+• \`جستجو 443\`
+• \`جستجو usa\`
+
+⚠️ **توجه:** اول باید کانفیگ داشته باشی! بنویس: **آپدیت**"
+            fi
+
+          # 🌐 فیلتر ISP
+          elif [[ "$BODY_LOWER" == *"/isp"* ]] || [[ "$BODY_LOWER" == *"اپراتور"* ]] || [[ "$BODY_LOWER" == *"ایرانسل"* ]] || [[ "$BODY_LOWER" == *"همراه اول"* ]] || [[ "$BODY_LOWER" == *"مخابرات"* ]]; then
+            if [ $CONFIG_COUNT -eq 0 ]; then
+              RESPONSE="❌ اول باید کانفیگ جمع‌آوری کنی!
+              
+🔄 بنویس: **آپدیت**"
+            else
+              # شناسایی ISP
+              TARGET_ISP=""
+              if [[ "$BODY_LOWER" == *"ایرانسل"* ]]; then TARGET_ISP="Irancell"; fi
+              if [[ "$BODY_LOWER" == *"همراه اول"* ]] || [[ "$BODY_LOWER" == *"mci"* ]]; then TARGET_ISP="MCI"; fi
+              if [[ "$BODY_LOWER" == *"مخابرات"* ]]; then TARGET_ISP="Mokhaberat"; fi
+              if [[ "$BODY_LOWER" == *"مخابرات"* ]]; then TARGET_ISP="TCI"; fi
+              if [[ "$BODY_LOWER" == *"آسیاتک"* ]]; then TARGET_ISP="Asiatech"; fi
+              if [[ "$BODY_LOWER" == *"پارس آنلاین"* ]]; then TARGET_ISP="ParsOnline"; fi
+              if [[ "$BODY_LOWER" == *"شاتل"* ]]; then TARGET_ISP="Shatel"; fi
+              if [[ "$BODY_LOWER" == *"های وب"* ]]; then TARGET_ISP="HiWeb"; fi
+              
+              if [ -n "$TARGET_ISP" ]; then
+                COUNT=$(cat configs/all_configs.json | jq --arg isp "$TARGET_ISP" '[.[] | select(.isp | contains($isp))] | length' 2>/dev/null || echo "0")
+                RESPONSE="🌐 **فیلتر ISP: $TARGET_ISP**
+                
+✅ **$COUNT** کانفیگ پیدا شد!
+
+📁 جزئیات توی فایل configs/ قابل مشاهده است."
+              else
+                # لیست همه ISP ها
+                ALL_ISPS=$(cat configs/all_configs.json | jq -r '[.[].isp // empty] | group_by(.) | map({name: .[0], count: length}) | sort_by(-.count) | .[] | \"• \(.name): \(.count) عدد\"' 2>/dev/null | head -10)
+                
+                RESPONSE="🌐 **لیست ISP های موجود:**
+                
+$ALL_ISPS
+
+💡 برای فیلتر بنویس:
+\`ایرانسل\` , \`همراه اول\` , \`مخابرات\` , ..."
+
+              fi
+            fi
+
+          # 🔌 فیلتر پروتکل
+          elif [[ "$BODY_LOWER" == *"/protocol"* ]] || [[ "$BODY_LOWER" == *"پروتکل"* ]] || [[ "$BODY_LOWER" == *"vless"* ]] || [[ "$BODY_LOWER" == *"vmess"* ]] || [[ "$BODY_LOWER" == *"trojan"* ]]; then
+            if [ $CONFIG_COUNT -eq 0 ]; then
+              RESPONSE="❌ اول باید کانفیگ جمع‌آوری کنی!
+              
+🔄 بنویس: **آپدیت**"
+            else
+              TARGET_PROTO=""
+              if [[ "$BODY_LOWER" == *"vless"* ]]; then TARGET_PROTO="VLESS"; fi
+              if [[ "$BODY_LOWER" == *"vmess"* ]]; then TARGET_PROTO="VMESS"; fi
+              if [[ "$BODY_LOWER" == *"trojan"* ]]; then TARGET_PROTO="Trojan"; fi
+              if [[ "$BODY_LOWER" == *"shadowsocks"* ]] || [[ "$BODY_LOWER" == *"ss"* ]]; then TARGET_PROTO="Shadowsocks"; fi
+              
+              if [ -n "$TARGET_PROTO" ]; then
+                COUNT=$(cat configs/all_configs.json | jq --arg proto "$TARGET_PROTO" '[.[] | select(.protocol == $proto)] | length' 2>/dev/null || echo "0")
+                RESPONSE="🔌 **فیلتر پروتکل: $TARGET_PROTO**
+                
+✅ **$COUNT** کانفیگ پیدا شد!"
+              else
+                # لیست همه پروتکل‌ها
+                ALL_PROTOS=$(cat configs/all_configs.json | jq -r '[.[].protocol // empty] | group_by(.) | map({name: .[0], count: length}) | sort_by(-.count) | .[] | \"• \(.name): \(.count) عدد\"' 2>/dev/null)
+                
+                RESPONSE="🔌 **پروتکل‌های موجود:**
+                
+$ALL_PROTOS
+
+💡 برای فیلتر بنویس:
+\`vless\` , \`vmess\` , \`trojan\` , ..."
+              fi
+            fi
+
+          # ⭐ بهترین کانفیگ‌ها
+          elif [[ "$BODY_LOWER" == *"/best"* ]] || [[ "$BODY_LOWER" == *"بهترین"* ]] || [[ "$BODY_LOWER" == *"سریع"* ]] || [[ "$BODY_LOWER" == *"پینگ"* ]]; then
+            if [ $CONFIG_COUNT -eq 0 ]; then
+              RESPONSE="❌ اول باید کانفیگ جمع‌آوری کنی!
+              
+🔄 بنویس: **آپدیت**"
+            else
+              BEST=$(cat configs/all_configs.json | jq -r 'sort_by(.ping // 9999) | .[0:5] | .[] | \"• \(.protocol // \"N/A\") | \(.server // \"N/A\") | پینگ: \(.ping // \"N/A\")ms\"' 2>/dev/null || echo "اطلاعات موجود نیست")
+              
+              RESPONSE="⭐ **۵ کانفیگ برتر (کمترین پینگ):**
+              
+$BEST
+
+💡 **نکته:** پینگ کمتر = سرعت بهتر
+⚠️ پینگ واقعی ممکن است متفاوت باشد."
+
+            fi
+
+          # 🎲 تصادفی
+          elif [[ "$BODY_LOWER" == *"/random"* ]] || [[ "$BODY_LOWER" == *"تصادفی"* ]] || [[ "$BODY_LOWER" == *"random"* ]]; then
+            if [ $CONFIG_COUNT -eq 0 ]; then
+              RESPONSE="❌ اول باید کانفیگ جمع‌آوری کنی!
+              
+🔄 بنویس: **آپدیت**"
+            else
+              RANDOM_CONFIGS=$(cat configs/all_configs.json | jq -r 'shuffle | .[0:3] | .[] | \"• \(.protocol // \"N/A\") | \(.server // \"N/A\") | \(.isp // \"N/A\")\"' 2>/dev/null || echo "اطلاعات موجود نیست")
+              
+              RESPONSE="🎲 **۳ کانفیگ تصادفی:**
+              
+$RANDOM_CONFIGS
+
+🔄 برای دریافت تصادفی دیگه، دوباره بنویس: **تصادفی**"
+
+            fi
+
+          # ⏰ زمان‌بندی
+          elif [[ "$BODY_LOWER" == *"/time"* ]] || [[ "$BODY_LOWER" == *"زمان"* ]] || [[ "$BODY_LOWER" == *"schedule"* ]] || [[ "$BODY_LOWER" == *"کرون"* ]]; then
+            RESPONSE="⏰ **زمان‌بندی اجرا**
+            
+🔄 **Collector:**
+• هر **۲ ساعت** (00:00, 02:00, 04:00, ...)
+• دستی: هر وقت بخوای با دستور **آپدیت**
+
+🤖 **Agent:**
+• بلافاصله بعد از هر Issue/Comment
+• 24/7 آنلاین
+
+📅 **آخرین اجرای Collector:** $LAST_UPDATE
+📊 **تعداد کانفیگ فعلی:** $CONFIG_COUNT"
+
+          # 📋 لاگ‌ها
+          elif [[ "$BODY_LOWER" == *"/logs"* ]] || [[ "$BODY_LOWER" == *"لاگ"* ]] || [[ "$BODY_LOWER" == *"خطا"* ]] || [[ "$BODY_LOWER" == *"error"* ]]; then
+            RESPONSE="📋 **مشاهده لاگ‌ها**
+            
+برای دیدن لاگ‌های کامل:
+1. برو به تب **Actions**
+2. انتخاب workflow مورد نظر
+3. کلیک روی آخرین اجرا
+4. بخش **logs** رو ببین
+
+📁 **لاگ‌های Collector:** توی Artifact قابل دانلوده (اگه fail شه)"
+
+          # ℹ️ درباره
+          elif [[ "$BODY_LOWER" == *"/about"* ]] || [[ "$BODY_LOWER" == *"درباره"* ]] || [[ "$BODY_LOWER" == *"ربات"* ]] || [[ "$BODY_LOWER" == *"تو کی هستی"* ]]; then
+            RESPONSE="🤖 **درباره GitClaw-V2Ray**
+            
+📌 **نسخه:** 2.0 Pro
+⚡ **نوع:** Rule-based Bot (بدون AI)
+💰 **هزینه:** 100% رایگان!
+🔒 **امنیت:** هیچ داده‌ای به بیرون نمیره
+
+🛠️ **قابلیت‌ها:**
+• جمع‌آوری خودکار کانفیگ V2Ray
+• پشتیبانی از VLESS, VMESS, Trojan, SS
+• فیلتر ISP و پروتکل
+• جستجوی پیشرفته
+• آمار و گزارش‌گیری
+
+👨‍💻 **سازنده:** MahanKenway
+📅 **سال:** 2026
+
+💡 **نکته:** من هوش مصنوعی ندارم ولی سریع، دقیق و رایگانم! 😊"
+
+          # ❤️ تشکر
+          elif [[ "$BODY_LOWER" == *"ممنون"* ]] || [[ "$BODY_LOWER" == *"تشکر"* ]] || [[ "$BODY_LOWER" == *"مرسی"* ]] || [[ "$BODY_LOWER" == *"thanks"* ]] || [[ "$BODY_LOWER" == *"thank you"* ]]; then
+            RESPONSE="❤️ **خواهش می‌کنم $ISSUE_USER عزیز!** 
+            
+خوشحالم که کمک کردم 😊
+
+اگه سوال دیگه‌ای داری، در خدمتم! 👋"
+
+          # 😂 جوک
+          elif [[ "$BODY_LOWER" == *"جوک"* ]] || [[ "$BODY_LOWER" == *"خند"* ]] || [[ "$BODY_LOWER" == *"joke"* ]]; then
+            JOKES=(
+              "چرا کامپیوتر نمی‌تونه دروغ بگه؟ 🤔 چون وقتی کراش می‌کنه، همه چیو لو میده! 😂"
+              "برنامه‌نویس وقتی می‌میره به بهشت میره یا جهنم؟ 🤔 به GitHub! 😂"
+              "چرا V2Ray سریعه؟ 🚀 چون همیشه از فیلتر رد می‌شه! 😎"
+              "Collector ما مثل زنبور عسله 🐝 همیشه داره کانفیگ جمع‌آوری می‌کنه!"
+              "چرا GitHub Actions خسته نیست؟ 😴 چون هر ۲ ساعت یه نفس میکشه! 😂"
+            )
+            RANDOM_JOKE=${JOKES[$RANDOM % ${#JOKES[@]}]}
+            RESPONSE="😂 $RANDOM_JOKE"
+
+          # 🎱 هشت توپ جادویی
+          elif [[ "$BODY_LOWER" == *"/8ball"* ]] || [[ "$BODY_LOWER" == *"هشت توپ"* ]] || [[ "$BODY_LOWER" == *"آینده"* ]] || [[ "$BODY_LOWER" == *"فال"* ]]; then
+            ANSWERS=(
+              "✅ **بله، قطعیه!**"
+              "❌ **خیر، اصلاً!**"
+              "🤔 **شاید...**"
+              "⏳ **صبر کن ببینیم**"
+              "🎯 **احتمال زیاد**"
+              "🌟 **قطعاً آره!**"
+              "😴 **بخواب ببین چی میشه**"
+              "🚀 **بزن بریم!**"
+            )
+            RANDOM_ANSWER=${ANSWERS[$RANDOM % ${#ANSWERS[@]}]}
+            RESPONSE="🎱 **هشت توپ جادویی میگه:**
+            
+$RANDOM_ANSWER"
+
+          # 🏓 پینگ پنگ
+          elif [[ "$BODY_LOWER" == *"پینگ"* ]] && [[ "$BODY_LOWER" == *"پونگ"* ]]; then
+            RESPONSE="🏓 **پونگ!**
+            
+من آماده‌ام! 😎"
+
+          # 🤷 نفهمیدم
+          else
+            RESPONSE="🤔 **متوجه نشدم $ISSUE_USER!**
+            
+من ربات ساده‌ای هستم و همه چی رو نمی‌فهمم 😅
+
+📌 **دستورات پرکاربرد:**
+• **سلام** → خوش‌آمد
+• **آپدیت** → جمع‌آوری کانفیگ
+• **وضعیت** → آمار کانفیگ‌ها
+• **راهنما** → لیست کامل دستورات
+
+💡 **نکته:** من هوش مصنوعی ندارم، فقط کدنویسی شدم! 🤖
+
+چیزی که نوشتی: «$ISSUE_BODY»"
+          fi
+          
+          # ارسال پاسخ نهایی
+          send_response "$RESPONSE"

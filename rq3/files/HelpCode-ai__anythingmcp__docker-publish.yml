@@ -1,0 +1,122 @@
+name: Publish Docker Image
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Image tag override (leave empty for default tagging)"
+        required: false
+        type: string
+
+jobs:
+  publish:
+    name: Build & Push to Docker Hub
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Extract metadata (tags, labels)
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: helpcodeai/anythingmcp
+          tags: |
+            # always tag as latest
+            type=raw,value=latest
+            # version tag from workflow input (if provided)
+            type=raw,value=${{ inputs.tag }},enable=${{ inputs.tag != '' }}
+            # short SHA for traceability
+            type=sha,prefix=
+
+      # The frontend build uploads its source maps to Sentry when this token is
+      # present. Set is not the same as valid (the website's first token got
+      # 401 while "set"), so ask the API up front and warn on the run.
+      # Never prints the token; never blocks the publish.
+      - name: Check the Sentry token for the source map upload
+        env:
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+        run: |
+          if [ -z "$SENTRY_AUTH_TOKEN" ]; then
+            echo "::warning::SENTRY_AUTH_TOKEN is not set: cloud frontend stack traces in Sentry will be minified"
+            exit 0
+          fi
+          code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 \
+            -H "Authorization: Bearer $SENTRY_AUTH_TOKEN" \
+            "https://de.sentry.io/api/0/organizations/helpcodeai-gmbh/releases/?per_page=1" || true)
+          if [ "$code" = "200" ]; then
+            echo "SENTRY_AUTH_TOKEN accepted — source maps will be uploaded for release ${{ github.sha }}"
+          else
+            echo "::warning::Sentry rejected SENTRY_AUTH_TOKEN: HTTP $code. Source maps will not upload."
+          fi
+
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          build-args: |
+            SENTRY_RELEASE=${{ github.sha }}
+          # Only the source map upload uses it; nothing Sentry-related that
+          # decides where an instance reports is baked into the public image.
+          secrets: |
+            sentry_auth_token=${{ secrets.SENTRY_AUTH_TOKEN }}
+          # arm64 dropped: Prisma 7.8.0's WASM schema engine misparses
+          # `onDelete: Cascade` on linux/arm64 (reads it as empty),
+          # blocking `prisma generate`. Production runs on amd64 droplets;
+          # re-add arm64 once Prisma ships a fix (track upstream).
+          platforms: linux/amd64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Read rather than hardcode. The count used to be written into the line
+      # below, which meant every adapter PR — including every one from a fork —
+      # had a legitimate reason to edit this workflow. A one-character change
+      # in a workflow file is the easiest place in the repository to hide a
+      # malicious one, and it was arriving as routine noise on PRs whose
+      # subject was a JSON file. Now nothing under .github/ quotes the number,
+      # so an edit here is never routine.
+      - name: Read the catalog count
+        id: catalog
+        run: |
+          set -euo pipefail
+          echo "adapters=$(node scripts/adapter-count.mjs | jq -er .adapters)" >> "$GITHUB_OUTPUT"
+
+      - name: Update Docker Hub description from README
+        uses: peter-evans/dockerhub-description@v5
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          repository: helpcodeai/anythingmcp
+          readme-filepath: ./README.md
+          # Docker Hub caps this at 100 characters and shows it in search
+          # results; the repo's was left at the truncated default.
+          short-description: "${{ steps.catalog.outputs.adapters }} connectors + any REST/SOAP/GraphQL/SQL as MCP tools for Claude & ChatGPT. Self-hosted, AGPL."
+
+      - name: Set Docker Hub categories
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          TOKEN=$(curl -s -X POST "https://hub.docker.com/v2/users/login/" \
+            -H "Content-Type: application/json" \
+            -d "{\"username\":\"$DOCKERHUB_USERNAME\",\"password\":\"$DOCKERHUB_TOKEN\"}" \
+            | jq -r '.token')
+          curl -s -X PATCH "https://hub.docker.com/v2/repositories/helpcodeai/anythingmcp/" \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Content-Type: application/json" \
+            -d '{"categories": [{"slug": "api-management"}, {"slug": "integration-and-delivery"}]}'

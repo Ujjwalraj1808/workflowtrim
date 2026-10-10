@@ -1,0 +1,72 @@
+name: Update code-server
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        type: string
+        required: true
+  schedule:
+    - cron: "0 16,21 * * *"
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ inputs.version }}
+      GH_TOKEN: ${{ secrets.HOMEBREW_GITHUB_API_TOKEN }}
+
+    steps:
+      - name: Fetch latest tag
+        if: env.TAG == ''
+        run: |
+          tag=$(curl -fsSLI -o /dev/null -w "%{url_effective}" https://github.com/microsoft/vscode/releases/latest)
+          tag="${tag#https://github.com/microsoft/vscode/releases/tag/}"
+          echo "TAG=$tag" >> $GITHUB_ENV
+
+      - name: Remove leading v from tag
+        run: |
+          echo "VERSION=${TAG#v}" >> $GITHUB_ENV
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          submodules: true
+
+      - name: Check current version
+        id: check
+        run: |
+          commit="$(git -C lib/vscode rev-parse HEAD)"
+          if [[ $(git -C lib/vscode ls-remote --tags | grep "$commit") == */"$VERSION" ]] ; then
+            echo "$VERSION update has already been merged into $(git rev-parse --abbrev-ref HEAD)"
+            echo done=true >> $GITHUB_OUTPUT
+          elif git ls-remote --exit-code --heads origin "update/$VERSION" ; then
+            echo "There is already a PR for updating to $VERSION"
+            echo done=true >> $GITHUB_OUTPUT
+          else
+            echo "$VERSION update has not started yet"
+            echo done=false >> $GITHUB_OUTPUT
+          fi
+
+      - uses: awalsh128/cache-apt-pkgs-action@553a35bb8ebd9fcabcb1c9451aa4c98e1b4ca8a9 # latest
+        if: steps.check.outputs.done == 'false'
+        with:
+          packages: quilt
+          version: 1.0
+
+      - run: ./ci/build/update-vscode.sh
+        if: steps.check.outputs.done == 'false'
+
+      - name: Open PR
+        if: steps.check.outputs.done == 'false'
+        run: |
+          git config --global user.name cdrci
+          git config --global user.email opensource@coder.com
+          git checkout -b "update/$VERSION"
+          git add .
+          git commit -m "Update Code to $VERSION"
+          git push -u origin "$(git branch --show)"
+          gh pr create \
+            --repo coder/code-server \
+            --title "Update Code to $VERSION" \
+            --body-file .cache/checklist \
+            --draft

@@ -1,0 +1,16 @@
+name: Synchronize to Gitee
+on: [push]
+jobs:
+  repo-sync:
+    if: github.repository == '1Panel-dev/1Panel'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mirror the Github organization repos to Gitee.
+        uses: Yikun/hub-mirror-action@ba51c01b28a6c9f95a25d4f1bcf6af2a147c0e18 # master
+        with:
+          src: 'github/1Panel-dev'
+          dst: 'gitee/fit2cloud-feizhiyun'
+          dst_key: ${{ secrets.GITEE_PRIVATE_KEY }}
+          dst_token:  ${{ secrets.GITEE_TOKEN }}
+          static_list: "1Panel"
+          force_update: true

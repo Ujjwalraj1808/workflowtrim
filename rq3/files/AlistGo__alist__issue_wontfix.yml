@@ -1,0 +1,32 @@
+name: Issue Wontfix
+
+on:
+  issues:
+    types: [labeled]
+
+permissions:
+  issues: write
+
+jobs:
+  lock-issue:
+    runs-on: ubuntu-latest
+    if: github.event.label.name == 'wontfix'
+    steps:
+      - name: Comment and close
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const user = context.payload.issue.user.login;
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: `Hello @${user}, this issue will not be worked on and will be closed.\n你好 @${user}，这不会被处理，将被关闭。`,
+            });
+            await github.rest.issues.update({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              state: 'closed',
+              state_reason: 'not_planned',
+            });

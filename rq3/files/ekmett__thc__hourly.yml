@@ -1,0 +1,47 @@
+# SPDX-FileCopyrightText: 2026 Edward Kmett
+# SPDX-License-Identifier: UPL-1.0 AND BSD-3-Clause
+
+name: Hourly
+on:
+  schedule:
+    - cron: '31 * * * *'
+  workflow_dispatch:
+    inputs:
+      expected_sha:
+        description: Expected source commit (empty uses this run's commit)
+        type: string
+        required: false
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  automation:
+    uses: ./.github/workflows/checks.yml
+    with:
+      cadence: hourly
+      expected_sha: ${{ inputs.expected_sha || github.sha }}
+  jvm-linux:
+    needs: automation
+    name: Linux ordinary tests
+    uses: ./.github/workflows/test-groups.yml
+    with:
+      os: ubuntu-latest
+      expected_sha: ${{ inputs.expected_sha || github.sha }}
+      cadence: hourly
+  jvm-macos:
+    needs: automation
+    name: macOS ordinary tests
+    uses: ./.github/workflows/test-groups.yml
+    with:
+      os: macos-26
+      expected_sha: ${{ inputs.expected_sha || github.sha }}
+      cadence: hourly
+  windows:
+    needs: automation
+    name: Windows tests
+    uses: ./.github/workflows/windows.yml
+    with:
+      testGroup: Runtime

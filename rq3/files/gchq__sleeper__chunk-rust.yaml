@@ -1,0 +1,43 @@
+name: Build Rust Modules
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/chunk-rust.yaml'
+      - '.github/workflows/chunk.yaml'
+      - '.github/config/chunks.yaml'
+      - 'code-style/checkstyle*.xml'
+      - 'code-style/spotbugs*.xml'
+      - 'rust/**'
+      - 'java/pom.xml'
+      - 'java/query/pom.xml'
+      - 'java/compaction/pom.xml'
+      - 'java/analytics-integration/pom.xml'
+      - 'java/common/pom.xml'
+      - 'java/query/query-datafusion/**'
+      - 'java/compaction/compaction-datafusion/**'
+      - 'java/analytics-integration/athena/**'
+      - 'java/common/foreign-bridge/**'
+      - 'java/compaction/compaction-core/**'
+      - 'java/query/query-runner/**'
+      - 'java/query/query-core/**'
+      - 'java/partitions/splitter/**'
+      - 'java/ingest/ingest-runner/**'
+      - 'java/common/parquet/**'
+      - 'java/common/arrow/**'
+      - 'java/statestore/**'
+      - 'java/common/common-job/**'
+      - 'java/ingest/ingest-tracker/**'
+      - 'java/example-iterators/**'
+      - 'java/common/sketches/**'
+      - 'java/configuration/**'
+      - 'java/ingest/ingest-core/**'
+      - 'java/common/dynamodb-tools/**'
+      - 'java/common/localstack-test/**'
+      - 'java/core/**'
+
+jobs:
+  chunk-workflow:
+    uses: ./.github/workflows/chunk.yaml
+    with:
+      chunkId: rust
+      skipRust: false

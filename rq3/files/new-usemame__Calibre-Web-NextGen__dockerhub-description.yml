@@ -1,0 +1,45 @@
+name: Update Docker Hub Description
+# Manually mirrors the README to a DockerHub repo. This fork publishes
+# to GHCR, not DockerHub, so the workflow is dispatch-only and
+# additionally gated on DOCKERHUB_USERNAME being present — operators
+# without DockerHub creds get a clean no-op instead of a red run.
+#
+# Backports CWA #1254's "make CI not fail when DockerHub creds are
+# missing" pattern (issue #152). The build pipeline itself is already
+# GHCR-only and already gates DockerHub on vars.DOCKERHUB_PUSH_ENABLED;
+# this is the remaining surface that touches DockerHub at all.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  dockerHubDescription:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Probe DockerHub creds
+      id: probe
+      env:
+        DH_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+      run: |
+        if [ -n "$DH_USER" ]; then
+          echo "have_creds=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "have_creds=false" >> "$GITHUB_OUTPUT"
+          echo "::notice::DOCKERHUB_USERNAME not set; skipping DockerHub description sync."
+        fi
+
+    - uses: actions/checkout@v7
+      if: steps.probe.outputs.have_creds == 'true'
+
+    - name: Docker Hub Description
+      if: steps.probe.outputs.have_creds == 'true'
+      uses: peter-evans/dockerhub-description@v5
+      with:
+        username: ${{ secrets.DOCKERHUB_USERNAME }}
+        password: ${{ secrets.DOCKERHUB_PASSWORD }}
+        repository: ${{ vars.DOCKERHUB_REPOSITORY || 'crocodilestick/calibre-web-automated' }}
+        short-description: ${{ github.event.repository.description }}
+        enable-url-completion: true

@@ -1,0 +1,167 @@
+name: Build and test JavaScript
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  testing:
+    env:
+      REPORT_DIR: reports
+    name: Run tests
+    runs-on: 'ubuntu-latest'
+    strategy:
+      matrix:
+        node-version:
+          - 22
+          - 24
+          - 26
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # 7.0.1
+      - name: Set up node ${{ matrix.node-version }}
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # 7.0.0
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: 'npm'
+      - name: Install dependencies
+        run: npm ci
+      - name: Run JavaScript tests
+        env:
+          JEST_JUNIT_OUTPUT_DIR: ${{ env.REPORT_DIR }}
+        run: npm run test
+
+  coverage:
+    env:
+      REPORT_DIR: reports
+    name: Upload coverage
+    runs-on: 'ubuntu-latest'
+    strategy:
+      matrix:
+        node-version:
+          - 24
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # 7.0.1
+      - name: Set up node ${{ matrix.node-version }}
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # 7.0.0
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: 'npm'
+      - name: Install dependencies
+        run: npm ci
+      - name: Run JavaScript tests
+        run: npm run test:coverage -- --reporter=default --reporter=junit --outputFile=${{ env.REPORT_DIR }}/test-report.xml
+      - name: Submit test coverage to codecov.io
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: false
+
+  linting:
+    name: Linting
+    runs-on: 'ubuntu-latest'
+    strategy:
+      matrix:
+        node-version:
+          - 22
+          - 24
+          - 26
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # 7.0.1
+      - name: Set up node ${{ matrix.node-version }}
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # 7.0.0
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: 'npm'
+      - name: Install dependencies
+        run: npm ci
+      - name: Lint files
+        run: |
+          set -o pipefail
+          echo "## Linting JavaScript files" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          npm run lint | tee -a $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+        shell: bash
+
+  typecheck:
+    name: Typecheck
+    runs-on: 'ubuntu-latest'
+    strategy:
+      matrix:
+        node-version:
+          - 22
+          - 24
+          - 26
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # 7.0.1
+      - name: Set up node ${{ matrix.node-version }}
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # 7.0.0
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: 'npm'
+      - name: Install dependencies
+        run: npm ci
+      - name: Run TypeScript typecheck
+        run: npm run type-check
+
+  translations:
+    name: Check translations
+    runs-on: 'ubuntu-latest'
+    strategy:
+      matrix:
+        node-version:
+          - 24
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # 7.0.1
+      - name: Set up node ${{ matrix.node-version }}
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # 7.0.0
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: 'npm'
+      - name: Install dependencies
+        run: npm ci
+      - name: Check if translations need an update
+        id: check
+        run: npm run i18n-extract -- --ci
+      - if: ${{ failure() && steps.check.outcome == 'failure' }}
+        run: |
+          echo "Translations are not up to date." >> $GITHUB_STEP_SUMMARY
+          echo 'Please run `npm run i18n-extract` and update the translation files.' >> $GITHUB_STEP_SUMMARY
+
+  format:
+    name: Check formatting
+    runs-on: 'ubuntu-latest'
+    strategy:
+      matrix:
+        node-version:
+          - 24
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # 7.0.1
+      - name: Set up node ${{ matrix.node-version }}
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # 7.0.0
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: 'npm'
+      - name: Install dependencies
+        run: npm ci
+      - name: Check code formatting
+        id: check
+        run: |
+          set -o pipefail
+          echo "## Formatting JavaScript/TypeScript files" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          npm run format-check | tee -a $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+        shell: bash
+      - if: ${{ failure() && steps.check.outcome == 'failure' }}
+        run: |
+          echo "Code formatting is not up to date." >> $GITHUB_STEP_SUMMARY
+          echo 'Please run `npm run format` and update the affected files.' >> $GITHUB_STEP_SUMMARY

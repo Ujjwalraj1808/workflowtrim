@@ -1,0 +1,354 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+env:
+  GO_VERSION: "1.26.3"
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  # ============================================================================
+  # RELEASE - Build and publish release artifacts
+  # ============================================================================
+  release:
+    name: Release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify release commit is on main
+        run: |
+          git fetch --no-tags origin '+refs/heads/main:refs/remotes/origin/main'
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::Release tags must point to a commit reachable from origin/main"
+            exit 1
+          fi
+
+      - name: Extract version
+        id: version
+        run: echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
+        with:
+          cosign-release: "v2.5.2"
+
+      - name: Install Syft (for SBOM)
+        uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0
+        with:
+          syft-version: "v1.46.0"
+
+      - name: Run GoReleaser
+        id: goreleaser
+        uses: goreleaser/goreleaser-action@e435ccd777264be153ace6237001ef4d979d3a7a # v6
+        with:
+          distribution: goreleaser
+          version: "v2.17.0"
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HOMEBREW_TAP_GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
+          SCOOP_GITHUB_TOKEN: ${{ secrets.SCOOP_GITHUB_TOKEN }}
+
+      # ----------------------------------------------------------------
+      # Verify Homebrew cask caveats use heredoc syntax.
+      # GoReleaser v2 now natively generates <<~EOS heredocs for caveats
+      # (goreleaser/goreleaser#6460), so no patching is needed.
+      # This step just verifies the generated cask is correct.
+      # See: https://github.com/Dicklesworthstone/ntm/issues/91
+      # ----------------------------------------------------------------
+      - name: Verify Homebrew cask caveats
+        env:
+          HOMEBREW_TAP_GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          CASK="Casks/ntm.rb"
+          REPO_URL="https://x-access-token:${HOMEBREW_TAP_GITHUB_TOKEN}@github.com/Dicklesworthstone/homebrew-tap.git"
+
+          git clone --depth 1 "$REPO_URL" homebrew-tap-verify
+          cd homebrew-tap-verify
+
+          if [ ! -f "$CASK" ]; then
+            echo "::warning::$CASK not found in homebrew-tap — skipping caveats verification"
+            exit 0
+          fi
+
+          # Verify caveats use heredoc syntax (not double-quoted strings)
+          if grep -q '<<~EOS' "$CASK"; then
+            echo "Cask caveats use heredoc syntax — OK"
+          else
+            echo "::error::Cask caveats do not use heredoc syntax — GoReleaser may have regressed. See ntm#91."
+            exit 1
+          fi
+
+          # Verify Ruby syntax if ruby is available
+          if command -v ruby >/dev/null 2>&1; then
+            ruby -c "$CASK" || { echo "::error::Ruby syntax check failed on generated cask"; exit 1; }
+            echo "Ruby syntax check passed"
+          fi
+
+      - name: Upload Release Artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-artifacts
+          path: dist/
+          retention-days: 30
+
+      # Generate attestations for release artifacts
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        continue-on-error: true  # Don't fail if attestation fails
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/checksums.txt
+
+  # ============================================================================
+  # DOCKER - Build and push multi-arch container images
+  # ============================================================================
+  docker:
+    name: Docker Images
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    needs: release
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+        with:
+          image: docker.io/tonistiigi/binfmt@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+        with:
+          version: "v0.35.0"
+          driver-opts: image=moby/buildkit@sha256:6b59b7df63a8cb9902736f9ddf7fcff8261613d3e7449b8ea8b7537fc399c03a
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=sha
+
+      - name: Check for Dockerfile
+        id: dockerfile
+        run: |
+          if [ -f Dockerfile ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "No Dockerfile found, skipping Docker build"
+          fi
+
+      - name: Extract Docker build metadata
+        id: docker_meta_args
+        run: echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push
+        if: steps.dockerfile.outputs.exists == 'true'
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ needs.release.outputs.version }}
+            COMMIT=${{ github.sha }}
+            DATE=${{ steps.docker_meta_args.outputs.date }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: true
+          sbom: true
+
+  # ============================================================================
+  # VERIFY - Verify release artifacts
+  # ============================================================================
+  verify:
+    name: Verify Release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    needs: release
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-artifacts
+          path: dist/
+
+      - name: List artifacts
+        run: |
+          echo "Release artifacts:"
+          ls -la dist/
+          echo ""
+          echo "Checksums:"
+          cat dist/checksums.txt || true
+
+      - name: Verify checksums
+        run: |
+          cd dist
+          if [ -f checksums.txt ]; then
+            echo "Verifying SHA256 checksums..."
+            sha256sum -c checksums.txt --ignore-missing
+            echo "All checksums verified successfully"
+          else
+            echo "No checksums.txt found"
+            exit 1
+          fi
+
+      - name: Verify archive contents
+        run: |
+          cd dist
+          echo "Verifying archive contents..."
+          for archive in *.tar.gz; do
+            if [ -f "$archive" ]; then
+              echo "Contents of $archive:"
+              tar -tzf "$archive" | head -20
+              echo ""
+            fi
+          done
+          for archive in *.zip; do
+            if [ -f "$archive" ]; then
+              echo "Contents of $archive:"
+              unzip -l "$archive" | head -20
+              echo ""
+            fi
+          done
+
+  # ============================================================================
+  # UPGRADE-VERIFY - Verify upgrade command works on all platforms
+  # This catches asset naming mismatches between upgrade.go and GoReleaser
+  # ============================================================================
+  upgrade-verify:
+    name: Verify Upgrade (${{ matrix.os }})
+    needs: release
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            goos: linux
+            goarch: amd64
+          - os: macos-15
+            goos: darwin
+            goarch: arm64
+          - os: macos-15-intel
+            goos: darwin
+            goarch: amd64
+          - os: windows-2025
+            goos: windows
+            goarch: amd64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Build ntm
+        run: go build -trimpath -ldflags "-X github.com/Dicklesworthstone/ntm/internal/cli.Version=0.0.0" -o ntm ./cmd/ntm
+
+      - name: Verify strict upgrade asset resolution
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          echo "Testing upgrade --check on ${{ matrix.goos }}/${{ matrix.goarch }}"
+          ./ntm upgrade --check --strict --release-tag="${GITHUB_REF_NAME}" 2>&1 | tee upgrade_output.txt
+          grep -q "Asset available:" upgrade_output.txt
+          echo "Strict asset naming contract verified for ${{ matrix.goos }}/${{ matrix.goarch }}"
+
+  # ============================================================================
+  # ANNOUNCE - Post-release notifications
+  # ============================================================================
+  announce:
+    name: Announce Release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    needs: [release, verify, upgrade-verify, docker]
+    steps:
+      - name: Get release info
+        id: release
+        run: |
+          echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          echo "Released ${GITHUB_REF#refs/tags/}"
+
+      - name: Create release summary
+        run: |
+          {
+            echo "# Release ${{ steps.release.outputs.tag }}"
+            echo ""
+            echo "## Installation"
+            echo ""
+            echo '```bash'
+            echo "# Quick install"
+            echo "curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/ntm/main/install.sh | bash -s -- --version=${{ steps.release.outputs.tag }}"
+            echo ""
+            echo "# Homebrew"
+            echo "brew install dicklesworthstone/tap/ntm"
+            echo ""
+            echo "# Source build"
+            echo "git clone --branch ${{ steps.release.outputs.tag }} --depth 1 https://github.com/Dicklesworthstone/ntm.git"
+            echo "cd ntm && go install ./cmd/ntm"
+            echo '```'
+            echo ""
+            echo "## Verification"
+            echo ""
+            echo "All release artifacts have been verified:"
+            echo "- SHA256 checksums validated"
+            echo "- Upgrade command tested on Linux, macOS, and Windows"
+            echo "- Docker images built with SBOM and provenance"
+          } >> "$GITHUB_STEP_SUMMARY"

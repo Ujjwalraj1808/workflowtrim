@@ -1,0 +1,81 @@
+name: Windows Tests
+
+on:
+  pull_request:
+    branches:
+      - main
+      - docusaurus-v**
+    paths:
+      - package.json
+      - pnpm-lock.yaml
+      - vitest.config.ts
+      - test/**
+      - packages/**
+      - tsconfig.*.json
+      - .github/workflows/tests-windows.yml
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  windows-test:
+    name: Windows Tests
+    timeout-minutes: 30
+    runs-on: windows-8-core
+    strategy:
+      matrix:
+        node: ['24.21', '26']
+    steps:
+      - name: Support longpaths
+        run: git config --system core.longpaths true
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Install pnpm
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+      - name: Use Node.js ${{ matrix.node }}
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ matrix.node }}
+          cache: pnpm
+      - name: Installation
+        run: pnpm install --frozen-lockfile || pnpm install --frozen-lockfile || pnpm install --frozen-lockfile
+      - name: Docusaurus Tests
+        run: pnpm test
+      - name: Create a deep path
+        # https://github.com/facebook/docusaurus/pull/4899
+        # https://github.com/facebook/docusaurus/issues/5793
+        run: |
+          mkdir -p "website/_dogfooding/_pages tests/deep-file-path-test/bar/foo/bar/foo/bar/foo/bar/foo/bar/foo/bar/foo/bar/foo/bar/foo/bar/foo/bar/foo/bar/foo/bar/foo/bar/foo/bar/foo/bar/foo/bar/foo/bar/foo/bar/foo/bar/foo/bar/foo/bar/foo/bar/foo/bar/foo/bar/foo/bar/foo/bar/foo/bar/foo/bar/foo/bar/foo/bar/foo/bar/foo/bar"
+          cd "$_"
+          echo "# hello" > test-file.md
+      # Lightweight version of tests-swizzle.yml workflow, but for Windows
+      - name: Swizzle Wrap TS
+        run: pnpm --filter website test:swizzle:wrap:ts
+      - name: Docusaurus Build
+        run: pnpm build:website:fast
+        env:
+          DOCUSAURUS_PERF_LOGGER: 'true'
+
+      - name: TypeCheck website
+        # see https://github.com/facebook/docusaurus/pull/10486
+        run: pnpm --filter website typecheck
+
+      - name: TypeCheck website - min version - v6.0
+        # We call the "typescript" package compiler explicitly, because the
+        # root "tsc" bin comes from "@typescript/native" (pinned TS 7)
+        run: |
+          pnpm add typescript@6.0 --save-exact -D -w --ignore-scripts
+          node node_modules/typescript/bin/tsc --version
+          node node_modules/typescript/bin/tsc --project website/tsconfig.json
+
+      - name: TypeCheck website - max version - Latest
+        # For latest TS there are often lib check errors, so we disable it
+        # Details: https://github.com/facebook/docusaurus/pull/10486
+        run: |
+          pnpm add typescript@latest --save-exact -D -w --ignore-scripts
+          node node_modules/typescript/bin/tsc --version
+          node node_modules/typescript/bin/tsc --project website/tsconfig.skipLibCheck.json

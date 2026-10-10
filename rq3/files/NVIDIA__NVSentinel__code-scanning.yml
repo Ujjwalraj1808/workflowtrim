@@ -1,0 +1,113 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: "CodeQL"
+
+on:
+  push:
+    branches:
+      - main
+      - "pull-request/[0-9]+"
+    tags:
+      - 'v*'
+  workflow_call: {}
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  codeql-pr-analysis:
+    if: github.repository == 'nvidia/nvsentinel' && startsWith(github.ref, 'refs/heads/pull-request/')
+    name: CodeQL PR Analysis
+    runs-on: linux-amd64-cpu32
+    timeout-minutes: 360
+    permissions:
+      security-events: write
+      packages: read
+      pull-requests: write   # Required for posting comments
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+    - name: Setup build environment
+      uses: ./.github/actions/setup-ci-env
+
+    - name: Initialize CodeQL
+      uses: github/codeql-action/init@17783bfb99b07f70fae080b654aed0c514057477  # v2.23.3
+      with:
+        languages: go
+        build-mode: manual
+      env:
+        CODEQL_EXTRACTOR_GO_BUILD_TRACING: on
+
+    - name: Build with CodeQL
+      run: |
+        make build-all
+
+    - name: Perform CodeQL Analysis
+      uses: github/codeql-action/analyze@17783bfb99b07f70fae080b654aed0c514057477  # v2.23.3
+      with:
+        category: "/language:go"
+
+    - name: Post CodeQL Results to PR
+      if: startsWith(github.ref, 'refs/heads/pull-request/')
+      run: |
+        PR_NUM="${{ github.ref }}"
+        PR_NUM="${PR_NUM##*/}"
+
+        ALERTS=$(gh api "repos/${{ github.repository }}/code-scanning/alerts?ref=${{ github.ref }}&state=open" --jq 'length')
+
+        # Only comment if security issues are found
+        if [[ "$ALERTS" -gt 0 ]]; then
+          REPORT="## 🛡️ CodeQL Analysis\n🚨 Found **$ALERTS** security alert(s)\n\n🔗 [View details](https://github.com/${{ github.repository }}/security/code-scanning?query=is%3Aopen+branch%3A${{ github.ref_name }})"
+          echo -e "$REPORT" | gh pr comment "$PR_NUM" --body-file=-
+        else
+          echo "No security issues found - skipping PR comment"
+        fi
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  codeql-baseline-analysis:
+    if: github.repository == 'nvidia/nvsentinel' && github.ref == 'refs/heads/main' && github.event_name == 'push'
+    name: CodeQL Baseline Analysis
+    runs-on: linux-amd64-cpu4
+    timeout-minutes: 360
+    permissions:
+      security-events: write
+      packages: read
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+    - name: Setup build environment
+      uses: ./.github/actions/setup-ci-env
+
+    - name: Initialize CodeQL
+      uses: github/codeql-action/init@17783bfb99b07f70fae080b654aed0c514057477  # v2.23.3
+      with:
+        languages: go
+        build-mode: manual
+      env:
+        CODEQL_EXTRACTOR_GO_BUILD_TRACING: on
+
+    - name: Build with CodeQL
+      run: |
+        make build-all
+
+    - name: Perform CodeQL Analysis
+      uses: github/codeql-action/analyze@17783bfb99b07f70fae080b654aed0c514057477  # v2.23.3
+      with:
+        category: "/language:go"

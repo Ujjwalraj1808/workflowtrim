@@ -1,0 +1,192 @@
+# For fork PRs only: org members trigger E2E runs by commenting /allow <commit-sha> on the PR.
+# (Same-repo PRs from collaborators run CI automatically via pull_request_target.)
+#
+# Flow: Maintainer comments "/allow <commit-sha>" → we verify the provided SHA matches
+# the current PR HEAD (prevents approving stale code), verify the SHA was seen by GitHub
+# before the comment (TOCTOU using check suite created_at; server-side, not spoofable),
+# then dispatch "e2e".  Requiring the SHA forces the maintainer to identify the exact
+# revision they reviewed before granting secret access to fork code.
+
+name: PR Comment Commands
+
+on:
+  issue_comment:
+    types: [created]
+
+jobs:
+  handle-command:
+    name: Handle /allow
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # required for repos.createDispatchEvent
+      pull-requests: read
+      checks: read      # list check suites for ref (when GitHub first saw this SHA)
+      issues: write     # for reactions and posting error comments
+    if: |
+      github.event.issue.pull_request &&
+      startsWith(github.event.comment.body, '/allow') &&
+      contains(fromJson('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)
+    steps:
+      - name: Verify Security & Get PR Details
+        id: pr
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3  # v9
+        with:
+          script: |
+            // 1. Parse the commit SHA from the comment body ("/allow <commit-sha>").
+            const parts = context.payload.comment.body.trim().split(/\s+/);
+            const providedSha = parts.length >= 2 ? parts[1] : '';
+
+            // 2. Fetch PR to get the current HEAD SHA.
+            const pr = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number
+            });
+            const headSha = pr.data.head.sha;
+
+            // 3. Validate: must be present, hex-only, 7–40 chars (rejects branch names/tags).
+            if (!providedSha) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: [
+                  "⚠️ **Missing commit SHA.** Usage: `/allow <commit-sha>`",
+                  "",
+                  "Copy the full commit SHA from the PR's **Commits** tab and include it:",
+                  "```",
+                  `/allow ${headSha}`,
+                  "```",
+                  "This ensures you are approving a specific, reviewed revision."
+                ].join("\n")
+              });
+              core.setFailed("No commit SHA provided.");
+              return;
+            }
+
+            // Full 40-char hex SHA required: rejects branches, tags, and abbreviated SHAs
+            // (short prefixes are collision-feasible and could match a different commit).
+            if (!/^[0-9a-f]{40}$/i.test(providedSha)) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: [
+                  `⚠️ **Invalid commit SHA.** \`${providedSha}\` is not a full 40-character commit SHA.`,
+                  "",
+                  "Copy the **full** commit SHA from the PR's **Commits** tab.",
+                  "Abbreviated SHAs, branch names, and tags are not accepted."
+                ].join("\n")
+              });
+              core.setFailed("Invalid ref format — must be a full 40-character hex commit SHA.");
+              return;
+            }
+
+            // 4. Provided SHA must exactly match the current PR HEAD.
+            if (headSha.toLowerCase() !== providedSha.toLowerCase()) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: [
+                  "⚠️ **SHA mismatch.** The commit you approved is not the current PR head.",
+                  "",
+                  `You provided: \`${providedSha}\``,
+                  `Current HEAD: \`${headSha}\``,
+                  "",
+                  "The PR may have been updated since you last reviewed it.",
+                  "Please review the latest changes and comment `/allow` again with the new SHA."
+                ].join("\n")
+              });
+              core.setFailed("Provided SHA does not match current PR HEAD.");
+              return;
+            }
+
+            console.log(`SHA verified: provided=${providedSha}, HEAD=${headSha}`);
+
+            // 5. TOCTOU: ensure the SHA was seen by GitHub before the /allow comment.
+            const { data: suitesData } = await github.rest.checks.listSuitesForRef({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: headSha,
+              per_page: 100
+            });
+
+            // Diagnostic only: checks.create on the later dispatch run attaches to the
+            // oldest Actions suite on this SHA. Log the inventory so we can see which
+            // suite that was without changing dispatch behavior.
+            try {
+              const suites = [...(suitesData.check_suites || [])].sort(
+                (a, b) => new Date(a.created_at) - new Date(b.created_at)
+              );
+              core.info(`e2e-diag check suites on HEAD: total_count=${suitesData.total_count} returned=${suites.length}`);
+              if (suitesData.total_count > suites.length) {
+                core.warning(
+                  `e2e-diag suite inventory incomplete: total_count=${suitesData.total_count} returned=${suites.length}; ` +
+                  `oldest_gha_suite may not be the true oldest on this SHA`
+                );
+              }
+              for (const s of suites) {
+                const app = s.app || {};
+                core.info(
+                  `e2e-diag suite id=${s.id} created=${s.created_at} app=${app.id}/${app.slug} ` +
+                  `status=${s.status}/${s.conclusion} latest_runs=${s.latest_check_runs_count} ` +
+                  `head_branch=${s.head_branch}`
+                );
+              }
+              const gha = suites.filter(s => (s.app || {}).slug === 'github-actions');
+              if (gha.length) {
+                core.info(`e2e-diag oldest github-actions suite (likely checks.create target): id=${gha[0].id} created=${gha[0].created_at}`);
+              }
+            } catch (err) {
+              core.warning(`e2e-diag suite inventory logging failed: ${err.message}`);
+            }
+
+            let shaFirstSeenAt;
+            if (suitesData.total_count > 0 && suitesData.check_suites.length > 0) {
+              const createdDates = suitesData.check_suites.map(s => new Date(s.created_at).getTime());
+              shaFirstSeenAt = new Date(Math.min(...createdDates));
+            } else {
+              shaFirstSeenAt = new Date();
+            }
+
+            const commentTime = new Date(context.payload.comment.created_at);
+            core.info(`Comment: ${commentTime.toISOString()}, SHA first seen: ${shaFirstSeenAt.toISOString()}`);
+
+            if (shaFirstSeenAt > new Date(commentTime.getTime() + 2000)) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: [
+                  "⚠️ **Security Halt:** The code revision is newer than your `/allow` command.",
+                  "",
+                  "To prevent testing unreviewed code, this run has been aborted.",
+                  "Please review the new changes and comment `/allow <commit-sha>` again with the updated SHA."
+                ].join("\n")
+              });
+              core.setFailed("Aborting: TOCTOU (SHA is newer than comment).");
+              return;
+            }
+
+            core.setOutput('number', pr.data.number);
+            core.setOutput('head_sha', headSha);
+
+      - name: Trigger E2E workflows
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3  # v9
+        env:
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+          TRIGGERED_BY: ${{ github.event.comment.user.login }}
+        with:
+          script: |
+            await github.rest.repos.createDispatchEvent({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              event_type: 'e2e',
+              client_payload: {
+                pr_number: parseInt(process.env.PR_NUMBER),
+                head_sha: process.env.HEAD_SHA,
+                triggered_by: process.env.TRIGGERED_BY
+              }
+            });

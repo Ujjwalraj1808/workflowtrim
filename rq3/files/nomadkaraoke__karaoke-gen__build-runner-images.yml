@@ -1,0 +1,327 @@
+name: Build GHA Runner Images
+
+# Produces the custom GCE images used by the ephemeral GitHub Actions runner
+# dispatcher: gha-runner-general, gha-runner-build, gha-runner-gpu,
+# gha-runner-gpu-windows.
+#
+# Flow per variant:
+#   1. Create a temporary build VM from the variant's base image with the
+#      variant's provisioning script as its startup script:
+#        - Linux variants:  debian-12 + runner-image-provision.sh (startup-script)
+#        - gpu-windows:     windows-2022 + runner-image-provision.ps1
+#                           (windows-startup-script-ps1)
+#   2. Poll the serial console for the READY/FAILED marker (survives reboots).
+#   3. Stop the VM, snapshot its boot disk to a new image in the `gha-runner-<variant>`
+#      image family with name gha-runner-<variant>-<timestamp>.
+#   4. Delete the build VM (boot disk auto-deletes).
+#   5. Delete older images in the family, keeping only the newest (GPU/windows images
+#      are 15-21 GiB each; roll back by re-running this workflow at an older ref).
+
+on:
+  workflow_dispatch:
+    inputs:
+      variants:
+        description: 'Comma-separated variants to build (general,build,gpu,gpu-windows) or "all" (= all except build)'
+        required: false
+        default: 'all'
+      skip_prune:
+        description: 'Skip pruning (deletion) of old images (debugging)'
+        type: boolean
+        required: false
+        default: false
+  schedule:
+    # Monthly on the 1st at 02:00 UTC
+    - cron: '0 2 1 * *'
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  GCP_PROJECT: nomadkaraoke
+  BUILD_REGION: us-central1
+  BUILD_ZONE: us-central1-a
+  BASE_IMAGE: projects/debian-cloud/global/images/family/debian-12
+  KEEP_IMAGES_PER_FAMILY: 1
+
+jobs:
+  resolve-matrix:
+    name: Resolve variant matrix
+    runs-on: ubuntu-latest
+    outputs:
+      variants: ${{ steps.resolve.outputs.variants }}
+    steps:
+      - id: resolve
+        run: |
+          requested='${{ github.event.inputs.variants || 'all' }}'
+          if [[ "$requested" == "all" || -z "$requested" ]]; then
+            # "build" (docker-build label) is excluded from "all": no job uses it
+            # since deploy-backend moved to ubuntu-latest + Cloud Build
+            # (2026-10-01). Still buildable via an explicit variants=build.
+            echo 'variants=["general","gpu","gpu-windows"]' >> "$GITHUB_OUTPUT"
+          else
+            json="$(echo "$requested" | tr ',' '\n' | jq -R . | jq -sc .)"
+            echo "variants=$json" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    name: Build ${{ matrix.variant }} image
+    needs: resolve-matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: ${{ fromJSON(needs.resolve-matrix.outputs.variants) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ env.GCP_PROJECT }}
+
+      - name: Resolve build parameters
+        id: params
+        run: |
+          variant='${{ matrix.variant }}'
+          ts="$(date -u +%Y%m%d-%H%M%S)"
+          name="gha-runner-${variant}-${ts}"
+          family="gha-runner-${variant}"
+          vm="gha-image-build-${variant}-${ts}"
+
+          # Per-variant base image + startup-script metadata key: Windows
+          # VMs only execute scripts under windows-startup-script-ps1.
+          image_flag="--image=${{ env.BASE_IMAGE }}"
+          metadata_file="startup-script=infrastructure/scripts/runner-image-provision.sh"
+
+          case "$variant" in
+            general|build)
+              machine="n2-standard-8"
+              disk_size="50"
+              accel=""
+              ;;
+            gpu)
+              # Build with a T4 attached so DKMS module is built and validated
+              # against the kernel that ships in the image.
+              machine="n1-standard-4"
+              disk_size="200"
+              accel="--maintenance-policy=TERMINATE --accelerator=type=nvidia-tesla-t4,count=1"
+              ;;
+            gpu-windows)
+              # T4 attached so the GRID driver install can validate WDDM mode
+              # (required for DirectML). Keep disk in sync with the
+              # gpu-windows FamilySpec in runner_manager/ephemeral.py.
+              machine="n1-standard-4"
+              disk_size="100"
+              accel="--maintenance-policy=TERMINATE --accelerator=type=nvidia-tesla-t4,count=1"
+              image_flag="--image-family=windows-2022 --image-project=windows-cloud"
+              metadata_file="windows-startup-script-ps1=infrastructure/scripts/runner-image-provision.ps1"
+              ;;
+            *)
+              echo "Unknown variant: $variant" >&2
+              exit 1
+              ;;
+          esac
+
+          {
+            echo "name=$name"
+            echo "family=$family"
+            echo "vm=$vm"
+            echo "machine=$machine"
+            echo "disk_size=$disk_size"
+            echo "accel=$accel"
+            echo "image_flag=$image_flag"
+            echo "metadata_file=$metadata_file"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create build VM
+        run: |
+          set -euo pipefail
+          gcloud compute instances create '${{ steps.params.outputs.vm }}' \
+            --project='${{ env.GCP_PROJECT }}' \
+            --zone='${{ env.BUILD_ZONE }}' \
+            --machine-type='${{ steps.params.outputs.machine }}' \
+            ${{ steps.params.outputs.image_flag }} \
+            --boot-disk-size='${{ steps.params.outputs.disk_size }}GB' \
+            --boot-disk-type=pd-balanced \
+            --boot-disk-auto-delete \
+            --service-account="${{ secrets.GCP_SERVICE_ACCOUNT }}" \
+            --scopes=https://www.googleapis.com/auth/cloud-platform \
+            --metadata=enable-oslogin=TRUE,image-variant='${{ matrix.variant }}' \
+            --metadata-from-file='${{ steps.params.outputs.metadata_file }}' \
+            --labels=purpose=gha-runner-image-builder,variant='${{ matrix.variant }}' \
+            ${{ steps.params.outputs.accel }}
+
+      - name: Wait for provisioning to complete
+        env:
+          VM: ${{ steps.params.outputs.vm }}
+          ZONE: ${{ env.BUILD_ZONE }}
+          PROJECT: ${{ env.GCP_PROJECT }}
+        run: |
+          set -uo pipefail
+          # Read the serial console — NOT SSH — to detect completion.
+          #
+          # The provisioner script tees its full output to /dev/ttyS0 (the GCE
+          # serial console). `gcloud compute instances get-serial-port-output`
+          # returns the full console buffer with zero SSH/IAP dependency. This
+          # makes the wait robust against the IAP tunnel issues that previously
+          # caused both false-positive readiness and false-negative timeouts.
+          #
+          # The script writes one of two distinctive marker lines:
+          #   "### runner-image: READY: ..."    — successful completion
+          #   "### runner-image-provision FAILED ..."  — fatal error (with line+rc)
+          #
+          # We also stream live progress to the GHA log so the operator can
+          # see what's happening without leaving the run page.
+          deadline=$(( $(date +%s) + 75 * 60 ))
+          last_size=0
+          attempt=0
+          while (( $(date +%s) < deadline )); do
+            attempt=$((attempt+1))
+            console=$(gcloud compute instances get-serial-port-output "$VM" \
+              --zone="$ZONE" --project="$PROJECT" --port=1 2>/dev/null || true)
+            cur_size=${#console}
+            # Stream new provisioner lines (filter syslog noise).
+            if (( cur_size > last_size )); then
+              echo "$console" | tail -c +$((last_size+1)) \
+                | grep -E "runner-image|### |Attempt " || true
+              last_size=$cur_size
+            fi
+            # Success marker
+            if echo "$console" | grep -qE 'runner-image: READY:'; then
+              echo
+              echo "### Image ready (attempt $attempt)"
+              echo "$console" | grep -E 'runner-image: READY:' | tail -1
+              exit 0
+            fi
+            # Failure marker
+            if echo "$console" | grep -qE 'runner-image-provision FAILED'; then
+              echo
+              echo "### Provisioner reported FAILURE — failure block + 40 lines of preceding context:" >&2
+              # -B 40: include 40 lines BEFORE the marker (where the actual
+              # error output of the failing command lives — python tracebacks,
+              # apt errors, curl messages, etc).
+              # -A 5: include the variant/line/cmd metadata lines after the marker.
+              echo "$console" | grep -B 40 -A 5 'runner-image-provision FAILED' \
+                | tail -80 >&2
+              exit 1
+            fi
+            sleep 30
+          done
+          echo
+          echo "### Timed out waiting for READY marker after 75 minutes" >&2
+          echo "### Last serial console output (tail):" >&2
+          gcloud compute instances get-serial-port-output "$VM" \
+            --zone="$ZONE" --project="$PROJECT" --port=1 2>/dev/null \
+            | grep -E "runner-image|### " | tail -50 >&2 || true
+          exit 1
+
+      - name: Stop build VM
+        env:
+          VM: ${{ steps.params.outputs.vm }}
+          ZONE: ${{ env.BUILD_ZONE }}
+          PROJECT: ${{ env.GCP_PROJECT }}
+        run: |
+          set -euo pipefail
+          gcloud compute instances stop "$VM" --zone="$ZONE" --project="$PROJECT" --quiet
+          # Belt-and-suspenders wait for TERMINATED.
+          for _ in $(seq 1 60); do
+            status=$(gcloud compute instances describe "$VM" --zone="$ZONE" --project="$PROJECT" --format='value(status)')
+            [[ "$status" == "TERMINATED" ]] && break
+            sleep 5
+          done
+
+      - name: Create image
+        env:
+          VM: ${{ steps.params.outputs.vm }}
+          ZONE: ${{ env.BUILD_ZONE }}
+          PROJECT: ${{ env.GCP_PROJECT }}
+          IMAGE: ${{ steps.params.outputs.name }}
+          FAMILY: ${{ steps.params.outputs.family }}
+        run: |
+          set -euo pipefail
+          # The "Create build VM" step doesn't pass --device-name or
+          # --boot-disk-name, so GCE auto-names the boot disk after the
+          # instance. We rely on that here instead of extracting the name
+          # via a format expression — the previous
+          # `disks[0].source.scope(disks).segment(1)` selector silently
+          # returned empty and gcloud rejected the call with
+          # "You cannot specify [--source-disk-zone] unless you are
+          # specifying [--source-disk]".
+          DISK="$VM"
+          echo "Creating image $IMAGE in family $FAMILY from disk $DISK in $ZONE..."
+          gcloud compute images create "$IMAGE" \
+            --project="$PROJECT" \
+            --source-disk="$DISK" \
+            --source-disk-zone="$ZONE" \
+            --family="$FAMILY" \
+            --description="GHA ephemeral runner image (${{ matrix.variant }}) built ${{ github.run_id }}" \
+            --labels=purpose=gha-ephemeral-runner,variant=${{ matrix.variant }},built-by=gha
+          echo "Created $IMAGE in family $FAMILY"
+
+      - name: Delete build VM
+        if: always()
+        env:
+          VM: ${{ steps.params.outputs.vm }}
+          ZONE: ${{ env.BUILD_ZONE }}
+          PROJECT: ${{ env.GCP_PROJECT }}
+        run: |
+          gcloud compute instances delete "$VM" --zone="$ZONE" --project="$PROJECT" --quiet || true
+
+      - name: Prune old images (keep newest ${{ env.KEEP_IMAGES_PER_FAMILY }})
+        if: ${{ github.event.inputs.skip_prune != 'true' }}
+        env:
+          PROJECT: ${{ env.GCP_PROJECT }}
+          FAMILY: ${{ steps.params.outputs.family }}
+          KEEP: ${{ env.KEEP_IMAGES_PER_FAMILY }}
+        run: |
+          set -euo pipefail
+          # DELETE (not deprecate — deprecated images still bill for storage)
+          # every image in this family beyond the newest $KEEP. The dispatcher
+          # boots from the family URL, which always resolves to the newest image,
+          # so older ones are only rollback insurance (~$0.05/GB-mo; gpu images
+          # are ~21 GB each). Previously this step used an invalid
+          # `-deprecated.state:*` filter: gcloud errored to stderr, stdout was
+          # empty, and it silently reported "Nothing to deprecate" every month
+          # while images piled up (31 runner images, ~$18/mo, by 2026-09).
+          # Match the family EXACTLY client-side: a gcloud `family=gha-runner-gpu`
+          # filter is a word-boundary regex that ALSO matches gha-runner-gpu-windows.
+          # Rank by ACTIVE (non-deprecated) images: the family URL skips deprecated
+          # images, so the newest $KEEP active ones are the real rollback path.
+          # Deprecated images never count toward $KEEP.
+          rows=$(gcloud compute images list \
+            --project="$PROJECT" \
+            --no-standard-images \
+            --show-deprecated \
+            --sort-by='~creationTimestamp' \
+            --format='value(name,family,deprecated.state)' | awk -v f="$FAMILY" '$2==f')
+          active=$(echo "$rows" | awk 'NF==2 {print $1}')
+          if [[ -z "$active" ]]; then
+            echo "::error::No active images found in family $FAMILY (list failed?) — refusing to prune."
+            exit 1
+          fi
+          keep=$(echo "$active" | head -n "$KEEP")
+          to_delete=$(echo "$rows" | awk '{print $1}' | grep -vxF "$keep" || true)
+          if [[ -z "$to_delete" ]]; then
+            echo "Nothing to prune (<= $KEEP images in $FAMILY)."
+            exit 0
+          fi
+          # Never delete an image some existing disk was created from (e.g. a
+          # long-lived VM still on an older image).
+          in_use=$(gcloud compute disks list --project="$PROJECT" \
+            --format='value(sourceImage.basename())' | sort -u)
+          for img in $to_delete; do
+            if grep -qx "$img" <<<"$in_use"; then
+              echo "Keeping $img (source image of an existing disk)"
+              continue
+            fi
+            echo "Deleting $img"
+            gcloud compute images delete "$img" --project="$PROJECT" --quiet
+          done

@@ -1,0 +1,120 @@
+name: News Archive Sync
+
+# ──────────────────────────────────────────────────────────────
+# news headlines forward-only archive cron (Phase A).
+#
+# Google News RSS 일별 수집 (KOSPI200 시총 상위 + 매크로 키워드) →
+# `data/news/public/rss/{market}/{YYYY}-{MM}-{DD}.parquet` upsert →
+# HF push (`eddmpython/dartlab-data/news/public/rss/...`).
+#
+# 본문 archive 영구 제외 (ToS) — 메타데이터 (title/source/url/date +
+# market/query/captured_at) 만 박는다.
+#
+# concurrency group `hf-news-push` 로 DART (`hf-dart-push`) 와 격리 —
+# 병렬 가능. RSS 비공식 rate-limit 보호는 syncNewsHeadlines.py 의
+# concurrency=4 + asyncio.Semaphore 가 수행.
+# ──────────────────────────────────────────────────────────────
+
+on:
+  schedule:
+    - cron: '0 16 * * *'  # UTC 16:00 = KST 01:00 (야간 헤드라인 — Data Sync 18:00 과 HF 충돌 분리)
+    - cron: '0 8 * * *'   # UTC 08:00 = KST 17:00 (오후 헤드라인 — Data Sync 06:00 과 HF 충돌 분리)
+  workflow_dispatch:
+    inputs:
+      max_queries:
+        description: '쿼리 상한 (smoke 테스트용)'
+        default: '150'
+        type: string
+      search_catalog_bootstrap:
+        description: '초기 public news search source catalog 생성 허용 (true=이전 manifest 없이 높은 하한으로 1회 bootstrap)'
+        default: 'false'
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  sync-news-kr:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    # job 레벨 concurrency 를 쓴다. 워크플로 레벨은 run 생성 즉시 큐를 점유하고, GitHub 은
+    # 그룹당 pending 을 1 개만 유지해 새 트리거가 오면 기존 pending 을 취소한다
+    # (cancel-in-progress 와 무관한 기본 동작). 2026-08 hf-dart-push 에서 대기 중이던 run
+    # 8 건이 job 0 개인 채 취소됐다. 같은 그룹을 2 개 이상이 공유하면 같은 위험을 진다.
+    concurrency:
+      group: hf-news-push
+      cancel-in-progress: false
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Smoke import
+        run: uv run python -c "import dartlab; print('dartlab', getattr(dartlab, '__version__', 'dev'))"
+
+      - name: Restore news headlines cache
+        uses: actions/cache/restore@v5
+        with:
+          path: data/news/public/rss
+          key: dartlab-news-headlines-${{ github.run_id }}
+          restore-keys: dartlab-news-headlines-
+
+      # 통합 진입점(dartlab.pipeline) — news stage 가 syncNewsHeadlines(KR/US, --once,
+      # --max-queries) + bulkUploadHf(newsHeadlines --since 86400) 를 동형 호출. bulkUploadHf
+      # 는 env>.env 토큰 해석으로 .env 임시작성 불필요. max-queries 는 NEWS_MAX_QUERIES_* env.
+      - name: Fetch headlines (KR/US) + HF push
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          NEWS_MAX_QUERIES_KR: ${{ github.event.inputs.max_queries || '150' }}
+          NEWS_MAX_QUERIES_US: ${{ github.event.inputs.max_queries || '80' }}
+        run: uv run python -X utf8 -m dartlab.pipeline news
+
+      # Phase B — 방금 받은 로컬 headlines 를 sentiment/topic enrich → newsEnriched HF push.
+      # 모델 미가용(narrative 그룹 미설치) 시 lm_dict/query-proxy fallback 자동(CI 기본 env 안전).
+      - name: Enrich headlines (KR/US) + HF push (Phase B)
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: uv run python -X utf8 -m dartlab.pipeline newsEnrich
+      - name: public news search source manifest + catalog
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          SEARCH_CATALOG_BOOTSTRAP: ${{ github.event.inputs.search_catalog_bootstrap == 'true' && '1' || '0' }}
+        run: |
+          extra=()
+          if [ "${SEARCH_CATALOG_BOOTSTRAP:-0}" != "1" ]; then
+            extra+=(--require-previous-manifest)
+          fi
+          uv run python -X utf8 .github/scripts/search/buildSearchCatalog.py \
+            --source newsPublic \
+            --input 'data/news/public/rss_enriched/**/*.parquet' \
+            --out-dir data/dart/searchCatalog/newsPublic \
+            --producer newsArchiveSync.newsEnrich \
+            --compare-remote-manifest \
+            --merge-previous-catalog \
+            --min-files 1 \
+            --min-rows 100 \
+            --min-catalog-rows 100 \
+            "${extra[@]}" \
+            --upload
+      - name: Upload public news search catalog evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: search-catalog-newsPublic-${{ github.job }}-${{ github.run_id }}
+          path: data/dart/searchCatalog/newsPublic/**
+          if-no-files-found: ignore
+
+      - name: Save news headlines cache
+        if: always()
+        uses: actions/cache/save@v5
+        with:
+          path: data/news/public/rss
+          key: dartlab-news-headlines-${{ github.run_id }}

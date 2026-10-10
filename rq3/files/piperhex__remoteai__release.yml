@@ -1,0 +1,605 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag, for example v0.1.0"
+        required: true
+        type: string
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+  # Check/test dependencies do not need full debug symbols. Release profiles stay unchanged.
+  CARGO_PROFILE_DEV_DEBUG: '0'
+  CARGO_PROFILE_TEST_DEBUG: '0'
+
+jobs:
+  create-release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    outputs:
+      release_id: ${{ steps.release.outputs.result }}
+      release_draft: ${{ steps.release.outputs.release_draft }}
+    steps:
+      - name: Create or find release
+        id: release
+        uses: actions/github-script@v9
+        env:
+          TAG_NAME: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+          RELEASE_NAME: "Remote AI ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}"
+          PRERELEASE: ${{ contains(github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name, '-') }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          result-encoding: string
+          script: |
+            const { owner, repo } = context.repo;
+            const tag = process.env.TAG_NAME;
+            const boilerplate = "Windows, macOS, Linux, Android, and iOS build artifacts are attached below.";
+
+            // Tag lookup omits drafts; retries must reuse the draft and its uploaded assets.
+            const releases = await github.paginate(github.rest.repos.listReleases, {
+              owner,
+              repo,
+              per_page: 100,
+            });
+            const existingRelease = releases.find((release) => release.tag_name === tag);
+            if (existingRelease) {
+              const release = existingRelease;
+              const update = {};
+              if (release.name !== process.env.RELEASE_NAME) {
+                update.name = process.env.RELEASE_NAME;
+              }
+              if (!release.body?.trim() || release.body.trim() === boilerplate) {
+                const { data: notes } = await github.rest.repos.generateReleaseNotes({
+                  owner,
+                  repo,
+                  tag_name: tag,
+                });
+                update.body = `${boilerplate}\n\n${notes.body}`;
+              }
+              if (Object.keys(update).length > 0) {
+                await github.rest.repos.updateRelease({
+                  owner,
+                  repo,
+                  release_id: release.id,
+                  ...update,
+                });
+                core.info(`Updated existing release ${release.id}.`);
+              }
+              core.setOutput("release_draft", String(release.draft));
+              core.info(`Using existing release ${release.id} for ${tag}.`);
+              return release.id.toString();
+            }
+
+            const { data: release } = await github.rest.repos.createRelease({
+              owner,
+              repo,
+              tag_name: tag,
+              name: process.env.RELEASE_NAME,
+              body: boilerplate,
+              draft: true,
+              prerelease: process.env.PRERELEASE === "true",
+              generate_release_notes: true,
+            });
+            core.setOutput("release_draft", "true");
+            core.info(`Created draft release ${release.id} for ${tag}.`);
+            return release.id.toString();
+
+  release:
+    name: Build ${{ matrix.name }}
+    needs: create-release
+    runs-on: ${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macos-aarch64
+            platform: macos-latest
+            releasePlatform: macos
+            args: "--target aarch64-apple-darwin"
+            rustTargets: "aarch64-apple-darwin,x86_64-apple-darwin"
+          - name: macos-x86_64
+            platform: macos-latest
+            releasePlatform: macos
+            args: "--target x86_64-apple-darwin"
+            rustTargets: "aarch64-apple-darwin,x86_64-apple-darwin"
+          - name: ubuntu-x86_64
+            platform: ubuntu-22.04
+            releasePlatform: linux
+            args: ""
+            rustTargets: ""
+          - name: windows-x86_64
+            # The desktop video helper requires the Visual Studio 2022 generator.
+            platform: windows-2022
+            releasePlatform: windows
+            args: ""
+            rustTargets: ""
+            msvcArch: "amd64"
+          - name: windows-aarch64
+            platform: windows-2022
+            releasePlatform: windows
+            args: "--target aarch64-pc-windows-msvc"
+            rustTargets: "aarch64-pc-windows-msvc"
+            msvcArch: "amd64_arm64"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+
+      - name: Install Linux build dependencies
+        if: startsWith(matrix.name, 'ubuntu')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file \
+            libxdo-dev libssl-dev libappindicator3-dev librsvg2-dev patchelf xdg-utils \
+            squashfs-tools xvfb xauth dbus-x11 x11-utils protobuf-compiler libprotobuf-dev clang cmake
+
+      # Ubuntu 22.04 ships protoc 3.12; EasyTier requires stable proto3 optional support.
+      - name: Install Linux connectivity protocol compiler
+        if: startsWith(matrix.name, 'ubuntu')
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/protoc-29.3-linux-x86_64.zip"
+          destination="$RUNNER_TEMP/protoc-29.3"
+          curl -fL --retry 3 \
+            https://github.com/protocolbuffers/protobuf/releases/download/v29.3/protoc-29.3-linux-x86_64.zip \
+            -o "$archive"
+          checksum=3e866620c5be27664f3d2fa2d656b5f3e09b5152b42f1bedbf427b333e90021a
+          echo "$checksum  $archive" | sha256sum --check --strict
+          unzip -q "$archive" -d "$destination"
+          "$destination/bin/protoc" --version
+          echo "$destination/bin" >> "$GITHUB_PATH"
+          echo "PROTOC=$destination/bin/protoc" >> "$GITHUB_ENV"
+          echo "PROTOC_INCLUDE=$destination/include" >> "$GITHUB_ENV"
+
+      - name: Install macOS connectivity build dependencies
+        if: startsWith(matrix.name, 'macos')
+        run: brew install protobuf
+
+      - name: Install Windows connectivity build dependencies
+        if: startsWith(matrix.name, 'windows')
+        run: choco install protoc --no-progress -y
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: lts/*
+          cache: npm
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: apps/admin-go/go.mod
+          cache-dependency-path: apps/admin-go/go.sum
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rustTargets }}
+
+      - name: Configure MSVC
+        if: startsWith(matrix.name, 'windows')
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ matrix.msvcArch }}
+
+      - name: Cache Rust build artifacts
+        uses: swatinem/rust-cache@v2
+        with:
+          # Cross-compilation targets can share a runner host, but need separate caches.
+          key: desktop-${{ matrix.name }}
+          cache-bin: false
+          workspaces: |
+            apps/desktop/src-tauri
+            apps/desktop/src-tauri/installer-helper
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Run checks
+        run: npm run check
+
+      - name: Prepare desktop video runtime
+        if: startsWith(matrix.name, 'windows') || startsWith(matrix.name, 'macos')
+        run: node scripts/prepare-remote-desktop-runtime.mjs
+
+      # tauri-action invokes Tauri directly, so build:app's service preparation is not run.
+      # These files must exist before Rust embeds their integrity manifest.
+      - name: Prepare Windows unattended service runtime
+        if: matrix.name == 'windows-x86_64'
+        run: >-
+          node --input-type=module -e
+          "import { prepareDesktopService } from './scripts/prepare-desktop-service.mjs';
+          await prepareDesktopService();"
+
+      - name: Test Linux AppImage preparation
+        if: startsWith(matrix.name, 'ubuntu')
+        run: node --test scripts/prepare-linux-appimage.test.mjs
+
+      - name: Build and upload release assets
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        with:
+          projectPath: apps/desktop
+          releaseId: ${{ needs.create-release.outputs.release_id }}
+          tagName: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+          args: ${{ matrix.args }}
+          releaseAssetNamePattern: "[name]_[version]_${{ matrix.releasePlatform }}-[arch][setup][ext]"
+          # Each matrix runner only knows about its own artifacts. Upload one
+          # complete updater manifest after every platform has finished.
+          uploadUpdaterJson: false
+          updaterJsonPreferNsis: true
+
+      - name: Checkout current Windows package verifier
+        if: matrix.name == 'windows-x86_64'
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .release-tools
+          sparse-checkout: |
+            scripts/verify-windows-service.mjs
+            scripts/verify-windows-service.test.mjs
+          sparse-checkout-cone-mode: false
+
+      - name: Verify packaged Windows unattended service
+        if: matrix.name == 'windows-x86_64'
+        shell: pwsh
+        run: |
+          node --test .release-tools/scripts/verify-windows-service.test.mjs
+          if ($LASTEXITCODE -ne 0) { throw 'Windows service verifier tests failed' }
+          $installers = @(Get-ChildItem apps/desktop/src-tauri/target/release/bundle/msi -Filter '*.msi')
+          if ($installers.Count -ne 1) { throw 'Expected one Windows x64 MSI' }
+          $destination = Join-Path $env:RUNNER_TEMP 'windows-service-verification'
+          $arguments = '/a "{0}" /qn TARGETDIR="{1}"' -f $installers[0].FullName, $destination
+          $process = Start-Process msiexec.exe -ArgumentList $arguments -WindowStyle Hidden -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "MSI extraction failed: $($process.ExitCode)" }
+          $executables = @(Get-ChildItem $destination -Recurse -Filter csw.exe)
+          if ($executables.Count -ne 1) { throw 'Expected one packaged Windows executable' }
+          node .release-tools/scripts/verify-windows-service.mjs $executables[0].DirectoryName
+          if ($LASTEXITCODE -ne 0) { throw 'Windows service package verification failed' }
+
+      # A successful build is insufficient: mode 0770 launchers can work for
+      # the builder but fail for other users. Gate publication on the final image.
+      - name: Verify Linux AppImage permissions and startup
+        if: startsWith(matrix.name, 'ubuntu')
+        shell: bash
+        run: |
+          set -euo pipefail
+          for appimage in apps/desktop/src-tauri/target/release/bundle/appimage/*.AppImage; do
+            python3 scripts/verify-linux-appimage.py "$appimage"
+          done
+
+  native-android:
+    name: Build Android APK
+    needs: create-release
+    runs-on: ubuntu-latest
+    env:
+      # The root workspace uses a different React version, so npm keeps Expo
+      # under apps/native. Gradle's bundling subprocess needs that lookup path.
+      NODE_PATH: ${{ github.workspace }}/apps/native/node_modules
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: lts/*
+          cache: npm
+
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Android NDK
+        id: android-ndk
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ndk_version="$(sed -n 's/^ndkVersion = "\([^"]*\)"/\1/p' apps/native/node_modules/react-native/gradle/libs.versions.toml)"
+          if [[ -z "$ndk_version" ]]; then
+            echo "::error::Unable to determine the React Native NDK version."
+            exit 1
+          fi
+
+          android_sdk_root="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
+          sdkmanager="$android_sdk_root/cmdline-tools/latest/bin/sdkmanager"
+          if [[ -z "$android_sdk_root" || ! -x "$sdkmanager" ]]; then
+            echo "::error::Android SDK command-line tools are unavailable."
+            exit 1
+          fi
+
+          for attempt in 1 2 3; do
+            if "$sdkmanager" "ndk;$ndk_version" \
+              && [[ -f "$android_sdk_root/ndk/$ndk_version/source.properties" ]]; then
+              echo "version=$ndk_version" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+
+            echo "::warning::NDK $ndk_version installation failed (attempt $attempt of 3)."
+            rm -rf "$android_sdk_root/ndk/$ndk_version" "$android_sdk_root/.temp"
+            if [[ "$attempt" -lt 3 ]]; then
+              sleep $((attempt * 10))
+            fi
+          done
+
+          echo "::error::Failed to install NDK $ndk_version after 3 attempts."
+          exit 1
+
+      - name: Install Rust connectivity toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
+      - name: Cache Android Rust dependencies and cargo-ndk
+        uses: swatinem/rust-cache@v2
+        with:
+          key: android-ndk-${{ steps.android-ndk.outputs.version }}-cargo-ndk-4.1.2-all-abis
+          workspaces: crates/chat-connectivity
+      - name: Install connectivity build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler libprotobuf-dev clang cmake
+          cargo install cargo-ndk --version 4.1.2 --locked
+
+      - name: Type-check native app
+        run: npm run check -w @codex-switch/native
+
+      - name: Generate Android project
+        working-directory: apps/native
+        run: npm run prebuild:android
+
+      - name: Cache Gradle downloads
+        uses: actions/cache@v5
+        with:
+          # Cache downloaded modules and Gradle distributions, not ABI-dependent task outputs.
+          path: |
+            ~/.gradle/caches/modules-2
+            ~/.gradle/wrapper
+          key: >-
+            gradle-downloads-${{ runner.os }}-java17-${{
+              hashFiles('package-lock.json', 'apps/native/android/**/*.gradle*',
+                'apps/native/android/gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: gradle-downloads-${{ runner.os }}-java17-
+
+      - name: Build release APK
+        working-directory: apps/native
+        run: |
+          chmod +x android/gradlew
+          cd android
+          ./gradlew assembleRelease --no-daemon --max-workers=2 \
+            --no-build-cache --rerun-tasks \
+            -PreactNativeArchitectures=armeabi-v7a,arm64-v8a,x86,x86_64 \
+            -Dorg.gradle.jvmargs="-Xmx4g -XX:MaxMetaspaceSize=768m"
+
+      # Release retries use current validation tooling while application sources stay at the immutable tag.
+      - name: Checkout release validation tooling
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: release-validation
+          sparse-checkout: apps/native/scripts/verify-apk.cjs
+          sparse-checkout-cone-mode: false
+
+      - name: Verify APK native libraries
+        run: >-
+          node release-validation/apps/native/scripts/verify-apk.cjs
+          apps/native/android/app/build/outputs/apk/release/app-release.apk
+
+      - name: Prepare APK asset
+        env:
+          TAG_NAME: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+        run: cp apps/native/android/app/build/outputs/apk/release/app-release.apk "apps/native/CodexSwitch-android-${TAG_NAME}.apk"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: CodexSwitch-android-apk-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+          path: apps/native/CodexSwitch-android-*.apk
+          if-no-files-found: error
+
+      - name: Upload APK to GitHub Release
+        uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+          draft: ${{ needs.create-release.outputs.release_draft }}
+          files: apps/native/CodexSwitch-android-*.apk
+          fail_on_unmatched_files: true
+
+  native-ios:
+    name: Build iOS app
+    needs: create-release
+    # React Native 0.79's fmt pod is not compatible with Xcode 26 yet.
+    runs-on: macos-15
+    env:
+      NODE_PATH: ${{ github.workspace }}/apps/native/node_modules
+      IOS_BUNDLE_IDENTIFIER: ${{ vars.IOS_BUNDLE_IDENTIFIER || 'com.codexswitch.mobile' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: lts/*
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Rust connectivity toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios
+      - name: Install connectivity build dependencies
+        run: brew install protobuf
+      - name: Identify Apple build toolchain
+        id: apple-cache
+        shell: bash
+        run: echo "version=$(xcodebuild -version | shasum -a 256 | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
+      - name: Cache iOS Rust dependencies
+        uses: swatinem/rust-cache@v2
+        with:
+          # Match chat-connectivity.yml so new tags can read the default branch cache.
+          shared-key: chat-connectivity-macos-15-${{ steps.apple-cache.outputs.version }}
+          cache-bin: false
+          workspaces: crates/chat-connectivity
+
+      - name: Type-check native app
+        run: npm run check -w @codex-switch/native
+
+      - name: Generate iOS project
+        working-directory: apps/native
+        run: npm run prebuild:ios
+
+      - name: Cache CocoaPods downloads
+        uses: actions/cache@v5
+        with:
+          # Always regenerate Pods and the app; only reuse downloaded dependency sources.
+          path: ~/Library/Caches/CocoaPods
+          key: >-
+            cocoapods-downloads-${{ runner.os }}-${{ runner.arch }}-${{
+              hashFiles('package-lock.json', 'apps/native/ios/Podfile',
+                'apps/native/ios/Podfile.properties.json', 'apps/native/plugins/**/*.podspec') }}
+          restore-keys: cocoapods-downloads-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Install iOS Pods
+        working-directory: apps/native/ios
+        run: pod install
+
+      - name: Build unsigned iOS Release app
+        working-directory: apps/native
+        run: >-
+          xcodebuild -workspace ios/RemoteAI.xcworkspace -scheme RemoteAI
+          -configuration Release -sdk iphoneos -derivedDataPath build
+          CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" build
+
+      - name: Package iOS app
+        working-directory: apps/native
+        run: >-
+          ditto -c -k --sequesterRsrc --keepParent
+          build/Build/Products/Release-iphoneos/RemoteAI.app
+          CodexSwitch-ios-unsigned.app.zip
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: CodexSwitch-ios-unsigned-app
+          path: apps/native/CodexSwitch-ios-unsigned.app.zip
+          if-no-files-found: error
+
+      - name: Upload iOS build to GitHub Release
+        uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+          draft: ${{ needs.create-release.outputs.release_draft }}
+          files: apps/native/CodexSwitch-ios-unsigned.app.zip
+          fail_on_unmatched_files: true
+
+  dream-skin-resources:
+    name: Publish Dream Skin resources
+    uses: ./.github/workflows/dream-skin-resources.yml
+    with:
+      ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+
+  publish-release:
+    name: Publish GitHub Release
+    needs:
+      - create-release
+      - release
+      - native-android
+      - native-ios
+      - dream-skin-resources
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+
+      - name: Test release metadata generators
+        run: node --test scripts/generate-updater-manifest.test.mjs scripts/organize-release-downloads.test.mjs
+
+      - name: Generate and validate updater manifest
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_ID: ${{ needs.create-release.outputs.release_id }}
+          TAG_NAME: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+        run: node scripts/generate-updater-manifest.mjs
+
+      - name: Upload updater manifest
+        uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+          draft: ${{ needs.create-release.outputs.release_draft }}
+          files: latest.json
+          fail_on_unmatched_files: true
+
+      - name: Organize release downloads
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_ID: ${{ needs.create-release.outputs.release_id }}
+          TAG_NAME: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+        run: node scripts/organize-release-downloads.mjs
+
+      - name: Publish release
+        uses: actions/github-script@v9
+        env:
+          RELEASE_ID: ${{ needs.create-release.outputs.release_id }}
+          TAG_NAME: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const { owner, repo } = context.repo;
+            const releaseId = Number(process.env.RELEASE_ID);
+            const tag = process.env.TAG_NAME;
+            const { data: release } = await github.rest.repos.getRelease({
+              owner,
+              repo,
+              release_id: releaseId,
+            });
+
+            if (!release.draft) {
+              core.info(`Release ${releaseId} is already published.`);
+              return;
+            }
+
+            await github.rest.repos.updateRelease({
+              owner,
+              repo,
+              release_id: releaseId,
+              tag_name: tag,
+              draft: false,
+            });
+            core.info(`Published release ${releaseId}.`);

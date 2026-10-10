@@ -1,0 +1,19 @@
+name: Pull Request Verification
+on:
+  pull_request_target:
+    types: [opened]
+
+permissions:
+    contents: read
+
+jobs:
+  Check-Team-Membership:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/github-script@v9
+        with:
+          github-token: ${{ secrets.HACKFORLA_ADMIN_TOKEN }}
+          script: |
+            const verifyPR = require('./github-actions/trigger-pr-target/verify-pr.js');
+            verifyPR({github, context});

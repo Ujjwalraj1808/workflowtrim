@@ -1,0 +1,43 @@
+name: Go Fuzz Testing
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 0 * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    name: Fuzz
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        command:
+          # -timeout must exceed -fuzztime; the default 10m test timeout
+          # expires at the same time as fuzztime and fails the job.
+          - "go test ./test/fuzz/... -run=^$ -fuzz=^FuzzReader$ -fuzztime 10m -timeout 20m"
+          - "go test ./test/fuzz/... -run=^$ -fuzz=^FuzzJSON$ -fuzztime 10m -timeout 20m"
+
+    steps:
+    - name: Set up Go 1.x
+      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      with:
+        go-version: stable
+      id: go
+
+    - name: Check out code into the Go module directory
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        fetch-depth: 0
+        persist-credentials: false
+
+    - name: Fuzz
+      run: ${{ matrix.command }}
+
+    - name: Report Failures
+      if: ${{ failure() }}
+      run: |
+        find . -path '*/testdata/fuzz/*' -type f 2>/dev/null | xargs -r -n1 tail -n +1 -v || true

@@ -1,0 +1,540 @@
+name: ToDesktop Build & Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Pull-request number whose body to use as release notes (optional; falls back to auto-generated notes if empty or absent)
+        required: false
+        type: string
+        default: ''
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+  # Required for Workload Identity Federation (keyless GCP auth) used to fetch
+  # the proprietary PP Formula font from gs://comfy-org-fonts before building.
+  id-token: write
+
+concurrency:
+  group: build-release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: >
+      startsWith(github.ref, 'refs/tags/v') &&
+      (github.event_name == 'workflow_dispatch' || github.actor != 'github-actions[bot]')
+    runs-on: ubuntu-latest
+    name: ToDesktop Build
+    env:
+      TODESKTOP_ACCESS_TOKEN: ${{ secrets.TODESKTOP_ACCESS_TOKEN }}
+      TODESKTOP_EMAIL: ${{ secrets.TODESKTOP_EMAIL }}
+    outputs:
+      build_id: ${{ steps.extract.outputs.build_id }}
+      mac_url: ${{ steps.extract.outputs.mac_url }}
+      windows_url: ${{ steps.extract.outputs.windows_url }}
+      linux_url: ${{ steps.extract.outputs.linux_url }}
+      build_status: ${{ steps.extract.outputs.build_status }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          run_install: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Validate ToDesktop credentials
+        run: |
+          if [ -z "$TODESKTOP_EMAIL" ] || [ -z "$TODESKTOP_ACCESS_TOKEN" ]; then
+            echo "TODESKTOP_EMAIL and TODESKTOP_ACCESS_TOKEN must be set in repository secrets."
+            exit 1
+          fi
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Resolve Datadog release version
+        id: datadog
+        shell: bash
+        run: |
+          release_version="$(node ./scripts/datadog-release-version.cjs)"
+          delimiter="DATADOG_RELEASE_$(node -p "require('node:crypto').randomUUID()")"
+          {
+            echo "release_version<<${delimiter}"
+            echo "${release_version}"
+            echo "${delimiter}"
+          } >> "$GITHUB_OUTPUT"
+
+      # Fetch the proprietary PP Formula font into the renderer public dir
+      # before the build. It is gitignored (never committed to this public
+      # repo) and pulled from a private bucket via keyless Workload Identity
+      # Federation. Release builds must ship the licensed display face, so the
+      # fetch fails loudly (no --soft-fail); a missing font would otherwise
+      # silently fall back to Inter.
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: 'projects/525069664901/locations/global/workloadIdentityPools/github-actions-pool/providers/github-oidc'
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Fetch proprietary fonts
+        run: pnpm run font:fetch
+
+      - name: Build app
+        env:
+          VITE_DATADOG_RUM_VERSION: ${{ steps.datadog.outputs.release_version }}
+        run: pnpm run build
+
+      - name: Ensure tag matches package.json version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          PKG_VERSION="$(node -p "require('./package.json').version")"
+          if [ "$TAG_VERSION" != "$PKG_VERSION" ]; then
+            echo "Tag version ($TAG_VERSION) does not match package.json version ($PKG_VERSION)."
+            exit 1
+          fi
+
+      - name: Upload Datadog sourcemaps
+        env:
+          DATADOG_API_KEY: ${{ secrets.DATADOG_API_KEY }}
+          DATADOG_SITE: us5.datadoghq.com
+          VITE_DATADOG_RUM_VERSION: ${{ steps.datadog.outputs.release_version }}
+        run: pnpm run datadog:sourcemaps:upload
+
+      - name: Install ToDesktop CLI
+        # 1.28.0 is the first release whose todesktop.json schema accepts
+        # `targetOverrides`, which selects the per-architecture Windows
+        # bootstrap-python (win-x64 vs win-arm64) in todesktop.json.
+        run: npm install --location=global @todesktop/cli@1.28.1
+
+      - name: Pre-fetch bootstrap-python for all platforms
+        # @todesktop/cli now eagerly validates the `extraResources` paths in
+        # todesktop.json *before* invoking the `beforeBuild` hook, so the
+        # platform-specific bootstrap-python directories must exist locally
+        # at the time `todesktop build` is invoked.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: pnpm run bootstrap:fetch
+
+      - name: Verify bootstrap-python is populated for every platform
+        # Belt-and-braces check: even though fetch-bootstrap-python.mjs now
+        # exits non-zero on failure, surface the directory state in the build
+        # log and explicitly fail if any platform's Python binary is missing.
+        # The 0.6.4 installer shipped without bootstrap-python because a fetch
+        # error was swallowed and the directory was empty going into the
+        # packaging step. That class of failure must never be quiet again.
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "bootstrap-python tree:"
+          ls -la bootstrap-python/ || true
+          missing=0
+          for f in \
+            bootstrap-python/win-x64/python.exe \
+            bootstrap-python/win-arm64/python.exe \
+            bootstrap-python/mac-arm64/bin/python3 \
+            bootstrap-python/linux-x64/bin/python3
+          do
+            if [ ! -f "$f" ]; then
+              echo "::error::bootstrap-python verification failed: $f is missing"
+              missing=$((missing + 1))
+            else
+              echo "  OK: $f"
+            fi
+          done
+          if [ "$missing" -gt 0 ]; then
+            echo "::error::$missing bootstrap-python binar(ies) missing — refusing to build a broken installer"
+            exit 1
+          fi
+
+      - name: Stage bootstrap-python for ToDesktop target overrides
+        shell: bash
+        run: |
+          set -euo pipefail
+          for arch in x64 arm64; do
+            source="bootstrap-python/win-${arch}"
+            target="todesktop-targets/windows-${arch}/bootstrap-python"
+            mkdir -p "$(dirname "$target")"
+            mv "$source" "$target"
+          done
+          mkdir -p todesktop-targets/linux-x64
+          mv bootstrap-python/linux-x64 todesktop-targets/linux-x64/bootstrap-python
+          # ToDesktop requires matching resource paths across architectures.
+          # Keep the ARM64 directory nonempty for upload, without a Python binary.
+          mkdir -p todesktop-targets/linux-arm64/bootstrap-python
+          printf '%s\n' 'Bootstrap Python is not available for Linux ARM64.' > todesktop-targets/linux-arm64/bootstrap-python/README.txt
+
+      - name: Build with ToDesktop
+        shell: bash
+        run: |
+          set -euo pipefail
+          todesktop build --config=todesktop.json --ephemeral | tee todesktop-build.log
+
+      - name: Extract ToDesktop build ID
+        id: build_id
+        shell: bash
+        run: |
+          node <<'NODE'
+          const fs = require('node:fs')
+
+          const log = fs.readFileSync('todesktop-build.log', 'utf8')
+          const matches = [
+            ...log.matchAll(
+              /https?:\/\/(?:app\.todesktop\.com\/apps|dl\.todesktop\.com)\/[^/\s]+\/builds\/([A-Za-z0-9_-]+)/g
+            )
+          ]
+          const buildIds = [...new Set(matches.map((match) => match[1]).filter(Boolean))]
+
+          if (buildIds.length === 0) {
+            throw new Error('Could not extract a ToDesktop build ID from CLI output.')
+          }
+          if (buildIds.length > 1) {
+            throw new Error(`Multiple build IDs found in CLI output (${buildIds.join(', ')}).`)
+          }
+
+          const output = process.env.GITHUB_OUTPUT
+          if (!output) throw new Error('GITHUB_OUTPUT not set')
+          fs.appendFileSync(output, `build_id=${buildIds[0]}\n`)
+          NODE
+
+      - name: Fetch ToDesktop build metadata by ID
+        env:
+          BUILD_ID: ${{ steps.build_id.outputs.build_id }}
+        run: todesktop builds "${BUILD_ID}" --config=todesktop.json --exit > todesktop-build.raw 2>&1
+
+      - name: Extract build details
+        id: extract
+        shell: bash
+        run: |
+          node <<'NODE'
+          const fs = require('node:fs')
+
+          const parseBuildOutput = (raw, expectedBuildId) => {
+            const buildIdPattern =
+              /https?:\/\/(?:app\.todesktop\.com\/apps|dl\.todesktop\.com)\/[^/\s]+\/builds\/([A-Za-z0-9_-]+)/g
+            const buildIds = [...new Set([...raw.matchAll(buildIdPattern)].map((match) => match[1]))].filter(
+              Boolean
+            )
+            if (expectedBuildId && buildIds.length > 0 && !buildIds.includes(expectedBuildId)) {
+              throw new Error(
+                `Build ID mismatch in raw CLI output. Expected ${expectedBuildId}, found ${buildIds.join(', ')}`
+              )
+            }
+
+            const buildId = expectedBuildId || buildIds[0] || ''
+            if (!buildId) {
+              throw new Error('Could not extract a ToDesktop build ID from metadata output.')
+            }
+
+            const appUrl = [...raw.matchAll(/https?:\/\/app\.todesktop\.com\/apps\/[^/\s]+\/builds\/[A-Za-z0-9_-]+/g)]
+              .map((match) => match[0])
+              .at(-1)
+            const downloadUrl = [...raw.matchAll(/https?:\/\/dl\.todesktop\.com\/[^/\s]+\/builds\/[A-Za-z0-9_-]+/g)]
+              .map((match) => match[0])
+              .at(-1)
+
+            return {
+              id: buildId,
+              status: /Build complete!/i.test(raw) ? 'succeeded' : 'unknown',
+              standardUniversalDownloadUrl: downloadUrl || '',
+              __appUrl: appUrl || ''
+            }
+          }
+
+          const expectedBuildId = process.env.EXPECTED_BUILD_ID || ''
+          const rawBuildOutput = fs.readFileSync('todesktop-build.raw', 'utf8')
+          const build = parseBuildOutput(rawBuildOutput, expectedBuildId)
+          const safeUrl = (value) => (typeof value === 'string' ? value : '')
+          const macUrl = safeUrl(build?.mac?.standardDownloadUrl)
+          const windowsUrl = safeUrl(build?.windows?.standardDownloadUrl)
+          const linuxUrl = safeUrl(build?.linux?.standardDownloadUrl)
+          const universalUrl = safeUrl(build?.standardUniversalDownloadUrl)
+          const status = build?.status || 'unknown'
+          const buildId = build?.id || ''
+
+          if (!buildId) {
+            throw new Error('Build ID missing from ToDesktop build output')
+          }
+          if (expectedBuildId && String(buildId) !== expectedBuildId) {
+            throw new Error(`Build ID mismatch. Expected ${expectedBuildId}, received ${buildId}`)
+          }
+
+          const titleCase = (value) =>
+            String(value)
+              .replace(/[-_]/g, ' ')
+              .replace(/\b\w/g, (m) => m.toUpperCase())
+
+          const normalizeFormatName = (value) => {
+            if (value === 'appImage') return 'AppImage'
+            return titleCase(value)
+          }
+
+          const normalizeArchName = (value) => {
+            const lowered = String(value).toLowerCase()
+            if (lowered === 'x64') return 'x64'
+            if (lowered === 'arm64') return 'arm64'
+            if (lowered === 'ia32') return 'ia32'
+            if (lowered === 'universal') return 'universal'
+            return titleCase(value)
+          }
+
+          const collectArtifacts = (platformName, platformData) => {
+            const rows = []
+            const artifactDownloads = platformData?.artifactDownloads
+            if (!artifactDownloads || typeof artifactDownloads !== 'object') return rows
+
+            for (const [formatKey, formatValue] of Object.entries(artifactDownloads)) {
+              if (!formatValue || typeof formatValue !== 'object') continue
+
+              const directUrl = safeUrl(formatValue.standardUrl || formatValue.url)
+              if (directUrl) {
+                rows.push({
+                  platform: platformName,
+                  format: normalizeFormatName(formatKey),
+                  arch: 'n/a',
+                  size: Number.isFinite(formatValue.size) ? `${formatValue.size} bytes` : 'n/a',
+                  url: directUrl
+                })
+                continue
+              }
+
+              for (const [archKey, archValue] of Object.entries(formatValue)) {
+                if (!archValue || typeof archValue !== 'object') continue
+                const url = safeUrl(archValue.standardUrl || archValue.url)
+                if (!url) continue
+
+                rows.push({
+                  platform: platformName,
+                  format: normalizeFormatName(formatKey),
+                  arch: normalizeArchName(archKey),
+                  size: Number.isFinite(archValue.size) ? `${archValue.size} bytes` : 'n/a',
+                  url
+                })
+              }
+            }
+
+            return rows.sort((a, b) => {
+              if (a.platform !== b.platform) return a.platform.localeCompare(b.platform)
+              if (a.format !== b.format) return a.format.localeCompare(b.format)
+              return a.arch.localeCompare(b.arch)
+            })
+          }
+
+          const assetRows = [
+            ...collectArtifacts('macOS', build?.mac),
+            ...collectArtifacts('Windows', build?.windows),
+            ...collectArtifacts('Linux', build?.linux)
+          ]
+
+          const todesktopConfig = JSON.parse(fs.readFileSync('todesktop.json', 'utf8'))
+          const appId = todesktopConfig.id
+          const configBuildPageUrl =
+            appId && buildId ? `https://app.todesktop.com/apps/${appId}/builds/${buildId}` : ''
+          const buildPageUrl = safeUrl(build?.__appUrl) || configBuildPageUrl
+
+          fs.writeFileSync(
+            'release-assets.json',
+            JSON.stringify(
+              {
+                buildId,
+                status,
+                buildPageUrl,
+                universalUrl,
+                platformPages: {
+                  macOS: macUrl || null,
+                  windows: windowsUrl || null,
+                  linux: linuxUrl || null
+                },
+                assets: assetRows
+              },
+              null,
+              2
+            )
+          )
+
+          const output = process.env.GITHUB_OUTPUT
+          if (!output) throw new Error('GITHUB_OUTPUT not set')
+          fs.appendFileSync(output, `build_id=${buildId}\n`)
+          fs.appendFileSync(output, `build_status=${status}\n`)
+          fs.appendFileSync(output, `mac_url=${macUrl}\n`)
+          fs.appendFileSync(output, `windows_url=${windowsUrl}\n`)
+          fs.appendFileSync(output, `linux_url=${linuxUrl}\n`)
+
+          const successStatuses = new Set(['succeeded', 'success', 'finished', 'complete', 'completed'])
+          if (!successStatuses.has(String(status).toLowerCase())) {
+            throw new Error(`ToDesktop build did not succeed (status=${status})`)
+          }
+          NODE
+        env:
+          EXPECTED_BUILD_ID: ${{ steps.build_id.outputs.build_id }}
+
+      - name: Upload release metadata artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: todesktop-release-assets
+          path: release-assets.json
+
+  release:
+    needs: build
+    if: >
+      startsWith(github.ref, 'refs/tags/v') &&
+      (github.event_name == 'workflow_dispatch' || github.actor != 'github-actions[bot]')
+    runs-on: ubuntu-latest
+    name: Publish Release
+
+    steps:
+      - name: Create GitHub Release (gh CLI)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+        run: |
+          set -euo pipefail
+
+          tag="${GITHUB_REF_NAME}"
+
+          if gh release view "${tag}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            echo "Release for ${tag} already exists."
+            exit 0
+          fi
+
+          # Classify the tag. Anything with a pre-release suffix
+          # (vX.Y.Z-rc.N, -beta.N, -alpha.N, etc.) ships as a GitHub
+          # "Pre-release" — visible at /releases but not surfaced as
+          # "Latest" and not picked up by auto-update unless the user
+          # explicitly opts in. Plain vX.Y.Z is the stable channel.
+          if [[ "${tag}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-.+$ ]]; then
+            channel_flag="--prerelease"
+            channel_label="pre-release"
+          else
+            channel_flag="--latest"
+            channel_label="latest"
+          fi
+
+          # Prefer the release PR body as release notes when the
+          # workflow was dispatched with a pr_number. Falls back to
+          # GitHub's auto-generated PR-titles list when no PR is
+          # known (manual tag push, etc.) so we never ship a release
+          # with empty notes.
+          notes_file=""
+          if [[ -n "${PR_NUMBER}" ]]; then
+            notes_file="$(mktemp)"
+            if gh pr view "${PR_NUMBER}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --json body \
+              --jq '.body' > "${notes_file}" && [[ -s "${notes_file}" ]]; then
+              echo "Using PR #${PR_NUMBER} body as release notes."
+            else
+              echo "PR #${PR_NUMBER} body unavailable; falling back to auto-generated notes."
+              notes_file=""
+            fi
+          fi
+
+          if [[ -n "${notes_file}" ]]; then
+            gh release create "${tag}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              ${channel_flag} \
+              --notes-file "${notes_file}"
+          else
+            gh release create "${tag}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              ${channel_flag} \
+              --generate-notes
+          fi
+
+          echo "Published ${channel_label} release for ${tag}."
+
+  comment-on-release-pr:
+    needs: build
+    # Post the ToDesktop build page + downloads back onto the version-bump PR
+    # that produced this tag. Runs on success or failure (a link to a failed
+    # build is still useful); skipped only when no build id was produced.
+    if: >
+      always() &&
+      startsWith(github.ref, 'refs/tags/v') &&
+      needs.build.result != 'skipped' &&
+      needs.build.outputs.build_id != ''
+    runs-on: ubuntu-latest
+    name: Comment build link on release PR
+    permissions:
+      contents: read
+      pull-requests: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      INPUT_PR: ${{ inputs.pr_number }}
+      BUILD_ID: ${{ needs.build.outputs.build_id }}
+      BUILD_STATUS: ${{ needs.build.outputs.build_status }}
+      MAC_URL: ${{ needs.build.outputs.mac_url }}
+      WIN_URL: ${{ needs.build.outputs.windows_url }}
+      LINUX_URL: ${{ needs.build.outputs.linux_url }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Resolve release PR and upsert build comment
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          app_id="$(jq -r '.id' todesktop.json)"
+          build_url="https://app.todesktop.com/apps/${app_id}/builds/${BUILD_ID}"
+
+          # Which PR produced this tagged commit?
+          pr="${INPUT_PR:-}"
+          if [[ -z "${pr}" ]]; then
+            pr="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/pulls" --jq '.[0].number' 2>/dev/null || true)"
+          fi
+          if [[ -z "${pr}" || "${pr}" == "null" ]]; then
+            subject="$(git log -1 --format=%s "${GITHUB_SHA}")"
+            pr="$(printf '%s' "${subject}" | grep -oE '#[0-9]+' | head -1 | tr -dc '0-9' || true)"
+          fi
+          if [[ -z "${pr}" ]]; then
+            echo "No PR associated with ${GITHUB_SHA}; nothing to comment on."
+            exit 0
+          fi
+
+          if printf '%s' "${BUILD_STATUS}" | grep -qiE '^(succeeded|success|finished|complete|completed)$'; then
+            icon="✅"
+          else
+            icon="⚠️"
+          fi
+
+          marker="<!-- todesktop-build-comment -->"
+          {
+            printf '%s\n' "${marker}"
+            printf '### %s ToDesktop build for `%s`\n\n' "${icon}" "${tag}"
+            printf '**Status:** %s  \n' "${BUILD_STATUS}"
+            printf '**Build page:** %s\n\n' "${build_url}"
+            printf '**Downloads**\n'
+          } > comment.md
+          have_links=0
+          if [[ -n "${MAC_URL}" ]];   then printf -- '- macOS: %s\n'   "${MAC_URL}"   >> comment.md; have_links=1; fi
+          if [[ -n "${WIN_URL}" ]];   then printf -- '- Windows: %s\n' "${WIN_URL}"   >> comment.md; have_links=1; fi
+          if [[ -n "${LINUX_URL}" ]]; then printf -- '- Linux: %s\n'   "${LINUX_URL}" >> comment.md; have_links=1; fi
+          if [[ "${have_links}" -eq 0 ]]; then printf '_No per-platform download links reported._\n' >> comment.md; fi
+
+          # Upsert: update our previous comment (matched by marker) or create a new one.
+          existing="$(gh api "repos/${GITHUB_REPOSITORY}/issues/${pr}/comments" --paginate \
+            --jq ".[] | select(.body | contains(\"${marker}\")) | .id" 2>/dev/null | head -1 || true)"
+          if [[ -n "${existing}" && "${existing}" != "null" ]]; then
+            jq -Rs '{body: .}' comment.md | gh api -X PATCH "repos/${GITHUB_REPOSITORY}/issues/comments/${existing}" --input - >/dev/null
+            echo "Updated build comment on PR #${pr}."
+          else
+            jq -Rs '{body: .}' comment.md | gh api -X POST "repos/${GITHUB_REPOSITORY}/issues/${pr}/comments" --input - >/dev/null
+            echo "Posted build comment on PR #${pr}."
+          fi

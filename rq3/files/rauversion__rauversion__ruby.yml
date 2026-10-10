@@ -1,0 +1,55 @@
+# .github/workflows/ci.yml
+
+name: CI
+on:
+  push:
+    branches_ignore:
+      - "l10n_master2"
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      db:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis
+        ports: ["6379:6379"]
+        options: --entrypoint redis-server
+
+    env:
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/test
+      REDIS_URL: redis://localhost:6379/0
+      RAILS_ENV: test
+      RAILS_MASTER_KEY: ${{ secrets.RAILS_MASTER_KEY }}
+    steps:
+      - uses: actions/checkout@v1
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: 3.3.5 # no need with ruby-version file
+          bundler-cache: true
+
+      - uses: actions/setup-node@v3
+        with:
+          node-version: 22
+          cache: "yarn"
+
+      - name: Build and precompile
+        run: |
+          sudo apt-get -yqq install libpq-dev curl
+          gem install bundler
+          bundle install --jobs 4 --retry 3
+          bundle exec rails db:prepare
+          bundle exec rake assets:precompile
+      - name: Build and run tests
+        run: |
+          bundle exec rspec ./spec -fd

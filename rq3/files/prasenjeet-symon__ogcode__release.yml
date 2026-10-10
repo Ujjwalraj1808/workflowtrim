@@ -1,0 +1,369 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag (e.g., v0.2.7)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  # The tag to build/release: the pushed tag, or the workflow_dispatch input.
+  RELEASE_REF: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.version || github.ref_name }}
+  GO_VERSION: "1.26.1"
+  NODE_VERSION: "20"
+  # Zig is the C cross-compiler for the Linux builds. See build-linux for why.
+  ZIG_VERSION: "0.16.0"
+  ZIG_SHA256: "70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00"
+  # zig puts its local build cache in a `.zig-cache` next to the build root. A
+  # grammar module under the Go module cache counts as one, and that tree is
+  # read-only, so a module shipping a build.zig fails to compile with
+  #   unable to open local cache directory '.../tree-sitter-c@v0.24.2/.zig-cache'
+  # Point the cache at a writable path instead.
+  ZIG_LOCAL_CACHE_DIR: /tmp/zig-cache
+
+jobs:
+  # Build the platform-independent web assets once, then embed the artifact into
+  # every platform binary. This avoids three identical npm installs and Vite builds.
+  build-web:
+    name: Build web UI
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_REF }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Build web UI
+        run: cd web && npm install --legacy-peer-deps && npm run build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist
+          retention-days: 1
+          if-no-files-found: error
+
+  # ── Build every target with CGO so go-fitz links libmupdf statically. macOS
+  #    and Windows build natively on their own runners; Linux cross-compiles
+  #    both architectures with zig so the binaries are static (see build-linux).
+  #    Binaries are staged at prebuilt/ogcode_<goos>_<goarch>/ogcode[.exe] and
+  #    consumed by the release job via the GoReleaser gobinary shim.
+  build-linux:
+    needs: build-web
+    name: Build (linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_REF }}
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist
+      - name: Install zig (C cross-compiler for both Linux targets)
+        shell: bash
+        run: |
+          set -euo pipefail
+          url="https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
+          curl -fsSL "$url" -o /tmp/zig.tar.xz
+          echo "${ZIG_SHA256}  /tmp/zig.tar.xz" | sha256sum -c -
+          mkdir -p /opt/zig && tar -xJf /tmp/zig.tar.xz -C /opt/zig --strip-components=1
+          echo "/opt/zig" >> "$GITHUB_PATH"
+      - name: Build binaries
+        shell: bash
+        env:
+          # The first-party client secret, baked into the binary at link time
+          # (internal/provider.OGXAppSecret) so the release signs its gateway
+          # calls as app `ogcode`. Unset in a fork, so the binary simply
+          # signs nothing rather than failing the build.
+          OGX_APP_SECRET: ${{ secrets.OGX_APP_SECRET }}
+        run: |
+          set -euo pipefail
+          LD="-s -w \
+            -X github.com/prasenjeet-symon/ogcode/internal/version.Version=${RELEASE_REF} \
+            -X github.com/prasenjeet-symon/ogcode/internal/version.Commit=$(git rev-parse HEAD) \
+            -X github.com/prasenjeet-symon/ogcode/internal/version.Date=$(date -u +%Y-%m-%dT%H:%M:%SZ) \
+            -X github.com/prasenjeet-symon/ogcode/internal/provider.OGXAppSecret=${OGX_APP_SECRET}"
+          # Link fully statically against musl rather than dynamically against
+          # the runner's glibc. Building natively on ubuntu-latest made the
+          # binaries require the runner's glibc symbol versions (GLIBC_2.38 as
+          # of Ubuntu 24.04), so they refused to start on Debian 12, Ubuntu
+          # 22.04 LTS, RHEL 9 and Amazon Linux 2023 with
+          #   version `GLIBC_2.38' not found (required by ogcode)
+          # A static musl binary depends on no libc at all and runs on every
+          # distro, glibc and musl alike. zig supplies the C cross-compiler for
+          # both architectures, so one runner covers amd64 and arm64.
+          #
+          # -tags musl is what go-fitz needs to select its bundled
+          # libmupdf_linux_<arch>_musl.a; without it the musl link fails.
+          CGO_ENABLED=1 GOOS=linux GOARCH=amd64 \
+            CC="zig cc -target x86_64-linux-musl" \
+            CXX="zig c++ -target x86_64-linux-musl" \
+            go build -tags musl -trimpath -ldflags "$LD -extldflags '-static'" \
+              -o prebuilt/ogcode_linux_amd64/ogcode .
+          CGO_ENABLED=1 GOOS=linux GOARCH=arm64 \
+            CC="zig cc -target aarch64-linux-musl" \
+            CXX="zig c++ -target aarch64-linux-musl" \
+            go build -tags musl -trimpath -ldflags "$LD -extldflags '-static'" \
+              -o prebuilt/ogcode_linux_arm64/ogcode .
+          # Fail the release rather than ship a binary that needs a libc.
+          for f in prebuilt/ogcode_linux_amd64/ogcode prebuilt/ogcode_linux_arm64/ogcode; do
+            if readelf -d "$f" | grep -q NEEDED; then
+              echo "ERROR: $f is dynamically linked; expected a static binary" >&2
+              readelf -d "$f" | grep NEEDED >&2
+              exit 1
+            fi
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: prebuilt-linux
+          path: prebuilt
+          retention-days: 1
+          if-no-files-found: error
+
+  build-macos:
+    name: Build (darwin)
+    needs: build-web
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_REF }}
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist
+      - name: Build binaries
+        shell: bash
+        env:
+          # The first-party client secret, baked into the binary at link time
+          # (internal/provider.OGXAppSecret) so the release signs its gateway
+          # calls as app `ogcode`. Unset in a fork, so the binary simply
+          # signs nothing rather than failing the build.
+          OGX_APP_SECRET: ${{ secrets.OGX_APP_SECRET }}
+        run: |
+          set -euo pipefail
+          LD="-s -w \
+            -X github.com/prasenjeet-symon/ogcode/internal/version.Version=${RELEASE_REF} \
+            -X github.com/prasenjeet-symon/ogcode/internal/version.Commit=$(git rev-parse HEAD) \
+            -X github.com/prasenjeet-symon/ogcode/internal/version.Date=$(date -u +%Y-%m-%dT%H:%M:%SZ) \
+            -X github.com/prasenjeet-symon/ogcode/internal/provider.OGXAppSecret=${OGX_APP_SECRET}"
+          # arm64 native; amd64 via clang's built-in cross arch (Apple universal toolchain).
+          CGO_ENABLED=1 GOOS=darwin GOARCH=arm64 \
+            go build -trimpath -ldflags "$LD" -o prebuilt/ogcode_darwin_arm64/ogcode .
+          CGO_ENABLED=1 GOOS=darwin GOARCH=amd64 CC="clang -arch x86_64" CXX="clang++ -arch x86_64" \
+            go build -trimpath -ldflags "$LD" -o prebuilt/ogcode_darwin_amd64/ogcode .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: prebuilt-darwin
+          path: prebuilt
+          retention-days: 1
+          if-no-files-found: error
+
+  build-windows:
+    name: Build (windows)
+    needs: build-web
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_REF }}
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist
+      - name: Install llvm-mingw (x86_64 + aarch64 windows C toolchains)
+        shell: bash
+        env:
+          # Authenticate the API lookup: unauthenticated api.github.com requests
+          # from shared runner IPs are rate-limited and intermittently 403.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          url=$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" \
+            https://api.github.com/repos/mstorsjo/llvm-mingw/releases/latest \
+            | grep browser_download_url | grep 'ucrt-x86_64.zip' | head -1 | cut -d'"' -f4)
+          if [ -z "$url" ]; then echo "could not resolve llvm-mingw download URL"; exit 1; fi
+          echo "Downloading $url"
+          curl -fsSL "$url" -o llvm-mingw.zip
+          # Extract to an absolute location; a relative dir on $GITHUB_PATH does
+          # not resolve as a PATH entry in later steps.
+          7z x llvm-mingw.zip -oC:/llvm-mingw >/dev/null
+          bin_unix=$(cd C:/llvm-mingw/*/bin && pwd)
+          echo "llvm-mingw bin: $bin_unix"
+          ls "$bin_unix" | grep -E 'w64-mingw32-clang(\+\+)?(\.exe)?$' || true
+          cygpath -w "$bin_unix" >> "$GITHUB_PATH"
+      - name: Verify windows C toolchain on PATH
+        shell: bash
+        run: |
+          set -euo pipefail
+          for cc in x86_64-w64-mingw32-clang aarch64-w64-mingw32-clang; do
+            command -v "$cc" >/dev/null || { echo "missing compiler: $cc"; exit 1; }
+            echo "found: $(command -v "$cc")"
+          done
+      - name: Build binaries
+        shell: bash
+        env:
+          # The first-party client secret, baked into the binary at link time
+          # (internal/provider.OGXAppSecret) so the release signs its gateway
+          # calls as app `ogcode`. Unset in a fork, so the binary simply
+          # signs nothing rather than failing the build.
+          OGX_APP_SECRET: ${{ secrets.OGX_APP_SECRET }}
+        run: |
+          set -euo pipefail
+          LD="-s -w \
+            -X github.com/prasenjeet-symon/ogcode/internal/version.Version=${RELEASE_REF} \
+            -X github.com/prasenjeet-symon/ogcode/internal/version.Commit=$(git rev-parse HEAD) \
+            -X github.com/prasenjeet-symon/ogcode/internal/version.Date=$(date -u +%Y-%m-%dT%H:%M:%SZ) \
+            -X github.com/prasenjeet-symon/ogcode/internal/provider.OGXAppSecret=${OGX_APP_SECRET}"
+          CGO_ENABLED=1 GOOS=windows GOARCH=amd64 CC=x86_64-w64-mingw32-clang CXX=x86_64-w64-mingw32-clang++ \
+            go build -trimpath -ldflags "$LD" -o prebuilt/ogcode_windows_amd64/ogcode.exe .
+          CGO_ENABLED=1 GOOS=windows GOARCH=arm64 CC=aarch64-w64-mingw32-clang CXX=aarch64-w64-mingw32-clang++ \
+            go build -trimpath -ldflags "$LD" -o prebuilt/ogcode_windows_arm64/ogcode.exe .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: prebuilt-windows
+          path: prebuilt
+          retention-days: 1
+          if-no-files-found: error
+
+  release:
+    needs: [build-linux, build-macos, build-windows]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_REF }}
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Download prebuilt binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: prebuilt-*
+          path: prebuilt
+          merge-multiple: true
+
+      - name: Stage prebuilt binaries
+        run: |
+          set -euo pipefail
+          chmod +x tools/gobuild-shim.sh
+          # upload-artifact drops the executable bit; the shim re-applies it on copy,
+          # but restore it here too so the staged tree is self-consistent.
+          find prebuilt -type f -name ogcode -exec chmod +x {} +
+          echo "Staged binaries:"
+          find prebuilt -type f | sort
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          WINGET_PKGS_TOKEN: ${{ secrets.WINGET_PKGS_TOKEN }}
+          PREBUILT_DIR: ${{ github.workspace }}/prebuilt
+
+      - name: Create Winget PR to microsoft/winget-pkgs
+        # Skip for prereleases (e.g. -rc/-beta tags): GoReleaser's winget step
+        # skips them too, so there's no fork branch to open a PR from.
+        if: success() && !contains(github.ref_name, '-')
+        env:
+          GH_TOKEN: ${{ secrets.WINGET_PKGS_TOKEN }}
+        run: |
+          # Get version from tag or workflow_dispatch input
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+          else
+            VERSION="${{ github.ref_name }}"
+          fi
+          VERSION="${VERSION#v}"
+          BRANCH="ogcode-${VERSION}"
+          FORK_OWNER="prasenjeet-symon"
+          
+          echo "Processing winget release for v${VERSION}..."
+          
+          # Check if PR already exists
+          EXISTING_PR=$(gh pr list \
+            --repo microsoft/winget-pkgs \
+            --head "${FORK_OWNER}:${BRANCH}" \
+            --base master \
+            --state all \
+            --json number \
+            --jq '.[0].number' 2>/dev/null || echo "")
+          
+          if [ -n "$EXISTING_PR" ]; then
+            echo "PR #${EXISTING_PR} already exists for branch ${BRANCH}. Checking status..."
+            PR_STATE=$(gh pr view "${EXISTING_PR}" --repo microsoft/winget-pkgs --json state --jq '.state')
+            if [ "$PR_STATE" = "merged" ]; then
+              echo "PR was already merged - version ${VERSION} is already in winget-pkgs"
+              exit 0
+            elif [ "$PR_STATE" = "closed" ]; then
+              echo "PR was closed - recreating with force push..."
+              # Re-create branch from current master
+              git fetch upstream master
+              git checkout -B "${BRANCH}" upstream/master
+              git push "${FORK_OWNER}" "${BRANCH}" --force
+            else
+              echo "PR #${EXISTING_PR} is still open - no action needed"
+              exit 0
+            fi
+          else
+            # Verify branch exists in fork, create if not
+            if ! git ls-remote --heads "https://github.com/${FORK_OWNER}/winget-pkgs.git" "${BRANCH}" | grep -q "${BRANCH}"; then
+              echo "Branch ${BRANCH} does not exist in fork. This may indicate GoReleaser didn't push."
+              echo "The winget-pkgs manifest may need to be created manually or GoReleaser config needs adjustment."
+              exit 1
+            fi
+          fi
+          
+          # Create PR body
+          PR_BODY="Automated PR created by GoReleaser for ogcode v${VERSION}. This PR updates the winget manifest for ogcode CLI tool. _This PR was automatically generated._"
+          
+          # Create PR
+          echo "Creating PR for ogcode v${VERSION}..."
+          gh pr create \
+            --repo microsoft/winget-pkgs \
+            --title "[ogcode] New version: prasenjeet-symon.ogcode version ${VERSION}" \
+            --body "${PR_BODY}" \
+            --head "${FORK_OWNER}:${BRANCH}" \
+            --base master || {
+              # If create fails, check if it's due to no new commits
+              if gh api "repos/microsoft/winget-pkgs/compare/master...${FORK_OWNER}:${BRANCH}" --jq '.behind_by' 2>/dev/null | grep -q "0"; then
+                echo "No new commits - PR may already be up to date"
+                exit 0
+              fi
+              echo "Failed to create PR - winget-pkgs may need manual intervention"
+              exit 1
+            }
+          
+          echo "✓ Winget PR created successfully!"

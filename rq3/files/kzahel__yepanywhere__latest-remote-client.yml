@@ -1,0 +1,115 @@
+name: Deploy Latest Remote Client
+
+on:
+  workflow_run:
+    workflows:
+      - CI
+    types:
+      - completed
+
+permissions:
+  contents: read
+  deployments: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  PREVIOUS_DEPLOYMENT_ORIGIN: https://latest.yepanywhere.com/
+
+jobs:
+  deploy:
+    # Skipped PR/manual CI completions must not cancel a real push deploy.
+    concurrency:
+      group: latest-remote-client
+      cancel-in-progress: true
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'main'
+    environment:
+      name: latest-remote-client
+      url: https://latest.yepanywhere.com/
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check Cloudflare deploy config
+        id: cloudflare-config
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_PAGES_PROJECT_NAME: ${{ vars.CLOUDFLARE_PAGES_PROJECT_NAME }}
+        run: |
+          if [ -z "$CLOUDFLARE_ACCOUNT_ID" ] ||
+             [ -z "$CLOUDFLARE_API_TOKEN" ] ||
+             [ -z "$CLOUDFLARE_PAGES_PROJECT_NAME" ]; then
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Skipping Cloudflare Pages deploy because CLOUDFLARE_* configuration is incomplete."
+            exit 0
+          fi
+          echo "enabled=true" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout CI head
+        if: steps.cloudflare-config.outputs.enabled == 'true'
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      - name: Install pnpm
+        if: steps.cloudflare-config.outputs.enabled == 'true'
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+
+      - name: Setup Node.js
+        if: steps.cloudflare-config.outputs.enabled == 'true'
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        if: steps.cloudflare-config.outputs.enabled == 'true'
+        run: pnpm install --frozen-lockfile
+
+      - name: Build shared package
+        if: steps.cloudflare-config.outputs.enabled == 'true'
+        run: pnpm --filter @yep-anywhere/shared build
+
+      - name: Build remote client
+        if: steps.cloudflare-config.outputs.enabled == 'true'
+        run: |
+          pnpm --filter @yep-anywhere/client exec tsc
+          pnpm --filter @yep-anywhere/client exec vite build --config vite.config.remote.ts --base /
+
+      - name: Prepare Cloudflare Pages output
+        if: steps.cloudflare-config.outputs.enabled == 'true'
+        env:
+          ASSET_RETENTION_BOOTSTRAP: ${{ vars.ASSET_RETENTION_BOOTSTRAP }}
+        run: |
+          cp packages/client/dist-remote/remote.html packages/client/dist-remote/index.html
+          rm -f packages/client/dist-remote/404.html
+          bootstrap_args=()
+          if [ "$ASSET_RETENTION_BOOTSTRAP" = "true" ]; then
+            bootstrap_args+=(--bootstrap)
+          fi
+          node packages/client/scripts/retain-previous-asset-generation.mjs \
+            --dist packages/client/dist-remote \
+            --previous-origin "$PREVIOUS_DEPLOYMENT_ORIGIN" \
+            "${bootstrap_args[@]}"
+          test -f packages/client/dist-remote/index.html
+          test -f packages/client/dist-remote/_headers
+          test -f packages/client/dist-remote/asset-generation.json
+
+      - name: Install Wrangler
+        if: steps.cloudflare-config.outputs.enabled == 'true'
+        run: npm ci --prefix sharing-worker
+
+      - name: Deploy to Cloudflare Pages
+        if: steps.cloudflare-config.outputs.enabled == 'true'
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_PAGES_PROJECT_NAME: ${{ vars.CLOUDFLARE_PAGES_PROJECT_NAME }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          sharing-worker/node_modules/.bin/wrangler pages deploy packages/client/dist-remote \
+            --project-name "$CLOUDFLARE_PAGES_PROJECT_NAME" \
+            --branch main \
+            --commit-hash "$HEAD_SHA" \
+            --commit-dirty=false

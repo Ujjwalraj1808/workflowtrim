@@ -1,0 +1,212 @@
+name: Visual-Regression-Tests
+on:
+  # When a PR is merged into main
+  pull_request:
+    types: [closed]
+    branches: [main]
+    # Skip when only visual-irrelevant files change.
+    # Lockfile/package.json are intentionally NOT here — they're handled via
+    # `untraced` below so TurboSnap can still detect runtime-dep changes.
+    paths-ignore:
+      - 'docs/**'
+      - '**/*.md'
+      - '**/*.mdx'
+      - '.changeset/**'
+
+  # Manual trigger
+  workflow_dispatch:
+
+  # When a comment is created on an issue or PR
+  issue_comment:
+    types: [created]
+
+jobs:
+  chromatic:
+    # To disable this workflow without code changes, set the repository variable
+    # VRT_ENABLED to 'false' (Settings → Secrets and variables → Actions → Variables).
+    # Unset or any other value keeps the workflow active (fail-open).
+    if: >
+      vars.VRT_ENABLED != 'false' && (
+        github.event_name == 'workflow_dispatch' ||
+        (
+          github.event_name == 'pull_request' &&
+          github.event.pull_request.merged == true
+        ) ||
+        (
+          github.event_name == 'issue_comment' &&
+          github.event.issue.pull_request &&
+          contains(github.event.comment.body, '/run-chromatic') &&
+          contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)
+        )
+      )
+
+    name: Visual Regression Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve branch and owner
+        id: resolve-branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "${{ github.event_name }}" = "issue_comment" ]; then
+            BRANCH=$(gh pr view ${{ github.event.issue.number }} --repo ${{ github.repository }} --json headRefName -q .headRefName)
+            OWNER=$(gh pr view ${{ github.event.issue.number }} --repo ${{ github.repository }} --json author -q .author.login)
+          elif [ "${{ github.event_name }}" = "pull_request" ]; then
+            BRANCH="${{ github.event.pull_request.base.ref }}"
+            OWNER="${{ github.event.pull_request.user.login }}"
+          elif [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            BRANCH="${{ github.ref_name }}"
+            OWNER="${{ github.actor }}"
+          else
+            BRANCH="${{ github.head_ref || github.ref_name }}"
+            OWNER="${{ github.actor }}"
+          fi
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+          echo "owner=$OWNER" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          # Pick the right ref depending on the trigger:
+          # 1. If merged PR: Use the merge commit on the target branch.
+          # 2. If Comment: Construct the specific pull request ref.
+          # 3. If push/dispatch: Leave empty (defaults to the pushed/selected branch).
+          ref: >-
+            ${{
+              github.event_name == 'pull_request' && github.event.pull_request.merge_commit_sha ||
+              github.event_name == 'issue_comment' && format('refs/pull/{0}/head', github.event.issue.number) ||
+              ''
+            }}
+          # Required by Chromatic
+          fetch-depth: 0
+      - name: Resolve checked-out commit
+        # The checkout above always lands on a real, persisted commit
+        # (merged squash commit on main / PR head / branch tip). We pin
+        # Chromatic to this SHA so the merge-triggered baseline build isn't
+        # tagged to GITHUB_SHA, which on pull_request events is an ephemeral
+        # test-merge ref that never enters git history — making the main
+        # baseline unusable and freezing the Chromatic ancestor at the last
+        # build that happened to have a real commit.
+        id: sha
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - uses: pnpm/action-setup@v6.1.0 # Uses version from package.json#packageManager
+      - name: Setup Node (using .node-version)
+        uses: actions/setup-node@v6
+        with:
+          node-version-file: '.node-version'
+          cache: 'pnpm'
+      - name: Install dependencies
+        run: pnpm install
+      - name: Build Storybook
+        run: pnpm build:sb
+      - name: Run visual regression tests on chromatic
+        id: chromatic
+        uses: chromaui/action@latest
+        env:
+          # Force Chromatic to record the build against the real checked-out
+          # commit instead of GITHUB_SHA, which on pull_request events is an
+          # ephemeral test-merge ref that never enters git history (making the
+          # build unusable as a baseline). The CLI only honors this override
+          # when BOTH CHROMATIC_SHA and CHROMATIC_BRANCH are set
+          # (isFromEnvironmentVariable = CHROMATIC_SHA && CHROMATIC_BRANCH);
+          # CHROMATIC_SLUG must also be passed because the override path sets
+          # `slug = CHROMATIC_SLUG` unconditionally and would otherwise clear it.
+          CHROMATIC_SHA: ${{ steps.sha.outputs.sha }}
+          CHROMATIC_BRANCH: ${{ steps.resolve-branch.outputs.branch }}
+          CHROMATIC_SLUG: ${{ github.repository }}
+        with:
+          projectToken: ${{ secrets.CHROMATIC_PROJECT_TOKEN }}
+          branchName: ${{ steps.resolve-branch.outputs.branch }}
+          onlyChanged: true # TurboSnap: https://www.chromatic.com/docs/turbosnap/setup/
+          zip: true # Zip the Storybook build for faster uploads
+          # Files whose changes should NOT trigger story re-snapshots via
+          # dependency tracing. Keep this list focused on files that change
+          # often but cannot affect rendered output.
+          untraced: |
+            ./.storybook/decorators.tsx
+            **/*.md
+            **/*.mdx
+            .changeset/**
+            **/*.test.{ts,tsx}
+            **/vitest.*.{ts,mjs,js}
+            **/vitest.setup.{ts,mjs,js}
+            eslint.config.*
+            **/tsconfig*.json
+          storybookConfigDir: './.storybook'
+          storybookBuildDir: './storybook-static'
+          storybookBaseDir: '.'
+          debug: true
+          # One-shot diagnostics so we can see WHY TurboSnap chose to
+          # snapshot what it did. Inspect via the uploaded artifact below.
+          diagnosticsFile: true
+          traceChanged: expanded
+
+      - name: Upload Chromatic diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: chromatic-diagnostics-${{ github.run_id }}
+          path: |
+            chromatic-diagnostics.json
+            chromatic.log
+          if-no-files-found: ignore
+
+      - name: Send Slack notification
+        if: always() && steps.chromatic.outputs.changeCount != '0' && startsWith(steps.chromatic.outputs.buildUrl, 'http')
+        uses: slackapi/slack-github-action@v4.0.0
+        with:
+          webhook: ${{ secrets.SLACK_HOOK_DST_REPO_STREAM }}
+          webhook-type: incoming-webhook
+          payload: |
+            {
+              "blocks": [
+                {
+                  "type": "header",
+                  "text": {
+                    "type": "plain_text",
+                    "text": "${{ steps.chromatic.outcome == 'success' && '✅' || '⚠️' }}  Visual Regression Tests — ${{ steps.resolve-branch.outputs.branch }}"
+                  }
+                },
+                {
+                  "type": "context",
+                  "elements": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Branch:* `${{ steps.resolve-branch.outputs.branch }}` | *Commit:* `${{ steps.sha.outputs.sha }}` | *Triggered by:* ${{ github.actor }} (${{ github.event_name }})"
+                    }
+                  ]
+                },
+                {
+                  "type": "divider"
+                },
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "🔍 *${{ steps.chromatic.outputs.changeCount }} visual changes* found that need review.\n\n👉 *@${{ steps.resolve-branch.outputs.owner }}*, please <${{ steps.chromatic.outputs.buildUrl }}|review the changes on Chromatic>."
+                  }
+                },
+                {
+                  "type": "actions",
+                  "elements": [
+                    {
+                      "type": "button",
+                      "text": {
+                        "type": "plain_text",
+                        "text": "Review on Chromatic"
+                      },
+                      "style": "primary",
+                      "url": "${{ steps.chromatic.outputs.buildUrl }}"
+                    },
+                    {
+                      "type": "button",
+                      "text": {
+                        "type": "plain_text",
+                        "text": "View Storybook"
+                      },
+                      "url": "${{ steps.chromatic.outputs.storybookUrl }}"
+                    }
+                  ]
+                }
+              ]
+            }

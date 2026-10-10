@@ -1,0 +1,227 @@
+name: CI Front
+
+on:
+  pull_request:
+  merge_group:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}${{ github.ref == 'refs/heads/main' && format('-{0}', github.sha) || '' }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  # restore-cache action adds 'v4-' prefix and '-<branch>-<sha>' suffix to the key
+  STORYBOOK_BUILD_CACHE_KEY_FOR_RESTORE_ACTION: storybook-build-ubuntu-latest-8-cores-runner
+  STORYBOOK_BUILD_CACHE_KEY_FOR_SAVE_ACTION: v4-storybook-build-ubuntu-latest-8-cores-runner-${{ github.ref_name }}-${{ github.sha }}
+  FRONT_TEST_SHARD_COUNTER: 3
+
+jobs:
+  changed-files-check:
+    if: github.event_name == 'pull_request'
+    uses: ./.github/workflows/changed-files.yaml
+    with:
+      files: |
+        package.json
+        yarn.lock
+        packages/twenty-front/**
+        packages/twenty-front-component-renderer/**
+        packages/twenty-ui/**
+        packages/twenty-shared/**
+        packages/twenty-sdk/**
+        !packages/twenty-sdk/package.json
+  front-sb-build:
+    needs: changed-files-check
+    if: >-
+      always() &&
+      (github.event_name == 'push' ||
+      needs.changed-files-check.outputs.any_changed == 'true')
+    timeout-minutes: 30
+    runs-on: ubuntu-latest-8-cores
+    env:
+      REACT_APP_SERVER_BASE_URL: http://localhost:3000
+    steps:
+      - name: Fetch local actions
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 10
+      - name: Install dependencies
+        uses: ./.github/actions/yarn-install
+      - name: Restore storybook build cache
+        uses: ./.github/actions/restore-cache
+        with:
+          key: ${{ env.STORYBOOK_BUILD_CACHE_KEY_FOR_RESTORE_ACTION }}
+      - name: Diagnostic disk space issue
+        run: df -h
+      - name: Front / Write .env
+        run: npx nx reset:env twenty-front
+      - name: Front / Build storybook
+        run: npx nx storybook:build twenty-front
+      - name: Upload storybook build
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: storybook-static
+          path: packages/twenty-front/storybook-static
+          retention-days: 1
+      - name: Save storybook build cache
+        uses: ./.github/actions/save-cache
+        with:
+          key: ${{ env.STORYBOOK_BUILD_CACHE_KEY_FOR_SAVE_ACTION }}
+  front-sb-test-modules:
+    needs: changed-files-check
+    if: >-
+      always() &&
+      (github.event_name == 'push' ||
+      needs.changed-files-check.outputs.any_changed == 'true')
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
+    uses: ./.github/workflows/ci-front-storybook-test.yaml
+    with:
+      scope: modules
+      shard: ${{ matrix.shard }}
+      shard-count: ${{ strategy.job-total }}
+  front-sb-test-pages:
+    needs: changed-files-check
+    if: >-
+      always() &&
+      (github.event_name == 'push' ||
+      needs.changed-files-check.outputs.any_changed == 'true')
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    uses: ./.github/workflows/ci-front-storybook-test.yaml
+    with:
+      scope: pages
+      shard: ${{ matrix.shard }}
+      shard-count: ${{ strategy.job-total }}
+  front-sb-test-performance:
+    needs: changed-files-check
+    if: needs.changed-files-check.outputs.any_changed == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    uses: ./.github/workflows/ci-front-storybook-test.yaml
+    with:
+      scope: performance
+      shard: ${{ matrix.shard }}
+      shard-count: ${{ strategy.job-total }}
+  front-sb-screenshots:
+    timeout-minutes: 5
+    runs-on: ubuntu-latest
+    needs: [front-sb-test-modules, front-sb-test-pages]
+    if: >-
+      always() &&
+      needs.front-sb-test-modules.result == 'success' &&
+      needs.front-sb-test-pages.result == 'success'
+    steps:
+      - name: Download shard screenshot artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: argos-screenshots-twenty-front-*
+          merge-multiple: true
+          path: screenshots
+      - name: Upload merged screenshots artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: argos-screenshots-twenty-front
+          path: screenshots
+          retention-days: 1
+          overwrite: true
+  front-task:
+    needs: changed-files-check
+    if: needs.changed-files-check.outputs.any_changed == 'true'
+    timeout-minutes: 30
+    runs-on: ubuntu-latest
+    env:
+      NODE_OPTIONS: '--max-old-space-size=6144'
+      TASK_CACHE_KEY: front-task-${{ matrix.name }}${{ matrix.shard && format('-{0}', matrix.shard) || '' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: lint, tasks: lint }
+          - { name: typecheck, tasks: typecheck }
+          - { name: lingui-extract, tasks: 'lingui:extract' }
+          - { name: lingui-compile, tasks: 'lingui:compile' }
+          - { name: test, tasks: test, shard: 1 }
+          - { name: test, tasks: test, shard: 2 }
+          - { name: test, tasks: test, shard: 3 }
+    steps:
+      - name: Fetch custom Github Actions and base branch history
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 10
+      - name: Install dependencies
+        uses: ./.github/actions/yarn-install
+      - name: Restore ${{ matrix.name }} cache
+        id: restore-task-cache
+        uses: ./.github/actions/restore-cache
+        with:
+          key: ${{ env.TASK_CACHE_KEY }}
+      - name: Reset .env
+        uses: ./.github/actions/nx-affected
+        with:
+          tag: scope:frontend
+          tasks: reset:env
+      - name: Run ${{ matrix.tasks }} task
+        id: run-task
+        uses: ./.github/actions/nx-affected
+        with:
+          tag: scope:frontend
+          tasks: ${{ matrix.tasks }}
+          args: ${{ matrix.shard && format('--shard={0}/{1}', matrix.shard, env.FRONT_TEST_SHARD_COUNTER) || '' }}
+      - name: Save ${{ matrix.name }} cache
+        uses: ./.github/actions/save-cache
+        with:
+          key: ${{ steps.restore-task-cache.outputs.cache-primary-key }}
+  front-build:
+    needs: changed-files-check
+    if: needs.changed-files-check.outputs.any_changed == 'true'
+    timeout-minutes: 30
+    runs-on: ubuntu-latest-8-cores
+    env:
+      NODE_OPTIONS: "--max-old-space-size=10240"
+      ANALYZE: "true"
+    steps:
+      - name: Fetch custom Github Actions and base branch history
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 10
+      - name: Install dependencies
+        uses: ./.github/actions/yarn-install
+      - name: Front / Write .env
+        run: npx nx reset:env twenty-front
+      - name: Build frontend
+        run: npx nx build twenty-front
+      # - name: Upload frontend build artifact
+      #   uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      #   with:
+      #     name: frontend-build
+      #     path: packages/twenty-front/build
+      #     retention-days: 1
+  ci-front-status-check:
+    if: always() && !cancelled()
+    timeout-minutes: 5
+    runs-on: ubuntu-latest
+    needs:
+      [
+        changed-files-check,
+        front-task,
+        front-build,
+        front-sb-test-modules,
+        front-sb-test-pages,
+        front-sb-test-performance,
+        front-sb-build,
+        front-sb-screenshots,
+      ]
+    steps:
+      - name: Fail job if any needs failed
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+        run: exit 1

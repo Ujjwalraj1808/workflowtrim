@@ -1,0 +1,88 @@
+name: Update Console Version
+
+on:
+  workflow_dispatch:
+    inputs:
+      console-version:
+        description: 'Console version to use (for example, v4.2.7)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-console-version-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  update-console-version:
+    if: startsWith(github.ref, 'refs/heads/')
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out the selected branch
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.ref_name }}
+
+      - name: Set up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: 'temurin'
+          java-version: '25'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Update console version
+        env:
+          CONSOLE_VERSION: ${{ inputs.console-version }}
+        run: |
+          TEMPLATE=src/main/resources/cloudformation/console/template.yaml
+          AWS_TEST=apps/console/src/integration/java/com/formkiq/stacks/console/awstest/AwsResourceTest.java
+          VERSION_PATTERN='v[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?'
+
+          if [[ ! "$CONSOLE_VERSION" =~ ^${VERSION_PATTERN}$ ]]; then
+            echo "console-version must use the format vX.Y.Z, optionally with a prerelease suffix"
+            exit 1
+          fi
+
+          template_matches=$(grep -Ec "^    Default: ${VERSION_PATTERN}$" "$TEMPLATE" || true)
+          test_matches=$(grep -Ec "^[[:space:]]*assertEquals\\(\"${VERSION_PATTERN}\",$" "$AWS_TEST" || true)
+
+          if [[ "$template_matches" -ne 1 ]]; then
+            echo "Expected exactly one console version in ${TEMPLATE}; found ${template_matches}"
+            exit 1
+          fi
+
+          if [[ "$test_matches" -ne 1 ]]; then
+            echo "Expected exactly one console version in ${AWS_TEST}; found ${test_matches}"
+            exit 1
+          fi
+
+          sed -i -E "s|^(    Default: )${VERSION_PATTERN}$|\\1${CONSOLE_VERSION}|" "$TEMPLATE"
+          sed -i -E "s|^([[:space:]]*assertEquals\\(\")${VERSION_PATTERN}(\",)$|\\1${CONSOLE_VERSION}\\3|" "$AWS_TEST"
+
+      - name: Run Spotless
+        run: ./gradlew spotlessApply --no-daemon --console=plain
+
+      - name: Commit and push the update
+        env:
+          CONSOLE_VERSION: ${{ inputs.console-version }}
+          BRANCH_NAME: ${{ github.ref_name }}
+        run: |
+          TEMPLATE=src/main/resources/cloudformation/console/template.yaml
+          AWS_TEST=apps/console/src/integration/java/com/formkiq/stacks/console/awstest/AwsResourceTest.java
+
+          git add "$TEMPLATE" "$AWS_TEST"
+
+          if git diff --cached --quiet; then
+            echo "Console version is already ${CONSOLE_VERSION}; nothing to commit."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "Update console version to ${CONSOLE_VERSION}"
+          git push origin "HEAD:${BRANCH_NAME}"

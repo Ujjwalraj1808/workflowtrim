@@ -1,0 +1,85 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+  actions: write
+  id-token: write
+  attestations: write
+  artifact-metadata: write
+
+jobs:
+  quality:
+    uses: ./.github/workflows/quality.yml
+    permissions:
+      contents: read
+  build-release:
+    needs: quality
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Verify tag and package version
+        run: node -e 'const p=require("./package.json"); const tag=process.env.GITHUB_REF_NAME.replace(/^v/, ""); if (p.version !== tag) throw new Error(`Tag ${tag} does not match package ${p.version}`)'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build and validate
+        run: |
+          pnpm run i18n:gen-editor
+          pnpm run i18n:gen-runtime
+          pnpm run validate:fast
+          git diff --exit-code
+
+      - name: Validate release assets and generate metadata
+        run: pnpm run release:metadata
+
+      - name: Attest build provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-checksums: release/SHA256SUMS
+
+      - name: Attest SBOM
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-checksums: release/SHA256SUMS
+          sbom-path: release/nodalia-cards.sbom.cdx.json
+
+      - name: Publish verified release assets
+        shell: bash
+        run: |
+          mapfile -t assets < release/release-assets.txt
+          release_title="${GITHUB_REF_NAME#v}"
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" "${assets[@]}" --clobber
+          elif [[ "$GITHUB_REF_NAME" == *-* ]]; then
+            node scripts/generate-prerelease-notes.mjs "$release_title" release/release-notes.md
+            gh release create "$GITHUB_REF_NAME" "${assets[@]}" \
+              --verify-tag \
+              --notes-file release/release-notes.md \
+              --title "$release_title" \
+              --prerelease
+          else
+            node scripts/generate-stable-release-notes.mjs "$release_title" release/release-notes.md
+            gh release create "$GITHUB_REF_NAME" "${assets[@]}" \
+              --verify-tag \
+              --notes-file release/release-notes.md \
+              --title "Nodalia Cards $release_title"
+          fi
+      # Owner requested stable 3.0.0 promotion without repeating RC benchmarks.
+      # benchmark-release.yml remains available for future explicit measurements.

@@ -1,0 +1,20 @@
+---
+name: Deploy GitHub Pages
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - website/**
+      - .github/workflows/deploy_doc.yaml
+      - .github/workflows/workflow_call_deploy_doc.yaml
+permissions: {}
+jobs:
+  deploy-doc:
+    uses: ./.github/workflows/workflow_call_deploy_doc.yaml
+    secrets:
+      TAKUMI_GUARD_BOT_ID: ${{secrets.TAKUMI_GUARD_BOT_ID}}
+    permissions:
+      contents: write
+      issues: write
+      id-token: write

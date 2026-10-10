@@ -1,0 +1,175 @@
+name: PR Images
+
+on:
+  pull_request:
+    branches: [master]
+    types: [opened, synchronize, reopened, closed]
+
+concurrency:
+  group: pr-image-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+  pull-requests: write
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+  TAG: pr-${{ github.event.pull_request.number }}
+
+jobs:
+  publish:
+    name: Publish PR image
+    if: >-
+      github.event.action != 'closed' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/metadata-action@v6
+        id: meta
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=raw,value=${{ env.TAG }}
+            type=raw,value=${{ env.TAG }}-${{ github.event.pull_request.head.sha }}
+          labels: |
+            org.opencontainers.image.revision=${{ github.event.pull_request.head.sha }}
+
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            APP_REPO=${{ github.repository }}
+            APP_VERSION=${{ env.TAG }}
+          cache-from: type=gha,scope=pr-images
+          cache-to: type=gha,mode=max,scope=pr-images
+
+      - name: Show image name
+        run: echo "Published ${{ steps.meta.outputs.tags }}"
+
+      - name: Comment on pull request
+        uses: actions/github-script@v9
+        env:
+          IMAGE: ${{ env.IMAGE }}
+          PR_TAG: ${{ env.TAG }}
+          REVISION: ${{ github.event.pull_request.head.sha }}
+        with:
+          script: |
+            const marker = '<!-- pr-image-deployment -->';
+            const image = process.env.IMAGE.toLowerCase();
+            const tag = process.env.PR_TAG;
+            const revision = process.env.REVISION;
+            const shortRevision = revision.slice(0, 7);
+            const body = [
+              marker,
+              '### Testing image deployed',
+              '',
+              `The testing images for commit \`${shortRevision}\` are ready:`,
+              '',
+              '```bash',
+              `docker pull ${image}:${tag}`,
+              `docker pull ${image}:${tag}-${revision}`,
+              '```',
+              '',
+              `The \`${tag}\` tag always points to the latest deployment for this pull request.`,
+            ].join('\n');
+
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              ...context.repo,
+              issue_number: context.issue.number,
+              per_page: 100,
+            });
+            const previousComment = comments.find(
+              (comment) => comment.user?.type === 'Bot' && comment.body?.includes(marker),
+            );
+
+            if (previousComment) {
+              await github.rest.issues.updateComment({
+                ...context.repo,
+                comment_id: previousComment.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                ...context.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }
+
+  cleanup:
+    name: Delete PR image
+    if: >-
+      github.event.action == 'closed' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@v9
+        env:
+          PACKAGE_NAME: ${{ github.event.repository.name }}
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const packageName = process.env.PACKAGE_NAME.toLowerCase();
+            const tag = process.env.TAG;
+            const isOrganization = context.payload.repository.owner.type === 'Organization';
+
+            const versions = isOrganization
+              ? await github.paginate(
+                  'GET /orgs/{org}/packages/{package_type}/{package_name}/versions',
+                  { org: owner, package_type: 'container', package_name: packageName, per_page: 100 },
+                )
+              : await github.paginate(
+                  'GET /users/{username}/packages/{package_type}/{package_name}/versions',
+                  { username: owner, package_type: 'container', package_name: packageName, per_page: 100 },
+                );
+
+            const matches = versions.filter((version) => {
+              const tags = version.metadata?.container?.tags ?? [];
+              return tags.includes(tag) || tags.some((candidate) => candidate.startsWith(`${tag}-`));
+            });
+
+            if (matches.length === 0) {
+              core.info(`No package version tagged ${tag} was found.`);
+              return;
+            }
+
+            for (const version of matches) {
+              if (isOrganization) {
+                await github.request(
+                  'DELETE /orgs/{org}/packages/{package_type}/{package_name}/versions/{package_version_id}',
+                  {
+                    org: owner,
+                    package_type: 'container',
+                    package_name: packageName,
+                    package_version_id: version.id,
+                  },
+                );
+              } else {
+                await github.request(
+                  'DELETE /users/{username}/packages/{package_type}/{package_name}/versions/{package_version_id}',
+                  {
+                    username: owner,
+                    package_type: 'container',
+                    package_name: packageName,
+                    package_version_id: version.id,
+                  },
+                );
+              }
+
+              core.info(`Deleted ${packageName}:${tag} (package version ${version.id}).`);
+            }

@@ -1,0 +1,197 @@
+# Copyright (c) 2026, Oracle and/or its affiliates. All rights reserved.
+# Licensed under the Universal Permissive License v 1.0 as shown at
+# http://oss.oracle.com/licenses/upl.
+
+name: Coherence Operator Dual Stack
+
+on:
+  workflow_dispatch:
+  push:
+    branches-ignore:
+      - gh-pages
+      - 1.0.0
+      - 2.x
+      - 3.x
+  pull_request:
+    types:
+      - opened
+      - synchronize
+    branches-ignore:
+      - gh-pages
+      - 1.0.0
+      - 2.x
+      - 3.x
+
+jobs:
+  dual-stack:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK
+        uses: oracle-actions/setup-java@v1
+        with:
+          website: oracle.com
+          release: 21
+
+      - name: Cache Go modules
+        uses: actions/cache@v5
+        with:
+          path: ~/go/pkg/mod
+          key: ${{ runner.os }}-go-mods-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-mods-
+
+      - name: Cache Maven packages
+        uses: actions/cache@v5
+        with:
+          path: ~/.m2
+          key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
+          restore-keys: ${{ runner.os }}-m2
+
+      - name: Validate verification script syntax
+        run: bash -n hack/kind/verify-operator-rest-dual-stack.sh
+
+      - name: Start dual-stack KinD cluster
+        run: make kind-dual
+
+      - name: Build operator image, Helm chart, and basic test image
+        run: make build-operator helm-chart build-basic-test-image
+
+      - name: Load operator and basic test images
+        run: make kind-load-operator kind-load-basic-test-image
+
+      - name: Verify REST Service IP-family matrix
+        run: |
+          set -o errexit
+          set -o nounset
+          set -o pipefail
+
+          chart_version="$(<build/_output/version.txt)"
+          chart="build/_output/helm-charts/coherence-operator-${chart_version}.tgz"
+
+          verify_scenario() {
+            local scenario="$1"
+            local expected_policy="$2"
+            local expected_families_csv="$3"
+            local configured_policy="$4"
+            local configured_families="$5"
+            local keep_release="${6:-false}"
+            local expected_families=()
+            local helm_args=(--set replicas=1)
+
+            IFS=',' read -r -a expected_families <<< "${expected_families_csv}"
+            if [[ -n "${configured_policy}" ]]; then
+              helm_args+=(--set "restService.ipFamilyPolicy=${configured_policy}")
+            fi
+            if [[ -n "${configured_families}" ]]; then
+              helm_args+=(--set "restService.ipFamilies={${configured_families}}")
+            fi
+
+            echo "Verifying scenario: ${scenario}"
+            helm upgrade --install coherence-operator "${chart}" \
+              --namespace operator-test \
+              --create-namespace \
+              --wait \
+              --timeout 5m \
+              "${helm_args[@]}"
+
+            hack/kind/verify-operator-rest-dual-stack.sh \
+              operator-test coherence-operator-rest "${expected_policy}" "${expected_families[@]}"
+
+            if [[ "${keep_release}" == false ]]; then
+              helm uninstall coherence-operator --namespace operator-test --wait --timeout 5m
+              kubectl --namespace operator-test wait --for=delete \
+                service/coherence-operator-rest --timeout=2m
+            fi
+          }
+
+          verify_scenario default SingleStack IPv6 "" ""
+          verify_scenario single-stack-ipv4 SingleStack IPv4 SingleStack IPv4
+          verify_scenario single-stack-ipv6 SingleStack IPv6 SingleStack IPv6
+          verify_scenario prefer-dual-stack-ipv4-first PreferDualStack IPv4,IPv6 PreferDualStack IPv4,IPv6
+          verify_scenario prefer-dual-stack-ipv6-first PreferDualStack IPv6,IPv4 PreferDualStack IPv6,IPv4
+          verify_scenario require-dual-stack-ipv4-first RequireDualStack IPv4,IPv6 RequireDualStack IPv4,IPv6
+          verify_scenario require-dual-stack-ipv6-first RequireDualStack IPv6,IPv4 RequireDualStack IPv6,IPv4 true
+
+      - name: Verify IPv6 suspend finalization
+        run: |
+          RUN_IPV6_FINALIZER_TEST=true make run-e2e-test \
+            OPERATOR_NAMESPACE=operator-test \
+            GO_TEST_FLAGS_E2E='-run=^TestSuspendServicesWithIPv6PodIP$ -count=1'
+
+      - name: Collect diagnostics
+        if: ${{ failure() || cancelled() }}
+        run: |
+          diagnostics=build/_output/test-logs/dual-stack-diagnostics
+          mkdir -p "${diagnostics}"
+
+          kubectl get all --all-namespaces -o wide \
+            | tee "${diagnostics}/all-resources.txt" || true
+          kubectl --namespace operator-test get coherence.coherence.oracle.com -o yaml \
+            > "${diagnostics}/coherence.yaml" || true
+          kubectl get storageclasses -o yaml \
+            > "${diagnostics}/storageclasses.yaml" || true
+          kubectl --namespace operator-test get persistentvolumeclaims -o yaml \
+            > "${diagnostics}/persistentvolumeclaims.yaml" || true
+          kubectl --namespace operator-test get statefulsets -o yaml \
+            > "${diagnostics}/statefulsets.yaml" || true
+          kubectl --namespace operator-test get pods -o yaml \
+            > "${diagnostics}/pods.yaml" || true
+          kubectl --namespace operator-test get pods \
+            -o custom-columns='NAME:.metadata.name,PRIMARY_IP:.status.podIP,POD_IPS:.status.podIPs[*].ip,NODE:.spec.nodeName' \
+            | tee "${diagnostics}/pod-addresses.txt" || true
+          kubectl --namespace operator-test get service coherence-operator-rest -o yaml \
+            > "${diagnostics}/operator-rest-service.yaml" || true
+          kubectl --namespace operator-test get endpointslices \
+            --selector kubernetes.io/service-name=coherence-operator-rest -o yaml \
+            > "${diagnostics}/operator-rest-endpointslices.yaml" || true
+          kubectl --namespace operator-test get events \
+            --sort-by=.metadata.creationTimestamp -o wide \
+            | tee "${diagnostics}/events.txt" || true
+          kubectl --namespace operator-test logs deployment/coherence-operator \
+            --all-pods=true --all-containers=true --prefix \
+            > "${diagnostics}/operator.log" || true
+
+          while read -r pod; do
+            if [[ -n "${pod}" ]]; then
+              pod_name="${pod#pod/}"
+              kubectl --namespace operator-test logs "${pod}" \
+                --all-containers=true --prefix \
+                > "${diagnostics}/${pod_name}.log" || true
+            fi
+          done < <(kubectl --namespace operator-test get pods \
+            --selector coherenceComponent=coherencePod -o name 2>/dev/null)
+
+      - name: Clean up dual-stack resources
+        if: ${{ always() }}
+        run: |
+          for resource in $(kubectl --namespace operator-test get \
+            coherence.coherence.oracle.com -o name 2>/dev/null); do
+            kubectl --namespace operator-test patch "${resource}" --type=merge \
+              --patch '{"metadata":{"finalizers":[]}}' || true
+            kubectl --namespace operator-test delete "${resource}" \
+              --ignore-not-found --wait=false || true
+          done
+          kubectl --namespace operator-test delete pod \
+            coherence-operator-rest-dual-stack-probe --ignore-not-found --wait=false || true
+          kubectl --namespace operator-test delete statefulsets \
+            --selector coherenceComponent=coherence --ignore-not-found --wait=false || true
+          kubectl --namespace operator-test delete pods \
+            --selector coherenceComponent=coherencePod --ignore-not-found --wait=false || true
+          kubectl --namespace operator-test delete persistentvolumeclaims \
+            --selector coherenceComponent=coherence-volume --ignore-not-found --wait=false || true
+          helm uninstall coherence-operator --namespace operator-test \
+            --wait --timeout 5m || true
+
+      - name: Upload dual-stack test logs
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: dual-stack-test-logs
+          path: build/_output/test-logs
+          if-no-files-found: warn

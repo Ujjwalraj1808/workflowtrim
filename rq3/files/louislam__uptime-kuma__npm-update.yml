@@ -1,0 +1,97 @@
+name: NPM Update
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 0 * * *" # Run daily at midnight UTC
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  npm-update:
+    # Only run on the original repository, not on forks
+    if: github.repository == 'louislam/uptime-kuma'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - branch: master
+            update_branch: npm-update
+          - branch: 2.5.X
+            update_branch: npm-update-2.5.X
+
+    steps:
+      - name: Checkout ${{ matrix.branch }} branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ matrix.branch }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 20
+
+      - name: Generate lockfile from scratch
+        run: |
+          npm install npm -g
+          npm -v
+          rm -f package-lock.json
+          npm install --package-lock-only
+          npm install-scripts approve --all
+
+      - name: Check if there are changes
+        id: check_changes
+        run: |
+          if git diff --quiet package.json package-lock.json; then
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+          else
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Configure git
+        if: steps.check_changes.outputs.has_changes == 'true'
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Commit changes
+        if: steps.check_changes.outputs.has_changes == 'true'
+        run: |
+          git add package.json package-lock.json
+          git commit -m "chore: Update dependencies"
+
+      - name: Force push to ${{ matrix.update_branch }} branch
+        if: steps.check_changes.outputs.has_changes == 'true'
+        run: |
+          git push -f origin HEAD:${{ matrix.update_branch }}
+
+      - name: Check if PR exists
+        if: steps.check_changes.outputs.has_changes == 'true'
+        id: check_pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PR_EXISTS=$(gh pr list --base ${{ matrix.branch }} --head ${{ matrix.update_branch }} --json number --jq 'length')
+          if [ "$PR_EXISTS" -eq "0" ]; then
+            echo "pr_exists=false" >> $GITHUB_OUTPUT
+          else
+            echo "pr_exists=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create Pull Request
+        if: steps.check_changes.outputs.has_changes == 'true' && steps.check_pr.outputs.pr_exists == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr create \
+            --base ${{ matrix.branch }} \
+            --head ${{ matrix.update_branch }} \
+            --title "chore: Update dependencies" \
+            --body ""

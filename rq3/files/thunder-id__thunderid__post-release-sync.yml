@@ -1,0 +1,123 @@
+# This workflow merges the selected branch, 'release' by default, back into main.
+# Started manually from the Actions tab.
+# If there are no conflicts, it commits directly to main.
+# If there are conflicts, it creates a sync PR for manual resolution.
+
+name: 🔁 Post-Release Sync
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: 'Branch to merge into main'
+        required: false
+        type: string
+        default: 'release'
+
+permissions:
+  contents: write
+  pull-requests: write
+
+env:
+  SOURCE_BRANCH: ${{ inputs.branch || 'release' }}
+  TARGET_BRANCH: "main"
+  RELEASE_GIT_USER_NAME: "thunderid-automation-bot"
+  RELEASE_GIT_USER_EMAIL: "thunderid-bot@thunderid.dev"
+
+jobs:
+  sync-to-main:
+    name: 🔀 Sync to main
+    runs-on: ubuntu-latest
+    steps:
+      - name: 📥 Checkout Target Branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.THUNDER_AUTOMATION_BOT }}
+          ref: ${{ env.TARGET_BRANCH }}
+
+      - name: 🔧 Configure Git
+        run: |
+          git config --local user.name "${{ env.RELEASE_GIT_USER_NAME }}"
+          git config --local user.email "${{ env.RELEASE_GIT_USER_EMAIL }}"
+
+      - name: 🔄 Merge Source Branch into Main
+        id: merge_sync
+        run: |
+          set -euo pipefail
+
+          git fetch origin "${SOURCE_BRANCH}" "${TARGET_BRANCH}"
+          git checkout "${TARGET_BRANCH}"
+
+          AHEAD=$(git rev-list --count "HEAD..origin/${SOURCE_BRANCH}")
+          if [ "${AHEAD}" = "0" ]; then
+            echo "✅ ${TARGET_BRANCH} is already up to date with ${SOURCE_BRANCH}. Nothing to sync."
+            echo "conflict_detected=false" >> "$GITHUB_OUTPUT"
+            echo "merged=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if ! git merge --no-ff --no-edit "origin/${SOURCE_BRANCH}"; then
+            echo "❌ Merge conflict detected while merging ${SOURCE_BRANCH} into ${TARGET_BRANCH}."
+            git merge --abort || true
+            echo "conflict_detected=true" >> "$GITHUB_OUTPUT"
+            echo "merged=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git push origin "HEAD:${TARGET_BRANCH}"
+          echo "✅ Successfully merged ${SOURCE_BRANCH} into ${TARGET_BRANCH}."
+          echo "conflict_detected=false" >> "$GITHUB_OUTPUT"
+          echo "merged=true" >> "$GITHUB_OUTPUT"
+
+      - name: 🔔 Create Sync PR for Conflict Resolution
+        if: steps.merge_sync.outputs.conflict_detected == 'true'
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const base = process.env.TARGET_BRANCH;
+            const headBranch = process.env.SOURCE_BRANCH;
+            const head = `${owner}:${headBranch}`;
+            const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
+            const triggerLine = `Triggered manually from Actions: ${runUrl}`;
+
+            const existing = await github.rest.pulls.list({
+              owner,
+              repo,
+              state: 'open',
+              base,
+              head
+            });
+
+            if (existing.data.length > 0) {
+              const pr = existing.data[0];
+              core.info(`Existing sync PR found: #${pr.number} ${pr.html_url}`);
+              return;
+            }
+
+            const created = await github.rest.pulls.create({
+              owner,
+              repo,
+              title: `Sync ${headBranch} branch back to ${base}`,
+              head: headBranch,
+              base,
+              body: [
+                'Automated PR created because post-release sync hit merge conflicts.',
+                '',
+                `Source branch: ${headBranch}`,
+                `Target branch: ${base}`,
+                '',
+                triggerLine
+              ].join('\n')
+            });
+
+            core.info(`Created sync PR: #${created.data.number} ${created.data.html_url}`);
+
+            await core.summary
+              .addHeading('⚠️ Merge Conflict Detected', 3)
+              .addRaw(`Conflicts were found while merging \`${headBranch}\` into \`${base}\`. A pull request has been opened for manual resolution.`)
+              .addBreak()
+              .addRaw(`**PR:** [#${created.data.number} — ${created.data.title}](${created.data.html_url})`)
+              .write();

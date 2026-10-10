@@ -1,0 +1,213 @@
+# Builds for Windows on Ubuntu and validates its build and startup on Windows runner
+# Can be called from pr-builder.yml and release-builder.yml
+
+name: 🪟 Windows PowerShell Validation
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+env:
+  GOFLAGS: "-mod=readonly"
+  PRODUCT_NAME: "ThunderID"
+  PRODUCT_NAME_LOWER: "thunderid"
+
+jobs:
+  build-windows:
+    name: 🔨 Build for Windows
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: ⚙️ Set up Go Environment
+        uses: ./.github/actions/setup-go
+
+      - name: 🔐 Generate Shared Certificates
+        run: |
+          echo "🔐 Generating shared SSL certificates for all components..."
+          # Ensure the certificate directory exists
+          mkdir -p target/out/.cert
+
+          # Generate certificates
+          openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+            -keyout target/out/.cert/server.key \
+            -out target/out/.cert/server.cert \
+            -subj "/O=ThunderID/OU=${PRODUCT_NAME}/CN=localhost" \
+            -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
+
+          echo "✅ Shared certificates generated:"
+          ls -la target/out/.cert/
+          echo "📄 Certificate info:"
+          openssl x509 -in target/out/.cert/server.cert -text -noout | head -10
+
+      - name: 🔨 Build for Windows
+        run: |
+          echo "🔨 Building backend for Windows/amd64..."
+          make build_backend OS=windows ARCH=amd64
+
+          echo "✅ Built for Windows successfully!"
+
+          echo "📦 Built artifacts:"
+          ls -lah target/dist/
+
+      - name: 📦 Upload Windows Distribution
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ env.PRODUCT_NAME_LOWER }}-windows-distribution-${{ github.run_id }}
+          path: target/dist/${{ env.PRODUCT_NAME_LOWER }}-*-win-*.zip
+          if-no-files-found: error
+
+  test-windows:
+    name: 🧪 Test on Windows
+    runs-on: windows-latest
+    needs: build-windows
+
+    steps:
+      - name: 📥 Download Windows Build Artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ env.PRODUCT_NAME_LOWER }}-windows-distribution-${{ github.run_id }}
+          path: .
+
+      - name: 📂 Extract Windows Build
+        run: |
+          Write-Host "📂 Extracting build..."
+
+          # Find the zip file
+          $zipFile = Get-ChildItem -Filter "$env:PRODUCT_NAME_LOWER-*-win-*.zip" | Select-Object -First 1
+
+          if (-not $zipFile) {
+            Write-Host "❌ No distribution zip found"
+            exit 1
+          }
+
+          Write-Host "Found: $($zipFile.Name)"
+
+          # Extract the archive
+          Expand-Archive -Path $zipFile.FullName -DestinationPath "." -Force
+
+          # Find the extracted directory
+          $extractedDir = Get-ChildItem -Directory -Filter "$env:PRODUCT_NAME_LOWER-*-win-*" | Select-Object -First 1
+
+          if (-not $extractedDir) {
+            Write-Host "❌ No extracted directory found"
+            exit 1
+          }
+
+          Write-Host "✅ Extraction completed"
+          Write-Host "📁 Extracted to: $($extractedDir.Name)"
+
+          # Save the directory name for later steps
+          $extractedDir.Name | Out-File -FilePath "server-dir.txt"
+
+          Write-Host "📁 Contents:"
+          Get-ChildItem -Path $extractedDir.FullName | Select-Object Name, Length
+        shell: pwsh
+
+      - name: ⚙️ Run setup.ps1
+        run: |
+          # Get the server directory name
+          $serverDir = Get-Content "server-dir.txt" -Raw
+          $serverDir = $serverDir.Trim()
+
+          Write-Host "⚙️ Running setup.ps1..."
+
+          cd $serverDir
+
+          # Set environment variables for setup
+          $env:BOOTSTRAP_FAIL_FAST = "true"
+          $env:DEBUG = "false"  # Disable debug logging
+
+          # Run setup script
+          .\setup.ps1
+
+          Write-Host "✅ Setup completed successfully"
+        shell: pwsh
+        timeout-minutes: 10
+
+      - name: 🚀 Start Server
+        run: |
+          # Get the server directory name
+          $serverDir = Get-Content "server-dir.txt" -Raw
+          $serverDir = $serverDir.Trim()
+
+          Write-Host "Starting server in background..."
+          Write-Host "Working directory: $serverDir"
+
+          cd $serverDir
+
+          # Start server in background using Start-Process
+          # This ensures the server runs in the same session context and ports are accessible
+          $startScript = Join-Path (Get-Location) "start.ps1"
+          $proc = Start-Process -FilePath "pwsh" -ArgumentList @("-File", $startScript) -WorkingDirectory (Get-Location) -NoNewWindow -PassThru
+
+          Write-Host "Server process started (PID: $($proc.Id))"
+          Write-Host "Waiting for server to start..."
+
+          # Wait for server to initialize
+          Start-Sleep -Seconds 15
+
+          # Check if process is still running
+          if ($proc.HasExited) {
+            Write-Host "❌ Server process exited unexpectedly"
+            Write-Host "Exit Code: $($proc.ExitCode)"
+            exit 1
+          }
+
+          Write-Host "✅ Server process is running (PID: $($proc.Id))"
+
+          # Wait additional time for server to be fully ready
+          Write-Host "Waiting for server to be fully ready..."
+          Start-Sleep -Seconds 15
+
+          # Save process ID for cleanup
+          $pidFilePath = Join-Path $env:GITHUB_WORKSPACE "server-pid.txt"
+          $proc.Id | Out-File -FilePath $pidFilePath
+          Write-Host "Saved PID to: $pidFilePath"
+        timeout-minutes: 5
+        shell: pwsh
+
+      - name: 🛑 Stop Server
+        if: always()
+        run: |
+          Write-Host "🛑 Cleaning up server..."
+
+          # Stop the server process using saved PID
+          $pidFilePath = Join-Path $env:GITHUB_WORKSPACE "server-pid.txt"
+          if (Test-Path $pidFilePath) {
+            $serverPid = Get-Content $pidFilePath -Raw
+            $serverPid = $serverPid.Trim()
+
+            $proc = Get-Process -Id $serverPid -ErrorAction SilentlyContinue
+            if ($proc) {
+              Write-Host "⏹️ Stopping server process (PID: $serverPid)"
+              Stop-Process -Id $serverPid -Force -ErrorAction SilentlyContinue
+              Write-Host "✅ Server process stopped"
+            } else {
+              Write-Host "ℹ️ Server process (PID: $serverPid) already exited"
+            }
+          } else {
+            Write-Host "ℹ️ PID file not found (server may not have started)"
+          }
+
+          # Also find and kill any remaining server processes by name
+          $serverProcesses = Get-Process -Name "$env:PRODUCT_NAME_LOWER" -ErrorAction SilentlyContinue
+          if ($serverProcesses) {
+            Write-Host "⏹️ Found server process(es), stopping..."
+            foreach ($proc in $serverProcesses) {
+              Write-Host "  Stopping server process (PID: $($proc.Id))"
+              Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+            }
+            Write-Host "✅ All server processes stopped"
+          } else {
+            Write-Host "✅ No running server processes found"
+          }
+
+          Write-Host "✅ Cleanup complete"
+        shell: pwsh

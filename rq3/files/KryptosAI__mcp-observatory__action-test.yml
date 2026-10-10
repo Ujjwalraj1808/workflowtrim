@@ -1,0 +1,36 @@
+name: Action Test
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-action:
+    permissions:
+      contents: read
+      pull-requests: write
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 22
+
+      - name: Install dependencies and build
+        run: npm ci && npm run build
+
+      - name: Install CLI locally
+        run: npm link
+
+      - name: Test action against everything-server
+        uses: ./action
+        with:
+          command: npx -y @modelcontextprotocol/server-everything
+          security: true
+          fail-on-regression: false
+          set-status: false
+          comment-on-pr: ${{ github.event_name == 'pull_request' }}

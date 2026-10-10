@@ -1,0 +1,178 @@
+name: Auto Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  build:
+    name: Build distribution
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7
+        with:
+          python-version: "3.14"
+
+      - name: Install build tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install build twine
+
+      - name: Build Python package
+        run: python -m build
+
+      - name: Check distribution
+        run: twine check dist/*
+
+      - name: Remove sdist tarball (replaced by full release archive)
+        run: rm -f dist/*.tar.gz
+
+      - name: Build full release archive
+        run: |
+          VERSION="${{ github.ref_name }}"
+          ARCHIVE="termux-app-store-${VERSION}.tar.gz"
+          tar -czf "$ARCHIVE" \
+            tools/ \
+            packages/ \
+            termux-build \
+            build-package.sh \
+            tasctl \
+            install.sh \
+            uninstall.sh \
+            install-repo.py \
+            guidebook.py \
+            pkg-scaffold.py \
+            doctor.py \
+            pyproject.toml \
+            MANIFEST.in \
+            termux_app_store/ \
+            ARCHITECTURE.md \
+            BINARY_DISCLAIMER.md \
+            CHANGELOG.md \
+            CODE_OF_CONDUCT.md \
+            CONTRIBUTING.md \
+            DISCLAIMER.md \
+            FAQ.md \
+            GOVERNANCE.md \
+            HOW_TO_UPLOAD.md \
+            INSTALL.md \
+            LICENSE \
+            PRIVACY.md \
+            README.md \
+            README.id.md \
+            README.in.md \
+            README.ch.md \
+            README.jp.md \
+            README.th.md \
+            README.vi.md \
+            SECURITY.md \
+            SUPPORT.md \
+            TROUBLESHOOTING.md
+          mv "$ARCHIVE" dist/
+
+      - name: Generate SHA256 checksums
+        run: |
+          cd dist
+          for f in *.whl *.tar.gz; do
+            [[ -f "$f" ]] && sha256sum "$f" > "${f}.sha256"
+          done
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7
+        with:
+          name: dist
+          path: dist/
+
+  attest:
+    name: Attest build artifacts
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8
+        with:
+          name: dist
+          path: dist/
+
+      - name: Attest distributions
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4
+        with:
+          subject-path: |
+            dist/*.whl
+            dist/*.tar.gz
+
+  release:
+    name: Auto Release
+    needs: attest
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          fetch-depth: 0
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8
+        with:
+          name: dist
+          path: dist/
+
+      - name: Extract version from tag
+        id: version
+        run: echo "version=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+
+      - name: Extract changelog entry
+        id: changelog
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+
+          echo "Looking for changelog entry: [${VERSION}]"
+
+          awk "/^## \[${VERSION}\]/{found=1; next} found && /^## \[/{exit} found{print}" \
+            CHANGELOG.md \
+            | sed '/./,$!d' \
+            | sed -e :a -e '/^\s*$/{$d;N;ba}' \
+            > release_notes.txt
+
+          # Fail loudly — do NOT silently fall back to a generic message
+          if [[ ! -s release_notes.txt ]]; then
+            echo "ERROR: No changelog entry found for [${VERSION}]"
+            echo "Entries available in CHANGELOG.md:"
+            grep "^## \[" CHANGELOG.md
+            exit 1
+          fi
+
+          echo "── Release notes preview ──"
+          cat release_notes.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64  # v3
+        with:
+          name: "Termux-App-Store ${{ steps.version.outputs.version }}"
+          body_path: release_notes.txt
+          draft: false
+          prerelease: ${{ contains(steps.version.outputs.version, '-') }}
+          files: |
+            dist/*.whl
+            dist/*.tar.gz
+            dist/*.sha256

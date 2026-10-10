@@ -1,0 +1,37 @@
+name: License Check
+
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  license:
+    name: Python dependency licenses
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12"
+      - name: Check aletheore dependency licenses
+        working-directory: src
+        run: |
+          pip install -e .
+          pip install --require-hashes -r ../requirements-ci-license-check.lock.txt
+          pip-licenses --fail-on "GPL;AGPL" --format=plain-vertical
+      - name: Check github-app dependency licenses
+        working-directory: github-app
+        run: |
+          pip install ../src
+          pip install --require-hashes -r requirements.lock.txt
+          pip install --require-hashes -r requirements-semgrep.lock.txt
+          pip install --require-hashes -r ../requirements-ci-license-check.lock.txt
+          pip-licenses --fail-on "GPL;AGPL" --format=plain-vertical

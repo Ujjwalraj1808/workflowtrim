@@ -1,0 +1,156 @@
+name: Build and test
+permissions:
+  contents: read
+on:
+  push:
+    branches:
+    - master
+  pull_request:
+
+jobs:
+  ## Make sure go.mod and go.sum files are up-to-date with the code
+  ## TODO: make this fail if they're not up-to-date to inform the committer to udpate them
+  gomod:
+    runs-on: ubuntu-24.04
+    outputs:
+      gomod: ${{ steps.gomod.outputs.gomod }}
+      gosum: ${{ steps.gosum.outputs.gosum }}
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+    - run: make go-mod-tidy
+    - id: gomod
+      run: |
+        {
+          echo 'gomod<<FILE'
+          cat go.mod
+          echo
+          echo FILE
+        } >> "$GITHUB_OUTPUT"
+    - id: gosum
+      run: |
+        {
+          echo 'gosum<<FILE'
+          cat go.sum
+          echo
+          echo FILE
+        } >> "$GITHUB_OUTPUT"
+  lint:
+    runs-on: ubuntu-24.04
+    needs: gomod
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+    ## Sync go.mod and go.sum files from gomod job
+    - name: restore_gomod
+      run: echo "${{needs.gomod.outputs.gomod}}" > go.mod
+    - name: restore_gosum
+      run: echo "${{needs.gomod.outputs.gosum}}" > go.sum
+    - run: make golint
+
+  reno_lint:
+    runs-on: ubuntu-24.04
+    needs: gomod
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        fetch-depth: 0
+    # - name: reset_git_extension
+    #   run: git config --unset-all extensions.worktreeconfig
+    - name: reno_lint
+      run: make reno-lint
+    ## Reno lint does not catch some errors which make reno report fail
+    - name: reno_report_check
+      run: make reno-report
+
+  test:
+    runs-on: ubuntu-24.04
+    needs: gomod
+    strategy:
+      fail-fast: false
+      matrix:
+        testSuite: [test, integration-test, helm-test]
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+    ## Sync go.mod and go.sum files from gomod job
+    - name: restore_gomod
+      run: echo "${{needs.gomod.outputs.gomod}}" > go.mod
+    - name: restore_gosum
+      run: echo "${{needs.gomod.outputs.gosum}}" > go.sum
+    - uses: helm/kind-action@06c1ae10762d3b9c1644e7fe69596ae519e015a2 # v1.15.0
+    # A test (CRDSuite) that runs as part of `make test` requies atleast one CRD to
+    # be present on the cluster. That's why we are only installing csi-hostpath-driver
+    # before running `make test`, to create some CRDs on the cluster.
+    - run: |
+        make install-csi-hostpath-driver
+        make install-s3mock
+    - run: |
+        export POD_NAME=$(kubectl get pods --namespace s3mock -l "release=s3mock" -o jsonpath="{.items[0].metadata.name}")
+        nohup kubectl port-forward $POD_NAME 9000:9090 --namespace s3mock &
+        sleep 5
+      if: matrix.testSuite == 'test'
+    ## We set LOCAL_S3MOCK to avoid issues with DNS in github action runniers
+    - run: make ${{ matrix.testSuite }} LOCAL_S3MOCK=true
+  build:
+    runs-on: ubuntu-24.04
+    needs: gomod
+    strategy:
+      matrix:
+        bin: [controller, kanctl, kando]
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+    ## Sync go.mod and go.sum files from gomod job
+    - name: restore_gomod
+      run: echo "${{needs.gomod.outputs.gomod}}" > go.mod
+    - name: restore_gosum
+      run: echo "${{needs.gomod.outputs.gosum}}" > go.sum
+    - run: make build BIN=${{ matrix.bin }}
+  docs:
+    runs-on: ubuntu-24.04
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+    - run: make docs
+  release:
+    runs-on: ubuntu-24.04
+    needs: [lint, test, build, docs]
+    if: github.ref_name == 'master' || startsWith(github.ref, 'refs/tags')
+    permissions:
+      packages: write
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+    - run: make go-mod-tidy
+    - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+      with:
+        registry: ghcr.io
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    - run: sudo rm -rf /usr/share/dotnet
+    - run: sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+    - run: docker image prune -af
+    - run: docker builder prune -af
+    - run: make release-snapshot
+    - run: COMMIT_SHA=${{ github.sha }} ./build/push_images.sh
+  image_tags:
+    runs-on: ubuntu-latest
+    outputs:
+      tag_short: ${{ steps.image_tags.outputs.tag_short }}
+      tag_long: ${{ steps.image_tags.outputs.tag_long }}
+    steps:
+    - id: image_tags
+      env:
+        COMMIT_SHA: ${{ github.sha }}
+      run: |
+        echo "tag_short=short-commit-${COMMIT_SHA::12}" >> $GITHUB_OUTPUT
+        echo "tag_long=commit-${COMMIT_SHA}" >> $GITHUB_OUTPUT
+  release_example_docker_images:
+    needs: [release, image_tags]
+    permissions:
+      packages: write
+      contents: read
+    uses: ./.github/workflows/build_example_images.yaml
+    with:
+      image_tag: v9.99.9-dev
+      ref: ${{ github.ref }}
+      platforms: linux/amd64
+      extra_tags: |
+        ${{ needs.image_tags.outputs.tag_short }}
+        ${{ needs.image_tags.outputs.tag_long }}
+

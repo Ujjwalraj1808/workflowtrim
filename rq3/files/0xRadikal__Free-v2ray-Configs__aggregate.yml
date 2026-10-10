@@ -1,0 +1,1456 @@
+name: 🔄 Aggregate V2Ray Configs
+
+# ─────────────────────────────────────────────────────────────────────────────
+# جمع‌آوری، حذف تکراری/خراب، برندینگ و انتشار کانفیگ‌ها — هدف: هر ۱۵ دقیقه
+# منبع: ۱۹ سورس (۵ سبک + ۱۴ انبوه) — بدون TCP-connect
+# توکن: از GITHUB_TOKEN داخلی Actions استفاده می‌شود (هیچ توکنی hardcode نشده)
+#
+# ★ فیکسِ «به‌روزرسانی نشدن سرِ ساعت» ★
+#   تجربه نشان داده زمان‌بندیِ cron در GitHub Actions در ساعاتِ شلوغ تا ده‌ها
+#   دقیقه تأخیر می‌خورد یا اصلاً اجرا نمی‌شود (محدودیتِ شناخته‌شدهٔ پلتفرم).
+#   راهکارِ مقاوم (سه‌لایه):
+#     ۱) cron با تواترِ بالا (هر ۵ دقیقه) ← شانسِ بیشتر برای اجرا
+#     ۲) دروازهٔ زمانی (freshness gate): اگر index.json در < ۱۳ دقیقهٔ اخیر
+#        آپدیت شده باشد، job زود خارج می‌شود (کارِ سنگین انجام نمی‌دهد).
+#        نتیجه: تواترِ مؤثرِ به‌روزرسانی ≈ ۱۵ دقیقه، حتی با تأخیرِ cron.
+#     ۳) repository_dispatch ← سرورِ همیشه‌روشنِ ربات می‌تواند به‌عنوانِ
+#        fallbackِ تضمینی، workflow را trigger کند (event: aggregate-now).
+# ─────────────────────────────────────────────────────────────────────────────
+
+on:
+  schedule:
+    # هر ۵ دقیقه تلاش می‌کنیم؛ ولی «دروازهٔ زمانی» فقط هر ~۱۵ دقیقه واقعاً کار
+    # می‌کند. این الگو تأخیر/حذفِ cronِ گیت‌هاب را جبران می‌کند.
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Force run (ignore freshness gate)"
+        required: false
+        default: "false"
+  repository_dispatch:
+    types: [aggregate-now]      # سرورِ ربات با این event می‌تواند trigger کند
+  push:
+    branches: [main]
+    paths:
+      - "scripts/**"
+      - ".github/workflows/aggregate.yml"
+    # ⚠️ چرا این trigger باعثِ حلقهٔ بی‌پایان نمی‌شود، با اینکه خودِ workflow
+    #    روی `main` پوش می‌کند (دو لایهٔ محافظت، هر دو تأییدشده):
+    #
+    #  ۱) مستنداتِ رسمیِ گیت‌هاب (docs.github.com → GITHUB_TOKEN):
+    #       «When you use the repository's GITHUB_TOKEN to perform tasks,
+    #        events triggered by the GITHUB_TOKEN will not create a new
+    #        workflow run … if a workflow run pushes code using the
+    #        repository's GITHUB_TOKEN, a new workflow will not run even when
+    #        the repository contains a workflow configured to run when push
+    #        events occur.»
+    #     این مرحله از همان GITHUB_TOKENِ داخلی استفاده می‌کند (هیچ PATی
+    #     تنظیم نشده)، پس پوشِ ربات هیچ runِ جدیدی نمی‌سازد.
+    #
+    #  ۲) حتی اگر لایهٔ اول یک روز عوض شود، فیلترِ `paths` هم جلویش را
+    #     می‌گیرد: ربات فقط مسیرهای خروجی (all/, heavy/, light/, protocols/,
+    #     archive/, index.json, health.json) را می‌نویسد و هیچ‌وقت
+    #     `scripts/**` یا خودِ این فایل را تغییر نمی‌دهد.
+    #     (گاردِ «رگرسیونِ سورس» در مرحلهٔ انتشار همین را تضمین می‌کند.)
+
+# جلوگیری از اجرای هم‌زمانِ چند run (اگر یکی در حال اجراست، بعدی صبر می‌کند)
+concurrency:
+  group: aggregate
+  cancel-in-progress: false
+
+permissions:
+  contents: write              # برای commit/push نتایج
+
+# فاصلهٔ هدفِ به‌روزرسانی (دقیقه). با update_interval_minutes در index.json یکی است.
+# ★ کاهش از ۳۱ → ۱۵ دقیقه (درخواستِ مالک: «وقفهٔ بینِ آپدیت‌ها را بیاور پایین»).
+env:
+  UPDATE_INTERVAL_MINUTES: "15"
+  AGG_UPDATE_INTERVAL_MIN: "15"   # به aggregate.py پاس داده می‌شود (index.json/ETA)
+  # حاشیهٔ امنیتی: کمی کمتر از ۱۵ می‌گیریم تا اگر cron با ۱-۲ دقیقه تأخیر آمد،
+  # باز هم به‌جای رد شدن، اجرا شود (جلوگیری از «۳۰ دقیقه‌ای شدن» تصادفی).
+  FRESHNESS_GATE_MINUTES: "13"
+  # ── شاخهٔ انتشار ─────────────────────────────────────────────────────────
+  #
+  # ★★★ چرا خروجی‌ها روی `main` (شاخهٔ پیش‌فرض) منتشر می‌شوند و نه یک شاخهٔ جدا
+  #
+  # نسخهٔ قبلیِ این فایل خروجی‌ها را روی یک شاخهٔ orphan به نامِ `data`
+  # می‌گذاشت تا تاریخِ گیت باد نکند. آن تصمیم از نظرِ مهندسی درست بود و از
+  # نظرِ محصول یک اشتباهِ جدی — با اندازه‌گیری اثبات شد، نه با حدس:
+  #
+  #   ۱) هر لینکی که کاربران قبلاً کپی کرده بودند (‎.../main/all/configs.txt‎)
+  #      با HTTP 404 پاسخ می‌داد. یعنی اشتراکِ هر کسی که از قبل ما را
+  #      اضافه کرده بود، بی‌صدا خالی می‌شد.
+  #   ۲) بازدیدکنندهٔ صفحهٔ اصلیِ گیت‌هاب هیچ فایلِ کانفیگی نمی‌دید. کاربرِ
+  #      معمولیِ این حوزه نمی‌داند «branch» چیست تا عوضش کند؛ او فقط دنبالِ
+  #      فایل است. نتیجه: افتِ کشف‌پذیری، ستاره، و ایندکسِ موتورهای جست‌وجو.
+  #   ۳) بررسیِ مخازنِ موفقِ همین حوزه: هیچ‌کدام خروجی را روی شاخهٔ جدا
+  #      نمی‌گذارند —
+  #        Epodonios/v2ray-configs      ⭐3166  → main  (۲۴.۷ گیگابایت!)
+  #        mahdibland/ShadowsocksAggregator ⭐4003 → master
+  #        Pawdroid/Free-servers        ⭐18420 → main
+  #      یعنی «حجمِ تاریخ» عملاً مانعِ موفقیت نیست، ولی «پنهان بودنِ فایل‌ها»
+  #      هست.
+  #
+  # پس فایل‌ها به `main` برمی‌گردند، و مسئلهٔ حجم با روشِ «rolling squash»
+  # حل می‌شود (توضیحِ کاملش بالای مرحلهٔ انتشار). خلاصه: `main` همیشه
+  # «تاریخِ کاملِ سورس + دقیقاً یک کامیتِ خروجی» است، پس هزینهٔ حجم O(1)
+  # می‌شود در حالی که فایل‌ها روی شاخهٔ پیش‌فرض و در معرضِ دید می‌مانند.
+  PUBLISH_BRANCH: main
+  # نشانگرِ کامیتِ خروجیِ خودکار. مرحلهٔ انتشار با همین رشته «کامیتِ خروجی» را
+  # از «کامیتِ سورس» تشخیص می‌دهد. تغییرش ندهید مگر با مهاجرتِ حساب‌شده:
+  # اگر عوض شود، کامیتِ خروجیِ قبلی «سورس» تشخیص داده می‌شود و یک بار در
+  # تاریخ می‌ماند (خرابی ایجاد نمی‌کند، ولی یک کامیتِ اضافه باقی می‌گذارد).
+  OUT_MARK: "[auto-output]"
+  # برای سازگاریِ عقب‌رو: اسکریپت‌ها/داکیومنت‌های قدیمی ممکن است این نام را
+  # بخوانند. هر دو به یک شاخه اشاره می‌کنند.
+  DATA_BRANCH: main
+
+jobs:
+  aggregate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: ⬇️ Checkout
+        # ★ SHA-pinned, not a moving tag ★
+        #   A major tag such as `v4` is mutable: the owner can repoint it, so the
+        #   bytes that execute in CI can change while this file does not. Pinning
+        #   the commit SHA makes the executed code immutable. The trailing comment
+        #   keeps the human-readable version visible and is the form Dependabot
+        #   understands, so version bumps are still proposed as normal PRs.
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # ── دروازهٔ زمانی: اگر به‌تازگی آپدیت شده، زود خارج شو ──────────────
+      - name: ⏱️ Freshness gate
+        id: gate
+        run: |
+          FORCE="${{ github.event.inputs.force }}"
+          EVENT="${{ github.event_name }}"
+          # رویدادهای دستی/دیسپچ/پوش همیشه اجرا می‌شوند (بدون دروازه)
+          if [ "$FORCE" = "true" ] || [ "$EVENT" = "workflow_dispatch" ] || \
+             [ "$EVENT" = "repository_dispatch" ] || [ "$EVENT" = "push" ]; then
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+            echo "✅ Manual/dispatch/push event → running unconditionally."
+            exit 0
+          fi
+          # ⚠️ index.json را از **remote** می‌خوانیم، نه از worktree.
+          #   دلیل: actions/checkout@v4 به‌صورتِ پیش‌فرض shallow (depth=1) است
+          #   و روی نوکِ همان لحظه می‌نشیند؛ ولی مرحلهٔ انتشار با force-push
+          #   نوک را جابه‌جا می‌کند. پس تنها منبعِ حقیقت برای «آخرین انتشار»
+          #   خودِ remote است. اگر این را از worktree می‌خواندیم، در بدترین
+          #   حالت فایل کهنه/غایب دیده می‌شد و دروازه همیشه «باز» می‌ماند:
+          #   هر ۵ دقیقه یک اجرای کاملِ سنگین به‌جای هر ۱۵ دقیقه — یعنی سه
+          #   برابر کامیت و سه برابر رشدِ حجم.
+          if git ls-remote --exit-code --heads origin "$PUBLISH_BRANCH" >/dev/null 2>&1; then
+            # عمق محدود است، ولی سقفِ زمانی هم لازم دارد تا دروازه نتواند
+            # روی یک اتصالِ گیرکرده بی‌نهایت بماند.
+            timeout 120 git fetch --depth=1 origin "$PUBLISH_BRANCH" >/dev/null 2>&1 || true
+            git show "FETCH_HEAD:index.json" > /tmp/gate_index.json 2>/dev/null || true
+          fi
+          if [ ! -s /tmp/gate_index.json ]; then
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+            echo "✅ No published index.json on '$PUBLISH_BRANCH' yet → running."
+            exit 0
+          fi
+          # اختلافِ زمانِ آخرین آپدیت با حالا (ثانیه)
+          AGE=$(python - <<'PY'
+          import json, time, datetime
+          try:
+              d = json.load(open("/tmp/gate_index.json"))
+              u = d.get("updated_at_unix")
+              if not u:
+                  ts = d.get("updated_at")
+                  u = datetime.datetime.fromisoformat(ts).timestamp() if ts else 0
+              print(int(time.time() - float(u)))
+          except Exception:
+              print(10**9)  # خطا → قدیمی فرض کن تا اجرا شود
+          PY
+          ) || AGE=""
+          # ↑ `|| AGE=""` — چرا (F-7، بخشِ دوم) ─────────────────────────────────
+          # این گام **پیش از** گامِ `🐍 Setup Python` اجرا می‌شود (ترتیبِ گام‌ها
+          # را ببینید؛ عمداً شمارهٔ سطر نمی‌نویسیم چون با هر ویرایش می‌لنگد)، پس
+          # `python` این‌جا هرچه در تصویرِ runner باشد است، نه پایتونِ پین‌شدهٔ
+          # ما. گامِ `run:` در GitHub Actions با `bash -e {0}` اجرا می‌شود و
+          # زیرِ `errexit` یک انتسابِ ساده وضعیتِ خروجِ جانشینیِ فرمان را به
+          # ارث می‌برد. با اجرا اندازه‌گیری شد (نه با حدس):
+          #     python غایب        → گام با rc=127 می‌مُرد
+          #     مفسر exit 1        → rc=1
+          #     مفسر SIGKILL (OOM) → rc=137
+          # یعنی یک نقصِ محیطیِ گذرا در *خواندنِ سنِ فایل* کلِ jobِ تجمیع را
+          # شکست می‌داد، در حالی که هیچ‌یک از ۱۷ گامِ بعدی به این `python`
+          # وابسته نیست. با `|| AGE=""` آن مرگ به «سنِ نامعلوم» بدل می‌شود و
+          # گاردِ پایین‌تر آن را به fail-open (اجرا) می‌نگارد.
+          # مسیرِ سالم بایت‌به‌بایت دست‌نخورده است: با `print(1200)` مقدارِ
+          # `$AGE` با و بدون این پسوند یکی است (سنجیده شد).
+          GATE_SEC=$(( FRESHNESS_GATE_MINUTES * 60 ))
+          echo "Last update age: ${AGE}s | gate: ${GATE_SEC}s"
+          # ── چرا این دو گارد لازم‌اند (F-7) ───────────────────────────────────
+          #
+          # heredocِ بالا نیتش را صریح نوشته است: `print(10**9)  # خطا → قدیمی
+          # فرض کن تا اجرا شود` — یعنی fail-OPEN. ولی مقایسهٔ شلِ زیرین آن نیت
+          # را **بی‌صدا نقض می‌کرد**. با اجرا اثبات شد، نه با خواندنِ کد:
+          #
+          #   $ [ "" -ge 780 ];      echo $?   → 2
+          #   $ [ "abc" -ge 780 ];   echo $?   → 2
+          #   $ [ "12.5" -ge 780 ];  echo $?   → 2
+          #
+          # `test` روی عملوندِ غیرصحیح **۲** برمی‌گرداند، نه ۰/۱. و `if` هر
+          # مقدارِ ناصفر را «نادرست» می‌شمارد، پس شاخهٔ `else` اجرا می‌شد:
+          # `should_run=false`.
+          #
+          # و `set -e` نجاتمان نمی‌داد: خطای `test` داخلِ شرطِ `if` است، پس
+          # errexit آن را نمی‌گیرد؛ گام با کدِ ۰ «موفق» گزارش می‌شد. یعنی
+          # خرابی نه لاگ داشت، نه علامتِ سرخ.
+          #
+          # ⚠️ دقتِ ادعا: کدام سناریوها **واقعاً** به این مقایسه می‌رسند؟
+          # نسخهٔ اولِ همین توضیح ادعا می‌کرد «مفسرِ غایب / مرگِ پیش از چاپ»
+          # هم به این‌جا می‌رسند. آن ادعا با اجرا **رد شد** و اصلاح شده است:
+          # زیرِ `errexit` آن سه حالت گام را با rc=127/1/137 می‌کشند و هرگز
+          # به مقایسه نمی‌رسند (به همین دلیل `|| AGE=""` بالا اضافه شد، که
+          # اکنون آن‌ها را هم به همین مسیر می‌آورد). سناریوهایی که پیش از
+          # افزودنِ آن پسوند هم بی‌صدا به این‌جا می‌رسیدند، این‌ها هستند و هر
+          # چهار مورد اندازه‌گیری شده‌اند:
+          #   • مفسر با کدِ ۰ خارج شود ولی چیزی چاپ نکند   → AGE=''
+          #   • stdout آلوده شود (هشدار + عدد، چندخطی)      → AGE='notice\n1200'
+          #   • عددِ منفی چاپ شود (مُهرِ آینده)              → AGE='-3599'
+          #   • عددِ بزرگ‌تر از عددِ ۶۴بیتی چاپ شود          → AGE='9…' (۱۹+ رقم)
+          #
+          # شعاعِ انفجار: ۱۷ گامِ پایین‌دستی به `steps.gate.outputs.should_run
+          # == 'true'` بسته‌اند. پس یک `$AGE`ِ ناخوانا = یک دورِ کاملاً پوچ که
+          # «سبز» گزارش می‌شود.
+          #
+          # ── نیمهٔ دومِ نقص که در گزارشِ اولیه نبود: $AGE منفی ────────────────
+          # `AGE = now - updated_at` است و `updated_at_unix` از ساعتِ خودِ
+          # runner می‌آید (`aggregate.py:711` ← `datetime.now(utc)`ِ سطرِ ۶۶۱).
+          # یک مُهرِ **آینده** (انحرافِ ساعت، یا index.jsonِ دستکاری‌شده) عددِ
+          # منفی می‌سازد. عددِ منفی «بدشکل» نیست: `[ -3599 -ge 780 ]` تمیز
+          # rc=1 می‌دهد و مستقیم به `else` می‌رود. اندازه‌گیری شد: مُهرِ
+          # ۳۰ روز آینده ⇒ AGE=-2591999 ⇒ `should_run=false` برای ۳۰ روز.
+          # الگوی `*[!0-9]*` علامتِ منفی را می‌گیرد، پس این نیمه هم بسته شد.
+          #
+          # ── چرا کلاهکِ طول (۱۸ رقم) ─────────────────────────────────────────
+          # الگوی «همه‌رقم» به‌تنهایی کافی نبود: عددِ صحیحِ ۶۴بیتیِ bash سرریز
+          # می‌کند و باز rc=2 می‌دهد. مرزِ دقیق با اجرا پیدا شد:
+          #   9223372036854775807 (۱۹ رقم) → rc=0   ✓
+          #   9223372036854775808 (۱۹ رقم) → rc=2   ✗
+          # پس ۱۸ رقم بزرگ‌ترین طولی است که **همیشه** ایمن است. و این حالت
+          # فرضی نیست: `{"updated_at_unix": 1e300}` یک AGEِ ۳۰۲رقمی تولید کرد
+          # و `{"updated_at_unix": -1e30}` یک ۳۱رقمی — هر دو با اجرا دیده شدند.
+          # (۱۸ رقم ≈ ۳۱٫۷ میلیارد سال سن؛ هیچ سنِ واقعی‌ای را رد نمی‌کند.)
+          #
+          # ── چرا fail-OPEN این‌جا درست است، در حالی که دروازهٔ انتشار
+          #    عامدانه fail-CLOSED است ───────────────────────────────────────
+          # این تفاوت سلیقه نیست، تقارنِ زیانْ نامتقارن است:
+          #   • اشتباهِ این دروازه به سمتِ «اجرا» ⇒ حداکثر یک دورِ اضافه
+          #     (هدرِ محاسبه). خروجی خراب نمی‌شود، چون دروازهٔ انتشارِ
+          #     fail-closed (گامِ «Publish») هنوز سرِ جایش است.
+          #   • اشتباه به سمتِ «رد» ⇒ خط‌لوله بی‌صدا و **پایدار** می‌خوابد و
+          #     اشتراکِ کاربران کهنه می‌ماند، بدونِ هیچ علامتِ سرخی.
+          # و مهم‌تر: fail-OPEN خودش را درمان می‌کند — `index.json` در
+          # `OUTPUT_PATHS` است، پس هر دورِ موفق مُهرِ سالمِ تازه
+          # می‌نویسد. fail-CLOSED برعکس، خودش را قفل می‌کند: مُهرِ بدِ منتشرشده
+          # هر دورِ بعدی را هم رد می‌کند و راهِ اصلاحِ خودکار بسته می‌شود.
+          #
+          # ── چرا `case` و نه `[[ =~ ]]` یا `expr` ────────────────────────────
+          # `case` تنها ابزارِ تطبیقِ الگو در شل است که POSIX است، زیرفرآیند
+          # نمی‌سازد، روی ورودیِ چندخطی هم درست کار می‌کند، و — برخلافِ
+          # `[[ $x =~ ^[0-9]+$ ]]` — به رفتارِ regexِ نسخهٔ bash وابسته نیست.
+          # همچنین همین اصطلاح از قبل در همین فایل به‌کار رفته
+          # (`is_output_path()` در گامِ انتشار)، پس سبکِ تازه‌ای نمی‌آورد.
+          #
+          # هر سه حالتِ گریز **بلند** اعلام می‌شوند (`::warning::`) تا خرابیِ
+          # زیرین در Actions دیده شود؛ هدف fail-open است، نه پنهان‌کاری.
+          AGE_OK=1
+          case "$AGE" in
+            ''|*[!0-9]*) AGE_OK=0 ;;
+            *) [ "${#AGE}" -gt 18 ] && AGE_OK=0 ;;
+          esac
+          GATE_OK=1
+          case "$GATE_SEC" in
+            ''|*[!0-9]*) GATE_OK=0 ;;
+            *) [ "${#GATE_SEC}" -gt 18 ] && GATE_OK=0 ;;
+          esac
+          if [ "$AGE_OK" != "1" ]; then
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::freshness gate could not read the published age (AGE='${AGE}') — running anyway (fail-open)."
+          elif [ "$GATE_OK" != "1" ]; then
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+            # هر دو مقدار چاپ می‌شوند چون علت می‌تواند در هر کدام باشد و پیامِ
+            # تک‌متغیره گمراه‌کننده است. این شاخه واقعاً قابلِ رسیدن است — با
+            # اجرا سنجیده شد: `FRESHNESS_GATE_MINUTES=13.5` یا `=1e3` باعث
+            # خطای حسابیِ `$(( … ))` می‌شود و `GATE_SEC` را **خالی** می‌گذارد،
+            # و شگفت‌آور این‌که `set -e` هم گام را نمی‌کشد (rc=0). همچنین
+            # `=-5` مقدارِ `-300` می‌سازد که همه‌رقم نیست.
+            echo "::warning::freshness gate threshold is unusable (FRESHNESS_GATE_MINUTES='${FRESHNESS_GATE_MINUTES}' → GATE_SEC='${GATE_SEC}') — running anyway (fail-open)."
+          elif [ "$AGE" -ge "$GATE_SEC" ]; then
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+            echo "✅ Stale enough → running aggregation."
+          else
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+            echo "⏭️ Updated ${AGE}s ago (< ${GATE_SEC}s) → skipping this tick."
+          fi
+
+      # ══════════════════════════════════════════════════════════════════════
+      # ⚠️  این پین **بارکش** است — تزئینی نیست. تغییرش را سبک نگیرید.
+      # ══════════════════════════════════════════════════════════════════════
+      # `scripts/core.py::dedup_key()` هویتِ هر کانفیگ را می‌سازد و ترتیبِ
+      # فایل‌های خروجی با همان کلید مرتب می‌شود. پیش از فاز E، این تابع از
+      # `base64.b64decode(..., validate=False)` استفاده می‌کرد و رفتارِ هرسِ
+      # نویسه‌های بیرونِ الفبا در CPython تغییر کرده است. اندازه‌گیریِ واقعی
+      # روی همین مخزن (فاز E، ۸٬۱۳۶ کلید):
+      #
+      #     Python 3.10.12 → md5(dump) = 4374d1eea707c56694916a900a979c6f
+      #     Python 3.13.13 → md5(dump) = 08713defeed8965d42e6e4e963887322   ❌
+      #
+      # یعنی تنها با عوض‌شدنِ مفسر، هویتِ برخی کانفیگ‌ها جابه‌جا می‌شد و نتیجه‌اش
+      # «بازنویسیِ فایلِ خروجی در یک ران» بود. با `core.decode_base64_text()`
+      # این وابستگی حذف شد و هر دو مفسر به `c991ec7f7b6cb54c83f03f5dae3239e8`
+      # رسیدند. **ولی** پین همچنان لازم است: هر رفتارِ نسخه‌وابستهٔ بعدی در
+      # کتابخانهٔ استاندارد می‌تواند همین اثر را برگرداند، و runnerهای GitHub
+      # بی‌اطلاعِ ما ارتقا می‌یابند.
+      #
+      # قواعد:
+      #   • مقدار باید **نقل‌قول‌شده** باشد. بی‌نقل‌قول، YAML آن را عدد می‌خواند
+      #     و «3.10» به «3.1» تبدیل می‌شود — نسخه‌ای که وجود ندارد.
+      #   • مقدار باید `major.minor` صریح باشد؛ `3.x` یا `3` ممنوع است.
+      #   • هنگام ارتقا، اول تفاوتِ خروجیِ `dedup_key` بین دو نسخه اندازه‌گیری
+      #     شود (روشِ کار در `PHASE_E_REPORT.md` §۹ ثبت است)، بعد پین عوض شود.
+      #
+      # این قواعد با آزمونِ
+      # `test_workflow_pins_python_precisely_because_identity_depends_on_it`
+      # در `scripts/test_pipeline.py` قفل شده‌اند.
+      # ══════════════════════════════════════════════════════════════════════
+      - name: 🐍 Setup Python
+        if: steps.gate.outputs.should_run == 'true'
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: 📦 Install dependencies
+        if: steps.gate.outputs.should_run == 'true'
+        run: pip install -r requirements.txt
+
+      # تست‌های واحد پیش از هر تولیدی — هر تست به یک باگِ واقعیِ کشف‌شده گره خورده
+      # است، پس شکستِ آن یعنی یک رگرسیونِ شناخته‌شده برگشته.
+      # ── پایگاهِ دادهٔ GeoIP ────────────────────────────────────────────────
+      # چرا لازم است: برچسبِ کشور پیش از این از متنِ ریمارک حدس زده می‌شد و
+      # اندازه‌گیری روی ۶۷۵ کانفیگ با مرجعِ مستقل نشان داد فقط ۵۳٫۶٪ درست بود و
+      # ۱۴٫۷٪ **غلط**. با این پایگاهِ داده به ۹۷٫۹٪ درست و ۲٫۱٪ غلط رسید.
+      #
+      # چرا DB-IP و نه GeoLite2: دانلودِ GeoLite2 از ۲۰۱۹ کلیدِ حساب می‌خواهد.
+      # آزمونِ زنده: DB-IP → HTTP 200 ، MaxMind → HTTP 401. پس DB-IP بدونِ هیچ
+      # رمزی در CI کار می‌کند و پروانه‌اش (CC-BY-4.0) هم اجازه می‌دهد.
+      #
+      # چرا cache: فایل ~۴ مگابایتِ فشرده است و ماهانه یک بار عوض می‌شود، ولی
+      # این ورک‌فلو روزی ۹۶ بار اجرا می‌شود. بدونِ cache یعنی ۹۶ دانلودِ روزانهٔ
+      # بی‌دلیل از سرورِ یک پروژهٔ رایگان. کلیدِ cache ماهانه است، پس در ماهِ
+      # جدید خودش تازه می‌شود.
+      #
+      # چرا `.cache/` در .gitignore است: اگر نبود، هر اجرا این ۸ مگابایت را
+      # commit می‌کرد — دقیقاً همان الگوی رشدی که فازِ پیشین حذفش کرد.
+      # ماهِ جاری و ماهِ پیش، هر دو به‌عنوانِ کلیدِ cache و هدفِ دانلود.
+      # عمداً در `env:` سراسری تعریف نشده، چون آن بخش در زمانِ پارس ارزیابی
+      # می‌شود و `date` در آن اجرا نمی‌شود.
+      #
+      # چرا «اولِ ماه منهای یک روز» و نه `1 month ago`:
+      # `date -d '1 month ago'` روزِ تقویمی را نگه می‌دارد، پس «۳۱ مارس منهای
+      # یک ماه» می‌شود «۳۱ فوریه» و به مارس سرریز می‌کند. آزمونِ جامع روی
+      # ۲۵۲ تاریخِ سه سالِ آینده: در **۲۰** روز (۲۹/۳۰/۳۱ مارس، ۳۱ مه،
+      # ۳۱ ژوئیه، ۳۱ اکتبر، ۳۱ دسامبر و …) مقدارِ «ماهِ پیش» با «ماهِ جاری»
+      # یکی می‌شد، یعنی حلقهٔ fallback دو بار همان ماه را امتحان می‌کرد و در
+      # نتیجه در اولِ ماه هیچ پایگاهِ داده‌ای به دست نمی‌آمد. فرمولِ زیر روی
+      # همان ۲۵۲ تاریخ، ۲۵۲ بار درست بود.
+      - name: 🌍 Resolve GeoIP cache key
+        if: steps.gate.outputs.should_run == 'true'
+        id: geoip_key
+        run: |
+          set -euo pipefail
+          {
+            echo "ym=$(date -u +%Y-%m)"
+            echo "ym_prev=$(date -u -d "$(date -u +%Y-%m-01) -1 day" +%Y-%m)"
+          } >> "$GITHUB_OUTPUT"
+
+      # چرا `cache/restore` و نه `cache`:
+      # گامِ `actions/cache` یک post-step دارد که در پایانِ job محتوایِ مسیر
+      # را زیرِ **کلیدِ اصلی** ذخیره می‌کند — حتی وقتی آن محتوا از راهِ
+      # `restore-keys` و از ماهِ پیش آمده باشد. چون کلیدهای cache در گیت‌هاب
+      # تغییرناپذیرند، همین یک بار کافی است تا بایتِ ماهِ پیش زیرِ نامِ ماهِ
+      # جاری قفل شود؛ از آن پس `cache-hit` صادق می‌شود، گامِ دانلود skip
+      # می‌شود و پایگاهِ داده **تا آخرِ ماه** کهنه می‌ماند.
+      #
+      # این حدس نیست. `Last-Modified`ِ واقعیِ سرور نشان می‌دهد فایلِ هر ماه
+      # حدودِ ۰۶:۳۰–۰۶:۴۵ UTC روزِ اول منتشر می‌شود، یعنی ~۶٫۶ ساعت پنجرهٔ
+      # ۴۰۴؛ با `cron: */5` احتمالِ افتادنِ دستِ‌کم یک اجرا در آن پنجره عملاً
+      # ۱ است. اثرش هم اندازه‌گیری شد: روی ۳۱۱۹ هاستِ واقعیِ همین مخزن،
+      # پایگاهِ دادهٔ یک‌ماه‌کهنه ۱۴۳ برچسبِ کشور (۴٫۵۹٪) را متفاوت — یعنی
+      # غلط — می‌داد. و برچسبِ غلط از نبودِ برچسب بدتر است.
+      #
+      # پس restore و save از هم جدا شده‌اند تا ذخیره‌سازی **فقط** زیرِ کلیدِ
+      # همان ماهی انجام شود که واقعاً در فایل است.
+      - name: 🌍 Restore GeoIP database cache
+        if: steps.gate.outputs.should_run == 'true'
+        id: geoip_cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .cache/dbip-country-lite.mmdb
+          key: dbip-country-lite-${{ steps.geoip_key.outputs.ym }}
+          # اگر فایلِ ماهِ جاری هنوز منتشر نشده، نسخهٔ ماهِ پیش از cache
+          # بازیابی می‌شود — بهتر از هیچ، و دقتش عملاً یکسان است. بازیابی از
+          # این مسیر `cache-hit` را false می‌کند (مستنداتِ رسمیِ اکشن)، ولی
+          # گامِ بعدی به آن پرچم هم تکیه نمی‌کند و خودِ فایل را می‌سنجد.
+          restore-keys: |
+            dbip-country-lite-
+
+      # ── تشخیصِ ماهِ واقعیِ فایل، از خودِ فایل ─────────────────────────────
+      # کلیدِ cache فقط یک **نام** است و می‌تواند دروغ بگوید؛ ولی خودِ فایلِ
+      # mmdb ماهش را در متادیتا حمل می‌کند (`build_epoch`). آزمونِ زنده روی
+      # هر دو نسخهٔ موجود، و راستی‌آزمایی با یک رمزگشای مستقلِ پایتونِ خالص:
+      #     2026-07 → build_epoch=1782869996 → 2026-07  ✓
+      #     2026-08 → build_epoch=1785548229 → 2026-08  ✓
+      # چون داوری بر پایهٔ **محتوا** است نه نامِ کلید، cacheِ از قبل آلوده هم
+      # خودش را ترمیم می‌کند — کاری که با تکیه بر کلید **ناممکن** است، چون
+      # کلید دیگر قابلِ بازنویسی نیست.
+      #
+      # این گام هرگز job را نمی‌شکند: ابزار همیشه با کدِ ۰ خارج می‌شود و
+      # خروجی‌اش تنها یک برچسبِ وضعیت است.
+      - name: 🌍 Identify cached GeoIP month
+        if: steps.gate.outputs.should_run == 'true'
+        id: geoip_have
+        run: |
+          set -euo pipefail
+          python scripts/geoip_probe.py \
+            ".cache/dbip-country-lite.mmdb" \
+            "${{ steps.geoip_key.outputs.ym }}" >> "$GITHUB_OUTPUT"
+
+      # دانلود فقط وقتی که فایلِ ماهِ جاری را **در دست نداریم**.
+      #
+      # شرط بر اساسِ محتوا است، نه `cache-hit`: اگر cache بایتِ ماهِ پیش را
+      # (یا هر چیزِ خرابی را) داده باشد، باز هم تلاش می‌کنیم.
+      #
+      # چرا اعتبارسنجیِ محتوایی، و چرا گاردِ اندازه به تنهایی کافی نیست:
+      # یک آرشیوِ نیمه‌تمام ۳٬۷۷۲٬۹۰۹ بایت mmdb تولید می‌کند که از آستانهٔ
+      # یک‌مگابایتی رد می‌شود، ولی خوانندهٔ mmdb رویش `InvalidDatabaseError`
+      # می‌دهد. فایلِ نصفه‌نیمه بدتر از نبودِ فایل است، چون ماژولِ geo آن را
+      # «موجود» می‌بیند و همهٔ جست‌وجوها بی‌صدا None برمی‌گردانند.
+      #
+      # وضعیتِ `unverifiable` یعنی ابزار نتوانست داوری کند (مثلاً کتابخانهٔ
+      # خوانندهٔ mmdb در دسترس نبود). در آن حالت عمداً به رفتارِ پیشینِ همین
+      # ورک‌فلو — گاردِ اندازه — عقب می‌نشینیم، تا این تغییر هرگز **بدتر** از
+      # وضعِ قبل نشود.
+      #
+      # وضعیتِ **خالی** هم همان‌طور رفتار می‌شود، و این با شبیه‌سازی کشف شد نه
+      # با حدس: اگر خودِ فایلِ ابزار گم شود یا مفسر نتواند اجرایش کند، خروجی
+      # بی‌`status=` می‌ماند. اگر آن حالت به «رد» ترجمه می‌شد، ورک‌فلو **هیچ**
+      # پایگاهِ داده‌ای به دست نمی‌آورد — یعنی بدتر از امروز. اندازه‌گیری شد:
+      # با ابزارِ گم‌شده، هر دو ماه رد شدند و نتیجه `NONE` بود. پس این شرط
+      # عمداً هر دو حالت را می‌گیرد.
+      #
+      # نکته دربارهٔ واژگان: نامِ کتابخانهٔ خواننده عمداً در بدنهٔ `run:`
+      # نوشته نشده. تستِ `test_workflow_never_uses_maxmind_...` متنِ `run:` را
+      # (که از دیدِ YAML یک رشتهٔ اجرایی است و کامنت‌های درونش حذف نمی‌شوند)
+      # از واژگانِ سرویسِ کلیددار پاک می‌خواهد؛ این کامنتِ سطحِ YAML در پارس
+      # حذف می‌شود و مشمولِ آن قاعده نیست.
+      - name: 🌍 Download GeoIP database
+        if: steps.gate.outputs.should_run == 'true' && steps.geoip_have.outputs.status != 'current'
+        id: geoip_dl
+        run: |
+          set -euo pipefail
+          mkdir -p .cache
+          DEST=".cache/dbip-country-lite.mmdb"
+
+          # چرا دو ماه و نه بیشتر: اندازه‌گیریِ زنده روی ۱۱ ماه نشان داد
+          # DB-IP فقط **دو ماهِ آخر** را نگه می‌دارد و بقیه ۴۰۴ می‌دهند، پس
+          # دو ماه سقفِ واقعیِ ممکن است و ماهِ سوم فقط یک ۴۰۴ِ اضافه بود.
+          got=""
+          for YM in "${{ steps.geoip_key.outputs.ym }}" \
+                    "${{ steps.geoip_key.outputs.ym_prev }}"; do
+            URL="https://download.db-ip.com/free/dbip-country-lite-${YM}.mmdb.gz"
+            echo "→ trying $URL"
+            if ! curl -fsSL --retry 4 --retry-delay 2 --retry-all-errors \
+                 --retry-max-time 45 --connect-timeout 15 --max-time 120 \
+                 -o /tmp/dbip.mmdb.gz "$URL"; then
+              echo "  ✗ not available"
+              continue
+            fi
+
+            # چرا `gunzip` داخلِ یک شرط و نه به‌صورتِ خطِ آزاد: این گام
+            # `set -e` دارد، پس یک آرشیوِ خراب کلِ گام را می‌کشت و حلقهٔ
+            # fallback هرگز به ماهِ دوم نمی‌رسید — با اجرا تأیید شد
+            # (خروجِ ۱ در همان تکرارِ اول). ضمناً CRC32ِ خودِ gzip در آزمون
+            # روی ۴۰ خرابیِ تصادفیِ درون‌جریانی، ۴۰ بار خرابی را گرفت.
+            if ! gunzip -c /tmp/dbip.mmdb.gz > "$DEST.tmp"; then
+              echo "  ✗ corrupt archive — rejecting"
+              rm -f "$DEST.tmp"
+              continue
+            fi
+
+            # اعتبارسنجیِ **محتوایی** پیش از جای‌گذاری — دلیلِ کاملش در
+            # کامنتِ بالای همین گام آمده.
+            #
+            # چرا با `$( )` و نه با `| grep -q`: خواندنِ خروجی از راهِ لوله
+            # زیرِ `pipefail` یک کلاسِ خرابیِ اضافه می‌سازد (اگر مصرف‌کننده
+            # زود ببندد، تولیدکننده SIGPIPE می‌گیرد و کلِ گام می‌میرد). با
+            # اجرا سنجیده شد: با یک تولیدکنندهٔ بزرگ، همان الگو rc≠۰ داد.
+            # `$( )` آن کلاس را کاملاً حذف می‌کند.
+            PROBE="$(python scripts/geoip_probe.py "$DEST.tmp" "$YM" || true)"
+            STATUS="$(printf '%s\n' "$PROBE" | sed -n 's/^status=//p')"
+            echo "  probe: ${STATUS:-<none>}"
+
+            # `unverifiable` یا وضعیتِ خالی → عقب‌نشینی به گاردِ اندازه.
+            # دلیلِ کامل در کامنتِ بالای گام؛ خلاصه: وضعیتِ خالی یعنی ابزار
+            # اصلاً مشورت‌پذیر نبود (فایلش گم شده، مفسر شکسته و …) و در آن
+            # حالت باید به رفتارِ پیشین برگشت، نه اینکه همه‌چیز رد شود.
+            if [ "$STATUS" = "unverifiable" ] || [ -z "$STATUS" ]; then
+              SZ="$(stat -c%s "$DEST.tmp")"
+              if [ "$SZ" -lt 1000000 ]; then
+                echo "  ✗ too small ($SZ bytes) — rejecting"
+                rm -f "$DEST.tmp"
+                continue
+              fi
+              echo "  ! content check unavailable — accepting on size ($SZ bytes)"
+            elif [ "$STATUS" != "current" ]; then
+              echo "  ✗ failed content validation ($STATUS) — rejecting"
+              rm -f "$DEST.tmp"
+              continue
+            fi
+
+            mv "$DEST.tmp" "$DEST"
+            echo "  ✓ $YM — $(stat -c%s "$DEST") bytes"
+            got="$YM"
+            break
+          done
+
+          echo "got=$got" >> "$GITHUB_OUTPUT"
+          if [ -z "$got" ]; then
+            # عمداً شکست نمی‌دهیم: نبودِ یک پایگاهِ دادهٔ کمکی نباید انتشارِ
+            # کانفیگ‌ها را متوقف کند. ماژول geo خودش به حالتِ کاهش‌یافته
+            # می‌رود و این وضعیت در health.json (کلیدِ geo.db_loaded) ثبت
+            # می‌شود.
+            echo "::warning::GeoIP database unavailable — country labels will fall back to remark parsing"
+          fi
+
+      # ذخیره‌سازیِ صریح، **فقط** زیرِ کلیدِ ماهی که واقعاً دانلود شد.
+      #
+      # همین گام است که نقصِ اصلی را می‌بندد: دیگر هیچ مسیری وجود ندارد که
+      # بایتِ ماهِ پیش زیرِ نامِ ماهِ جاری ذخیره شود. اگر کلید از قبل وجود
+      # داشته باشد، خودِ اکشن آن را با یک پیامِ info رد می‌کند و گام سبز
+      # می‌ماند — این در سورسِ همان نسخهٔ pinشده بررسی شد (`saveImpl.ts`
+      # همه‌چیز را در `catch` می‌گیرد و `ReserveCacheError` به `core.info`
+      # نگاشته می‌شود)، نه از روی مستندات فرض شد.
+      - name: 🌍 Save GeoIP database cache
+        if: steps.gate.outputs.should_run == 'true' && steps.geoip_dl.outputs.got != ''
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .cache/dbip-country-lite.mmdb
+          key: dbip-country-lite-${{ steps.geoip_dl.outputs.got }}
+
+      # بررسیِ سلامتِ پایگاهِ داده با همان کدی که خط‌لوله استفاده می‌کند.
+      # اگر cache خراب شده باشد، بهتر است همین‌جا در لاگ دیده شود تا بعداً از
+      # روی برچسب‌های غلط حدس زده شود.
+      - name: 🌍 Verify GeoIP database
+        if: steps.gate.outputs.should_run == 'true'
+        run: |
+          python - <<'EOF'
+          import sys
+          sys.path.insert(0, "scripts")
+          import geo
+          if not geo.database_available():
+              print("::warning::GeoIP database not loaded — degraded labelling")
+              raise SystemExit(0)
+          # سه نشانیِ با کشورِ معلوم و پایدار، به‌عنوانِ آزمونِ سلامت
+          checks = {"8.8.8.8": "US", "1.1.1.1": "AU", "5.6.7.8": "DE"}
+          bad = {ip: geo.country_of_ip(ip) for ip, exp in checks.items()
+                 if geo.country_of_ip(ip) != exp}
+          if bad:
+              print(f"::warning::GeoIP sanity check mismatch: {bad}")
+          else:
+              print(f"GeoIP OK — {len(checks)}/{len(checks)} sanity checks passed")
+          EOF
+
+      - name: 🧪 Unit tests
+        if: steps.gate.outputs.should_run == 'true'
+        run: python scripts/test_pipeline.py
+
+      - name: 🚀 Run aggregator
+        if: steps.gate.outputs.should_run == 'true'
+        run: python scripts/aggregate.py --out .
+
+      # ── نصبِ کلاینت‌های واقعی برای اعتبارسنجی ────────────────────────────
+      # چرا: یک نودِ نامعتبر در وسطِ فایل باعث می‌شود کلاینت **کلِ فایل** را رد
+      # کند، نه فقط همان نود. پس تنها اعتبارسنجیِ قابل‌اعتماد، اجرای همان
+      # باینری‌هایی است که کاربر استفاده می‌کند. نسخه‌ها pin شده‌اند تا
+      # به‌روزرسانیِ ناگهانیِ upstream، انتشار را نشکند.
+      # ── چرا checksum و نه فقط pinِ نسخه ──────────────────────────────────
+      # pinِ نسخه تنها می‌گوید «کدام تگ»، نه «کدام بایت». تگ و asset در GitHub
+      # قابلِ جایگزینی‌اند (حذفِ release و انتشارِ مجددِ همان تگ)، پس نسخهٔ pinشده
+      # به‌تنهایی جلوی تغییرِ خاموشِ باینری را نمی‌گیرد. این دو باینری، خروجیِ
+      # منتشرشده را **اعتبارسنجی** می‌کنند؛ اگر جای معتبرسنج، چیزِ دیگری اجرا
+      # شود، همهٔ اعتبارسنجی‌های پایین‌دست بی‌معنا می‌شوند.
+      #
+      # ترتیب عامدانه است و از الگویِ گامِ xray-knife تقلید می‌شود:
+      #   ۱) تأییدِ آرشیو **پیش از** استخراج — باز کردنِ آرشیوِ تأییدنشده یعنی
+      #      دادنِ ورودیِ نامعتمد به tar/gunzip.
+      #   ۲) تأییدِ باینریِ استخراج‌شده **پیش از** install — یک استخراجِ خراب یا
+      #      آرشیوی با محتوایِ عوض‌شده را هم می‌گیرد.
+      # عامدانه cache اضافه نشده: این گام هر بار دانلود می‌کند، پس «تأییدِ
+      # همیشگیِ باینری» به‌طورِ طبیعی برقرار است و پیچیدگیِ کلیدِ cache (که در
+      # گامِ xray-knife لازم بود) اینجا هزینهٔ بی‌دلیل است.
+      #
+      # هر چهار مقدار از **دو منبعِ مستقل** تأیید شده‌اند: فیلدِ `digest`ِ خودِ
+      # GitHub برای asset، و محاسبهٔ محلیِ `sha256sum` پس از دانلودِ جداگانه.
+      # هر دو باینری اجرا شدند و همان نسخهٔ pinشده را گزارش کردند.
+      - name: 🧰 Install sing-box & mihomo (pinned + checksum verified)
+        if: steps.gate.outputs.should_run == 'true'
+        env:
+          SING_BOX_VERSION: "1.13.14"
+          MIHOMO_VERSION: "v1.19.29"
+          # sha256ِ آرشیوها (پیش از استخراج)
+          SING_BOX_TGZ_SHA256: "f48703461a15476951ac4967cdad339d986f4b8096b4eb3ff0829a500502d697"
+          MIHOMO_GZ_SHA256: "60de76a35a6cbf7b4fa4a20f5c257c24345d1d635ab1aa3877022a1997ef413c"
+          # sha256ِ خودِ باینری‌های استخراج‌شده (پیش از install)
+          SING_BOX_BIN_SHA256: "68aeab83cc4ab2659a5b92232261a20746ccdafc3b3d1e19b2d63247eec3bbf7"
+          MIHOMO_BIN_SHA256: "9c397be7489538628fae781bc005e4c5b8cd7b0961b8bb2ca815c8150f193577"
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.local/bin"
+
+          # verify <file> <expected-sha256> <label>
+          # یک تابعِ مشترک، تا دو مسیرِ تأیید هرگز از هم واگرا نشوند.
+          verify() {
+            local got
+            got="$(sha256sum "$1" | cut -d' ' -f1)"
+            if [ "$got" != "$2" ]; then
+              echo "::error::$3 checksum mismatch (tampered release or corrupt download)"
+              echo "  expected $2"
+              echo "  actual   $got"
+              rm -f "$1"
+              exit 1
+            fi
+            echo "  ✓ $3 sha256 verified"
+          }
+
+          # ── sing-box ────────────────────────────────────────────────────
+          curl -fsSL --retry 5 --retry-delay 2 --retry-all-errors \
+            --retry-max-time 60 --connect-timeout 15 --max-time 180 \
+            "https://github.com/SagerNet/sing-box/releases/download/v${SING_BOX_VERSION}/sing-box-${SING_BOX_VERSION}-linux-amd64.tar.gz" \
+            -o /tmp/sb.tar.gz
+          verify /tmp/sb.tar.gz "$SING_BOX_TGZ_SHA256" "sing-box archive"
+          tar -xzf /tmp/sb.tar.gz -C /tmp
+          verify "/tmp/sing-box-${SING_BOX_VERSION}-linux-amd64/sing-box" \
+                 "$SING_BOX_BIN_SHA256" "sing-box binary"
+          install -m 755 "/tmp/sing-box-${SING_BOX_VERSION}-linux-amd64/sing-box" "$HOME/.local/bin/sing-box"
+
+          # ── mihomo (فایل .gz تک‌فایلی است، نه tar) ──────────────────────
+          curl -fsSL --retry 5 --retry-delay 2 --retry-all-errors \
+            --retry-max-time 60 --connect-timeout 15 --max-time 180 \
+            "https://github.com/MetaCubeX/mihomo/releases/download/${MIHOMO_VERSION}/mihomo-linux-amd64-${MIHOMO_VERSION}.gz" \
+            -o /tmp/mihomo.gz
+          verify /tmp/mihomo.gz "$MIHOMO_GZ_SHA256" "mihomo archive"
+          gunzip -f /tmp/mihomo.gz
+          verify /tmp/mihomo "$MIHOMO_BIN_SHA256" "mihomo binary"
+          install -m 755 /tmp/mihomo "$HOME/.local/bin/mihomo"
+
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/sing-box" version
+          "$HOME/.local/bin/mihomo" -v
+
+      # ── نصبِ xray-knife: ابزارِ آزمونِ واقعیِ پروکسی (لایهٔ L3) ─────────────
+      #
+      # چرا این ابزار: لایه‌های پیشین فقط «قابلِ اتصال بودن» را می‌سنجند.
+      # سنجشِ زنده روی ۶۰۰ کانفیگِ تصادفی نشان داد نرخِ واقعیِ کارکرد
+      # ۶٫۰۰٪ است (بازهٔ اطمینانِ ۹۵٪ به روشِ Wilson: ۴٫۳۷٪ تا ۸٫۱۹٪)، در
+      # حالی که L2 نرخِ ۴۷٫۹۱٪ می‌دهد. یعنی حدودِ چهار پنجمِ آنچه از L2
+      # می‌گذرد، در عمل ترافیک را عبور نمی‌دهد. تنها راهِ تفکیکِ این دو،
+      # اجرای یک هستهٔ واقعیِ Xray است.
+      #
+      # چرا نسخه pin شده: خروجیِ CSVِ این ابزار قراردادِ ورودیِ
+      # `scripts/realtest.py` است. سنجشِ نسخهٔ ۱۰٫۱٫۱ نشان داد CSV پانزده
+      # ستون دارد و وضعیت‌ها `passed / semi-passed / failed / broken` هستند —
+      # و `semi-passed` در هیچ مستندی ذکر نشده است. یک به‌روزرسانیِ خودکارِ
+      # upstream می‌تواند بی‌صدا ستون‌ها یا نامِ وضعیت‌ها را عوض کند و آن‌گاه
+      # دستهٔ `verified/` بی‌آنکه خطایی دیده شود، اشتباه پر می‌شود.
+      #
+      # چرا checksum — همان استانداردی که گامِ sing-box/mihomo هم به آن رسید:
+      # فقط pin کردنِ *نسخه* تضمینی نمی‌دهد، چون یک انتشارِ گیت‌هاب قابلِ
+      # جای‌گزینی است (asset را می‌توان با همان نام دوباره بارگذاری کرد).
+      # مقدارهای زیر دوسویه تأیید شده‌اند: فایلِ `.dgst`ِ رسمیِ upstream در
+      # هر سه الگوریتمِ MD5، SHA-256 و SHA-512 با فایلِ دانلودشده می‌خواند.
+      #
+      # چرا cache: زمان‌بندی `*/5` است (≈۹۶ اجرا در شبانه‌روز). بدونِ cache
+      # این مرحله روزانه ~۲ گیگابایت از انتشارهای گیت‌هاب می‌کشید — همان
+      # استدلالی که برای پایگاهِ دادهٔ GeoIP هم به کار رفت. کلیدِ cache شاملِ
+      # خودِ checksum است، پس تغییرِ pin به‌طورِ خودکار cache را بی‌اعتبار
+      # می‌کند و هیچ گامِ دستی‌ای فراموش نمی‌شود.
+      - name: 📦 Restore xray-knife cache
+        if: steps.gate.outputs.should_run == 'true'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .cache/xray-knife
+          # نسخه و checksum هر دو در کلید هستند: اگر یکی عوض شود، cacheِ
+          # قدیمی هرگز بازیابی نمی‌شود. عمداً از `restore-keys` استفاده
+          # نشده — برخلافِ GeoIP، اینجا «نسخهٔ نزدیک» بی‌فایده است، چون
+          # هدفِ pin دقیقاً همان یک باینریِ مشخص است.
+          key: xray-knife-10.1.1-linux-64-a3b10a40ccaf423d96836f9606ffec8b2e5f4fce36375eac1aadc10ba9c58034
+
+      - name: 📦 Install xray-knife (pinned + checksum verified)
+        if: steps.gate.outputs.should_run == 'true'
+        env:
+          XRAY_KNIFE_VERSION: "10.1.1"
+          XRAY_KNIFE_ASSET: "Xray-knife-linux-64.zip"
+          # sha256ِ آرشیوِ منتشرشده — با فایلِ `.dgst`ِ upstream تطبیق داده شد
+          XRAY_KNIFE_ZIP_SHA256: "39696103eb99b4cb55ae5d2c2456210d826f4bbcf0f89e298a05fb5fb82f09e5"
+          # sha256ِ خودِ باینریِ استخراج‌شده — این یکی cacheِ آلوده را هم می‌گیرد
+          XRAY_KNIFE_BIN_SHA256: "a3b10a40ccaf423d96836f9606ffec8b2e5f4fce36375eac1aadc10ba9c58034"
+        run: |
+          set -euo pipefail
+          mkdir -p .cache "$HOME/.local/bin"
+          BIN=".cache/xray-knife"
+
+          # ── دانلود، تنها در صورتِ نبودِ نسخهٔ cacheشده ──────────────────
+          if [ ! -f "$BIN" ]; then
+            URL="https://github.com/lilendian0x00/xray-knife/releases/download/v${XRAY_KNIFE_VERSION}/${XRAY_KNIFE_ASSET}"
+            echo "→ downloading $URL"
+            curl -fsSL --retry 5 --retry-delay 2 --retry-all-errors \
+                 --retry-max-time 60 --connect-timeout 15 --max-time 300 \
+                 -o /tmp/xk.zip "$URL"
+
+            # تأییدِ آرشیو *پیش از* باز کردن. ترتیب مهم است: باز کردنِ یک
+            # آرشیوِ تأییدنشده یعنی اجرای کدِ فشرده‌سازیِ آن روی محتوایی که
+            # به آن اعتماد نداریم.
+            GOT_ZIP="$(sha256sum /tmp/xk.zip | cut -d' ' -f1)"
+            if [ "$GOT_ZIP" != "$XRAY_KNIFE_ZIP_SHA256" ]; then
+              echo "::error::xray-knife archive checksum mismatch"
+              echo "  expected $XRAY_KNIFE_ZIP_SHA256"
+              echo "  actual   $GOT_ZIP"
+              exit 1
+            fi
+            echo "  ✓ archive sha256 verified"
+
+            # `-j` چون آرشیو تخت است (README.md, xray-knife, LICENSE) و تنها
+            # همان یک فایل لازم است. در فایلِ موقت باز می‌شود و فقط پس از
+            # تأییدِ باینری به مسیرِ cache منتقل می‌گردد — تا cache هرگز
+            # حاملِ فایلِ نیمه‌نوشته یا نامعتبر نشود.
+            unzip -q -o -j /tmp/xk.zip xray-knife -d /tmp/xkbin
+            mv /tmp/xkbin/xray-knife "$BIN.tmp"
+            mv "$BIN.tmp" "$BIN"
+          else
+            echo "→ using cached binary"
+          fi
+
+          # ── تأییدِ باینری: *همیشه*، نه فقط پس از دانلود ─────────────────
+          # این نکته عمدی است. اگر تأیید تنها در شاخهٔ دانلود بود، یک cacheِ
+          # خراب یا دست‌کاری‌شده کاملاً از کنترل می‌گشت و آزمونِ L3 با یک
+          # باینریِ ناشناس اجرا می‌شد.
+          GOT_BIN="$(sha256sum "$BIN" | cut -d' ' -f1)"
+          if [ "$GOT_BIN" != "$XRAY_KNIFE_BIN_SHA256" ]; then
+            echo "::error::xray-knife binary checksum mismatch (corrupt cache or tampered release)"
+            echo "  expected $XRAY_KNIFE_BIN_SHA256"
+            echo "  actual   $GOT_BIN"
+            rm -f "$BIN"
+            exit 1
+          fi
+          echo "  ✓ binary sha256 verified"
+
+          install -m 755 "$BIN" "$HOME/.local/bin/xray-knife"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+          # ── تأییدِ نهایی: خودِ ابزار باید همان نسخه را اعلام کند ─────────
+          # زیرفرمانِ `version` در این ابزار وجود ندارد (آزمون شد: خطای
+          # «unknown command»). پرچمِ درست `--version` است و خروجیِ سنجیده‌شدهٔ
+          # آن دقیقاً «xray-knife version 10.1.1» است.
+          VER_OUT="$("$HOME/.local/bin/xray-knife" --version 2>&1 | head -1)"
+          echo "  $VER_OUT"
+          case "$VER_OUT" in
+            *"$XRAY_KNIFE_VERSION"*) echo "  ✓ version pin honoured" ;;
+            *) echo "::error::xray-knife reports '$VER_OUT', expected version $XRAY_KNIFE_VERSION"; exit 1 ;;
+          esac
+
+      # ── آبشارِ چهارلایه: برچسبِ «کار می‌کند» فقط با آزمونِ واقعی ───────────
+      #
+      # این گام `verified/` و `fast/` و `secure/` و `top100.txt` را می‌سازد.
+      # ورودی‌اش `all/configs.txt`ِ همین دور است (سنجیده شد: `filters` سرآیندِ
+      # `#` را خودش می‌اندازد — از ۸۰۲۹ سطر، ۷۹۴۸ ماند و صفر سرآیند رد شد).
+      #
+      # بودجه — عددِ اجراشده، نه تخمین. روی یک سرورِ اختصاصی با همان کد و
+      # ۸۱۵۸ کانفیگ سنجیده شد (دو بار، مستقل):
+      #     L0/L1  ۰٫۳۵s   ·  L2  ۴۲٫۰۷s  ·  سه اجرای L3  ۱۰۶٫۹۲s
+      #     کلِ آبشار **۱۴۹٫۳۴s** از بودجهٔ ۹۰۰ ثانیه‌ای، کندترین اجرا ۳۶٫۲۱s
+      # پس `timeout-minutes: 15` سه‌برابرِ سرآمدِ سنجیده‌شده حاشیه دارد.
+      #
+      # ⚠️ `continue-on-error: true` عمدی است. این لایه به شبکهٔ runner وابسته
+      # است و اگر یک دور نتواند به اندازهٔ کافی کانفیگِ پایدار پیدا کند،
+      # **نباید** انتشارِ `all/ heavy/ light/` را بشکند؛ آن‌ها با معیارِ
+      # دیگری تولید شده‌اند و مستقل‌اند. سکوت هم نمی‌کند: خروجیِ گام و
+      # `pipeline.json` هر دو در خلاصهٔ کار دیده می‌شوند.
+      - name: 🧬 Verify configs with real proxied requests (L3 cascade)
+        id: cascade
+        if: steps.gate.outputs.should_run == 'true'
+        continue-on-error: true
+        timeout-minutes: 15
+        run: python scripts/pipeline.py all/configs.txt --out . --json pipeline.json
+
+      # ── دروازهٔ اعتبارسنجی: خروجیِ خراب هرگز commit نمی‌شود ───────────────
+      #
+      # ⚠️ ترتیب مهم است و تصادفی نیست: این گام **بعد** از آبشار می‌آید.
+      # سنجیده شد که `validate.py` هر دایرکتوریِ دستهٔ اختیاری را که وجود
+      # داشته باشد با همان سختیِ دسته‌های اصلی می‌سنجد. پس اگر آبشار
+      # `verified/` را بسازد، همین دروازه هم آن را واقعاً می‌سنجد — یعنی
+      # لایهٔ جدید از اعتبارسنجی معاف نمی‌شود، بلکه مشمولِ آن می‌شود.
+      - name: 🔍 Validate outputs with real clients
+        if: steps.gate.outputs.should_run == 'true'
+        run: python scripts/validate.py --out . --strict --json validation.json
+
+      - name: 📎 Upload validation report on failure
+        if: failure() && steps.gate.outputs.should_run == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: validation-report
+          path: |
+            validation.json
+            all/singbox.json
+            all/clash.yaml
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: 📊 Job summary
+        if: always() && steps.gate.outputs.should_run == 'true'
+        run: |
+          if [ -f index.json ]; then
+            python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          d = json.load(open("index.json"))
+          c = d["categories"]
+          print("## 🔄 Aggregation Result — @Raydikalx\n")
+          print(f"- **Updated:** {d['updated_at']}")
+          print(f"- **Next ETA:** {d.get('next_update_eta','?')}")
+          print(f"- **Elapsed:** {d['elapsed_seconds']}s\n")
+          print("| Category | Unique | Duplicates | Broken | Sources |")
+          print("|---|---|---|---|---|")
+          for k in ("all","heavy","light"):
+              b=c[k]
+              print(f"| {k} | {b['unique']} | {b['duplicates']} | {b['broken']} | {b['active_sources']} |")
+          print("\n### Protocols")
+          print(", ".join(f"`{k}`={v}" for k,v in d["protocols"].items() if v))
+          PY
+          fi
+          # ── خلاصهٔ سلامتِ منابع ────────────────────────────────────────────
+          if [ -f health.json ]; then
+            python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          h = json.load(open("health.json"))
+          s = h["summary"]
+          print(f"\n### 🩺 Source Health — {s['ok']}/{s['total']} ok"
+                f" ({s['empty']} empty, {s['fail']} fail)")
+          dead = [x for x in h["sources"] if x.get("status") != "ok"]
+          if dead:
+              print("\n<details><summary>⚠️ Unhealthy sources</summary>\n")
+              print("| Tier | Source | Status | HTTP | Error |")
+              print("|---|---|---|---|---|")
+              for x in dead:
+                  print(f"| {x['tier']} | {x.get('name','?')} | {x.get('status','?')}"
+                        f" | {x.get('http_code','-')} | {x.get('error','-')} |")
+              print("\n</details>")
+          PY
+          fi
+          # ── نرخِ واقعیِ کارکرد، سنجیده در همین اجرا ────────────────────────
+          #
+          # چرا این‌جا: شرطِ خروجیِ ② فاز B می‌گوید نرخِ `verified/` باید «با
+          # CI» سنجیده شود، نه یک‌بار روی یک ماشین و بعد به‌صورت عددِ ثابت در
+          # README بماند. آمارِ آبشار را `pipeline.py` در `health.json`
+          # (کلیدِ `cascade`) ادغام می‌کند؛ این بلوک همان را در خلاصهٔ هر
+          # اجرا نشان می‌دهد، همراه با محلِ جغرافیاییِ رانر — چون نرخِ کارکرد
+          # بی‌ذکرِ «از کجا سنجیده شد» عددی گمراه‌کننده است.
+          #
+          # مرحلهٔ آبشار `continue-on-error` است؛ اگر شکسته باشد کلیدِ
+          # `cascade` وجود ندارد و این بلوک ساکت می‌ماند، نه خراب.
+          if [ -f health.json ]; then
+            python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          h = json.load(open("health.json"))
+          c = h.get("cascade")
+          if c:
+              L = c["layers"]
+              b = c["buckets"]
+              l3 = L["l3"]
+              geo = c.get("exit_country") or {}
+              where = f"{geo.get('loc', '?')}/{geo.get('colo', '?')}"
+              pool = L["l0_l1"]["in"] or 1
+              pct = lambda n: round(100.0 * n / pool, 2)
+              print(f"\n### 🧬 How many actually work — measured this run"
+                    f" (runner exit: {where})")
+              print("\n| Layer | In | Out | Note |")
+              print("|---|---|---|---|")
+              print(f"| L0+L1 structure | {L['l0_l1']['in']} |"
+                    f" {L['l0_l1']['out']} | {L['l0_l1']['seconds']}s |")
+              print(f"| L2 TCP reachable | {L['l2']['in']} | {L['l2']['out']} |"
+                    f" {L['l2']['open_pct']}% of this layer's input,"
+                    f" {L['l2']['seconds']}s |")
+              print(f"| L3 real request | {l3['in']} | {l3['stable']} |"
+                    f" per-round {l3['per_run_ok']} over {l3['rounds']} rounds,"
+                    f" {l3['seconds']}s |")
+              print(f"\n- **stable in every round:** {l3['stable']}"
+                    f" ({pct(l3['stable'])}% of the {pool} published configs)")
+              print(f"- **worked at least once:** {l3['ever_ok']}"
+                    f" ({pct(l3['ever_ok'])}% of the pool) — flaky"
+                    f" {l3['flaky_pct']}%")
+              print(f"- **published:** verified={b['verified']}"
+                    f" fast={b['fast']} secure={b['secure']} top={b['top']}")
+              print(f"- **cascade time:** {c['total_seconds']}s")
+          PY
+          fi
+
+      # ── ★★★ انتشار روی `main` با روشِ «rolling squash» ★★★ ────────────────
+      #
+      # مسئله‌ای که این مرحله حل می‌کند (همه اندازه‌گیری‌شده، هیچ‌کدام حدس)
+      # ─────────────────────────────────────────────────────────────────────
+      #   دو خواستهٔ به‌ظاهر متناقض داریم:
+      #     (الف) فایل‌ها باید روی شاخهٔ پیش‌فرض (`main`) باشند تا لینک‌های
+      #           قدیمی کار کنند، بازدیدکننده فایل را ببیند، و SEO/ستاره
+      #           آسیب نبیند.
+      #     (ب) تاریخِ گیت نباید بی‌نهایت باد کند. اندازه‌گیریِ زندهٔ همین
+      #           مخزن با روشِ «عمیق‌سازیِ پیش‌روندهٔ shallow fetch»
+      #           (depth=1/5/15/40، اثباتِ عددی در exp/cost.log):
+      #             ۶۰۴ کیلوبایت به‌ازای هر کامیتِ خروجی
+      #             × ۹۶ دور در روز  = ۵۶.۶ مگابایت در روز
+      #                              = ۲۰.۲ گیگابایت در سال
+      #           مخزن همین حالا روی ۳.۵۵ گیگابایت است.
+      #
+      # راهکار: «rolling squash» ─────────────────────────────────────────────
+      #   در هر دور:
+      #     ۱) «anchor» = تازه‌ترین کامیتی که نشانگرِ $OUT_MARK را ندارد،
+      #        یعنی آخرین کامیتِ واقعیِ سورس.
+      #     ۲) درختِ جدید = درختِ anchor + خروجی‌های تازهٔ همین دور.
+      #     ۳) `git commit-tree <tree> -p <anchor>` و سپس force-push.
+      #   نتیجه: `main` همیشه = «تاریخِ کاملِ سورس + دقیقاً یک کامیتِ خروجی».
+      #   کامیتِ خروجیِ دورِ قبل غیرقابل‌دسترس می‌شود و gc آزادش می‌کند، پس
+      #   هزینه O(1) است نه O(commits) — در حالی که فایل‌ها روی شاخهٔ
+      #   پیش‌فرض و در معرضِ دید باقی می‌مانند. یعنی هم (الف) هم (ب).
+      #
+      # چرا فقط این کافی نبود و «پایدارسازیِ خروجی» هم لازم شد
+      # ─────────────────────────────────────────────────────────────────────
+      #   مقایسهٔ دو کامیتِ واقعیِ پشت‌سرهمِ ربات نشان داد از ۳۵۳۷ خط فقط ۹ خط
+      #   مشترک بود — ولی با نادیده‌گرفتنِ ‎#remark‎ عدد به ۳۲۷۷ می‌رسید. یعنی
+      #   ۳۲۶۸ خط بی‌هیچ دلیلِ کارکردی تغییر می‌کرد و delta compressionِ گیت
+      #   را بی‌اثر می‌کرد. سه ریشه پیدا و رفع شد (در scripts/core.py):
+      #     • برچسبِ کشور از remarkِ هر سورس می‌آمد، پس یک سرور در یک دور
+      #       ‎RU 🇷🇺‎ و در دورِ بعد ‎US 🇺🇸‎ می‌شد → با کشِ endpoint‑محور
+      #       (`country_for_endpoint`) قفل شد.
+      #     • شمارهٔ انتهایِ remark «موقعیتی» بود، پس اضافه‌شدنِ یک کانفیگ،
+      #       remarkِ همهٔ خطوطِ بعدی را جابه‌جا می‌کرد → با
+      #       `stable_label()` = sha256(dedup_key)[:6] محتوا‑محور شد.
+      #     • ترتیبِ خطوط تصادفی بود → با `sorted(key=dedup_key)` قطعی شد.
+      #   اندازه‌گیریِ اثر (دو اجرای واقعیِ پشت‌سرهم): ۳۲ فایل از ۳۴ فایل
+      #   بایت‑به‑بایت یکسان شدند؛ دو فایلِ دیگر (index.json / health.json)
+      #   فقط در timestamp تفاوت داشتند.
+      #
+      # نرخِ واقعیِ تغییرِ سورس‌ها (اندازه‌گیری‌شده، و یک تصحیحِ مهم)
+      # ─────────────────────────────────────────────────────────────────────
+      #   دو snapshotِ زندهٔ ۳۰ دقیقه فاصله مقایسه شد: از ۸۱۵۷ کانفیگ، ۸۱۲۶
+      #   مشترک بودند → churn واقعی ‎۰.۳۸٪‎ در ۳۰ دقیقه ≈ ‎۰.۱۹٪‎ در هر دور.
+      #   (یک اندازه‌گیریِ اولیه ۱۹.۶٪ داده بود؛ آن **غلط** بود، چون remarkِ
+      #    vmess داخلِ base64 است و با split("#") جدا نمی‌شود، پس ۲۲۵۴ خطِ
+      #    vmess اشتباهاً «تغییریافته» شمرده شده بودند. با dedup_key تصحیح شد.)
+      #
+      # سهمِ هر نوع فایل در رشدِ حجم (اندازه‌گیری‌شده با churnِ واقعی)
+      # ─────────────────────────────────────────────────────────────────────
+      #     configs.txt خالی           ۰.۶ کیلوبایت در هر دور
+      #     + clash.yaml               ۱.۱
+      #     + singbox.json             ۱.۱
+      #     + configs_base64.txt     ۳۰۴.۰   ← ۹۹.۴٪ از کلِ رشد
+      #   دلیل: در base64 یک بایت تغییر در ابتدا، کلِ جریان را از نو رمز
+      #   می‌کند، پس هیچ delta ای پیدا نمی‌شود. همین یک قلم رشد را از
+      #   ۰.۶ به ۳۰۵ کیلوبایت می‌بَرد → ۲۸.۶ مگابایت در روز → ۹.۴ گیگابایت
+      #   در سال. یعنی پایدارسازی به‌تنهایی کافی نیست و rolling squash
+      #   **الزامی** است، نه یک بهینه‌سازیِ تزئینی.
+      #
+      # وضعیتِ صحت‌سنجیِ همین مرحله
+      # ─────────────────────────────────────────────────────────────────────
+      #   هارنسِ exp/publish_verify.sh این اسکریپت را روی یک مخزنِ bare واقعی
+      #   با ۱۰ سناریو و ۶۲ assertion اجرا می‌کند: ۶۲/۶۲ پاس.
+      #     • ۳۰ دورِ پشت‌سرهم → شاخه دقیقاً ۴ کامیت (۳ سورس + ۱ خروجی)،
+      #       رشدِ حجم ۰ کیلوبایت در هر دور، و هر ۲۶ مسیرِ لینک‌دار سرِ جایش.
+      #     • فایلی که upstream حذف شود، از snapshot بیرون می‌رود (ارث نمی‌رسد).
+      #     • ۴ دور با lease واقعاً contested (پوشِ مالک بینِ fetch و pushِ ما
+      #       تزریق شد): در هر ۴ مورد کامیتِ مالک سالم ماند، خروجی هم منتشر شد.
+      #     • کنترلِ منفی: همان سناریو با force-pushِ ساده، کامیتِ مالک را
+      #       **نابود کرد** (تعداد=۰). پس این گارد تزئینی نیست.
+      #     • سه سناریوی fail-closed (index.json خالی / لیستِ کم‌محتوا /
+      #       نبودِ کلِ خروجی‌ها) → همه رد شدند و شاخه دست‌نخورده ماند.
+      #     • نبودِ پوشهٔ archive/ → بدونِ کرشِ «pathspec did not match».
+      - name: 🚀 Publish outputs to `main` (rolling squash — O(1) history)
+        if: steps.gate.outputs.should_run == 'true'
+        # ⏱️ سقفِ زمانیِ خودِ step — قبلاً **هیچ** سقفی نداشت.
+        #    این مرحله چند عملیاتِ شبکه‌ای دارد و تنها سقفِ موجود، سقفِ
+        #    کلِ job (۱۵ دقیقه) بود؛ یعنی یک fetchِ گیرکرده می‌توانست کلِ
+        #    job را ببلعد و مرحلهٔ purge را هم قربانی کند. ۸ دقیقه در برابرِ
+        #    سرآمدِ سنجیده‌شدهٔ ۷ ثانیه‌ای، ~۶۸ برابر حاشیه دارد.
+        timeout-minutes: 8
+        env:
+          PUBLISH_BRANCH: ${{ env.PUBLISH_BRANCH }}
+          OUT_MARK: ${{ env.OUT_MARK }}
+          # سقفِ هر عملیاتِ fetch به‌تنهایی (ثانیه). بدترین fetchِ سنجیده‌شدهٔ
+          # سالم ۲.۸ ثانیه بود، پس ۱۲۰ ثانیه ~۴۳ برابر حاشیه دارد.
+          FETCH_TIMEOUT: '120'
+        run: |
+          set -euo pipefail
+          git config user.name  "raydikalx-bot[actions]"
+          git config user.email "actions@users.noreply.github.com"
+
+          STAMP=$(date -u +'%Y-%m-%d %H:%M UTC')
+
+          # مسیرهایی که «خروجیِ تولیدشده» محسوب می‌شوند. هر چیزِ دیگری «سورس»
+          # است و ربات هرگز نباید آن را عقب ببرد.
+          # ⚠️ دسته‌های آبشار (`verified/ fast/ secure/ top100.txt`) باید
+          #    این‌جا باشند، وگرنه تولید می‌شوند و **بی‌صدا دور ریخته
+          #    می‌شوند**: درختِ snapshot فقط همین مسیرها را stage می‌کند و از
+          #    `$ANCHOR` شروع می‌شود، پس هر چیزِ فهرست‌نشده هرگز منتشر
+          #    نمی‌شود. گاردِ رگرسیونِ سورس هم به همین تابع تکیه دارد؛ اگر
+          #    `verified/*` را «سورس» بشمارد، وجودِ آن هر بار به‌عنوان
+          #    «تغییرِ سورس» دیده می‌شود و انتشار در حلقهٔ تلاشِ مجدد می‌افتد.
+          #    این‌ها اختیاری‌اند (آبشار `continue-on-error` است) و منطقِ
+          #    «فقط مسیرهای موجود stage می‌شوند» همان پایین از نبودشان
+          #    عبور می‌کند.
+          OUTPUT_PATHS="all heavy light protocols archive index.json health.json verified fast secure top100.txt state.json Countries"
+
+          is_output_path() {
+            case "$1" in
+              all/*|heavy/*|light/*|protocols/*|archive/*|index.json|health.json) return 0 ;;
+              verified/*|fast/*|secure/*|top100.txt|state.json) return 0 ;;
+              Countries/*) return 0 ;;
+              *) return 1 ;;
+            esac
+          }
+
+          # ── ۰) دروازهٔ سلامتِ خروجی (fail-closed) ──────────────────────────
+          #
+          # چرا: انتشار force-push است و راهِ بازگشتی ندارد. اگر snapshotِ این
+          # دور ناقص باشد و منتشرش کنیم، نسخهٔ سالمِ قبلی از دسترس خارج
+          # می‌شود و لیستِ هر مشترکی با «هیچ» جایگزین می‌شود. پس پیش از
+          # ساختِ درخت، وجود و غیرخالی‌بودنِ فایل‌های حیاتی تأیید می‌شود.
+          #
+          # چرا `heavy/*` و `light/*`ِ مبدل‌ها هم اینجا آمدند (F-8، دروازهٔ
+          # مبدل‌ها — نه دروازهٔ بایتِ کنترلی که نامِ دیگری دارد): تا پیش از
+          # این فقط `all/clash.yaml` و `all/singbox.json` پوشش داشتند، پس اگر
+          # مبدلِ دستهٔ heavy یا light شکست می‌خورد، انتشار **بی‌مانع** جلو
+          # می‌رفت. حالا `write_category` فایلِ بایات را حذف می‌کند، و این
+          # دروازه آن حذف را می‌بیند و انتشار را متوقف می‌کند.
+          #
+          # اثباتِ اجرایی که این افزودن، انتشار را برای همیشه قفل نمی‌کند:
+          #   • هر شش مسیر همین حالا در `main` ردگیری می‌شوند و غیرخالی‌اند
+          #     (۳٫۲ MB / ۳٫۹ MB / ۱٫۰ MB / ۱٫۳ MB — اندازه‌گیری شد).
+          #   • بدترین حالتِ واقعی (دسته‌ای با **صفر** کانفیگ): مبدل‌ها استثنا
+          #     نمی‌دهند، بلکه سندِ معتبرِ کوچک می‌سازند — `clash.yaml` = ۸۴۳
+          #     بایت و `singbox.json` = ۱۱۸ بایت — پس `[ -s ]` رد نمی‌شود.
+          #   • فاز فاز کردنِ ۴۱۶ ورودیِ خرابِ ساختگی + هر سه ورودیِ واقعیِ
+          #     منتشرشده: **صفر** استثنا. یعنی این مبدل‌ها فقط بر شکستِ
+          #     فراگیر (نه یک کانفیگِ خراب) استثنا می‌دهند؛ درست همان چیزی که
+          #     باید انتشار را متوقف کند.
+          # این همان هشدارِ ثبت‌شده در `test_pipeline.py` (آزمونِ state.json)
+          # است: هر مسیری که «همیشه» ساخته نمی‌شود نباید در این فهرست بیاید.
+          MUST_EXIST="index.json health.json
+          all/configs.txt all/configs_base64.txt all/clash.yaml all/singbox.json
+          heavy/configs.txt light/configs.txt
+          heavy/clash.yaml heavy/singbox.json
+          light/clash.yaml light/singbox.json"
+          MISSING=""
+          for f in $MUST_EXIST; do
+            [ -s "$f" ] || MISSING="$MISSING $f"
+          done
+          if [ -n "$MISSING" ]; then
+            echo "❌ refusing to publish — missing/empty critical outputs:$MISSING"
+            echo "   شاخهٔ '$PUBLISH_BRANCH' دست‌نخورده می‌ماند (snapshotِ سالمِ قبلی حفظ می‌شود)."
+            exit 1
+          fi
+          # سنجهٔ کمینهٔ محتوا: یک لیستِ تقریباً خالی هم باید متوقف شود.
+          ALL_LINES=$(grep -cv '^\s*\(#\|$\)' all/configs.txt || true)
+          if [ "${ALL_LINES:-0}" -lt 100 ]; then
+            echo "❌ refusing to publish — all/configs.txt has only ${ALL_LINES} payload lines (< 100)."
+            exit 1
+          fi
+          echo "✅ output sanity: all/configs.txt has ${ALL_LINES} payload lines"
+
+          COUNT=$(python -c "import json;print(json.load(open('index.json'))['categories']['all']['unique'])" 2>/dev/null || echo '?')
+
+          # ── حلقهٔ انتشار: تا ۵ تلاش، هر تلاش با anchorِ تازه ────────────────
+          #
+          # چرا حلقه لازم است: بینِ خواندنِ نوکِ شاخه و push، مالک ممکن است
+          # کامیت بزند. در آن حالت lease رد می‌شود و ما anchor را از نو
+          # می‌خوانیم تا کامیتِ تازهٔ مالک را روی شانهٔ خودمان سوار کنیم —
+          # نه اینکه پاکش کنیم. (این سناریو در هارنس واقعاً تزریق و تست شد.)
+          PUBLISHED=0
+          for attempt in 1 2 3 4 5; do
+            # ۱) وضعیتِ واقعیِ remote را بخوان — با عمقِ **محدود**.
+            #
+            # ⚠️⚠️ نقصِ سنجیده‌شده: همین fetch بدونِ `--depth`، روی یک کلونِ
+            #   shallow و در لحظه‌ای که نوکِ remote جابه‌جا شده باشد، **کلِ
+            #   تاریخِ مخزن** را دانلود می‌کند — نه یک کامیت.
+            #
+            #   چرا: انتشار خودش force-push است، پس کامیتی که checkout روی آن
+            #   نشسته بعد از انتشارِ اجرای دیگر **از دسترس خارج** می‌شود. کلونِ
+            #   shallow فقط همان یک کامیت را به‌عنوان «have» دارد و آن have
+            #   دیگر جزوِ تاریخِ نوکِ جدید نیست؛ پس سرور مبنایی برای ساختنِ
+            #   بستهٔ کوچک ندارد و کلِ تاریخ را می‌فرستد.
+            #
+            #   روی همین مخزنِ واقعی (۳.۵۵ گیگابایت) اندازه گرفتم:
+            #     بدونِ --depth، نوکِ جابه‌جاشده → Enumerating 149,895 objects،
+            #        دریافتِ 3.55 GiB، ‏۹۶ ثانیه شبکه + ۲۱۴ ثانیه حلِ delta
+            #        = **۳۵۲.۶ ثانیه**
+            #     با --depth=2 در همان شرایط → Enumerating **121** objects،
+            #        **۲.۸ ثانیه** (۱۲۶ برابر سریع‌تر، و کرانمند)
+            #   در حالتِ عادی (نوکِ ثابت) هم بهتر است: ۲.۲۸ ثانیه در برابرِ
+            #   ۳.۴۴ ثانیه، چون anchor در همان یک رفت‌وبرگشت می‌آید و پلهٔ
+            #   بعدی لازم نمی‌شود.
+            #   اثباتِ صحت: هر چهار استراتژیِ آزموده‌شده درختِ **یکسان**
+            #   ساختند (tree=baac1772، files=66).
+            #
+            #   `timeout` هم لازم است، چون این یک عملیاتِ شبکه‌ایِ بی‌سقف است.
+            #   ⚠️ زیرِ `set -euo pipefail` نمی‌توان لختش گذاشت: شکستِ fetch
+            #   کلِ step را می‌کشد و دورِ انتشار از دست می‌رود. پس با `if !`
+            #   می‌گیریمش و مثلِ هر خطای گذرای دیگر دوباره تلاش می‌کنیم.
+            if ! timeout "${FETCH_TIMEOUT:-120}" git fetch --no-tags --force --depth=2 origin \
+                 "+refs/heads/$PUBLISH_BRANCH:refs/remotes/origin/$PUBLISH_BRANCH"; then
+              echo "⚠️ tip fetch failed or exceeded ${FETCH_TIMEOUT:-120}s (attempt $attempt) — retrying …"
+              sleep $((attempt * 2))
+              continue
+            fi
+
+            TIP=$(git rev-parse "refs/remotes/origin/$PUBLISH_BRANCH")
+
+            # ۲) anchor = تازه‌ترین کامیتی که خروجیِ خودکار نیست.
+            #
+            # ⚠️⚠️ مسئلهٔ shallow — یک تلهٔ واقعی که با تست کشف شد ⚠️⚠️
+            #   `actions/checkout@v4` به‌صورتِ پیش‌فرض `fetch-depth: 1` است.
+            #   نوکِ شاخه در حالتِ عادی یک کامیتِ **خروجی** است، پس در یک
+            #   کلونِ shallow دستورِ `git log` فقط همان یک کامیت را می‌بیند و
+            #   anchor **پیدا نمی‌شود** → این مرحله هر بار fail-closed می‌شد و
+            #   انتشار برای همیشه متوقف می‌ماند.
+            #   این را در exp/shallow_test.sh مستقیماً اندازه گرفتم:
+            #     کلونِ depth=1  → visible=1 کامیت،  anchor=NONE
+            #     fetchِ ساده    → همچنان visible=1 (عمق را باز نمی‌کند)
+            #     یک بار --deepen → visible=2،  anchor پیدا و **درست** بود
+            #   و اثبات شد که commit-tree روی anchorِ عمیق‌شده و سپس push از
+            #   همان مخزنِ shallow کاملاً کار می‌کند و تاریخِ origin سالم
+            #   می‌ماند (۱۵/۱۵ assertion پاس).
+            #
+            #   چرا `fetch-depth: 0` نمی‌گذاریم؟ چون این مخزن ۳.۵۵ گیگابایت
+            #   تاریخ دارد؛ کلونِ کاملش در هر دور (۹۶ بار در روز) نه از نظرِ
+            #   زمان و نه پهنای‌باند قابل‌قبول نیست. پس فقط به‌اندازهٔ نیاز
+            #   عمیق می‌کنیم — معمولاً ۱ تا ۲ کامیت.
+            #   نردبانِ عمق: پلهٔ اول (۲) را همان fetchِ بالا گرفته است، پس
+            #   در حالتِ عادی این حلقه **هیچ عملیاتِ شبکه‌ای اضافه‌ای ندارد**.
+            #   پله‌های بعدی فقط برای حالتِ نامنتظرِ «چند کامیتِ خروجیِ روی هم»
+            #   است (rolling-squash عادی همیشه یک کامیت می‌گذارد، ولی اگر یک
+            #   force-pushِ دستی یا نسخهٔ قدیمی‌تر چند کامیت گذاشته باشد، step
+            #   نباید fail-closed شود). این حالت در هارنس واقعاً تزریق و تست شد.
+            #
+            #   ⚠️ چرا `--depth` مطلق و نه `--deepen` نسبی: `--deepen` روی
+            #   کلونی که نوکش عوض شده مبنای مشخصی ندارد و همان مسیرِ
+            #   «کلِ تاریخ» را باز می‌کند؛ `--depth=N` سقفِ صریح و کرانمند
+            #   می‌گذارد. بیشترین پله ۱۲۸ کامیت است — یعنی حتی در بدترین حالت
+            #   هم چند مرتبه کوچک‌تر از تاریخِ کاملِ مخزن.
+            ANCHOR=""
+            for depth in 2 4 8 32 128; do
+              if [ "$depth" -gt 2 ]; then
+                echo "   ↕️ widening shallow depth to $depth to locate the source anchor …"
+                timeout "${FETCH_TIMEOUT:-120}" git fetch --no-tags --force --depth="$depth" origin \
+                  "+refs/heads/$PUBLISH_BRANCH:refs/remotes/origin/$PUBLISH_BRANCH" 2>/dev/null || true
+              fi
+              ANCHOR=$(git log --format='%H%x09%s' "$TIP" \
+                       | grep -v -F "$OUT_MARK" | head -1 | cut -f1 || true)
+              [ -n "$ANCHOR" ] && break
+            done
+            if [ -z "$ANCHOR" ]; then
+              echo "❌ no source anchor found on '$PUBLISH_BRANCH' even at shallow depth 128."
+              echo "   یعنی یا کلِ تاریخ '$OUT_MARK' دارد یا تاریخ ناقص است."
+              echo "   برای جلوگیری از خرابی، انتشار انجام نمی‌شود."
+              exit 1
+            fi
+
+            N_OUT=$(git rev-list --count "$ANCHOR..$TIP")
+            echo "🔗 attempt $attempt: tip=${TIP:0:8} anchor=${ANCHOR:0:8} output-commits-on-top=$N_OUT"
+
+            # ۳) گاردِ رگرسیونِ سورس — قلبِ ایمنیِ این طرح.
+            #    اگر بینِ anchor و tip فایلی *غیر از خروجی* تغییر کرده باشد،
+            #    یعنی anchorِ ما کهنه است و کامیت‌زدن روی آن کارِ مالک را پاک
+            #    می‌کند. در حالتِ سالم anchor..tip فقط کامیت‌های $OUT_MARK است.
+            REGRESS=""
+            if [ "$ANCHOR" != "$TIP" ]; then
+              while IFS= read -r p; do
+                [ -n "$p" ] || continue
+                if ! is_output_path "$p"; then
+                  REGRESS="$REGRESS $p"
+                fi
+              done <<< "$(git diff --name-only "$ANCHOR" "$TIP")"
+            fi
+            if [ -n "$REGRESS" ]; then
+              echo "⚠️ source paths changed between anchor and tip:$REGRESS"
+              echo "   کامیت‌زدن روی همین anchor تغییرِ سورس را پاک می‌کند → دوباره تلاش می‌کنیم."
+              sleep $((attempt * 2))
+              continue
+            fi
+
+            # ۴) درختِ جدید = درختِ anchor + خروجی‌های تازه.
+            #    از anchor شروع می‌کنیم (نه از tip) تا خروجیِ دورِ قبل ارث
+            #    نرسد؛ پس فایلی که این دور تولید نشده خودبه‌خود از snapshot
+            #    بیرون می‌ماند (این را هارنس مستقیماً تست می‌کند).
+            TMP_INDEX="$(mktemp -u /tmp/rollidx.XXXXXX)"
+            rm -f "$TMP_INDEX"
+            export GIT_INDEX_FILE="$TMP_INDEX"
+
+            git read-tree "$ANCHOR"
+            for p in $OUTPUT_PATHS; do
+              git rm -r --cached --ignore-unmatch -q -- "$p" >/dev/null 2>&1 || true
+            done
+
+            # ⚠️ باگی که با تستِ واقعی کشف شد — «pathspec did not match»
+            #    `archive/` و `protocols/` تضمینِ وجود ندارند: aggregate.py
+            #    آن‌ها را فقط جانبی و از طریقِ `_write_text` → `os.makedirs`
+            #    می‌سازد. اگر در یک دور هیچ کانفیگِ خرابی نباشد، پوشهٔ archive
+            #    ساخته نمی‌شود و `git add -- archive` با
+            #        fatal: pathspec 'archive' did not match any files  (exit 128)
+            #    زیرِ `set -e` کلِ step را بی‌صدا می‌کشت و شاخه روی snapshotِ
+            #    کهنه یخ می‌زد. پس فقط مسیرهایِ موجود stage می‌شوند.
+            PATHS=""
+            for p in $OUTPUT_PATHS; do
+              if [ -e "$p" ]; then
+                PATHS="$PATHS $p"
+              else
+                echo "   ℹ️ '$p' absent this round — skipping (not an error)"
+              fi
+            done
+            # shellcheck disable=SC2086
+            git add -A -- $PATHS
+
+            TREE=$(git write-tree)
+            unset GIT_INDEX_FILE
+            rm -f "$TMP_INDEX"
+
+            # محافظ: درختِ خالی یا کم‌فایل منتشر نمی‌شود.
+            EMPTY_TREE=$(git hash-object -t tree /dev/null)
+            if [ "$TREE" = "$EMPTY_TREE" ]; then
+              echo "❌ refusing to publish an EMPTY tree — '$PUBLISH_BRANCH' left untouched."
+              exit 1
+            fi
+            N_FILES=$(git ls-tree -r --name-only "$TREE" | wc -l)
+            if [ "$N_FILES" -lt 15 ]; then
+              echo "❌ refusing to publish — tree has only $N_FILES files (expected ≥ 15)."
+              exit 1
+            fi
+
+            # محافظِ سورس روی خودِ درخت: مطمئن شو سورس‌ها سرِ جایشان‌اند.
+            # (اگر anchor به هر دلیلی درختِ ناقصی داشت، انتشار متوقف می‌شود.)
+            for must in scripts/aggregate.py scripts/core.py README.md \
+                        .github/workflows/aggregate.yml; do
+              if ! git cat-file -e "$TREE:$must" 2>/dev/null; then
+                echo "❌ refusing to publish — '$must' missing from the new tree."
+                exit 1
+              fi
+            done
+
+            echo "🌳 tree=$TREE  files=$N_FILES"
+
+            # اگر درختِ جدید با نوکِ فعلی یکی است، کاری برای انجام نیست.
+            if [ "$TREE" = "$(git rev-parse "$TIP^{tree}")" ]; then
+              echo "ℹ️ tree identical to current tip — nothing to publish this round."
+              PUBLISHED=1
+              break
+            fi
+
+            # ۵) کامیت روی anchor. نشانگرِ $OUT_MARK در subject است تا دورِ
+            #    بعد بتواند این کامیت را «خروجی» تشخیص دهد و anchor را درست
+            #    پیدا کند.
+            COMMIT=$(git commit-tree "$TREE" -p "$ANCHOR" \
+                     -m "chore: update configs — $STAMP — $COUNT configs [@Raydikalx] $OUT_MARK")
+            echo "📦 commit=$COMMIT"
+
+            # ۶) force-push با lease. lease روی همان نوکی بسته می‌شود که خودمان
+            #    خواندیم؛ اگر مالک در این فاصله کامیت زده باشد، push **رد**
+            #    می‌شود (نه اینکه کارش را پاک کند) و حلقه با anchorِ تازه
+            #    دوباره تلاش می‌کند. کنترلِ منفیِ هارنس نشان داد نسخهٔ ساده
+            #    (`--force` بی‌lease) کامیتِ مالک را واقعاً نابود می‌کند.
+            if git push --force-with-lease="refs/heads/$PUBLISH_BRANCH:$TIP" \
+                 origin "$COMMIT:refs/heads/$PUBLISH_BRANCH"; then
+              echo "✅ published to '$PUBLISH_BRANCH' on attempt $attempt"
+              PUBLISHED=1
+              break
+            fi
+            echo "⚠️ lease rejected or push failed (attempt $attempt) — re-anchoring and retrying …"
+            sleep $((attempt * 2))
+          done
+
+          if [ "$PUBLISHED" != "1" ]; then
+            echo "❌ could not publish after 5 attempts — '$PUBLISH_BRANCH' left untouched."
+            exit 1
+          fi
+
+          # ── ۷) گزارشِ نهایی: تأیید کن شاخه دقیقاً یک کامیتِ خروجی دارد ─────
+          #    این fetch هم باید `--depth` و `timeout` داشته باشد: هرچند
+          #    `|| true` دارد و step را نمی‌کشد، ولی بی‌سقف بودنش یعنی می‌تواند
+          #    همان ۳۵۲ ثانیه را **بعد از** انتشارِ موفق هم بسوزاند.
+          timeout "${FETCH_TIMEOUT:-120}" git fetch --no-tags --force --depth=2 origin \
+            "+refs/heads/$PUBLISH_BRANCH:refs/remotes/origin/$PUBLISH_BRANCH" >/dev/null 2>&1 || true
+          NEW_TIP=$(git rev-parse "refs/remotes/origin/$PUBLISH_BRANCH" 2>/dev/null || echo "?")
+          if [ "$NEW_TIP" != "?" ]; then
+            NEW_ANCHOR=$(git log --format='%H%x09%s' "$NEW_TIP" \
+                         | grep -v -F "$OUT_MARK" | head -1 | cut -f1 || echo "")
+            if [ -n "$NEW_ANCHOR" ]; then
+              echo "🔎 post-publish: output commits on top of source = $(git rev-list --count "$NEW_ANCHOR..$NEW_TIP")"
+              echo "🔎 total commits on '$PUBLISH_BRANCH' = $(git rev-list --count "$NEW_TIP")"
+            fi
+          fi
+      # ── پاک‌سازیِ کشِ jsDelivr ★★★ ─────────────────────────────
+      #
+      # مسئله (اندازه‌گیریِ زندهٔ همین مخزن، نه حدس)
+      # ─────────────────────────────────────────────────────────────────────
+      #   سرآیندِ واقعیِ jsDelivr برای فایل‌های این مخزن:
+      #     cache-control: public, max-age=604800, s-maxage=43200
+      #     age: 26870
+      #   و مستنداتِ رسمیِ jsDelivr: «Branches — 12 hours».
+      #   مقایسهٔ محتوای زنده در لحظهٔ سنجش:
+      #     raw.githubusercontent → updated_at 2026-07-28T20:23:34Z (۸۱۶۸ کانفیگ)
+      #     cdn.jsdelivr.net      → updated_at 2026-07-28T07:38:26Z (۴۳۵۳ کانفیگ)
+      #   یعنی ۱۲ ساعت و ۴۵ دقیقه تأخیر = ۵۱ برابرِ بازهٔ هدفِ ۱۵ دقیقه‌ای.
+      #   پس تلاش برای رساندنِ آپدیت به ۱۵ دقیقه، برای هر کاربری که لینکِ
+      #   jsDelivr را subscribe کرده، عملاً بی‌اثر بود.
+      #
+      # راهکار و تأییدِ عملی
+      # ─────────────────────────────────────────────────────────────────────
+      #   Purge APIِ jsDelivr به‌صورتِ زنده تست شد:
+      #     POST https://purge.jsdelivr.net/  {"path":[…]}
+      #     ۲۶ مسیر در یک درخواست → status finished،
+      #     throttled=false برای همهٔ ۲۶ مسیر، providers CF=true FY=true
+      #   و سپس md5 برای all/configs.txt، index.json، health.json و
+      #   light/clash.yaml بین raw و jsDelivr «یکسان» شد (پیش از purge متفاوت بود).
+      #
+      # حدِ واقعیِ این راهکار — چیزی که با اندازه‌گیریِ دقیق روشن شد
+      # ─────────────────────────────────────────────────────────────────────
+      #   در یک purgeِ دوم (۱۴ مسیر، status=finished، throttled=0) نتیجه
+      #   «نیم‌کاره» بود و این تفاوت مهم است:
+      #     all/configs.txt   → md5 با raw یکسان شد ✅
+      #     light/clash.yaml  → md5 با raw یکسان شد ✅
+      #     index.json        → همچنان متفاوت ❌
+      #     health.json       → همچنان متفاوت ❌
+      #   سرآیندِ jsDelivr پس از purge برای هر دو فایل `age: 22` بود — یعنی
+      #   کشِ لبه واقعاً پاک شده. پس تأخیرِ باقی‌مانده در «لایهٔ originِ خودِ
+      #   jsDelivr» است (resolve کردنِ نامِ برنچ به آخرین کامیت)، نه در CDN.
+      #   purge کشِ لبه را پاک می‌کند ولی نمی‌تواند jsDelivr را مجبور کند
+      #   نامِ برنچ را دوباره resolve کند.
+      #
+      #   ★ نتیجه‌گیریِ عملی که با تست اثبات شد: مسیرِ pin‌شده به کامیت
+      #     همیشه دقیق است. آزمایشِ زنده روی کامیتِ 5cfb623:
+      #       cdn.jsdelivr.net/gh/…@5cfb623/index.json → updated_at 21:23:27.336034
+      #       raw.githubusercontent.com/…/5cfb623/index.json → 21:23:27.336034
+      #     یعنی بیت‌به‌بیت یکی. پس اگر کسی به تازگیِ تضمین‌شده نیاز دارد،
+      #     لینکِ raw (اصلی، کشِ ۵ دقیقه‌ای) یا لینکِ jsDelivrِ pin‌شده به
+      #     کامیت را بگیرد؛ لینکِ jsDelivr روی نامِ برنچ ذاتاً تأخیر دارد.
+      #     دلیلش همین است: raw لینکِ اصلی شد و jsDelivr آینه.
+      #
+      #   این مرحله عمداً `continue-on-error` است: انتشار روی گیت‌هاب همان
+      #   لحظه انجام شده و لینک‌های raw تازه‌اند؛ اگر purge موقتاً throttle
+      #   یا قطع شود، نباید کلِ اجرا شکست‌خورده اعلام شود.
+      - name: 🧹 Purge jsDelivr cache
+        if: steps.gate.outputs.should_run == 'true'
+        continue-on-error: true
+        timeout-minutes: 3
+        run: |
+          python - <<'PY'
+          import json, os, time, urllib.request, urllib.error
+
+          repo   = os.environ.get("GITHUB_REPOSITORY", "0xRadikal/Free-v2ray-Configs")
+          # شاخهٔ انتشار = شاخهٔ پیش‌فرض (`main`). نامِ قدیمیِ DATA_BRANCH فقط
+          # برای سازگاریِ عقب‌رو خوانده می‌شود و مقدارش هم `main` است. اگر
+          # هیچ‌کدام تنظیم نبود، پیش‌فرضِ درست `main` است — نه `data`؛ در
+          # غیرِ این صورت purge روی مسیرِ ۴۰۴ انجام می‌شد و بی‌اثر بود.
+          branch = (os.environ.get("PUBLISH_BRANCH")
+                    or os.environ.get("DATA_BRANCH")
+                    or "main")
+          base   = f"/gh/{repo}@{branch}"
+
+          # فقط سطحِ انتشارِ واقعی purge می‌شود (چیزی که کاربر subscribe می‌کند).
+          # فایل‌های archive/ عمداً بیرون‌اند: کاربرِ نهایی آن‌ها را subscribe
+          # نمی‌کند و اضافه‌کردنشان فقط سهمیهٔ purge را هدر می‌دهد.
+          paths = [f"{base}/index.json", f"{base}/health.json"]
+          for cat in ("all", "heavy", "light"):
+              for f in ("configs.txt", "configs_base64.txt", "clash.yaml", "singbox.json"):
+                  paths.append(f"{base}/{cat}/{f}")
+
+          # پروتکل‌ها از خودِ index.json خوانده می‌شوند تا مسیرِ ۴۰۴ purge نشود
+          # (فقط پروتکل‌های غیرخالی فایل دارند).
+          try:
+              idx = json.load(open("index.json", encoding="utf-8"))
+              for p, n in idx.get("protocols", {}).items():
+                  if n:
+                      paths.append(f"{base}/protocols/{p}.txt")
+                      paths.append(f"{base}/protocols/{p}_base64.txt")
+          except Exception as e:
+              print(f"⚠️ could not read index.json for protocol list: {e}")
+
+          print(f"🧹 purging {len(paths)} paths on {base}")
+          req = urllib.request.Request(
+              "https://purge.jsdelivr.net/",
+              data=json.dumps({"path": paths}).encode(),
+              headers={"content-type": "application/json", "cache-control": "no-cache"},
+          )
+          try:
+              res = json.load(urllib.request.urlopen(req, timeout=60))
+          except Exception as e:
+              print(f"⚠️ purge request failed: {e}")
+              raise SystemExit(0)   # عمداً بدونِ خطا: انتشار انجام شده است
+
+          job = res.get("id")
+          print(f"   job={job} status={res.get('status')}")
+
+          # نتیجه را واقعاً بررسی می‌کنیم — «درخواست فرستادم» با «کش پاک شد» یکی نیست
+          for _ in range(10):
+              if res.get("status") == "finished":
+                  break
+              time.sleep(3)
+              try:
+                  res = json.load(urllib.request.urlopen(
+                      f"https://purge.jsdelivr.net/status/{job}", timeout=30))
+              except Exception as e:
+                  print(f"   ⚠️ status poll failed: {e}")
+                  raise SystemExit(0)
+
+          done = res.get("paths", {}) or {}
+          throttled = [p for p, v in done.items() if v.get("throttled")]
+          failed    = [p for p, v in done.items()
+                       if not all((v.get("providers") or {}).values())]
+          print(f"   status={res.get('status')} purged={len(done)}"
+                f" throttled={len(throttled)} provider-failures={len(failed)}")
+          for p in throttled[:10]:
+              print(f"   ⏳ throttled: {p}")
+          for p in failed[:10]:
+              print(f"   ⚠️ provider miss: {p} -> {done[p].get('providers')}")
+
+          # ── تأییدِ واقعیِ اثر، نه فقط «درخواست فرستادم» ────────────────────
+          # اگر md5ِ نسخهٔ آینه با نسخهٔ raw یکی شد، purge مؤثر بوده است.
+          # اگر نه، لاگ صادقانه می‌گوید کدام فایل عقب مانده — چون سنجش نشان
+          # داد purge کشِ لبه را پاک می‌کند ولی resolveِ نامِ برنچ در origin
+          # خودِ jsDelivr ممکن است هنوز عقب باشد (به کامنتِ بالای این مرحله
+          # نگاه کنید). این «شکست» نیست، محدودیتِ شناخته‌شده است — و دقیقاً
+          # همان دلیلی که لینکِ اصلی را raw کردیم.
+          import hashlib
+          repo_slug = repo
+          def md5_of(url):
+              try:
+                  r = urllib.request.urlopen(urllib.request.Request(
+                      url, headers={"User-Agent": "raydikalx-ci", "Cache-Control": "no-cache"}),
+                      timeout=30)
+                  return hashlib.md5(r.read()).hexdigest()
+              except Exception:
+                  return None
+
+          probes = ["index.json", "all/configs.txt"]
+          agree = 0
+          for f in probes:
+              m_raw = md5_of(f"https://raw.githubusercontent.com/{repo_slug}/{branch}/{f}")
+              m_cdn = md5_of(f"https://cdn.jsdelivr.net/gh/{repo_slug}@{branch}/{f}")
+              same = (m_raw is not None and m_raw == m_cdn)
+              agree += same
+              print(f"   {'✅' if same else 'ℹ️ '} mirror {f}: "
+                    f"raw={str(m_raw)[:8]} cdn={str(m_cdn)[:8]}"
+                    f"{'' if same else '  (branch-ref lag on jsDelivr origin — raw links are unaffected)'}")
+          print(f"   mirror agreement: {agree}/{len(probes)}")
+          PY

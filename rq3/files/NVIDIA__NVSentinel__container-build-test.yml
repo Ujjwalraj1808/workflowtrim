@@ -1,0 +1,183 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: Container Build Validation
+
+on:
+  push:
+    branches:
+      - "pull-request/[0-9]+"
+    paths:
+      # Container-related files
+      - '**/Dockerfile*'
+      - '**/docker/**'
+      - '**/*.go'
+      - '**/go.mod'
+      - '**/go.sum'
+      - '**/pyproject.toml'
+      - '**/poetry.lock'
+      - '**/*Makefile*'
+      - 'scripts/**'
+      # Workflow files
+      - '.github/workflows/container-build-test.yml'
+      - '.github/actions/build-container/**'
+      - '.github/actions/setup-ci-env/**'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read       # Required for checking out code
+  actions: read        # Required for cache operations
+  packages: write      # Required for GHCR build cache access
+
+jobs:
+  container-build-test:
+    if: github.repository == 'nvidia/nvsentinel'
+    runs-on: linux-amd64-cpu32
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false  # Continue testing other containers even if one fails
+      matrix:
+        include:
+          # Health Monitors (Docker-based)
+          - component: gpu-health-monitor-dcgm3
+            make_command: 'make -C health-monitors/gpu-health-monitor docker-build-dcgm3'
+          - component: gpu-health-monitor-dcgm4
+            make_command: 'make -C health-monitors/gpu-health-monitor docker-build-dcgm4'
+          - component: syslog-health-monitor
+            make_command: 'make -C health-monitors/syslog-health-monitor docker-build'
+          # Log Collection (Docker-based)
+          - component: log-collector
+            make_command: 'make -C log-collector docker-build-log-collector'
+          - component: file-server-cleanup
+            make_command: 'make -C log-collector docker-build-file-server-cleanup'
+          # Preflight Checks (Docker-based)
+          - component: preflight-dcgm-diag
+            make_command: 'make -C preflight-checks/dcgm-diag docker-build'
+          - component: preflight-nccl-allreduce
+            make_command: 'make -C preflight-checks/nccl-allreduce docker-build'
+          - component: preflight-nccl-loopback
+            make_command: 'make -C preflight-checks/nccl-loopback docker-build'
+          # Metadata Collector (Docker-based)
+          - component: metadata-collector
+            make_command: 'make -C metadata-collector docker-build'
+          # GPU Reset (Docker-based)
+          - component: gpu-reset
+            make_command: 'make -C gpu-reset docker-build'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Setup build environment
+        uses: ./.github/actions/setup-ci-env
+
+      - name: Build container for ${{ matrix.component }}
+        run: echo "Building container for ${{ matrix.component }}..."
+
+      - name: Compute ref name with short SHA
+        id: ref-name
+        run: |
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          SAFE_REF="${{ github.ref_name }}-${SHORT_SHA}"
+          # Sanitize ref name: replace slashes with hyphens for Docker tag compatibility
+          SAFE_REF=$(echo "$SAFE_REF" | sed 's/\//-/g')
+          echo "value=$SAFE_REF" >> $GITHUB_OUTPUT
+
+      - name: Execute build
+        uses: ./.github/actions/build-container
+        env:
+          CI_COMMIT_REF_NAME: ${{ steps.ref-name.outputs.value }}
+          # Disable registry cache for validation builds (this is a test workflow, not publish)
+          # Registry cache writing requires special permissions that may not be available
+          DISABLE_REGISTRY_CACHE: 'true'
+          # Disable --load flag in CI builds (causes issues with multi-platform builds)
+          DOCKER_LOAD_ARG: ''
+        with:
+          make_command: ${{ matrix.make_command }}
+
+  # Test ko-based builds (Go modules)
+  ko-build-test:
+    if: github.repository == 'nvidia/nvsentinel'
+    runs-on: linux-amd64-cpu32
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - module: platform-connectors
+            path: .
+          - module: health-events-analyzer
+            path: .
+          - module: fault-quarantine
+            path: .
+          - module: labeler
+            path: .
+          - module: node-drainer
+            path: .
+          - module: fault-remediation
+            path: .
+          - module: janitor
+            path: .
+          - module: health-monitors/csp-health-monitor
+            path: ./cmd/csp-health-monitor
+          - module: health-monitors/csp-health-monitor
+            path: ./cmd/maintenance-notifier
+          - module: health-monitors/kubernetes-object-monitor
+            path: .
+          - module: health-monitors/nvcre-certification-monitor
+            path: .
+          - module: health-monitors/nic-health-monitor
+            path: .
+          - module: health-monitors/slurm-drain-monitor
+            path: .
+          - module: event-exporter
+            path: .
+          - module: plugins/slinky-drainer
+            path: .
+          - module: preflight
+            path: .
+          - module: lifecycle-manager
+            path: .
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Setup build environment
+        uses: ./.github/actions/setup-ci-env
+
+      - name: Use ko to build ${{ matrix.module }}
+        run: |
+          cd ${{ matrix.module }}
+          ko build --bare --platform=linux/amd64,linux/arm64 ${{ matrix.path }}
+        env:
+          KO_DOCKER_REPO: ko.local
+
+  container-build-summary:
+    runs-on: linux-amd64-cpu32
+    needs: [container-build-test, ko-build-test]
+    if: always() && github.repository == 'nvidia/nvsentinel'
+    steps:
+      - name: Check build results
+        run: |
+          echo "Container build validation completed"
+          if [[ "${{ needs.container-build-test.result }}" == "failure" ]] || [[ "${{ needs.ko-build-test.result }}" == "failure" ]]; then
+            echo "❌ Some container builds failed"
+            exit 1
+          elif [[ "${{ needs.container-build-test.result }}" == "cancelled" ]] || [[ "${{ needs.ko-build-test.result }}" == "cancelled" ]]; then
+            echo "⚠️ Container builds were cancelled"
+            exit 1
+          else
+            echo "✅ All container builds passed"
+          fi

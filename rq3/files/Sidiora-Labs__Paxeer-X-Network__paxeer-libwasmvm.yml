@@ -1,0 +1,156 @@
+name: Paxeer / Build libwasmvm
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Git ref to checkout (branch, tag, or SHA)'
+        required: false
+        type: string
+        default: ''
+  push:
+    branches:
+      - main
+      - release/**
+    paths:
+      - 'go.mod'
+      - 'go.sum'
+      - 'chain.mk'
+      - 'docker/layerx/Dockerfile'
+      - 'docker/layerx/Dockerfile.dockerignore'
+      - 'foundry.paxeer.toml'
+      - 'buf.gen.yaml'
+      - 'buf.lock'
+      - 'buf.yaml'
+      - 'codecov.yml'
+      - 'config.yml'
+      - '.golangci.yml'
+      - 'gen.go'
+      - 'link_directives_test.go'
+      - 'mod_test.go'
+      - 'run_blocktests.sh'
+      - 'version.json'
+      - 'admin/**'
+      - 'api/**'
+      - 'assets/**'
+      - 'benchmark/**'
+      - 'consensus/**'
+      - 'custodyproof/**'
+      - 'daemon/**'
+      - 'docker/**'
+      - 'engine/**'
+      - 'example/**'
+      - 'hpx/**'
+      - 'integration_test/**'
+      - 'interchain/**'
+      - 'loadtest/**'
+      - 'modules/**'
+      - 'node/**'
+      - 'occ_tests/**'
+      - 'parallelization/**'
+      - 'precompiles/**'
+      - 'ratelimiter/**'
+      - 'rpc/**'
+      - 'sdk/**'
+      - 'storage/**'
+      - 'store/**'
+      - 'sync/**'
+      - 'testutil/**'
+      - 'types/**'
+      - 'utils/**'
+      - 'wasm/**'
+      - 'wasm-runtime/**'
+      - 'wasmbinding/**'
+      - 'contracts/src/**'
+      - 'contracts/test/**'
+      - 'contracts/scripts/**'
+      - 'contracts/wasm/**'
+      - 'docs/swagger/**'
+      - 'docs/swagger-ui/**'
+      - 'tests/chain/**'
+      - 'tools/chain/**'
+      - 'tools/tx-scanner/**'
+      - 'tools/utils/**'
+      - 'contracts/config/client.toml'
+      - 'contracts/hardhat.config.js'
+      - 'contracts/package.json'
+      - 'contracts/package-lock.json'
+      - 'contracts/tsconfig.json'
+      - 'docs/evm_jsonrpc_unsupported.md'
+      - 'docs/paxeer-network.md'
+      - 'docs/paxeer-chain-docs.md'
+      - 'scripts/**'
+      - '!scripts/PaxeerBetaDeploy.s.sol'
+      - '!scripts/qualify-mirror-live.sh'
+      - '!scripts/qualify-mirror-verification-live.sh'
+      - '.github/workflows/paxeer-libwasmvm.yml'
+
+concurrency:
+  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event_name == 'push' && github.sha || github.ref }}
+
+defaults:
+  run:
+    working-directory: wasm-runtime
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - release-build-alpine
+          - release-build-linux
+          - release-build-macos
+          - release-build-macos-static
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+           ref: ${{ inputs.ref || github.sha }}
+      - name: Build
+        run: |
+          mkdir -p libwasmvm/artifacts
+          make ${{ matrix.target }}
+          ls -alh internal/api
+      - name: Upload libraries
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: paxeer-libwasmvm-${{ matrix.target }}-${{ inputs.ref || github.sha }}
+          path: |
+            wasm-runtime/internal/api/*.h
+            wasm-runtime/internal/api/*.so
+            wasm-runtime/internal/api/*.a
+            wasm-runtime/internal/api/*.dylib
+          if-no-files-found: error
+
+  verify-docker-runtime-artifacts:
+    name: Verify Docker runtime artifacts (${{ matrix.arch }})
+    runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && 'ubuntu-latest' || vars.CI_LINUX_RUNNER || 'lx-runner' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        arch:
+          - x86_64
+          - aarch64
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+      - name: Download and verify pinned runtime artifacts
+        env:
+          ARCH_SUFFIX: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          artifact_dir=$(mktemp -d)
+          trap 'rm -rf "${artifact_dir}"' EXIT
+          for library in \
+            "libwasmvm.${ARCH_SUFFIX}.so" \
+            "libwasmvm152.${ARCH_SUFFIX}.so" \
+            "libwasmvm155.${ARCH_SUFFIX}.so"; do
+              expected=$(awk -v name="${library}" '$2 == name { print $1 }' libwasmvm-linux.sha256)
+              test -n "${expected}"
+              curl --fail --location --proto '=https' --tlsv1.2 --retry 5 \
+                --output "${artifact_dir}/${library}" \
+                "https://node.hyperpaxeer.com/lib/${library}"
+              echo "${expected}  ${artifact_dir}/${library}" | sha256sum --check --strict
+          done

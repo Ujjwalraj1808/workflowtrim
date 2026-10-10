@@ -1,0 +1,52 @@
+name: Refresh literature snapshot from Europe PMC
+
+on:
+  schedule:
+    - cron: "41 5 * * 2" # Tuesdays 05:41 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run fetch:papers -- --force
+      # The merge below is unattended, so the tree the pull request carries must pass what a person's branch passes.
+      # The gates never fail the job: when one does the pull request is still opened, the merge step is skipped and
+      # the next step labels it for review, so a red snapshot waits for a person instead of landing on main.
+      - id: gates
+        uses: ./.github/actions/gates
+      - uses: peter-evans/create-pull-request@v7
+        id: cpr
+        with:
+          branch: bot/refresh-papers
+          title: "Weekly refresh: Europe PMC literature snapshot"
+          commit-message: "chore: refresh literature snapshot from Europe PMC"
+          body: |
+            Automated weekly pull of paper counts per year and the five most recent titles for every product, target, cancer, and technology, from the Europe PMC REST API.
+            Files under `public/papers/` changed. The /papers/ page recomputes fastest-growing topics from this snapshot.
+          labels: automated, pipeline
+          delete-branch: true
+      - name: Merge it (only when this run's gates passed)
+        if: steps.cpr.outputs.pull-request-number != '' && steps.gates.outputs.passed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh pr merge --squash --delete-branch "${{ steps.cpr.outputs.pull-request-number }}" || echo "merge deferred, the pull request stays open for a human"
+      - name: Leave it for review (a gate failed in this run)
+        if: steps.cpr.outputs.pull-request-number != '' && steps.gates.outputs.passed != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh label create needs-review --color D93F0B --description "A person must check this before it lands" --force || true
+          gh pr edit "${{ steps.cpr.outputs.pull-request-number }}" --add-label needs-review
+          gh pr comment "${{ steps.cpr.outputs.pull-request-number }}" --body "Not merged: ${{ steps.gates.outputs.failed }} failed in [this run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}). The snapshot is on this branch for a person to read."

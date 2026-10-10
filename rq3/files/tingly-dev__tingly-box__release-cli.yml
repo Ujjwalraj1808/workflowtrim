@@ -1,0 +1,316 @@
+name: Release CLI
+
+# The CLI half of a release: build the six CLI binaries around the shared
+# frontend build, gate on the harness, publish the GitHub release (the zips +
+# checksums.txt), dispatch the CLI npm publish (npm.yml, pending its
+# `production` approval) and verify the result (verify-release-cli.yml). The
+# desktop GUI is a separate, independent pipeline (release-gui.yml); release.yml
+# runs the two in parallel.
+#
+# Run by release.yml (tag push, or dispatch there), which builds the frontend and
+# runs the harness once for both pipelines (`orchestrated`). Dispatched by hand
+# with a tag to redo just the CLI release, it builds its own frontend and runs
+# its own harness gate.
+on:
+  workflow_call:
+    inputs:
+      release_tag:
+        description: 'Release tag (e.g., v0.20250101.0)'
+        required: true
+        type: string
+      orchestrated:
+        description: 'Set by release.yml: the frontend-dist artifact and the harness gate come from the caller'
+        required: false
+        type: boolean
+        default: false
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Release tag (e.g., v0.20250101.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  GO_VERSION: '1.26'
+
+jobs:
+  # Only when run on its own: release.yml builds it once for both pipelines.
+  frontend:
+    name: Frontend
+    if: ${{ !inputs.orchestrated }}
+    uses: ./.github/workflows/build-frontend.yml
+
+  build-cli:
+    needs: frontend
+    # `frontend` is skipped when orchestrated; a skipped need would skip this too.
+    if: ${{ !failure() && !cancelled() }}
+    env:
+      RELEASE_TAG: ${{ inputs.release_tag }}
+    runs-on: ${{ matrix.runs-on }}
+    strategy:
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            suffix: linux-amd64
+            runs-on: ubuntu-22.04
+          - goos: linux
+            goarch: arm64
+            suffix: linux-arm64
+            runs-on: ubuntu-22.04
+            cross_compile: true
+          - goos: darwin
+            goarch: amd64
+            suffix: macos-amd64
+            runs-on: macos-15-intel
+          - goos: darwin
+            goarch: arm64
+            suffix: macos-arm64
+            runs-on: macos-latest
+          - goos: windows
+            goarch: amd64
+            suffix: windows-amd64
+            exe: .exe
+            runs-on: windows-latest
+          - goos: windows
+            goarch: arm64
+            suffix: windows-arm64
+            exe: .exe
+            runs-on: ubuntu-22.04
+            cross_compile: true
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          submodules: true
+
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      - name: Locate Go caches
+        id: gocache
+        shell: bash
+        run: |
+          echo "build=$(go env GOCACHE)" >> "$GITHUB_OUTPUT"
+          echo "mod=$(go env GOMODCACHE)" >> "$GITHUB_OUTPUT"
+
+      # Keyed per job: setup-go's own key is only OS/arch, so jobs sharing a
+      # runner (e.g. the three ubuntu-22.04 targets) overwrite each other's cache.
+      - name: Cache Go build
+        uses: actions/cache@v6
+        with:
+          path: |
+            ${{ steps.gocache.outputs.build }}
+            ${{ steps.gocache.outputs.mod }}
+          key: go-${{ matrix.suffix }}-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            go-${{ matrix.suffix }}-
+
+      - name: Download frontend artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: frontend-dist
+          path: internal/web/dist/
+
+      - name: Install musl toolchain (for amd64 static linking)
+        if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
+        run: |
+          sudo apt-get update -qq || echo "done"
+          sudo apt-get install -y -qq musl-tools musl-dev  || echo "done"
+
+      - name: Install zig (for arm64 cross-compilation)
+        if: matrix.cross_compile == true
+        run: |
+          wget -q https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz
+          tar -xf zig-linux-x86_64-0.13.0.tar.xz
+          echo "$PWD/zig-linux-x86_64-0.13.0" >> $GITHUB_PATH
+
+      - name: Build Go binary (${{ matrix.suffix }})
+        shell: bash
+        run: |
+          # Create build directory
+          mkdir -p dist
+
+          # Get build info
+          VERSION="${{ env.RELEASE_TAG }}"
+          GIT_COMMIT="$(git rev-parse HEAD 2>/dev/null || echo 'unknown')"
+          BUILD_TIME="$(date -u '+%Y-%m-%d-%H-%M-%S' 2>/dev/null || echo 'unknown')"
+          GO_VERSION="$(go version | awk '{print $3}' | sed 's/go//' 2>/dev/null || echo 'unknown')"
+          PLATFORM="${{ matrix.goos }}/${{ matrix.goarch }}"
+
+          # Build with optimized ldflags
+          # -s: strip symbol table
+          # -w: strip DWARF debug info
+          # -X: for metadata
+          LDFLAGS="-s -w"
+          LDFLAGS+=" -X main.version=${VERSION}"
+          LDFLAGS+=" -X main.gitCommit=${GIT_COMMIT}"
+          LDFLAGS+=" -X main.buildTime=${BUILD_TIME}"
+          LDFLAGS+=" -X main.goVersion=${GO_VERSION}"
+          LDFLAGS+=" -X main.platform=${PLATFORM}"
+
+          # Configure build flags based on platform
+          # An empty value is a valid "no tags". Never quote inside the value:
+          # `-tags 'x'` hands go a tag literally named 'x' (with the quotes).
+          BUILD_TAGS="-tags="
+          LDFLAGS_EXT=""
+
+          if [ "${{ matrix.goos }}" == "linux" ]; then
+            if [ "${{ matrix.goarch }}" == "amd64" ]; then
+              # Static linking with musl for Linux amd64
+              BUILD_TAGS="-tags=sqlite_omit_load_extension"
+              LDFLAGS_EXT="-linkmode external -extldflags \"-static\""
+              CC=musl-gcc
+              export CC
+            elif [ "${{ matrix.goarch }}" == "arm64" ]; then
+              # Use zig for cross-compilation with musl (static)
+              CC="zig cc -target aarch64-linux-musl"
+              CXX="zig c++ -target aarch64-linux-musl"
+              export CC CXX
+              BUILD_TAGS="-tags=sqlite_omit_load_extension"
+              LDFLAGS_EXT="-linkmode external -extldflags \"-static\""
+            fi
+          elif [ "${{ matrix.goos }}" == "windows" ] && [ "${{ matrix.goarch }}" == "arm64" ]; then
+            # Cross-compile Windows on ARM (e.g. Snapdragon) via zig.
+            # Link statically so the bare .exe carries no mingw runtime DLL
+            # dependency (libwinpthread/libssp), matching the linux-arm64 leg.
+            CC="zig cc -target aarch64-windows-gnu"
+            CXX="zig c++ -target aarch64-windows-gnu"
+            export CC CXX
+            BUILD_TAGS="-tags=sqlite_omit_load_extension"
+            LDFLAGS_EXT="-linkmode external -extldflags \"-static\""
+          fi
+
+          # Build with optimizations
+          CGO_ENABLED=1 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} \
+            go build \
+            "${BUILD_TAGS}" \
+            -ldflags="${LDFLAGS} ${LDFLAGS_EXT}" \
+            -trimpath \
+            -o ./dist/tingly-box${{ matrix.exe }} \
+            ./cli/tingly-box
+
+          # Make binary executable for non-Windows
+          [ "${{ matrix.goos }}" != "windows" ] && chmod +x ./dist/tingly-box${{ matrix.exe }} || true
+
+      - name: Upload build artifact (${{ matrix.suffix }})
+        uses: actions/upload-artifact@v7
+        with:
+          name: cli-${{ matrix.suffix }}
+          path: ./dist/tingly-box${{ matrix.exe }}
+          retention-days: 7
+
+  # Gate the release on a green harness: the shared template (same definition
+  # harness-matrix.yml uses), full matrix. Only when run on its own; release.yml
+  # runs it once for both pipelines and only calls this workflow once it passed.
+  harness:
+    if: ${{ !inputs.orchestrated }}
+    uses: ./.github/workflows/harness-template.yml
+    with:
+      focus: all
+
+  github-release:
+    needs: [build-cli, harness]
+    runs-on: ubuntu-latest
+    # harness: success, or skipped because the caller already gated on it.
+    if: ${{ !failure() && !cancelled() && needs.build-cli.result == 'success' }}
+    env:
+      RELEASE_TAG: ${{ inputs.release_tag }}
+    permissions:
+      contents: write
+    steps:
+      # Only for the local ensure-release action.
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          sparse-checkout: .github
+
+      - name: Download CLI artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: cli-*
+          path: ./dist/cli
+          # Keep artifacts in separate subdirectories to avoid overwriting same-named binaries
+
+      - name: Package binaries with proper extensions
+        run: |
+          # Save original directory and use absolute path for release
+          ORIGINAL_DIR="$(pwd)"
+          RELEASE_DIR="${ORIGINAL_DIR}/release"
+          mkdir -p "$RELEASE_DIR"
+
+          # Process CLI binaries - each artifact is in its own subdirectory
+          if [ -d "dist/cli" ]; then
+            for artifact_dir in dist/cli/cli-*; do
+              if [ -d "$artifact_dir" ]; then
+                # Extract platform from artifact directory name
+                platform=$(basename "$artifact_dir" | sed 's/cli-//')
+                chmod +x "$artifact_dir"/tingly-box* || true
+
+                # Package the binary with platform suffix in zip filename
+                binary=$(ls "$artifact_dir"/tingly-box* 2>/dev/null | head -1)
+                if [ -n "$binary" ]; then
+                  (cd "$artifact_dir" && zip "${RELEASE_DIR}/tingly-box-${platform}.zip" "$(basename "$binary")")
+                fi
+              fi
+            done
+          fi
+
+          # Create checksums for all files (only if we have zip files)
+          if ls "$RELEASE_DIR"/*.zip 1> /dev/null 2>&1; then
+            (cd "$RELEASE_DIR" && sha256sum *.zip > checksums.txt)
+          else
+            echo "No zip files found in release directory"
+          fi
+
+      - name: Ensure the GitHub release exists
+        uses: ./.github/actions/ensure-release
+        with:
+          tag: ${{ env.RELEASE_TAG }}
+
+      - name: Upload CLI assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --clobber -- \
+            release/*.zip release/checksums.txt
+
+  # The explicit conditions on the jobs below: a skipped ancestor (frontend,
+  # harness when orchestrated) would otherwise skip them too.
+  trigger-npm-publish:
+    needs: github-release
+    if: ${{ !cancelled() && needs.github-release.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      # Only for the local dispatch-npm action.
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          sparse-checkout: .github
+
+      - name: Dispatch NPX publish workflow
+        uses: ./.github/actions/dispatch-npm
+        with:
+          tag: ${{ inputs.release_tag }}
+          publish_cli: true
+          publish_gui: false # release-gui.yml dispatches its own
+          build_docker: true
+
+  # Verify the CLI release we just published. verify-release-cli.yml's own
+  # `release: published` trigger never fires for it (same GITHUB_TOKEN rule
+  # as above), so call it directly. Non-blocking for the npm dispatch.
+  verify-release:
+    needs: github-release
+    if: ${{ !cancelled() && needs.github-release.result == 'success' }}
+    uses: ./.github/workflows/verify-release-cli.yml
+    with:
+      tag: ${{ inputs.release_tag }}

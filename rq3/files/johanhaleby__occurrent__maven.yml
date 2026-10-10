@@ -1,0 +1,385 @@
+name: Java CI with Maven
+
+on:
+  push:
+    paths-ignore:
+      - '**/*.md'
+  # So the image mirror can be refreshed by hand instead of waiting for a push to notice a gap.
+  workflow_dispatch:
+
+# Cancel superseded runs on the same ref so pushes don't queue up behind stale builds.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Keep the Maven local repository inside the workspace so cache and artifact paths are
+  # deterministic across jobs (avoids '~' expansion differences in actions/cache and
+  # upload/download-artifact). Unquoted expansion is intentional: the value word-splits into
+  # separate mvn arguments.
+  MVN: -B -ntp -Dmaven.repo.local=${{ github.workspace }}/.m2repo
+  # Budget for one shard's tests, in seconds. Roughly 20% over the slowest shard the split below
+  # targets, so ordinary runner variance stays quiet and a subtree that actually grew does not.
+  # Exceeding it warns, never fails: nothing here is close to the 20 minute shard timeout, and a
+  # timing gate that can redden an unrelated push would just get ignored.
+  SHARD_BUDGET_SECONDS: 240
+  # Private mirror of the Docker Hub images the tests need, so a Docker Hub outage cannot fail a run.
+  # Images keep their Docker Hub repository and tag under this prefix, so mongo:8.0 is mirrored as
+  # <prefix>/mongo:8.0.
+  IMAGE_MIRROR: ghcr.io/${{ github.repository_owner }}/occurrent-ci
+
+jobs:
+  # Stage 1: compile and install every module artifact into the local repo, skipping tests.
+  # -DskipTests (not -Dmaven.test.skip) still test-compiles, so test-scoped dependencies
+  # (Testcontainers, JUnit, Awaitility) are resolved and cached for the test shards. Runs on
+  # both JDKs to preserve the "compiles on 21 and 25" signal. Compilation is a small fraction of
+  # the old ~13 min single-job build (measured: tests dominate), so this stage is cheap.
+  build:
+    name: build (java-${{ matrix.java }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        java: [ 21, 25 ]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up JDK ${{ matrix.java }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ matrix.java }}
+      - name: Cache Maven dependencies
+        uses: actions/cache@v4
+        with:
+          # Cache only third-party deps and plugins; this commit's org/occurrent SNAPSHOTs
+          # travel to the test shards via the per-run artifact, so they never linger here.
+          path: |
+            ${{ github.workspace }}/.m2repo
+            !${{ github.workspace }}/.m2repo/org/occurrent
+          key: ${{ runner.os }}-m2deps-java${{ matrix.java }}-${{ hashFiles('**/pom.xml') }}
+          restore-keys: |
+            ${{ runner.os }}-m2deps-java${{ matrix.java }}-
+            ${{ runner.os }}-m2deps-
+      - name: Build and install (skip tests)
+        run: mvn $MVN -T1C -DskipTests install
+      # Hand this commit's freshly built SNAPSHOTs to the test shards as an immutable per-run
+      # artifact, so fresh jars never linger in the long-lived dependency cache.
+      - name: Upload project artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: occurrent-m2-java${{ matrix.java }}
+          path: ${{ github.workspace }}/.m2repo/org/occurrent
+          retention-days: 1
+          if-no-files-found: error
+
+  # Keep a private mirror of the images the tests need, so a Docker Hub outage stops being able to
+  # fail a run. #432 made an outage cheap and legible but left the dependency, and it cost us runs 4
+  # times in one morning.
+  #
+  # This never blocks the pipeline. continue-on-error here, plus the fall back in the shards, means a
+  # cold or broken mirror only costs a warning and the tests pull from Docker Hub as they did before.
+  # That is why the shards do not use Testcontainers' hub.image.name.prefix: it rewrites every Docker
+  # Hub image with no per-image opt-out and no fallback, so a mirror that lags a version bump would
+  # fail the run outright. Pulling from the mirror and retagging to the Docker Hub name leaves the
+  # tests finding the image locally, which is what they already do after a pre-pull.
+  mirror-images:
+    name: mirror test images
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    continue-on-error: true
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      # javap reads the ryuk tag out of the Testcontainers jar. Runners ship a JDK, but relying on that
+      # would make ryuk quietly stop being mirrored if one ever did not, so ask for one explicitly.
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+      # Only to resolve the ryuk tag, which lives in the Testcontainers jar. A cache miss just means
+      # ryuk is left out of the mirror and pulled from Docker Hub.
+      - name: Restore Maven dependencies
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ${{ github.workspace }}/.m2repo
+            !${{ github.workspace }}/.m2repo/org/occurrent
+          key: ${{ runner.os }}-m2deps-java21-${{ hashFiles('**/pom.xml') }}
+          restore-keys: |
+            ${{ runner.os }}-m2deps-java21-
+            ${{ runner.os }}-m2deps-
+      - name: Log in to the mirror
+        run: echo '${{ github.token }}' | docker login ghcr.io -u '${{ github.actor }}' --password-stdin
+      - name: Copy any image the mirror is missing
+        run: |
+          while IFS= read -r image; do
+            target="$IMAGE_MIRROR/$image"
+            # Presence is checked by pulling rather than with `docker manifest inspect`, which reported a
+            # miss for images a registry demonstrably served when this was tested. An always-missing check
+            # would quietly make this job pull from Docker Hub on every run, which is the dependency the
+            # mirror exists to remove.
+            if docker pull -q "$target" >/dev/null 2>&1; then
+              echo "mirror already serves $image"
+              continue
+            fi
+            echo "mirror is missing $image, copying it from Docker Hub"
+            if ! docker pull -q "$image" >/dev/null; then
+              echo "::warning::Could not pull $image from Docker Hub, so the mirror still lacks it and the shards will fall back."
+              continue
+            fi
+            docker tag "$image" "$target"
+            if docker push -q "$target" >/dev/null; then
+              echo "mirrored $image"
+            else
+              echo "::warning::Could not push $image to the mirror. Check that the job has packages write permission."
+            fi
+          done < <(bash .github/scripts/required-test-images.sh .)
+
+  # Guard against silent coverage loss: every module that has tests must fall under exactly one
+  # test shard's paths. Parses the shard paths straight out of this file (no separate list to
+  # keep in sync) and fails if any test-bearing module is not covered, e.g. a newly added module.
+  verify-shard-coverage:
+    name: verify shard coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check every test module is assigned to a shard
+        run: |
+          prefixes=()
+          while IFS= read -r p; do prefixes+=("$p"); done < <(grep -oE 'paths: "[^"]+"' .github/workflows/maven.yml \
+            | sed -E 's/paths: "//; s/"$//' | tr ' ' '\n' | sort -u)
+          echo "Shard path prefixes:"; printf '  %s\n' "${prefixes[@]}"
+          uncovered=()
+          while IFS= read -r d; do
+            covered=0
+            for p in "${prefixes[@]}"; do
+              if [[ "$d" == "$p" || "$d" == "$p/"* ]]; then covered=1; break; fi
+            done
+            [[ $covered -eq 0 ]] && uncovered+=("$d")
+          done < <(find . -type d -path '*/src/test' | sed 's#/src/test##; s#^\./##' | sort)
+          if [[ ${#uncovered[@]} -gt 0 ]]; then
+            echo "::error::These modules have tests but are not covered by any shard:"
+            printf '::error::  %s\n' "${uncovered[@]}"
+            exit 1
+          fi
+          echo "All test modules are covered by a shard."
+
+  # Stage 2: run each subtree's tests against the pre-built local repo, one shard per runner
+  # (isolated Docker daemon). Within a shard, modules stay sequential (no -T). Nothing pins a host
+  # port any more, but sequential execution is still load-bearing: a MongoDB database belongs to one
+  # container object in one JVM (ADR 97), and two test classes running at once inside a JVM would
+  # need a per-class axis on top of that. Do not read this as licence to add -T.
+  #
+  # Shard count is pinned at 10 by the concurrency limit, not chosen for tidiness: this account's
+  # GitHub plan allows 20 concurrent jobs, and 10 shards x 2 JDKs is exactly 20. An 11th shard buys
+  # no parallelism, it makes one runner execute two shards back to back, and since every shard is
+  # over 100s that is slower than an imbalanced single wave. Rebalance by moving paths between
+  # shards, not by adding one. Shards run roughly slowest first so that if runners are scarce, the
+  # cheap shards are the ones that wait.
+  #
+  # Balance by measured test time, because the slowest shard sets the whole stage's wall clock.
+  # Measurements are deliberately NOT written down here: that is what went stale last time (#423).
+  # Instead every shard reports its own per-subtree timings to the run summary and, as
+  # `shard-timing` lines, to its log, and a shard over SHARD_BUDGET_SECONDS annotates the run. So
+  # the live numbers are always one click away, drift reports itself instead of waiting to be
+  # noticed, and the whole picture is one command:
+  #
+  #   gh run view <run-id> --log | grep shard-timing
+  #
+  # The floor is occurrent-mongodb-spring-boot-starter: one Maven module, and the only unit here
+  # that cannot be divided without splitting a single module's tests by class, which would be the
+  # most stale-prone thing in this file. Any shard above it is a subtree that could be listed as
+  # its own paths instead, so if the floor ever needs chasing, look there first.
+  #
+  # Note that moving a subtree between shards can change what it costs: several of these boot a
+  # MongoDB container, and with Testcontainers reuse on, whichever one runs first on a runner pays
+  # for the container and the rest ride along. A subtree that is cheap next to a neighbour can get
+  # noticeably slower alone. Re-read the summary after moving anything, do not assume the old number
+  # travels with it.
+  #
+  # Use -f <subtree>/pom.xml, NOT -pl: -pl on an aggregator does not descend into its children and
+  # would run zero tests. We do NOT pass -o: the build job's `install -DskipTests` does not resolve
+  # Surefire's JUnit-platform provider (that happens lazily at test execution), so a fully offline
+  # shard could fail to resolve it on a cold runner. The restored dependency cache + downloaded
+  # project artifacts still supply the bulk; only genuinely missing artifacts fall back to network.
+  test:
+    name: test (${{ matrix.shard.name }}, java-${{ matrix.java }})
+    # mirror-images is continue-on-error, so waiting on it costs nothing when it fails. It only means
+    # the mirror has been given its chance to fill before any shard reads from it.
+    needs: [ build, mirror-images ]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: read
+      # download-artifact reads this run's artifacts through the Actions API.
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        java: [ 21, 25 ]
+        shard:
+          # A shard's name says what dominates it, not everything in it: filling 10 shards evenly
+          # means some carry a lodger from a subtree that had nowhere cheaper to go. That costs
+          # nothing for triage, because each subtree gets its own ::group:: in the log.
+          #
+          # `application` lodges here: it needs a MongoDB container anyway, so it starts cheaper
+          # next to a subtree that already booted one than it does in a shard of its own.
+          - { name: subscription-mongodb-spring, paths: "subscription/mongodb/spring application" }
+          - { name: eventstore-spring,           paths: "eventstore/mongodb/spring" }
+          # Everything that talks to MongoDB through the driver rather than through Spring.
+          - { name: mongodb-native,              paths: "eventstore/mongodb/native subscription/mongodb/native eventstore/api eventstore/mongodb/common eventstore/mongodb/dcb-common subscription/mongodb/common testing/mongodb" }
+          # Listed per module, not as the framework aggregator, because the blocking starter is the
+          # single most expensive module in the build. It shares the shard with framework/annotations and
+          # the framework/spring-boot-autoconfigure aggregate (common, blocking, reactor), both cheap
+          # enough to ride along without pushing the shard over budget.
+          - { name: framework,                   paths: "framework/spring-boot-starter-mongodb framework/annotations framework/spring-boot-autoconfigure" }
+          - { name: dsl,                         paths: "dsl" }
+          # misc is the deliberate junk drawer: whatever is too small to shard on its own. The
+          # reactive Spring Boot starter is here because the blocking one nearly fills a shard by
+          # itself, so the two cannot share.
+          # `tck` and the two store-neutral `testing` leaves lodge here: their own tests run against the in-memory
+          # event store and subscription model, so they need no container and cost almost nothing. `testing/mongodb`
+          # is named separately in mongodb-native rather than riding along, because it does start a container. The
+          # leaves are listed one by one for that reason, since the bare `testing` prefix would pull it back in here.
+          - { name: misc,                        paths: "framework/spring-boot-starter-mongodb-reactive rewrite common deadline library cloudevents-extension tck testing/junit-jupiter-blocking testing/junit-jupiter-reactor testing/spring-boot test-support broker/api/blocking broker/rabbitmq/blocking broker/kafka/blocking broker/rabbitmq/spring-boot-starter broker/kafka/spring-boot-starter" }
+          # example modules run real MongoDB replica-set containers with timing-sensitive
+          # Awaitility subscription-catchup tests. A single example shard started 12 containers
+          # sequentially on one runner, which tipped those waits over. Split by container load
+          # (projection+forwarder ~5 vs domain ~7) to cut per-runner churn, keeping an in-run
+          # retry as a backstop for residual timing flakiness.
+          - { name: example-domain,              paths: "example/domain", args: "-Dsurefire.rerunFailingTestsCount=2" }
+          - { name: example-projection,          paths: "example/projection example/forwarder example/snapshot example/saga example/broker", args: "-Dsurefire.rerunFailingTestsCount=2" }
+          - { name: subscription-util-blocking,  paths: "subscription/util/blocking subscription/synchronous/blocking subscription/push/blocking" }
+          # `args` applies to every path in a shard, so the two `eventstore` lodgers are here rather
+          # than in an `example` shard. Parking them next to a rerun flag they do not need would
+          # retry a genuine failure twice before reporting it.
+          - { name: subscription-rest,           paths: "subscription/api subscription/core subscription/inmemory subscription/util/reactor subscription/synchronous/reactor subscription/push/reactor subscription/redis eventstore/migration eventstore/inmemory" }
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up JDK ${{ matrix.java }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ matrix.java }}
+      - name: Restore Maven dependencies
+        uses: actions/cache/restore@v4
+        with:
+          # Only third-party deps come from cache; org/occurrent arrives via the downloaded artifact.
+          path: |
+            ${{ github.workspace }}/.m2repo
+            !${{ github.workspace }}/.m2repo/org/occurrent
+          key: ${{ runner.os }}-m2deps-java${{ matrix.java }}-${{ hashFiles('**/pom.xml') }}
+          restore-keys: |
+            ${{ runner.os }}-m2deps-java${{ matrix.java }}-
+            ${{ runner.os }}-m2deps-
+      - name: Download project artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: occurrent-m2-java${{ matrix.java }}
+          path: ${{ github.workspace }}/.m2repo/org/occurrent
+      # Reuse lets the subtrees within a shard share a container instead of each booting its own. pull.timeout
+      # is lowered from its 120s default so an unreachable registry costs a bounded amount per test class.
+      # At the default, one blip cost ~292s per class, because the 120s pull deadline is paid again by the
+      # container-start retry, and that is what pushed a shard past its 20 minute timeout (#432).
+      - name: Configure Testcontainers on this runner
+        run: |
+          {
+            echo "testcontainers.reuse.enable=true"
+            echo "pull.timeout=60"
+          } > "$HOME/.testcontainers.properties"
+          cat "$HOME/.testcontainers.properties"
+      # A failed login is not fatal. Every image then misses in the mirror and falls back to Docker Hub,
+      # which is the behaviour this repo had before the mirror existed.
+      - name: Log in to the mirror
+        continue-on-error: true
+        run: echo '${{ github.token }}' | docker login ghcr.io -u '${{ github.actor }}' --password-stdin
+      # Put every image the tests need on this runner before any test can look for one, so no test class
+      # ever rediscovers a broken registry for itself. Preferred order is the mirror, then Docker Hub.
+      #
+      # Pulling from the mirror and retagging to the Docker Hub name is what lets the mirror be optional:
+      # the tests keep asking for mongo:8.0 and find it locally either way, so a mirror that lags a
+      # version bump costs a Docker Hub pull rather than a red run.
+      #
+      # Falling back still fails the job when Docker Hub cannot serve the image either, and that is the
+      # point of #432: about a minute, with an error that names the registry, instead of ~292s per test
+      # class and a run cancelled at the 20 minute timeout.
+      - name: Pre-pull the test container images
+        run: |
+          from_mirror=0
+          from_docker_hub=0
+          while IFS= read -r image; do
+            # Keep the pull's own error. A failure here can be a missing image, but it can equally be a
+            # login problem or GHCR having a bad day, and the warning should not claim to know which.
+            if mirror_error=$(docker pull -q "$IMAGE_MIRROR/$image" 2>&1); then
+              docker tag "$IMAGE_MIRROR/$image" "$image"
+              echo "have $image from the mirror"
+              from_mirror=$(( from_mirror + 1 ))
+              continue
+            fi
+            echo "::warning::Could not pull $image from the mirror, falling back to Docker Hub. The mirror said: $(echo "$mirror_error" | tail -1)"
+            pulled=0
+            for attempt in 1 2 3; do
+              if docker pull -q "$image" >/dev/null; then
+                pulled=1
+                break
+              fi
+              echo "::warning::Pull of $image from Docker Hub failed, attempt $attempt of 3"
+              # No backoff after the last attempt, since the job is about to fail either way and the point
+              # is to fail fast.
+              if [ "$attempt" -lt 3 ]; then
+                sleep $(( attempt * 5 ))
+              fi
+            done
+            if [ "$pulled" -eq 0 ]; then
+              echo "::error::Could not pull $image from the mirror or from Docker Hub after 3 attempts. This is a registry problem, not a test failure."
+              exit 1
+            fi
+            echo "have $image from Docker Hub"
+            from_docker_hub=$(( from_docker_hub + 1 ))
+          done < <(bash .github/scripts/required-test-images.sh .)
+          echo "images ready: $from_mirror from the mirror, $from_docker_hub from Docker Hub"
+      # Each subtree is timed and reported to the run summary, so the shard balance can always be
+      # re-derived from the last green run instead of being measured by hand. Rows are appended as
+      # they complete rather than collected and written at the end, so a shard that fails partway
+      # still leaves the timings it did get behind.
+      - name: Run shard tests
+        run: |
+          {
+            echo "### ${{ matrix.shard.name }} (java-${{ matrix.java }})"
+            echo
+            echo "| subtree | seconds |"
+            echo "| --- | ---: |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          total=0
+          for d in ${{ matrix.shard.paths }}; do
+            echo "::group::mvn test -f $d/pom.xml"
+            start=$SECONDS
+            # Take the exit status by hand so a test failure does not abort the step here. Without
+            # this the step dies inside the group above, which leaves the group open and hides the
+            # Maven failure in a collapsed section.
+            status=0
+            mvn $MVN ${{ matrix.shard.args }} --fail-at-end -f "$d/pom.xml" test || status=$?
+            elapsed=$(( SECONDS - start ))
+            echo "::endgroup::"
+            if [ "$status" -ne 0 ]; then
+              echo "| \`$d\` | $elapsed (failed) |" >> "$GITHUB_STEP_SUMMARY"
+              echo "shard-timing ${{ matrix.shard.name }} java-${{ matrix.java }} $d ${elapsed}s FAILED"
+              exit "$status"
+            fi
+            total=$(( total + elapsed ))
+            echo "| \`$d\` | $elapsed |" >> "$GITHUB_STEP_SUMMARY"
+            # Also on stdout, outside the collapsed group: the summary is the readable view, this is
+            # the greppable one, so the numbers can be pulled from a run's logs without the UI.
+            echo "shard-timing ${{ matrix.shard.name }} java-${{ matrix.java }} $d ${elapsed}s"
+          done
+          echo "| **shard total** | **$total** |" >> "$GITHUB_STEP_SUMMARY"
+          echo "shard-timing ${{ matrix.shard.name }} java-${{ matrix.java }} TOTAL ${total}s budget ${SHARD_BUDGET_SECONDS}s"
+          if [ "$total" -gt "$SHARD_BUDGET_SECONDS" ]; then
+            echo "::warning::Shard ${{ matrix.shard.name }} spent ${total}s on tests, over the ${SHARD_BUDGET_SECONDS}s budget. The slowest shard sets the whole test stage's wall clock, so move a path to a cheaper shard. Per-subtree timings for every shard are in this run's summary."
+          fi

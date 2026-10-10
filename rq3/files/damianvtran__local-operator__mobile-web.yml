@@ -1,0 +1,101 @@
+name: Mobile web
+
+# The phone UI's TypeScript had NO pre-release gate. `pnpm build` (which is
+# `tsc -b && vite build`, so it is also the only typecheck) ran in exactly one
+# place: publish.yml, at release time, after the tag exists. ci.yml has no
+# mobile-web job at all.
+#
+# That is a trap rather than a gap. Vitest does not typecheck, so a PR adding
+# type-invalid tests goes green on every check GitHub shows — 16/16 — and the
+# TS2322 detonates on whoever cuts the next tag, who is not the author and has
+# no context. Observed on PR #864: five `pid={1}` props against `pid: string`
+# passed the vitest suite in 24 ms while `pnpm build` was red.
+#
+# Paths-gated as a separate workflow, matching extension.yml, because that is
+# how this repo already gates a pnpm subproject: ci.yml gates nothing by path
+# and would make every Python-only PR pay a Node toolchain install for a bundle
+# it cannot affect. The gate keys on the web sources, PLUS the Python modules
+# this job reads — the `paths:` list below names them, and each one is there
+# because a test in this job pins a value out of it. The TS BUILD reads no
+# Python at all; the web TEST SUITE does, and a value it pins is exactly the
+# change the gate has to see. Modules no web test reads (`projection.py`) stay
+# out, since listing one would spend a job for no signal.
+
+on:
+  push:
+    branches:
+      # `main` only, matching ci.yml and extension.yml: a `dev-*` branch with an
+      # open PR would otherwise fire a push run and a pull_request run for one
+      # identical result.
+      - main
+    paths:
+      - 'local_operator/mobile/web/**'
+      # The web job also READS two Python modules: the generated status order and
+      # link cap come from `STATUS_RANK` (server/models/desktop_projects.py) and
+      # `SESSIONS_MAX` (projects.py), and `src/projects-status.test.tsx` is what
+      # fails when they diverge. A paths gate that omitted them was a guard that
+      # could not fire on the one change it guards against: a status added on
+      # the server alone ran no web job at all, so the phone's board would
+      # silently mis-group it (review round 6, M2).
+      - 'local_operator/server/models/desktop_projects.py'
+      - 'local_operator/projects.py'
+      - '.github/workflows/mobile-web.yml'
+  pull_request:
+    paths:
+      - 'local_operator/mobile/web/**'
+      - 'local_operator/server/models/desktop_projects.py'
+      - 'local_operator/projects.py'
+      - '.github/workflows/mobile-web.yml'
+  workflow_dispatch:
+
+# Matches ci.yml, including the per-SHA group for `main` so a merge commit's run
+# can never be evicted by the next merge. See the long note in ci.yml.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.ref == 'refs/heads/main' && github.sha || 'shared' }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # Bounded so a wedged step cannot hold a concurrency slot for GitHub's
+    # 360-minute default; the real run is well under a minute.
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: local_operator/mobile/web
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.22.0
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          cache: pnpm
+          cache-dependency-path: local_operator/mobile/web/pnpm-lock.yaml
+
+      - name: Install mobile web dependencies
+        run: pnpm install --frozen-lockfile
+
+      # THE THEME CONTRACT, on its own step: the generated CSS must be current
+      # AND every palette pair the phone paints must clear its floor
+      # (scripts/contrast-contract.mjs, the same file `pnpm check-themes` runs
+      # locally). Neither fact shows up in tsc or vitest — a palette is data,
+      # and a pair at 4.2:1 compiles and tests exactly as green as one at 7:1 —
+      # so without this step an unreadable palette reaches the phone. Batch-2
+      # D3/D4: six palettes were 0.01-0.28 under their floors with no gate to
+      # say so.
+      - name: Check the theme contract (freshness + contrast floors)
+        run: pnpm check-themes
+
+      # Build FIRST and separately from the tests. `pnpm build` is `tsc -b &&
+      # vite build`, so this step is the typecheck the vitest suite does not
+      # perform — the failure this workflow exists to catch surfaces here, with
+      # a job name that says which surface broke.
+      - name: Build the phone bundle (typechecks)
+        run: pnpm build
+
+      - name: Run mobile web tests
+        run: pnpm test

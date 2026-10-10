@@ -1,0 +1,51 @@
+name: Frontend Pull Requests
+
+on:
+  pull_request:
+    paths:
+      - 'master/front-end/**'
+    branches: [ master ]
+
+concurrency:
+  # Unique ID of the concurrency group, which cancels an already running workflow for this PR (if any)
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  check-pr-size:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Check PR size
+        uses: ./.github/actions/check-pr-size
+        with:
+          max-lines: '600'
+
+  frontend-build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version-file: ./master/front-end/.nvmrc
+
+      - run: npm ci
+        working-directory: ./master/front-end
+        shell: bash
+
+      - run: npm run lint && npm run lint-css && npm run test
+        working-directory: ./master/front-end
+        shell: bash
+
+      - run: npm run build
+        working-directory: ./master/front-end
+        shell: bash

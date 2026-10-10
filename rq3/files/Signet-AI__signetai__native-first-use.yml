@@ -1,0 +1,74 @@
+name: Native First-Use Acceptance
+
+on:
+  pull_request:
+    paths:
+      - "platform/core/**"
+      - "platform/daemon/**"
+      - "surfaces/cli/**"
+      - "scripts/build-native-bun.ts"
+      - "scripts/native-first-use-smoke.test.ts"
+      - "package.json"
+      - "bun.lock"
+      - ".github/workflows/native-first-use.yml"
+  push:
+    branches: [main]
+    paths:
+      - "platform/core/**"
+      - "platform/daemon/**"
+      - "surfaces/cli/**"
+      - "scripts/build-native-bun.ts"
+      - "scripts/native-first-use-smoke.test.ts"
+      - "package.json"
+      - "bun.lock"
+      - ".github/workflows/native-first-use.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  first-use:
+    name: Compiled ${{ matrix.platform }} setup, doctor, remember, and recall
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux-x64
+            asset: signet-linux-x64
+          - os: ubuntu-24.04-arm
+            platform: linux-arm64
+            asset: signet-linux-arm64
+          - os: macos-15-intel
+            platform: darwin-x64
+            asset: signet-darwin-x64
+          - os: xcode-27
+            platform: darwin-arm64
+            asset: signet-darwin-arm64
+          - os: windows-latest
+            platform: win32-x64
+            asset: signet-win32-x64.exe
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    env:
+      ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
+      SIGNET_NATIVE_PLATFORM: ${{ matrix.platform }}
+      RELEASE_ASSET: ${{ matrix.asset }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: package.json
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+      - name: Build workspace dependencies
+        run: bun run build
+      - name: Build dashboard assets
+        run: bun run build:dashboard
+      - name: Build native Signet binary
+        run: bun run build:native-bun
+      - name: Run compiled first-use acceptance
+        env:
+          SIGNET_NATIVE_FIRST_USE_SMOKE: "1"
+          SIGNET_NATIVE_SMOKE_BINARY: ./dist/native/${{ matrix.asset }}
+        run: bun test scripts/native-first-use-smoke.test.ts

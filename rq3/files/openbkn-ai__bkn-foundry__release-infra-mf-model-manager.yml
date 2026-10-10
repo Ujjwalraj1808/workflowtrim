@@ -1,0 +1,76 @@
+name: release-infra-mf-model-manager
+
+# Image FROM ghcr.io/<owner>/model-factory-base:v2 (built by
+# release-infra-model-factory-base.yml); that base build must have published first.
+# The reusable test job still lints the chart. The focused authz-unit job runs
+# the permission regression suite inside the same runtime base image used by
+# the service without making unrelated legacy tests a release gate.
+
+on:
+  push:
+    tags:
+      - 'v*'
+    branches: ['**']
+    paths:
+      - 'infra/mf-model-manager/**'
+      - '.github/workflows/release-infra-mf-model-manager.yml'
+      - '.github/workflows/reusable-*.yml'
+      # 版本冻结提交（release/<x.y.z> 分支）触发全量重建
+      - 'VERSION'
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: 'Publish to GHCR (true) or verify build only (false)'
+        type: boolean
+        default: false
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  version:
+    uses: ./.github/workflows/reusable-version.yml
+
+  verify:
+    needs: version
+    uses: ./.github/workflows/reusable-release-verify.yml
+    with:
+      service-path: infra/mf-model-manager
+      stack: chart-only
+
+  authz-unit:
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/openbkn-ai/model-factory-base:v2
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run permission authorization regression tests
+        working-directory: infra/mf-model-manager
+        run: |
+          python -m pip install --disable-pip-version-check -r requirements-test.txt
+          python -m unittest -v app.test.test_permission_manager_authz app.test.test_auth_middleware_identity
+
+  build:
+    needs: [version, verify, authz-unit]
+    uses: ./.github/workflows/reusable-container-image.yml
+    secrets: inherit
+    with:
+      service-path: infra/mf-model-manager
+      dockerfile: Dockerfile
+      context: '.'
+      image-name: mf-model-manager
+      version: ${{ needs.version.outputs.version }}
+      publish: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish) }}
+
+  chart:
+    needs: [version, verify, build]
+    uses: ./.github/workflows/reusable-chart.yml
+    with:
+      service-path: infra/mf-model-manager
+      chart-path: charts
+      chart-name: mf-model-manager
+      version: ${{ needs.version.outputs.version }}
+      publish: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish) }}

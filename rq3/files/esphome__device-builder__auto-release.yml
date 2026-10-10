@@ -1,0 +1,87 @@
+name: Auto Release
+
+# Nightly. Cuts a prerelease via ``release.yml`` when ≥ 2 commits
+# have landed on main since the last release. Stable releases are
+# manual.
+
+on:
+  schedule:
+    # An hour after sync-component-catalog, so its PR (if any) has settled.
+    - cron: "0 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check-and-compute:
+    name: Check commits and compute next version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      should-release: ${{ steps.commits.outputs.go }}
+    steps:
+      - name: Check out code from GitHub
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Resolve next prerelease version
+        id: resolve
+        uses: ./.github/actions/resolve-release-versions
+
+      - name: Count commits since last release
+        id: commits
+        env:
+          LATEST_TAG: ${{ steps.resolve.outputs.latest-overall }}
+        run: |
+          set -euo pipefail
+          if [ -z "$LATEST_TAG" ]; then
+            echo "No previous release; will cut initial prerelease."
+            echo "go=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Counting via the tag range (rather than ``--since=<date>``)
+          # is reliable when commits land via rebase / fast-forward
+          # with older committer dates.
+          git fetch --tags --quiet origin
+          COUNT=$(git rev-list "$LATEST_TAG"..HEAD --count)
+
+          echo "Latest release: $LATEST_TAG"
+          echo "Commits since: $COUNT"
+
+          if [ "$COUNT" -ge 2 ]; then
+            echo "go=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "go=false" >> "$GITHUB_OUTPUT"
+            echo "Only $COUNT commit(s) since last release — skipping."
+          fi
+
+  trigger-release:
+    name: Trigger release workflow
+    needs: check-and-compute
+    if: needs.check-and-compute.outputs.should-release == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      # Dispatch via an app token rather than calling release.yml as a
+      # reusable workflow: PyPI Trusted Publishing matches on the OIDC
+      # ``workflow`` claim, which is the *caller* under workflow_call.
+      # Dispatching gives release.yml its own run so the claim matches.
+      # The default GITHUB_TOKEN can't trigger workflows, so use the app.
+      - name: Mint GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1  # v3.2.0
+        with:
+          client-id: ${{ vars.ESPHOME_GITHUB_APP_CLIENT_ID }}
+          private-key: ${{ secrets.ESPHOME_GITHUB_APP_PRIVATE_KEY }}
+
+      - name: Dispatch release workflow
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          VERSION: ${{ needs.check-and-compute.outputs.version }}
+        run: |
+          gh workflow run release.yml \
+            --repo "${{ github.repository }}" \
+            --ref "${{ github.ref_name }}" \
+            -f version="$VERSION"

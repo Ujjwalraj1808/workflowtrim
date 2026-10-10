@@ -1,0 +1,31 @@
+name: Sonatype
+
+on:
+  push:
+    branches:
+      - master
+
+permissions: read-all
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    if: github.repository_owner == 'mybatis' && ! contains(toJSON(github.event.head_commit.message), '[maven-release-plugin]')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Setup Java
+        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6
+        with:
+          cache: maven
+          distribution: temurin
+          java-version: 25
+      - name: Deploy to Sonatype
+        run: ./mvnw deploy --batch-mode --no-transfer-progress --settings ./.mvn/settings.xml --show-version  -Dgpg.skip -Dlicense.skip=true -DskipTests -Prelease
+        env:
+          CI_DEPLOY_USERNAME: ${{ secrets.CI_DEPLOY_USERNAME }}
+          CI_DEPLOY_PASSWORD: ${{ secrets.CI_DEPLOY_PASSWORD }}

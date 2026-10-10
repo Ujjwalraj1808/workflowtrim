@@ -1,0 +1,20 @@
+---
+name: "Pull Request Labeler"
+
+permissions:
+  contents: read
+  pull-requests: write
+
+on:
+  workflow_call:
+
+jobs:
+  triage:
+    runs-on: ubuntu-26.04
+    steps:
+      - name: 🏷️ Labeler
+        uses: actions/labeler@bf12e9b00b37c5c0ca2b87b79b2daf7891dbda13 # v7.0.0
+        continue-on-error: true
+        with:
+          repo-token: "${{ secrets.GITHUB_TOKEN }}"
+          sync-labels: true

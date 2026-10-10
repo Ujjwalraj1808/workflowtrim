@@ -1,0 +1,39 @@
+name: Build Common Modules
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/chunk-common.yaml'
+      - '.github/workflows/chunk.yaml'
+      - '.github/config/chunks.yaml'
+      - 'code-style/checkstyle*.xml'
+      - 'code-style/spotbugs*.xml'
+      - 'java/pom.xml'
+      - 'java/common/pom.xml'
+      - 'java/core/**'
+      - 'java/example-iterators/**'
+      - 'java/configuration/**'
+      - 'java/common/sketches/**'
+      - 'java/common/parquet/**'
+      - 'java/common/common-job/**'
+      - 'java/common/common-task/**'
+      - 'java/common/common-invoke-tables/**'
+      - 'java/build/**'
+      - 'java/common/dynamodb-tools/**'
+      - 'java/common/localstack-test/**'
+      - 'java/statestore/**'
+      - 'java/statestore-committer-core/**'
+      - 'java/statestore-committer/**'
+      - 'java/statestore-lambda/**'
+      - 'java/statestore/**'
+      - 'java/metrics/**'
+      - 'java/compaction/compaction-tracker/**'
+      - 'java/compaction/compaction-core/**'
+      - 'java/ingest/ingest-tracker/**'
+      - 'java/ingest/ingest-core/**'
+      - 'java/common/arrow/**'
+
+jobs:
+  chunk-workflow:
+    uses: ./.github/workflows/chunk.yaml
+    with:
+      chunkId: common

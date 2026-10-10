@@ -1,0 +1,79 @@
+# PR 和 main 的红绿灯。发版流水线是另一个文件（release.yml），这条只管「代码有没有坏」。
+#
+# 在这条之前，16 个测试套件只在作者本机手敲 npm test 时才跑：一个把 require 图改坏、
+# 把依赖漏声明的 commit 可以一路走到 tag，外部 PR 也完全无人把关。
+#
+# 为什么分两条腿而不是一条 ubuntu 跑全套：e2e 会真拉起 electron 开 BrowserWindow
+# （test/frontend.js、test/admin-ui.js），还要验 .app 的装机态，Linux runner 上没有屏幕、
+# 也没有 .app 这个概念。与其套 xvfb 赌它能过，不如让 macOS 跑全套、ubuntu 跑不需要屏幕的那批——
+# ubuntu 那条几十秒就回来，坏得早、报得快。
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # 分支上手动点一次：只有真 Windows 才验得了的改动（系统沙箱），合进 main 之前先在这里跑绿
+  workflow_dispatch:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false # 一条腿红了，另一条也要把结论跑出来
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            label: 快跑（除 e2e 外全跑）
+            # 这条腿装了 ffmpeg（见下面 apt 那步），真 ffmpeg 那几段找不到就算红，不许悄悄跳过
+            require_ffmpeg: "1"
+            cmd: node test/all.js --only repo-hygiene,lint,typecheck,data-guard,layout-invariants,layers,icons,lanes,md-tty,doctor,cli-args,cli-attach,cli-live,cli-ask,cli-approve,cli-toolview,im-card,im-attach,im-reply,trip-card,im-feishu-media,cli-pty,cli-oneshot,engine-resilience,engine-bridge,engine-approve,engine-tool-relay,repl-commands,session-search,systemone,decide-tool,task-doubt,continue-gate,cmd-risk,cmd-gate,memory-gate,push-gate,ask-gate,skill-gate,perm-gate,desktop-ux,tpl-blanks,ui-copy-length,memory-rules,prefs,chat-models,api-formats,media-models,media-health,gen-cache,tool-jobs,upload-name,canvas-store,tts-segments,sweep,quota,media-metering,memory-embed,relay,totp,auth-2fa,skill-guard,skills-cache,toolward,rbac,tenant,account-spaces,lifecycle,prompt-tpls,ops,deploy,trace,term-image,office-tools,remote,checkpoints,shot-history,web-demo,cdp,agent-loop,explore,code-tools,self-check,run-reap,launcher-log,slash-review,hooks,workflow,recipes,workflow-panel,worktree,deps-guard,child-env,net-guard,sandbox,sandbox-win,eval,stop,task-dirs,memory,search-providers,model-probe,media-probe,library-ws,library-cover,library-favs,ql-thumb,video-frame,brand-kit,motion,timeline-compose,delivery-page,backup-auto,skill-sync,license,retention,live-abort,electron-bridge,server-supervisor,main-stall,server-stall,win-ui,win-main,win-paths,win-tools,win-env
+          - os: macos-latest
+            label: 全套（含 e2e）
+            cmd: npm test
+          # Windows 系统沙箱靠完整性级别，这层只有真 Windows 上才立得起来：
+          # 降权起命令、打标记、读不到 Key、写不了应用目录，都在这条腿上真跑一遍，不许跳过。
+          # 借给本机引擎的工具交回主进程跑（engine-tool-relay），在 Windows 上走的是命名管道，也在这儿真跑一遍
+          - os: windows-latest
+            label: Windows 沙箱
+            sandbox_win: "1"
+            cmd: node test/sandbox-win.js && node test/engine-tool-relay.js
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    # 兜底的保险丝。GitHub 默认给 6 小时，2026-09-13 那次就是这么烧掉的：
+    # e2e 里一个 electron 子进程不回话，五个 job 一起挂着，谁也拿不到结论。
+    # 测试本身本机 137 秒、CI 上几分钟；40 分钟还没完就是卡了，早点红早点查。
+    timeout-minutes: 40
+    steps:
+      # 要完整的 git log。README「最新动态」那道闸门拿 git log 当底本核对日期，
+      # actions/checkout 默认 fetch-depth: 1 只克一个 commit，CI 上就只剩 HEAD 那一天，
+      # 每条动态都会被判成「git 里那天没有提交」——2026-09-13 真这么红过一次，
+      # 报错指向 README，实际错在这一行。releasePipelineDrift 里钉死了这个值。
+      # 这几个 action 钉的都是「第一个跑 Node 24 的大版本」。GitHub 已经在弃用 node20，
+      # 停在老大版本上每趟 CI 都刷一条 deprecation 警告，到期直接变硬失败。
+      # 只抬到 node24 那一档、不追最新：再往上是 ESM 迁移和 fork PR 的行为改动，这个仓库用不上。
+      # releasePipelineDrift 里有张表钉死这个下限，谁退回去当场红。
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      # 只在 ubuntu 那条腿装发行版的 ffmpeg：它带 libass/drawtext，本机 Homebrew 那份不带，
+      # 烧字幕这类分支只有在这儿才真跑得到。中文字体给 libass 排字用。macOS 那条腿不装，照旧跳过真 ffmpeg 段。
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg fonts-noto-cjk
+      # 沙箱小助手是 Go 写的、不进 git，Windows 那条腿现编一份
+      - if: runner.os == 'Windows'
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: native/owb-sandbox/go.mod
+          cache: false
+      - if: runner.os == 'Windows'
+        run: npm run build:sandbox
+      # 测试用的是模拟 LLM，不需要任何 API Key（CONTRIBUTING.md 里写了）
+      - run: ${{ matrix.cmd }}
+        env:
+          OWB_REQUIRE_FFMPEG: ${{ matrix.require_ffmpeg }}
+          OWB_REQUIRE_SANDBOX_WIN: ${{ matrix.sandbox_win }}

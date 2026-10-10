@@ -1,0 +1,354 @@
+name: Build
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+    paths:
+      - 'apps/**'
+      - 'docs/**'
+      - 'packages/**'
+      - '.npmrc'
+      - 'package.json'
+      - 'pnpm-lock.yaml'
+      - 'pnpm-workspace.yaml'
+      - 'tsconfig.json'
+      - 'turbo.json'
+      - 'docker-compose.yml'
+      - 'scripts/run-compose.mjs'
+      - '.github/workflows/build.yml'
+      - 'scripts/test-docker-image.sh'
+      - 'scripts/test-web-image.mjs'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  REGISTRY: ghcr.io
+  PREFIX: ghcr.io/${{ github.repository_owner }}
+  PNPM: '10.16.0'
+
+jobs:
+  # ── Validation ───────────────────────────────────────────────
+  validate:
+    name: Lint, Typecheck, Test, Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm lint
+      - run: pnpm typecheck
+      - run: pnpm test
+      - run: pnpm deadcode
+      - run: pnpm build
+
+  # ── Detect which apps changed ────────────────────────────────
+  changes:
+    name: Detect Changes
+    runs-on: ubuntu-latest
+    outputs:
+      web:      ${{ steps.f.outputs.web }}
+      agent:    ${{ steps.f.outputs.agent }}
+      postgres: ${{ steps.f.outputs.postgres }}
+      apps:     ${{ steps.apps.outputs.apps }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: f
+        with:
+          filters: |
+            web:
+              - 'apps/web/src/**'
+              - 'apps/web/public/**'
+              - 'apps/web/middleware.ts'
+              - 'apps/web/next.config.js'
+              - 'apps/web/postcss.config.js'
+              - 'apps/web/tailwind.config.ts'
+              - 'apps/web/package.json'
+              - 'apps/web/tsconfig.json'
+              - 'apps/web/Dockerfile'
+              - 'apps/web/Dockerfile.dockerignore'
+              - 'packages/db/src/**'
+              - 'packages/db/drizzle/**'
+              - 'packages/db/drizzle.config.ts'
+              - 'packages/db/package.json'
+              - 'packages/db/tsconfig.json'
+              - 'packages/errors/src/**'
+              - 'packages/errors/package.json'
+              - 'packages/errors/tsconfig.json'
+              - 'packages/services/src/**'
+              - 'packages/services/package.json'
+              - 'packages/services/tsconfig.json'
+              - 'packages/types/src/**'
+              - 'packages/types/package.json'
+              - 'packages/types/tsconfig.json'
+              - 'packages/ui/src/**'
+              - 'packages/ui/package.json'
+              - 'packages/ui/tsconfig.json'
+              - 'packages/utils/src/**'
+              - 'packages/utils/package.json'
+              - 'packages/utils/tsconfig.json'
+              - '.npmrc'
+              - 'package.json'
+              - 'pnpm-lock.yaml'
+              - 'pnpm-workspace.yaml'
+              - 'tsconfig.json'
+              - 'turbo.json'
+              - '.github/workflows/build.yml'
+              - 'scripts/test-docker-image.sh'
+              - 'scripts/test-web-image.mjs'
+            agent:
+              - 'apps/agent/src/**'
+              - 'apps/agent/docker/**'
+              - 'apps/agent/package.json'
+              - 'apps/agent/tsconfig.json'
+              - 'apps/agent/Dockerfile'
+              - 'apps/agent/Dockerfile.dockerignore'
+              - 'packages/db/src/**'
+              - 'packages/db/package.json'
+              - 'packages/db/tsconfig.json'
+              - 'packages/errors/src/**'
+              - 'packages/errors/package.json'
+              - 'packages/errors/tsconfig.json'
+              - 'packages/services/src/**'
+              - 'packages/services/package.json'
+              - 'packages/services/tsconfig.json'
+              - 'packages/types/src/**'
+              - 'packages/types/package.json'
+              - 'packages/types/tsconfig.json'
+              - 'packages/utils/src/**'
+              - 'packages/utils/package.json'
+              - 'packages/utils/tsconfig.json'
+              - '.npmrc'
+              - 'package.json'
+              - 'pnpm-lock.yaml'
+              - 'pnpm-workspace.yaml'
+              - 'tsconfig.json'
+              - 'turbo.json'
+              - '.github/workflows/build.yml'
+              - 'scripts/test-docker-image.sh'
+              - 'scripts/test-web-image.mjs'
+            postgres:
+              - 'packages/db/Dockerfile'
+              - 'packages/db/init-scripts/**'
+              - 'docker-compose.yml'
+              - 'scripts/run-compose.mjs'
+              - '.github/workflows/build.yml'
+
+      - name: Select app images
+        id: apps
+        env:
+          WEB: ${{ steps.f.outputs.web }}
+          AGENT: ${{ steps.f.outputs.agent }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          node <<'NODE' >> "$GITHUB_OUTPUT"
+          const apps = ['web', 'agent'].filter(app =>
+            process.env.EVENT === 'workflow_dispatch' ||
+            process.env[app.toUpperCase()] === 'true');
+          console.log(`apps=${JSON.stringify(apps)}`);
+          NODE
+
+  # ── Native app image builds ──────────────────────────────────
+  build-apps:
+    name: ${{ matrix.app }} (${{ matrix.arch }})
+    needs: changes
+    if: ${{ needs.changes.outputs.apps != '[]' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        app: ${{ fromJSON(needs.changes.outputs.apps) }}
+        arch: [amd64, arm64]
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        if: ${{ github.event_name != 'pull_request' }}
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/metadata-action@v5
+        id: meta
+        with:
+          images: ${{ env.PREFIX }}/oneglanse-${{ matrix.app }}
+      - name: Build image
+        uses: docker/build-push-action@v6
+        id: build
+        with:
+          context: .
+          file: ./apps/${{ matrix.app }}/Dockerfile
+          build-args: |
+            PNPM_VERSION=${{ env.PNPM }}
+            ${{ matrix.app == 'agent' && 'CAMOUFOX_PIP_SPEC=cloverlabs-camoufox[geoip]' || '' }}
+            ${{ matrix.app == 'agent' && 'CAMOUFOX_BROWSER_CHANNEL=official/prerelease' || '' }}
+          platforms: linux/${{ matrix.arch }}
+          load: ${{ github.event_name == 'pull_request' }}
+          tags: ${{ github.event_name == 'pull_request' && format('oneglanse-{0}:ci', matrix.app) || '' }}
+          outputs: ${{ github.event_name != 'pull_request' && format('type=image,name={0}/oneglanse-{1},push-by-digest=true,name-canonical=true,push=true', env.PREFIX, matrix.app) || '' }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=oneglanse-${{ matrix.app }}-${{ matrix.arch }}
+          cache-to: ${{ github.event_name != 'pull_request' && format('type=gha,scope=oneglanse-{0}-{1},mode=max', matrix.app, matrix.arch) || '' }}
+      - name: Load published digest for runtime tests
+        if: ${{ github.event_name != 'pull_request' }}
+        env:
+          IMAGE: ${{ env.PREFIX }}/oneglanse-${{ matrix.app }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+          APP: ${{ matrix.app }}
+        run: |
+          docker pull "$IMAGE@$DIGEST"
+          docker tag "$IMAGE@$DIGEST" "oneglanse-$APP:ci"
+      - name: Test runtime image
+        timeout-minutes: 5
+        env:
+          APP: ${{ matrix.app }}
+        run: bash scripts/test-docker-image.sh "$APP" "oneglanse-$APP:ci"
+      - name: Export image digest
+        if: ${{ github.event_name != 'pull_request' }}
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/digests"
+          touch "$RUNNER_TEMP/digests/${DIGEST#sha256:}"
+      - uses: actions/upload-artifact@v4
+        if: ${{ github.event_name != 'pull_request' }}
+        with:
+          name: digests-${{ matrix.app }}-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # Publish tags only after validation and both native builds pass.
+  publish-apps:
+    name: Publish ${{ matrix.app }}
+    needs: [validate, changes, build-apps]
+    if: ${{ github.event_name != 'pull_request' && needs.changes.outputs.apps != '[]' }}
+    strategy:
+      matrix:
+        app: ${{ fromJSON(needs.changes.outputs.apps) }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: digests-${{ matrix.app }}-*
+          path: ${{ runner.temp }}/digests
+          merge-multiple: true
+      - uses: docker/metadata-action@v5
+        id: meta
+        with:
+          images: ${{ env.PREFIX }}/oneglanse-${{ matrix.app }}
+          tags: |
+            type=raw,value=latest
+            type=sha,prefix=sha-,format=short
+      - name: Publish multi-platform manifest
+        working-directory: ${{ runner.temp }}/digests
+        env:
+          IMAGE: ${{ env.PREFIX }}/oneglanse-${{ matrix.app }}
+          METADATA: ${{ steps.meta.outputs.json }}
+        run: |
+          shopt -s nullglob
+          digests=(*)
+          test "${#digests[@]}" -eq 2
+          args=()
+          while IFS= read -r tag; do
+            args+=(--tag "$tag")
+          done < <(jq -r '.tags[]' <<< "$METADATA")
+          for digest in "${digests[@]}"; do
+            args+=("$IMAGE@sha256:$digest")
+          done
+          docker buildx imagetools create --dry-run "${args[@]}" > "$RUNNER_TEMP/manifest.json"
+          jq -e '[.manifests[].platform | select(.os == "linux") | .architecture] | sort == ["amd64", "arm64"]' "$RUNNER_TEMP/manifest.json"
+          docker buildx imagetools create "${args[@]}"
+
+  build-postgres:
+    name: Postgres
+    needs: [validate, changes]
+    if: ${{ github.event_name == 'workflow_dispatch' || needs.changes.outputs.postgres == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        if: ${{ github.event_name != 'pull_request' }}
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/metadata-action@v5
+        id: meta
+        with:
+          images: ${{ env.PREFIX }}/oneglanse-postgres
+          tags: |
+            type=raw,value=latest
+            type=sha,prefix=sha-,format=short
+      - uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./packages/db/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=oneglanse-postgres
+          cache-to: ${{ github.event_name != 'pull_request' && 'type=gha,scope=oneglanse-postgres,mode=max' || '' }}
+
+  merge-gate:
+    name: PR Gate
+    if: ${{ always() }}
+    needs:
+      - validate
+      - changes
+      - build-apps
+      - publish-apps
+      - build-postgres
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify required jobs
+        env:
+          VALIDATE: ${{ needs.validate.result }}
+          CHANGES: ${{ needs.changes.result }}
+          APPS: ${{ needs.build-apps.result }}
+          PUBLISH: ${{ needs.publish-apps.result }}
+          POSTGRES: ${{ needs.build-postgres.result }}
+        run: |
+          test "$VALIDATE" = "success"
+          test "$CHANGES" = "success"
+
+          for result in "$APPS" "$PUBLISH" "$POSTGRES"; do
+            case "$result" in
+              success|skipped) ;;
+              *) exit 1 ;;
+            esac
+          done

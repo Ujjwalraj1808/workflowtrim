@@ -1,0 +1,406 @@
+name: build-binaries
+
+on:
+  workflow_call:
+    inputs:
+      release_tag:
+        description: "Release tag to build, for example v1.2.3"
+        required: false
+        type: string
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-binaries-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-cli:
+    name: Build CLI (${{ matrix.goos }}/${{ matrix.goarch }}${{ matrix.goarm != '' && format('/{0}', matrix.goarm) || '' }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: windows
+            goarch: amd64
+            goarm: ""
+          - goos: windows
+            goarch: arm64
+            goarm: ""
+          - goos: linux
+            goarch: amd64
+            goarm: ""
+          - goos: linux
+            goarch: arm64
+            goarm: ""
+          - goos: linux
+            goarch: arm
+            goarm: "7"
+          - goos: darwin
+            goarch: amd64
+            goarm: ""
+          - goos: darwin
+            goarch: arm64
+            goarm: ""
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.release_tag || github.ref }}
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 10.27.0
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: webui/pnpm-lock.yaml
+
+      - name: Install frontend dependencies
+        shell: bash
+        working-directory: webui
+        run: pnpm install --frozen-lockfile
+
+      - name: Build embedded web assets
+        shell: bash
+        working-directory: webui
+        run: pnpm run build:bundle
+
+      - name: Sync embedded web assets
+        shell: pwsh
+        run: pwsh -NoProfile -File ./scripts/sync-webui-assets.ps1
+
+      - name: Build CLI
+        shell: bash
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+          CGO_ENABLED: 0
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist/cli
+          version="$RELEASE_TAG"
+          if [[ -z "$version" && "$REF_TYPE" == "tag" ]]; then
+            version="$REF_NAME"
+          fi
+          if [[ -z "$version" ]]; then
+            version="dev"
+          fi
+          build_id="$(git rev-parse --short=12 HEAD)"
+
+          suffix=""
+          if [[ "$GOOS" == "windows" ]]; then
+            suffix=".exe"
+          fi
+
+          arm_suffix=""
+          if [[ -n "${GOARM:-}" ]]; then
+            arm_suffix="v${GOARM}"
+          fi
+
+          out="dist/cli/upbrr-${GOOS}-${GOARCH}${arm_suffix}${suffix}"
+          go build -trimpath -ldflags="-s -w -X main.version=${version} -X main.buildIdentifier=${build_id}" -o "$out" ./cmd/upbrr
+
+      - name: Package CLI
+        shell: bash
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist/packages
+          version="$RELEASE_TAG"
+          if [[ -z "$version" && "$REF_TYPE" == "tag" ]]; then
+            version="$REF_NAME"
+          fi
+          if [[ -z "$version" ]]; then
+            version="dev"
+          fi
+
+          arm_suffix=""
+          if [[ -n "${GOARM:-}" ]]; then
+            arm_suffix="v${GOARM}"
+          fi
+
+          suffix=""
+          if [[ "$GOOS" == "windows" ]]; then
+            suffix=".exe"
+          fi
+
+          bin_name="upbrr-${GOOS}-${GOARCH}${arm_suffix}${suffix}"
+          target="${GOOS}-${GOARCH}${arm_suffix}"
+
+          if [[ "$GOOS" == "windows" ]]; then
+            archive="dist/packages/upbrr-cli-${version}-${target}.zip"
+            (cd dist/cli && zip -q -j "../packages/$(basename "$archive")" "$bin_name")
+          else
+            archive="dist/packages/upbrr-cli-${version}-${target}.tar.gz"
+            tar -C dist/cli -czf "$archive" "$bin_name"
+          fi
+
+      - name: Upload CLI artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: cli-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.goarm != '' && format('v{0}', matrix.goarm) || '' }}
+          path: dist/packages/upbrr-cli-*-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.goarm != '' && format('v{0}', matrix.goarm) || '' }}${{ matrix.goos == 'windows' && '.zip' || '.tar.gz' }}
+          if-no-files-found: error
+
+  build-docker-amd64:
+    name: Build Docker Image (CLI+WebUI linux/amd64)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.release_tag || github.ref }}
+
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Resolve build metadata
+        id: build
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "id=$(git rev-parse --short=12 HEAD)" >> "$GITHUB_OUTPUT"
+          echo "go_version=$(awk '/^go /{print $2; exit}' go.mod)" >> "$GITHUB_OUTPUT"
+
+      - name: Login to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker metadata (Combined)
+        id: meta_combined
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/upbrr
+          tags: |
+            type=sha,enable=${{ inputs.release_tag == '' }}
+            type=raw,value=sha-${{ steps.build.outputs.id }},enable=${{ inputs.release_tag != '' }}
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}},value=${{ inputs.release_tag || github.ref_name }},enable=${{ inputs.release_tag != '' || github.ref_type == 'tag' }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ inputs.release_tag || github.ref_name }},enable=${{ inputs.release_tag != '' || github.ref_type == 'tag' }}
+            type=raw,value=latest,enable=${{ github.event_name == 'push' && github.ref_type == 'tag' }}
+
+      - name: Derive amd64 image tags
+        id: amd64_tags
+        shell: bash
+        env:
+          META_JSON: ${{ steps.meta_combined.outputs.json }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          import os
+
+          data = json.loads(os.environ["META_JSON"])
+          tags = data["tags"]
+          amd64_tags = [f"{tag}-amd64" for tag in tags]
+          print("tags<<EOF")
+          print("\n".join(amd64_tags))
+          print("EOF")
+          PY
+
+      - name: Build and push amd64 combined image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.amd64_tags.outputs.tags }}
+          labels: ${{ steps.meta_combined.outputs.labels }}
+          build-args: |
+            VERSION=${{ inputs.release_tag || (github.ref_type == 'tag' && github.ref_name) || 'dev' }}
+            BUILD_ID=${{ steps.build.outputs.id }}
+            GO_VERSION=${{ steps.build.outputs.go_version }}
+          cache-from: type=gha,scope=build-docker-amd64
+          cache-to: type=gha,scope=build-docker-amd64,mode=min
+
+  build-docker-arm64:
+    name: Build Docker Image (CLI+WebUI linux/arm64)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.release_tag || github.ref }}
+
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Resolve build metadata
+        id: build
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "id=$(git rev-parse --short=12 HEAD)" >> "$GITHUB_OUTPUT"
+          echo "go_version=$(awk '/^go /{print $2; exit}' go.mod)" >> "$GITHUB_OUTPUT"
+
+      - name: Login to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker metadata (Combined)
+        id: meta_combined
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/upbrr
+          tags: |
+            type=sha,enable=${{ inputs.release_tag == '' }}
+            type=raw,value=sha-${{ steps.build.outputs.id }},enable=${{ inputs.release_tag != '' }}
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}},value=${{ inputs.release_tag || github.ref_name }},enable=${{ inputs.release_tag != '' || github.ref_type == 'tag' }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ inputs.release_tag || github.ref_name }},enable=${{ inputs.release_tag != '' || github.ref_type == 'tag' }}
+            type=raw,value=latest,enable=${{ github.event_name == 'push' && github.ref_type == 'tag' }}
+
+      - name: Derive arm64 image tags
+        id: arm64_tags
+        shell: bash
+        env:
+          META_JSON: ${{ steps.meta_combined.outputs.json }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          import os
+
+          data = json.loads(os.environ["META_JSON"])
+          tags = data["tags"]
+          arm64_tags = [f"{tag}-arm64" for tag in tags]
+          print("tags<<EOF")
+          print("\n".join(arm64_tags))
+          print("EOF")
+          PY
+
+      - name: Build and push arm64 combined image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.arm64_tags.outputs.tags }}
+          labels: ${{ steps.meta_combined.outputs.labels }}
+          build-args: |
+            VERSION=${{ inputs.release_tag || (github.ref_type == 'tag' && github.ref_name) || 'dev' }}
+            BUILD_ID=${{ steps.build.outputs.id }}
+            GO_VERSION=${{ steps.build.outputs.go_version }}
+          cache-from: type=gha,scope=build-docker-arm64
+          cache-to: type=gha,scope=build-docker-arm64,mode=min
+
+  publish-docker-manifest:
+    name: Publish Docker Manifest (CLI+WebUI)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs:
+      - build-docker-amd64
+      - build-docker-arm64
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.release_tag || github.ref }}
+
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Resolve build metadata
+        id: build
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "id=$(git rev-parse --short=12 HEAD)" >> "$GITHUB_OUTPUT"
+          echo "go_version=$(awk '/^go /{print $2; exit}' go.mod)" >> "$GITHUB_OUTPUT"
+
+      - name: Login to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker metadata (Combined)
+        id: meta_combined
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/upbrr
+          tags: |
+            type=sha,enable=${{ inputs.release_tag == '' }}
+            type=raw,value=sha-${{ steps.build.outputs.id }},enable=${{ inputs.release_tag != '' }}
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}},value=${{ inputs.release_tag || github.ref_name }},enable=${{ inputs.release_tag != '' || github.ref_type == 'tag' }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ inputs.release_tag || github.ref_name }},enable=${{ inputs.release_tag != '' || github.ref_type == 'tag' }}
+            type=raw,value=latest,enable=${{ github.event_name == 'push' && github.ref_type == 'tag' }}
+
+      - name: Create and push multi-arch manifests
+        if: github.event_name != 'pull_request'
+        shell: bash
+        env:
+          META_JSON: ${{ steps.meta_combined.outputs.json }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' > /tmp/upbrr-docker-tags.txt
+          import json
+          import os
+
+          data = json.loads(os.environ["META_JSON"])
+          for tag in data["tags"]:
+              print(tag)
+          PY
+
+          while IFS= read -r tag; do
+            docker buildx imagetools create \
+              --tag "$tag" \
+              "${tag}-amd64" \
+              "${tag}-arm64"
+          done < /tmp/upbrr-docker-tags.txt

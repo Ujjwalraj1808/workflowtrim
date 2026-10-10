@@ -1,0 +1,45 @@
+name: golangci-lint
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: golangci-lint-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  golangci:
+    name: golangci-lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Run architecture ownership policy
+        run: go run ./cmd/architecturepolicy
+
+      - name: Run path portability policy
+        run: go run ./cmd/pathpolicy
+
+      - name: Run composite literal layout policy
+        run: go run ./cmd/literalpolicy
+
+      - name: Validate release workflow contracts
+        run: go run ./cmd/workflowcontractgen -check
+
+      - name: Run golangci-lint
+        uses: golangci/golangci-lint-action@v8
+        with:
+          version: v2.13.2
+          args: --timeout=5m

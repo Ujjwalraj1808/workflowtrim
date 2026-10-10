@@ -1,0 +1,86 @@
+
+name: Build
+
+on:
+  push:
+    branches: [ '**' ]
+    tags-ignore: [ '**' ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build:
+    name: Build
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+
+    strategy:
+      matrix:
+        os: [ macos-latest, ubuntu-latest, windows-latest ]
+
+    steps:
+      - name: Clone Git repository
+        uses: actions/checkout@v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24.15'
+
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: 3.x
+
+      - name: Install Packages
+        run: npm run install
+
+      - name: Validate
+        run: npm run validate
+
+      - name: Build Python Server
+        run: npm run build python
+
+      - name: Build Electron
+        shell: bash
+        run: |
+          npx electron-builder install-app-deps
+          case "${{ matrix.os }}" in
+            macos*)
+              npm run build electron mac
+              ;;
+            ubuntu*)
+              sudo apt-get install rpm --yes
+              npm run build electron linux
+              ;;
+            windows*)
+              npm run build electron windows
+              ;;
+          esac
+
+  analyze:
+    name: Analyze
+    runs-on: ubuntu-latest
+
+    permissions:
+      security-events: write
+
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [ 'javascript', 'python' ]
+
+    steps:
+      - name: Clone Git repository
+        uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@v3
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3

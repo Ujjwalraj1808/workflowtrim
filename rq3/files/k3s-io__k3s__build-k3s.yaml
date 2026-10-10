@@ -1,0 +1,138 @@
+on: 
+  workflow_call:
+    inputs:
+      platforms:
+        type: string
+        description: 'Buildx platform list.'
+        required: false
+        default: 'linux/amd64'
+      upload-image:
+        type: boolean
+        description: 'Build and upload k3s image (only works on arm64 or amd64)'
+        required: false
+        default: false
+      upload-build:
+        type: boolean
+        description: 'Upload contents of build/out, used to build the k3s image externally'
+        required: false
+        default: false
+      test-coverage:
+        type: boolean
+        description: 'Whether to build K3s with -cover for test coverage collection'
+        required: false
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build # DO NOT CHANGE THIS NAME, we rely on it for INSTALL_K3S_PR functionality
+    runs-on: ${{ (!contains(inputs.platforms, 'amd64') && !contains(inputs.platforms, 'windows/') && !contains(inputs.platforms, 'riscv64') && (github.repository_owner == 'k3s-io' && 'cncf-ubuntu-16-64-arm' || 'ubuntu-24.04-arm')) 
+      || (github.repository_owner == 'k3s-io' && 'cncf-ubuntu-16-64-x86' || 'ubuntu-24.04') }}
+    timeout-minutes: 30
+    steps:
+    - name: Checkout K3s
+      uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+    
+    - name: Set up Docker
+      uses: docker/setup-docker-action@77e84dbf09b47d1e29270283c22f16145aa85ca1 # v5.4.0
+      with:
+        version: type=image,tag=29
+        daemon-config: '{"features":{"containerd-snapshotter":true}}'
+        set-host: true
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+    - name: Determine Git Version Info
+      id: git_vars
+      run: |
+        source ./scripts/git_version.sh
+        {
+          echo "git_tag=${GIT_TAG}"
+          echo "tree_state=${TREE_STATE}"
+          echo "commit=${COMMIT}"
+          echo "dirty=${DIRTY}"
+        } >> "$GITHUB_OUTPUT"
+
+    - name: Determine build platforms
+      id: platforms
+      run: |
+        platforms='${{ inputs.platforms }}'
+        case "${platforms}" in
+          linux/amd64) artifact_name='k3s-amd64' ;;
+          linux/arm64) artifact_name='k3s-arm64' ;;
+          linux/arm/v7) artifact_name='k3s-arm' ;;
+          windows/amd64) artifact_name='k3s-windows' ;;
+          *) artifact_name='k3s-all' ;;
+        esac
+        contains_linux=false
+        image_allowed=false
+        if [[ ",${platforms}," == *,linux/* ]]; then
+          contains_linux=true
+        fi
+        if [ "${platforms}" = 'linux/amd64' ] || [ "${platforms}" = 'linux/arm64' ]; then
+          image_allowed=true
+        fi
+        {
+          echo "platforms=${platforms}"
+          echo "artifact_name=${artifact_name}"
+          echo "contains_linux=${contains_linux}"
+          echo "image_allowed=${image_allowed}"
+        } >> "$GITHUB_OUTPUT"
+
+    - name: Build K3s binaries
+      env:
+        DOCKER_BUILD_SUMMARY: false
+      uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+      with:
+        context: .
+        file: ./Dockerfile
+        target: multiarch-result
+        build-args: |
+          GIT_TAG=${{ steps.git_vars.outputs.git_tag }}
+          TREE_STATE=${{ steps.git_vars.outputs.tree_state }}
+          COMMIT=${{ steps.git_vars.outputs.commit }}
+          DIRTY=${{ steps.git_vars.outputs.dirty }}
+          GOCOVER=${{ inputs.test-coverage && '1' || '' }}
+        push: false
+        provenance: mode=min
+        platforms: ${{ steps.platforms.outputs.platforms }}
+        outputs: type=local,dest=.,platform-split=false
+
+    - name: Caculate binary checksum
+      run: |
+        for binary in dist/artifacts/k3s dist/artifacts/k3s-* dist/artifacts/k3s.exe; do
+          [ -f "${binary}" ] || continue
+          name=$(basename "${binary}")
+          case "${name}" in
+            k3s-armhf) checksum=k3s-arm.sha256sum ;;
+            *) checksum=${name}.sha256sum ;;
+          esac
+          sha256sum "${binary}" | sed 's|dist/artifacts/||' > "dist/artifacts/${checksum}"
+        done
+    
+    - name: Build and save K3s image
+      if: inputs.upload-image == true && steps.platforms.outputs.image_allowed == 'true'
+      run: |
+        ./scripts/package-image
+        docker image save rancher/k3s -o ./dist/artifacts/k3s-image.tar
+      
+    - name: "Save K3s build"
+      if: inputs.upload-build == true
+      run: |
+        cp ./build/out/data-*.tar.zst ./dist/artifacts/
+
+    # We use this version of the k3s binary to symlink to kubectl (and any other symlinks we need)
+    - name: "Save bin k3s binary"
+      if: contains(steps.platforms.outputs.platforms, 'linux/amd64')
+      run: |
+        tar --zstd -xf ./build/out/data-linux-amd64.tar.zst ./bin/k3s
+        install -m 0755 ./bin/k3s ./dist/artifacts/bin-k3s
+
+    - name: "Upload K3s Artifacts"
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      with:
+        name: ${{ steps.platforms.outputs.artifact_name }}
+        path: dist/artifacts/

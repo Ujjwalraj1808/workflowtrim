@@ -1,0 +1,263 @@
+# Build + draft-publish the prebuilt HilbertRaum packages on every version tag.
+#
+# Draft → the owner downloads the artifacts, runs the manual post-package smoke
+# (docs/packaging.md "Manual pre-ship checklist"), then clicks Publish. A bad build
+# never becomes publicly linkable. `workflow_dispatch` runs the three build legs
+# ad-hoc without publishing (the release job is tag-gated).
+#
+# Unsigned at stage 0 (no signing secrets in CI): Windows shows SmartScreen
+# "More info → Run anyway"; macOS needs System Settings → Privacy & Security →
+# "Open Anyway" (both documented in docs/troubleshooting.md). Supplying the env
+# secrets electron-builder.yml documents (CSC_*/APPLE_* for mac, WIN_CSC_* for
+# windows) upgrades to signed builds with no repo change — then drop the
+# CSC_IDENTITY_AUTO_DISCOVERY line below.
+#
+# This is dev infrastructure (same network class as ci.yml): the packaging needs the
+# Electron binary, so the skip knobs are deliberately NOT set here. Since wave DEP-4
+# (Electron 43) the mechanism differs from what this comment used to describe: Electron
+# >= 42 has no postinstall at all, so `npm ci` downloads nothing, and the binary arrives
+# either lazily on the first electron-bin invocation or — for the packaged artifact —
+# via electron-builder's own @electron/get fetch, which is independent of the npm
+# package. The outcome is unchanged: the release legs get the binary they need.
+# The shipped app itself makes no network calls. `npm ci` keeps the install
+# lockfile-pinned (hardening L-8, CI half).
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch: {}
+
+# Least privilege at the top; only the release job needs to create the draft.
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # The windows test job, sharded exactly the way ci.yml shards its windows legs (#458
+  # residual): same `--shard=1/2` / `2/2` matrix, same shard-aware anti-false-green
+  # guard (tests/full-suite-guard.ts — unchanged, it keys off the shard flag, not the
+  # workflow file), same forks cap (vitest.config.ts's `capWindowsCiForks` keys off
+  # `CI` + `win32`, both true here same as on ci.yml's windows legs — nothing to set
+  # here). This IS the "cheap belt-and-braces on the exact tagged commit" ci.yml's
+  # windows legs already gave master; running it unsharded, in one job, was the leg
+  # that hit the `onTaskUpdate` starvation flake on a release run (#458).
+  test-win:
+    name: build-win test (${{ matrix.label }})
+    runs-on: windows-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { label: '1 of 2', shard: '--shard=1/2' }
+          - { label: '2 of 2', shard: '--shard=2/2' }
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with: { node-version: 24, cache: npm }
+      - run: npm ci
+      - run: npm run typecheck
+      # Build BEFORE the tests, mirroring ci.yml: the AUD-18 positive control in
+      # csp-build-output.test.ts asserts that on CI the packaged-CSP assertions really
+      # ran against out/renderer, so a test run without a prior build fails on any CI.
+      # (Latent since AUD-18 landed after the v0.1.55 tag; first surfaced by a
+      # workflow_dispatch run of this workflow.)
+      - run: npm run build
+      - run: npm test -- ${{ matrix.shard }}
+
+  build-win:
+    needs: test-win
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with: { node-version: 24, cache: npm }
+      - run: npm ci
+      - run: npm run typecheck
+      # Build BEFORE packaging, same reason as test-win above (AUD-18); the full suite
+      # already ran, sharded, in test-win above on this exact checkout.
+      - run: npm run build
+      - run: npm run package:win
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: win-portable
+          path: apps/desktop/release/HilbertRaum-*-portable.exe
+          if-no-files-found: error
+      - name: Fetch win llama.cpp runtime (Vulkan), zip for offline install
+        # #102 item 1 — the mac Metal zip's Windows twin: a convenience re-host of the
+        # SAME pinned upstream build the in-app engine installer fetches
+        # (runtime-sources.yaml first win/x64 match = Vulkan; SHA-256-verified inside
+        # fetch-runtime before extraction), repackaged as the extracted install tree
+        # (root entry `win/`, incl. the .hilbertraum-runtime.json marker) so it drops
+        # straight into `runtime/llama.cpp/` for offline/air-gapped installs. The
+        # fetch script runs under git-bash; the zip via Compress-Archive (no `zip`
+        # binary on windows-latest; the win build carries no symlinks, so the mac
+        # step's dereference concern does not apply).
+        shell: bash
+        run: |
+          set -euo pipefail
+          STAGE="$RUNNER_TEMP/drive"
+          mkdir -p "$STAGE"
+          bash scripts/fetch-runtime.sh --target "$STAGE"
+      - name: Zip the win runtime tree
+        shell: pwsh
+        run: Compress-Archive -Path "$env:RUNNER_TEMP\drive\runtime\llama.cpp\win" -DestinationPath "$env:GITHUB_WORKSPACE\llama-runtime-win-x64.zip"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with: { name: win-runtime, path: llama-runtime-win-x64.zip, if-no-files-found: error }
+
+  build-mac:
+    runs-on: macos-14 # arm64 (Apple Silicon)
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with: { node-version: 24, cache: npm }
+      - run: npm ci
+      - run: npm run typecheck
+      - name: Package .app (unsigned dir target)
+        # Stage 0: skip Developer ID lookup; remove when the APPLE_*/CSC_* secrets exist.
+        env: { CSC_IDENTITY_AUTO_DISCOVERY: 'false' }
+        run: npm run package
+      - name: Ad-hoc sign + ditto-zip the .app
+        # The .app must STAY zipped on an exFAT drive (framework symlinks); ditto
+        # preserves symlinks, resource forks and exec bits inside the zip.
+        run: |
+          set -euo pipefail
+          APP=$(ls -d apps/desktop/release/mac*/HilbertRaum.app | head -1)
+          codesign --force --deep --sign - "$APP"
+          codesign --verify --verbose=2 "$APP"
+          VERSION=$(node -p "require('./apps/desktop/package.json').version")
+          ditto -c -k --keepParent "$APP" "HilbertRaum-${VERSION}-mac-arm64.app.zip"
+      - name: Fetch mac llama.cpp runtime (Metal), zip symlink-dereferenced
+        # Convenience re-host of the pinned Metal build (MIT). Zip WITHOUT -y so
+        # symlinks are dereferenced → safe to extract onto exFAT.
+        run: |
+          set -euo pipefail
+          STAGE="$RUNNER_TEMP/drive"
+          mkdir -p "$STAGE"
+          bash scripts/fetch-runtime.sh --target "$STAGE"
+          (cd "$STAGE/runtime/llama.cpp" && zip -r "$GITHUB_WORKSPACE/llama-runtime-mac-arm64.zip" mac)
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with: { name: mac-app, path: 'HilbertRaum-*-mac-arm64.app.zip', if-no-files-found: error }
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with: { name: mac-runtime, path: llama-runtime-mac-arm64.zip, if-no-files-found: error }
+
+  build-linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with: { node-version: 24, cache: npm }
+      - run: npm ci
+      - run: npm run typecheck
+      # AppImage target from electron-builder.yml (default filename HilbertRaum-<version>.AppImage).
+      - run: npm run package
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: linux-appimage
+          path: apps/desktop/release/*.AppImage
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build-win, build-mac, build-linux]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write # create the draft release
+      issues: read # enumerate the issues the range's PRs closed (notes section)
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Assert tag matches package version
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          PKG=$(node -p "require('./apps/desktop/package.json').version")
+          [ "$TAG" = "$PKG" ] || { echo "tag v$TAG != package $PKG"; exit 1; }
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with: { path: dist, merge-multiple: true }
+      - name: Checksums
+        run: (cd dist && sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt)
+      - name: Release notes from the CHANGELOG section for this version
+        # Prefer "## [<version>]" — the release ritual is that the version-bump PR renames
+        # [Unreleased] to the version being cut, so by tag time the notes for THIS release
+        # live under their own heading. [Unreleased] is the fallback for a tag pushed
+        # without that rename; without it, forgetting the rename would publish an empty
+        # body. Never both: a version section, once present, wins.
+        run: |
+          node -e "
+            const fs = require('fs');
+            const v = require('./apps/desktop/package.json').version;
+            const md = fs.readFileSync('CHANGELOG.md', 'utf8');
+            const lines = md.split('\n');
+            const section = (heading) => {
+              const i = lines.findIndex((l) => l.startsWith(heading));
+              if (i === -1) return '';
+              const rest = lines.slice(i + 1);
+              const j = rest.findIndex((l) => l.startsWith('## '));
+              return (j === -1 ? rest : rest.slice(0, j)).join('\n').trim();
+            };
+            const body = section('## [' + v + ']') || section('## [Unreleased]');
+            fs.writeFileSync('dist/NOTES.md',
+              '## Which file do I need?\n\n' +
+              'The downloads are at the very bottom of this page, in the **Assets** list' +
+              ' underneath all these notes. Scroll all the way down, and click Assets if the' +
+              ' list is folded. You need exactly one file:\n\n' +
+              '| Your computer | Download this ONE file |\n' +
+              '|---|---|\n' +
+              '| **Windows** 10/11 | **HilbertRaum-' + v + '-portable.exe** |\n' +
+              '| **macOS** (Apple Silicon) | **HilbertRaum-' + v + '-mac-arm64.app.zip** |\n' +
+              '| **Linux** | **HilbertRaum-' + v + '.AppImage** |\n\n' +
+              'The other files are NOT the app: the llama-runtime-*.zip files carry the AI' +
+              ' engine for offline/air-gapped installs only (normally the app offers that same' +
+              ' download built in), SHA256SUMS.txt is for optional download verification, and' +
+              ' the two Source code archives are the source for developers, not a runnable app.\n\n' +
+              '> **This download is the app only** — a working chat needs **two more downloads**,' +
+              ' both offered on the **AI Model** screen inside the app: the **AI engine**' +
+              ' (llama.cpp — the screen shows an install banner until it is present; without it,' +
+              ' models run in demo mode with simulated answers) and an **AI model** of your' +
+              ' choice. Two optional downloads are offered in the app only when you need them:' +
+              ' the knowledge-pack tools, and the **text-recognition (OCR) files** for scanned' +
+              ' PDFs and photos (German + English, about 4 MB; offered on the scan or photo in' +
+              ' Documents and on the AI Model screen). Every download asks first and is' +
+              ' SHA-256-verified. Offline installs:' +
+              ' the llama-runtime-*.zip assets below hold the same verified engine build —' +
+              ' unzip into the runtime/llama.cpp/ folder on the drive. Repo users can' +
+              ' provision a drive up front instead (README step 2). Unsigned build: see the' +
+              ' SmartScreen/Gatekeeper notes in docs/troubleshooting.md.\n\n' + body + '\n');
+          "
+      - name: Append issues resolved since last published release
+        # GitHub's generated notes (below) list PRs only; this section lists the
+        # ISSUES those PRs closed, from the same PREV baseline. Best-effort: an API
+        # hiccup must never block the release build — the draft's notes can be
+        # hand-edited before publishing.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if bash scripts/release-issues-section.sh "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" > issues-section.md; then
+            cat issues-section.md >> dist/NOTES.md
+          else
+            echo "::warning::Issues-resolved section skipped (release-issues-section.sh failed)"
+          fi
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+        with:
+          draft: true
+          prerelease: true # while 0.x
+          body_path: dist/NOTES.md
+          # Appends GitHub's auto-generated notes AFTER the body above: "What's
+          # Changed" (each merged PR + author), "New Contributors", and the Full
+          # Changelog compare link — computed against the latest PUBLISHED release
+          # at draft-creation time, so an abandoned draft just folds into the next
+          # tag's notes.
+          generate_release_notes: true
+          files: |
+            dist/HilbertRaum-*
+            dist/llama-runtime-mac-arm64.zip
+            dist/llama-runtime-win-x64.zip
+            dist/SHA256SUMS.txt

@@ -1,0 +1,88 @@
+# SPDX-FileCopyrightText: 2026 Edward Kmett
+# SPDX-License-Identifier: UPL-1.0 AND BSD-3-Clause
+
+name: Scheduled test groups
+on:
+  workflow_call:
+    inputs:
+      os:
+        type: string
+        required: true
+      expected_sha:
+        type: string
+        required: true
+      cadence:
+        type: string
+        required: true
+permissions:
+  contents: read
+  actions: read
+jobs:
+  compile:
+    uses: ./.github/workflows/test-common.yml
+    with:
+      os: ${{ inputs.os }}
+      expected_sha: ${{ inputs.expected_sha }}
+      cadence: ${{ inputs.cadence }}
+  group:
+    needs: compile
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.compile.outputs.matrix) }}
+    runs-on: ${{ inputs.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          submodules: false
+          persist-credentials: false
+      - name: Check dispatched revision before setup
+        env:
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+      - uses: ./.github/actions/setup
+      - name: Download only this source platform and workflow attempt
+        uses: actions/download-artifact@v8
+        with:
+          name: common-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: build/ci/download
+          digest-mismatch: error
+      - name: Verify and restore common compilation
+        run: python3 .github/scripts/fast_ci.py restore-common --archive build/ci/download/common.tar.gz
+      - name: Run each original group with its own preparation and both handoff modes
+        env:
+          CI_GROUPS: ${{ join(matrix.groups, ' ') }}
+          CI_CADENCE: ${{ inputs.cadence }}
+        run: |
+          ./gradlew --stop
+          trap './gradlew --stop' EXIT
+          failed=0
+          for group in $CI_GROUPS; do
+            echo "::group::$group"
+            if python3 .github/scripts/fast_ci.py group --group "$group" --cadence "$CI_CADENCE" --reuse-daemon --report-dir "build/ci/group-results/$group"; then
+              echo "- $group: passed" >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "::error title=$group::$group failed; see its preserved preparation and test output"
+              echo "- $group: failed" >> "$GITHUB_STEP_SUMMARY"
+              failed=1
+            fi
+            echo "::endgroup::"
+          done
+          exit "$failed"
+      - name: Preserve each group's original test and preparation output
+        if: always()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: tests-${{ runner.os }}-${{ matrix.batch }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            build/ci/setup-results/
+            build/ci/group-results/
+            build/test-results/testDefault/
+            build/test-results/testDense/
+            build/reports/tests/testDefault/
+            build/reports/tests/testDense/
+          if-no-files-found: warn
+          retention-days: 7

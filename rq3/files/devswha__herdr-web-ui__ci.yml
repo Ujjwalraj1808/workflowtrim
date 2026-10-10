@@ -1,0 +1,122 @@
+name: CI
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  workflow_call:
+permissions:
+  contents: read
+concurrency:
+  group: validation-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+jobs:
+  windows-install:
+    name: Native Windows install
+    runs-on: windows-latest
+    timeout-minutes: 10
+    env:
+      HERDR_TEST_MODE: unit
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/windows-install.test.ps1
+      - run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/preflight.ps1
+      - run: bun install --frozen-lockfile
+      - run: bun run build
+      - run: bun test ./scripts/windows-plugin.test.ts ./scripts/plugin-runtime.test.ts ./scripts/phone-setup.test.ts ./server/windows-native.test.ts
+  macos-session:
+    name: Native macOS session identity
+    runs-on: macos-15
+    timeout-minutes: 5
+    env:
+      HERDR_TEST_MODE: unit
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - run: bun install --frozen-lockfile
+      - run: bun test ./server/claude-store.test.ts ./server/process-start.test.ts
+  fast:
+    name: Fast checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      CHECK_DIR: ${{ github.workspace }}/.ci
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+      - run: bun install --frozen-lockfile
+      # scripts/check.ts is what a developer runs too: workflow syntax (checksum-pinned actionlint),
+      # generated types, typecheck, build, unit tests (no herdr required)
+      - run: bun run check fast
+      - name: Preserve check report and verification logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: check-fast-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            .ci/report.json
+            .ci/**/*.log
+            .ci/browser-evidence/**/*.png
+            .ci/browser-evidence/**/*.json
+            .ci/browser-evidence/**/*.zip
+          include-hidden-files: true
+          if-no-files-found: ignore
+  integration:
+    name: Integration and browser
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      # where the run's own herdr keeps its config and state (scripts/check.ts): kept, for the failure logs
+      CHECK_DIR: ${{ github.workspace }}/.ci
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+      - name: Install checksum-pinned herdr 0.9.3
+        run: |
+          mkdir -p "$RUNNER_TEMP/herdr-bin"
+          curl --fail --location --retry 3 https://github.com/herdrdev/herdr/releases/download/v0.9.3/herdr-linux-x86_64 -o "$RUNNER_TEMP/herdr-bin/herdr"
+          echo "18a8dc65f1c2fa485884344356dea1cfd911c6f06cf46fa78e193f4087f4dba7  $RUNNER_TEMP/herdr-bin/herdr" | sha256sum --check
+          chmod +x "$RUNNER_TEMP/herdr-bin/herdr"
+          echo "$RUNNER_TEMP/herdr-bin" >> "$GITHUB_PATH"
+      - run: bun install --frozen-lockfile
+      # A build, then the two lanes side by side on a herdr of the run's own, which it stops when
+      # it ends. The lanes share nothing: the integration files run on herdr sessions of their own.
+      - name: Integration tests (updater restart and rollback included) beside the browser regressions
+        run: bun run check integration browser
+      - name: Preserve check report and verification logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: herdr-logs-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            .ci/report.json
+            .ci/**/*.log
+            .ci/config/herdr/sessions/*/test-server.log
+            .ci/browser-evidence/**/*.png
+            .ci/browser-evidence/**/*.json
+            .ci/browser-evidence/**/*.zip
+          include-hidden-files: true
+          if-no-files-found: ignore

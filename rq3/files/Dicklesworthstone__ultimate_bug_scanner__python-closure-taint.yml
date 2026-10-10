@@ -1,0 +1,90 @@
+name: Python Closure Taint
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/python-closure-taint.yml
+      - modules/helpers/ubs_core/analyzers/taint_py.py
+      - modules/helpers/ubs_core/registry.py
+      - test-suite/quality/test_taint_python_*.py
+      - modules/lib/ubs-common.sh
+      - ubs
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  closure-dataflow:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-22.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+      UBS_NO_AUTO_UPDATE: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        if: runner.arch == 'X64'
+        with:
+          python-version: '3.9'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install real scanner dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq ripgrep rsync shellcheck
+          export npm_config_cache="$RUNNER_TEMP/ubs-npm-cache-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          prefix="$RUNNER_TEMP/ubs-ast-grep-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          npm install --global --prefix "$prefix" @ast-grep/cli typescript@5.8.3
+          echo "$prefix/bin" >> "$GITHUB_PATH"
+          "$prefix/bin/ast-grep" --version
+          "$prefix/bin/tsc" --version
+          node -e 'const ts = require(process.argv[1]); if (typeof ts.resolveModuleName !== "function") process.exit(1)' "$prefix/lib/node_modules/typescript"
+      - name: Require real Python 3.9 on x64
+        if: runner.arch == 'X64'
+        run: python3.9 --version
+      - name: Verify checked-in runtime integrity before execution
+        run: |
+          ./scripts/verify_checksums.sh
+          ./scripts/verify_sha256sums.sh
+          shellcheck -S warning ubs modules/lib/ubs-common.sh scripts/new-module.sh modules/ubs-*.sh
+      - name: Exercise checked-in callback, closure and cross-language regressions
+        run: |
+          set -o pipefail
+          mkdir -p "$RUNNER_TEMP/closure-validation"
+          python3 -m unittest discover -s test-suite/quality -p 'test_taint*.py' -v 2>&1 | tee "$RUNNER_TEMP/closure-validation/all-taint.log"
+          python3 -m unittest discover -s test-suite/quality -p test_python_command_injection_dataflow.py -v 2>&1 | tee "$RUNNER_TEMP/closure-validation/command.log"
+          python3 -m unittest discover -s test-suite/shareable -p test_contract_checksums.py -v 2>&1 | tee "$RUNNER_TEMP/closure-validation/contract.log"
+          python3 -m unittest discover -s test-suite/shareable -p test_helper_python_floor.py -v 2>&1 | tee "$RUNNER_TEMP/closure-validation/python-floor.log"
+      - name: Validate real JSON and SARIF output
+        env:
+          UBS_TAINT_E2E: '1'
+        run: |
+          set -o pipefail
+          for suite in test_taint_python_effects.py test_taint_python_dataflow.py test_taint_go_decoding.py; do
+            python3 -m unittest discover -s test-suite/quality -p "$suite" -v 2>&1 | tee "$RUNNER_TEMP/closure-validation/${suite%.py}-cli.log"
+          done
+      - name: Verify tests and checksum regeneration leave source unchanged
+        run: |
+          python3 scripts/update_checksums.py
+          ./scripts/verify_checksums.sh
+          ./scripts/verify_sha256sums.sh
+          git diff --exit-code
+          test -z "$(git ls-files --others --exclude-standard)"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: closure-validation-${{ matrix.runner }}
+          path: |
+            ${{ runner.temp }}/closure-validation
+            test-suite/artifacts/python-mutable-effects
+            test-suite/artifacts/go-decoding
+          retention-days: 3

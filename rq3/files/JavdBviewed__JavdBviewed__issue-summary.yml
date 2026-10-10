@@ -1,0 +1,258 @@
+name: Issue Summary Bot
+
+on:
+  issues:
+    types: [opened, edited, reopened]
+  issue_comment:
+    types: [created]
+
+permissions:
+  issues: write
+  contents: read
+
+jobs:
+  summarize:
+    if: github.event_name == 'issues' || ((contains(github.event.comment.body, '/summarize') || contains(github.event.comment.body, '/triage')) && (github.event.comment.author_association == 'OWNER' || github.event.comment.author_association == 'MEMBER' || github.event.comment.author_association == 'COLLABORATOR'))
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate issue summary
+        uses: actions/github-script@v7
+        env:
+          ISSUE_TITLE: ${{ github.event.issue.title }}
+          ISSUE_BODY: ${{ github.event.issue.body }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          ISSUE_URL: ${{ github.event.issue.html_url }}
+        with:
+          script: |
+            const marker = '<!-- issue-summary-bot -->';
+            const reminderMarker = '<!-- issue-summary-bot-reminder -->';
+            const title = process.env.ISSUE_TITLE || '';
+            const body = process.env.ISSUE_BODY || '';
+            const issueNumber = process.env.ISSUE_NUMBER || '';
+            const issueUrl = process.env.ISSUE_URL || '';
+
+            const lines = body.split('\n').map(line => line.trimRight());
+            const placeholderTexts = [
+              '粘贴控制台错误信息（如果有的话）',
+              'paste console error messages here (if any)',
+              '[代码块已省略]'
+            ];
+
+            function detectLanguage(text) {
+              const chineseMatches = text.match(/[\u4e00-\u9fff]/g) || [];
+              return chineseMatches.length >= 3 ? 'zh' : 'en';
+            }
+
+            function getSectionContent(sectionNames) {
+              const names = Array.isArray(sectionNames) ? sectionNames : [sectionNames];
+              const index = lines.findIndex(line => names.some(name => line.startsWith(name)));
+              if (index === -1) return '';
+              const content = [];
+              for (let i = index + 1; i < lines.length; i += 1) {
+                const line = lines[i];
+                if (line.startsWith('## ')) break;
+                if (line.startsWith('---')) break;
+                if (line.startsWith('**提交前确认：**') || line.startsWith('**Before submitting:**')) break;
+                if (line.startsWith('<!--')) continue;
+                content.push(line);
+              }
+              return content.join('\n').trim();
+            }
+
+            function cleanText(value) {
+              return value
+                .replace(/```[\s\S]*?```/g, (match) => {
+                  const inner = match.replace(/```/g, '').trim();
+                  return inner ? ` ${inner} ` : ' ';
+                })
+                .replace(/<!--.*?-->/g, '')
+                .replace(/\n{3,}/g, '\n\n')
+                .trim();
+            }
+
+            function normalizeText(value) {
+              return value.toLowerCase().replace(/\s+/g, ' ').trim();
+            }
+
+            function isPlaceholderLine(line) {
+              return placeholderTexts.some(item => normalizeText(line) === normalizeText(item));
+            }
+
+            function hasMeaningfulContent(value) {
+              if (!value) return false;
+              const normalized = normalizeText(value)
+                .replace(/[\s`>*\-_[\]()：:]/g, '')
+                .trim();
+              return normalized.length >= 2 && !placeholderTexts.some(item => normalized === normalizeText(item).replace(/[\s`>*\-_[\]()：:]/g, '').trim());
+            }
+
+            function filterMeaningfulLines(value) {
+              return value
+                .split('\n')
+                .map(line => line.trim())
+                .filter(Boolean)
+                .filter(line => !line.startsWith('## '))
+                .filter(line => !isPlaceholderLine(line));
+            }
+
+            function oneLine(value, fallback) {
+              const filtered = filterMeaningfulLines(value).join(' / ');
+              if (!hasMeaningfulContent(filtered)) return fallback;
+              return filtered.replace(/\s+/g, ' ').slice(0, 220).trim();
+            }
+
+            function detectArea(text, language) {
+              const content = text.toLowerCase();
+              const areas = [
+                { zh: 'WebDAV 同步', en: 'WebDAV sync', patterns: ['webdav', '同步', 'sync', 'restore', '备份'] },
+                { zh: '115 集成', en: '115 integration', patterns: ['115', '离线下载', '网盘'] },
+                { zh: 'AI 翻译', en: 'AI translation', patterns: ['ai', '翻译', 'translator', 'gemini', 'openai', 'claude'] },
+                { zh: '隐私保护', en: 'privacy protection', patterns: ['隐私', 'privacy', '密码', 'lock', '加密'] },
+                { zh: '新作品', en: 'new works', patterns: ['新作品', 'new works', '订阅'] },
+                { zh: '搜索功能', en: 'search', patterns: ['搜索', 'search', '磁力', 'magnet'] },
+                { zh: '设置面板', en: 'settings', patterns: ['settings', '设置', '配置'] },
+                { zh: '站点兼容性', en: 'site compatibility', patterns: ['javdb', 'javbus', 'selector', 'dom'] }
+              ];
+              const match = areas.find(area => area.patterns.some(pattern => content.includes(pattern)));
+              if (!match) return language === 'zh' ? '相关模块' : 'the relevant area';
+              return language === 'zh' ? match.zh : match.en;
+            }
+
+            function parseEnvironmentBlock(value) {
+              const fields = [
+                { key: '扩展版本', enKey: 'Extension Version', aliases: ['扩展版本', 'extension version'] },
+                { key: '浏览器信息', enKey: 'Browser', aliases: ['浏览器信息', 'browser'] },
+                { key: '操作系统', enKey: 'Operating System', aliases: ['操作系统', 'operating system'] }
+              ];
+              const result = {};
+              for (const field of fields) result[field.key] = '';
+
+              for (const rawLine of value.split('\n')) {
+                const line = rawLine.trim();
+                if (!line) continue;
+                for (const field of fields) {
+                  const match = field.aliases.find(alias => normalizeText(line).startsWith(`${normalizeText(alias)}:`));
+                  if (!match) continue;
+                  const extracted = line.slice(line.indexOf(':') + 1).trim();
+                  if (hasMeaningfulContent(extracted)) {
+                    result[field.key] = extracted;
+                  }
+                }
+              }
+
+              const filled = fields.filter(field => hasMeaningfulContent(result[field.key]));
+              return {
+                values: result,
+                hasAny: filled.length > 0,
+                summary(language) {
+                  if (filled.length === 0) return language === 'zh' ? '当前没有可用环境信息。' : 'No usable environment details are available yet.';
+                  return filled
+                    .map(field => `${language === 'zh' ? field.key : field.enKey}=${result[field.key]}`)
+                    .join(language === 'zh' ? '，' : ', ');
+                }
+              };
+            }
+
+            const language = detectLanguage(`${title}\n${body}`);
+            const environmentRaw = cleanText(getSectionContent(['## 📋 基本信息', '## 📋 Environment']));
+            const description = cleanText(getSectionContent(['## 🐛 问题描述', '## 🐛 Bug Description', '## 💡 功能描述', '## 💡 Feature Description']));
+            const steps = cleanText(getSectionContent(['## 📝 复现步骤', '## 📝 Steps to Reproduce', '## 🎯 使用场景', '## 🎯 Use Case']));
+            const expected = cleanText(getSectionContent(['## ✅ 期望行为', '## ✅ Expected Behavior', '## 🎨 期望的实现方式', '## 🎨 Proposed Solution']));
+            const logs = cleanText(getSectionContent(['## 📄 控制台日志', '## 📄 Console Logs']));
+            const extra = cleanText(getSectionContent(['## 💡 补充说明', '## 💡 Additional Context', '## 📸 参考示例', '## 📸 Examples or References']));
+            const environment = parseEnvironmentBlock(environmentRaw);
+
+            const type = title.toLowerCase().includes('[feature]') ? (language === 'zh' ? '功能建议' : 'feature request') : (language === 'zh' ? '问题反馈' : 'bug report');
+            const area = detectArea(`${title}\n${body}`, language);
+            const judgment = type === (language === 'zh' ? '功能建议' : 'feature request')
+              ? (language === 'zh'
+                  ? `这条 Issue 指向 ${area} 的功能建议，当前需求重点是 ${oneLine(description || expected, '功能诉求还不够具体')}。`
+                  : `This issue is a feature request for ${area}. The main request is ${oneLine(description || expected, 'still not specific enough')}.`)
+              : (language === 'zh'
+                  ? `这条 Issue 落在 ${area}链路。当前只能确认 ${oneLine(description, '存在异常')}，具体卡在连接、鉴权、数据读写还是冲突处理阶段还不明确。`
+                  : `This issue falls in the ${area} flow. It currently confirms ${oneLine(description, 'an unexpected failure')}, while the exact stage is still unclear.`);
+
+            const knownFacts = [];
+            if (hasMeaningfulContent(description)) knownFacts.push(language === 'zh' ? oneLine(description, '') : oneLine(description, ''));
+            if (hasMeaningfulContent(steps)) knownFacts.push(language === 'zh' ? `复现：${oneLine(steps, '')}` : `Reproduction: ${oneLine(steps, '')}`);
+            if (hasMeaningfulContent(expected)) knownFacts.push(language === 'zh' ? `期望：${oneLine(expected, '')}` : `Expected: ${oneLine(expected, '')}`);
+            knownFacts.push(environment.summary(language));
+            if (hasMeaningfulContent(logs)) {
+              knownFacts.push(language === 'zh' ? `日志：${oneLine(logs, '')}` : `Logs: ${oneLine(logs, '')}`);
+            } else if (type === (language === 'zh' ? '问题反馈' : 'bug report')) {
+              knownFacts.push(language === 'zh' ? '当前没有可用错误日志。' : 'No usable error logs are available yet.');
+            }
+
+            const summary = language === 'zh'
+              ? [
+                  marker,
+                  '## 🤖 Triage Summary',
+                  '',
+                  judgment,
+                  '',
+                  '已知信息：',
+                  ...knownFacts.slice(0, 3).map(item => `- ${item}`),
+                  '',
+                  `补充说明：${oneLine(extra, '当前没有额外补充')}`
+                ].join('\n')
+              : [
+                  marker,
+                  '## 🤖 Triage Summary',
+                  '',
+                  judgment,
+                  '',
+                  'Known facts:',
+                  ...knownFacts.slice(0, 3).map(item => `- ${item}`),
+                  '',
+                  `Additional notes: ${oneLine(extra, 'No extra notes were provided.')}`
+                ].join('\n');
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: Number(issueNumber),
+              per_page: 100,
+            });
+
+            const { data: issue } = await github.rest.issues.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: Number(issueNumber),
+            });
+
+            const currentLabels = new Set((issue.labels || []).map(label => typeof label === 'string' ? label : label.name));
+            const summaryComment = comments.find(comment => comment.body && comment.body.includes(marker));
+            const reminderComment = comments.find(comment => comment.body && comment.body.includes(reminderMarker));
+
+            if (summaryComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: summaryComment.id,
+                body: summary,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: Number(issueNumber),
+                body: summary,
+              });
+            }
+
+            if (currentLabels.has('needs-info')) {
+              await github.rest.issues.removeLabel({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: Number(issueNumber),
+                name: 'needs-info',
+              }).catch(() => undefined);
+            }
+
+            if (reminderComment) {
+              await github.rest.issues.deleteComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: reminderComment.id,
+              });
+            }

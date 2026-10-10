@@ -1,0 +1,49 @@
+---
+name: OpenSpec CI
+on:
+  push:
+    branches: [main, "renovate/**"]
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+  merge_group:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate OpenSpecs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - name: Install Node dependencies
+        run: npm ci
+      - name: Validate OpenSpecs
+        env:
+          OPENSPEC_TELEMETRY: "0"
+        run: make check-openspec
+
+  gate:
+    name: OpenSpec Gate
+    needs: [validate]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Evaluate gate
+        run: |
+          if [ "${{ needs.validate.result }}" = "success" ]; then
+            echo "OpenSpec validation passed."
+            exit 0
+          elif [ "${{ needs.validate.result }}" = "skipped" ]; then
+            echo "Unexpected: validate job was skipped."
+            exit 1
+          else
+            echo "OpenSpec validation failed or was cancelled."
+            exit 1
+          fi

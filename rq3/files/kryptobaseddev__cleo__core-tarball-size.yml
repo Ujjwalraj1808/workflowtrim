@@ -1,0 +1,131 @@
+name: Core Tarball Size Gate
+
+# @task T11342 — SG-RUNTIME-UNIFICATION R1 (T11252).
+# @task T11580 — R10-L1: worktree-napi joins the supervisor picker.
+# @task T11976 — DHQ-079 fix: filter bug + 25→30 MB budget (Studio headroom T11979).
+#
+# Asserts the packed @cleocode/core tarball stays <= 30 MB and bundles ONLY the
+# linux-x64-gnu fallback for each CLEO-managed native binary family
+# (cleo-supervisor + worktree-napi, Pattern P1). Fails the build with a
+# largest-contributors message when the budget is exceeded or an extra platform
+# binary sneaks in.
+#
+# Budget composition (v2026.6.14 baseline, binaries estimated from release builds):
+#   dist/.js files (runtime):         ~16.3 MB uncompressed / ~5.2 MB packed
+#   dist/.d.ts files (type decls):     ~7.5 MB uncompressed / ~2.1 MB packed
+#   dist/.js.map (source maps):        ~9.2 MB uncompressed / ~2.6 MB packed (optional trim)
+#   dist/.d.ts.map (decl maps):        ~1.9 MB uncompressed / ~0.5 MB packed (optional trim)
+#   migrations + schemas + templates:  ~1.9 MB uncompressed / ~0.4 MB packed
+#   cleo-supervisor binary (est.):     ~8-12 MB binary       / ~7-10 MB packed
+#   worktree-napi .node (measured):    ~3.1 MB binary        / ~2.8 MB packed
+#   ─────────────────────────────────────────────────────────────────────────
+#   Total estimate (today):           ~18-22 MB packed → 30 MB budget leaves ~8-12 MB headroom
+#   T11979 Studio assets (planned):   +3-5 MB packed (Svelte/JS bundles)
+#   → 30 MB accommodates today's content + Studio; maps are the first trim lever.
+#
+# Runs at RELEASE-TAG time (and on-demand), NOT on PRs/main: the assertion is only
+# meaningful once the cross-compiled linux-x64-gnu fallback binaries have been
+# produced and bundled into the packed tarball. On PRs the fallbacks are
+# placeholders, so the gate would false-fail (T11252 integration).
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  tarball-size:
+    name: core tarball <= 30MB
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: pnpm
+
+      # This gate has failed on EVERY run since v2026.6.10 — 47 runs, 47
+      # failures, 0 successes — always in the build step, so it never once
+      # reached its own size assertion. Nobody knows whether @cleocode/core is
+      # under 30 MB.
+      #
+      # It failed for two reasons, and the first one hid the second.
+      #
+      # (1) The pnpm filter ellipsis was INVERTED. Trailing `pkg...` selects a
+      #     package and its DEPENDENCIES; leading `...pkg` selects it and its
+      #     DEPENDENTS. T11976/DHQ-079 switched both filters to the leading form
+      #     and wrote a comment asserting the opposite meaning, which is why it
+      #     survived 47 runs. Measured: the leading form selects 12 projects and
+      #     omits paths, contracts, lafs, agents, git-shim, nexus, skills and
+      #     utils — exactly what `packages/brain` reported as unresolvable.
+      #
+      # (2) Correcting the direction moved the failure rather than fixing it:
+      #     `packages/adapters` then could not resolve `@cleocode/caamp`. The
+      #     real obstacle is that NO pnpm filter expression can order this
+      #     graph, because it contains a genuine production cycle —
+      #     core -> adapters -> caamp -> core (pnpm names it in the log:
+      #     "There are cyclic workspace dependencies: core, adapters,
+      #     playbooks"). A topological sort does not exist, so pnpm picks an
+      #     arbitrary order and something always builds before its dependency.
+      #
+      # That cycle is precisely why this repo has `build.mjs`, a hand-ordered
+      # wave build with an explicit comment at its caamp wave about "breaking
+      # the build cycle". The release job builds with `pnpm run build`
+      # (= `node build.mjs`) for the same reason.
+      #
+      # So this gate now performs the SAME build the release performs, rather
+      # than a private approximation of it. That is also what makes the number
+      # it prints meaningful: a bespoke build measures a tarball nobody ships.
+      - name: Install workspace dependencies
+        # Mirrors release.yml's prebuild install. `!@cleocode/studio` keeps the
+        # vite/@sveltejs/kit build out — the thing T11976 was correctly trying
+        # to avoid. build.mjs does not build studio, so nothing here needs it.
+        run: pnpm install --frozen-lockfile --filter '!@cleocode/studio'
+
+      # @cleocode/core's `files` includes `dist`, so it must be built before
+      # `npm pack` reflects the real tarball contents.
+      - name: Build workspace (wave-ordered, same as the release)
+        run: pnpm run build
+
+      # Stage the P1 fallback binary so the gate measures the REAL shipped
+      # tarball (with the linux-x64-gnu fallback bundled), not a stripped one.
+      - name: Build + stage linux-x64-gnu supervisor fallback
+        run: |
+          set -euo pipefail
+          cargo build --release -p cleo-supervisor
+          mkdir -p packages/core/binaries/fallback
+          cp target/release/cleo-supervisor packages/core/binaries/fallback/cleo-supervisor
+          # Stage a representative manifest so the bundled-binary check sees the
+          # real shipped layout (manifest is NOT counted as a platform binary).
+          mkdir -p /tmp/sup-bin
+          cp target/release/cleo-supervisor /tmp/sup-bin/cleo-supervisor.linux-x64-gnu
+          node packages/core/scripts/gen-supervisor-manifest.mjs \
+            --bin-dir /tmp/sup-bin \
+            --out packages/core/binaries/cleo-supervisor-manifest.json
+
+      # Stage the P1 worktree-napi fallback addon + manifest so the gate measures
+      # the REAL shipped layout for the worktree-napi family too (T11580 · R10-L1).
+      # Only the linux-x64-gnu .node is bundled; the manifest pins all triples for
+      # the postinstall P2 picker.
+      - name: Build + stage linux-x64-gnu worktree-napi fallback
+        run: |
+          set -euo pipefail
+          cargo build --release -p worktree-napi
+          # cargo emits the cdylib as libworktree_napi.so; rename to the .node
+          # triple name the loader + manifest expect.
+          mkdir -p packages/core/binaries/fallback /tmp/napi-bin
+          cp target/release/libworktree_napi.so \
+            packages/core/binaries/fallback/worktree-napi.linux-x64-gnu.node
+          cp target/release/libworktree_napi.so \
+            /tmp/napi-bin/worktree-napi.linux-x64-gnu.node
+          node packages/core/scripts/gen-napi-manifest.mjs \
+            --bin-dir /tmp/napi-bin \
+            --out packages/core/binaries/worktree-napi-manifest.json
+
+      - name: Assert tarball size + fallback policy
+        run: node packages/core/scripts/check-core-tarball-size.mjs

@@ -1,0 +1,225 @@
+name: CI
+
+# Lint, type-check and test. Also reused by publish.yml (workflow_call) as the release gate.
+# The docs site build/deploy stays in gh-pages.yml: it needs pages/id-token permissions that a
+# reusable-workflow call from publish.yml (contents: read) could not grant.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  # Reusable calls keep the caller's event and workflow name. Give each release run its
+  # own group so dispatching another version cannot cancel or replace its CI gate.
+  group: ${{ github.workflow }}-${{ github.workflow == 'CI' && (github.event.pull_request.number || github.ref) || github.run_id }}
+  cancel-in-progress: ${{ github.workflow == 'CI' }}
+
+jobs:
+  prek:
+    name: Lint and type-check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v7
+      # install extension deps too: vscode is type-aware linted by root oxlint
+      # (needs e.g. @types/vscode), anywidget is checked by root svelte-check
+      # (needs its matterviz/* subpath imports to resolve, else TS2882)
+      - name: Install dependencies
+        uses: ./.github/actions/setup
+        with:
+          extensions: vscode anywidget jupyterlab
+          build-package: 'false'
+      # Locally the vp-staged hook checks only staged files; with nothing staged (CI) it is a
+      # no-op, so the repo-wide format/lint/type-aware pass runs explicitly here.
+      - name: Format, lint and type-check the whole repo
+        run: |
+          pnpm exec vp check
+          npx svelte-check --tsconfig ./tsconfig.json --config ./vite.config.ts --threshold warning
+      - name: Run prek checks
+        uses: j178/prek-action@main
+
+      # The root tsconfig excludes extensions/, and `vp build` strips types without
+      # checking them, so extensions/vscode/tsconfig.json never ran anywhere. The
+      # extension imports #lib types directly (file-viewer/eligibility, io/decompress,
+      # trajectory/format-detect), so a change to a shared type broke it silently -
+      # e.g. making HostFileRequest.filename required produced four errors nothing caught.
+      - name: Type-check and test VS Code extension
+        run: |
+          pnpm -C extensions/vscode run typecheck
+          pnpm -C extensions/vscode test
+
+      # Its settings and custom-editor selectors are generated from #lib, but only by a local
+      # prebuild, so a change to the shared lists could land with package.json left behind.
+      - name: Check VS Code package.json is in sync with #lib
+        run: pnpm -C extensions/vscode run sync-config -- --check
+
+      # Same blind spot as vscode: this tsconfig ran nowhere.
+      - name: Type-check and test JupyterLab extension
+        run: |
+          pnpm -C extensions/jupyterlab run typecheck
+          pnpm -C extensions/jupyterlab test
+
+      # The widget passes component props by name from a table; a renamed or removed prop
+      # (e.g. BarPlot.point_tween) went stale silently until this ran somewhere.
+      - name: Type-check anywidget
+        run: pnpm -C extensions/anywidget run typecheck
+
+  publint:
+    name: Validate npm package
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v7
+
+      - name: Install dependencies
+        uses: ./.github/actions/setup
+        with:
+          test-cache: package
+
+      # publint checks that every export target exists, so build dist/ first
+      - name: Build and validate package exports and types
+        run: |
+          pnpm package:dist
+          pnpm run publint
+      - name: Test package exports and check unused code
+        run: |
+          pnpm exec vitest run tests/vitest/package-exports.test.ts --fsModuleCache --fsModuleCachePath=.cache/vitest
+          pnpm run knip
+
+  unit-test-shards:
+    name: Unit tests (shard ${{ matrix.shard }}/4)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v7
+      - name: Install dependencies
+        uses: ./.github/actions/setup
+        with:
+          test-cache: ${{ matrix.shard }}
+      - name: Run unit tests
+        # Built-output checks run once in publint; the remaining tests import source files.
+        run: pnpm exec vitest run --exclude=tests/vitest/package-exports.test.ts --shard=${{ matrix.shard }}/4 --maxWorkers=100% --fsModuleCache --fsModuleCachePath=.cache/vitest
+
+  # Calibrate timing stability on main/manual runs before making this a PR or release gate.
+  performance:
+    name: Performance baselines
+    if: github.workflow == 'CI' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup
+        with:
+          test-cache: performance
+      - name: Run isolated performance baselines
+        env:
+          MATTERVIZ_PERF: '1'
+        run: pnpm exec vitest run tests/vitest/perf-baselines.test.ts --maxWorkers=1 --no-file-parallelism --fsModuleCache --fsModuleCachePath=.cache/vitest --reporter=verbose --silent=false
+
+  # Keep the required check name and fail if any shard fails or is cancelled/skipped.
+  unit-tests:
+    name: Unit tests
+    if: always()
+    needs: [unit-test-shards, publint]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require all unit test shards
+        env:
+          RESULT: ${{ needs.unit-test-shards.result == 'success' && needs.publint.result == 'success' && 'success' || 'failure' }}
+        run: test "$RESULT" = success
+
+  build-site:
+    name: Build browser test site
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup
+      - name: Build production site
+        run: pnpm exec vp build
+      - uses: actions/upload-artifact@v7
+        with:
+          name: browser-test-site
+          path: .svelte-kit/output/
+          include-hidden-files: true
+          retention-days: 1
+
+  e2e-source:
+    name: E2E source inspection
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup
+      - run: pnpm exec playwright install chromium --no-shell
+      # Linux headless WebGPU presents transparent canvases, including drawImage captures.
+      - run: xvfb-run -a pnpm exec playwright test --headed
+        env:
+          MATTERVIZ_E2E_MODE: source
+          DEBUG: pw:browser
+      - uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: playwright-traces-source
+          path: test-results/
+          retention-days: 7
+
+  e2e-test-shards:
+    name: E2E production (shard ${{ matrix.shard }}/6)
+    needs: build-site
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false # let every shard finish so we see all failures, not just the first
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6]
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v7
+      - name: Install dependencies
+        uses: ./.github/actions/setup
+      - name: Install Chromium
+        run: pnpm exec playwright install chromium --no-shell
+      - name: Install FFmpeg for movie export tests
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends ffmpeg
+      - uses: actions/download-artifact@v8
+        with:
+          name: browser-test-site
+          path: .svelte-kit/output/
+      - name: Run E2E tests
+        run: xvfb-run -a pnpm exec playwright test --headed --shard=${{ matrix.shard }}/6
+        env:
+          MATTERVIZ_E2E_MODE: preview
+          DEBUG: pw:browser
+      - name: Upload failure traces
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: playwright-traces-shard-${{ matrix.shard }}
+          path: test-results/
+          retention-days: 7
+
+  # These four names are required by the main ruleset. Each gates the complete matrix.
+  e2e-tests:
+    name: E2E tests (shard ${{ matrix.shard }}/4)
+    if: always()
+    needs: [e2e-test-shards, e2e-source]
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        shard: [1, 2, 3, 4]
+    steps:
+      - name: Require all E2E test shards
+        env:
+          RESULT: ${{ needs.e2e-test-shards.result == 'success' && needs.e2e-source.result == 'success' && 'success' || 'failure' }}
+        run: test "$RESULT" = success

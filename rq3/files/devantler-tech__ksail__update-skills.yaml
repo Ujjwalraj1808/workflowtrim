@@ -1,0 +1,33 @@
+name: Update Agent Skills
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 6 * * *" # Daily at 06:00 UTC
+
+concurrency:
+  group: "${{ github.workflow }}-${{ github.ref }}"
+  cancel-in-progress: false
+  # Keep a pending run instead of replacing it with a newer one.
+  queue: max
+
+permissions: {}
+
+jobs:
+  update-agent-skills:
+    permissions:
+      contents: write
+      pull-requests: write
+    uses: devantler-tech/actions/.github/workflows/update-agent-skills.yaml@1d726483facb9340655489913f609082677be8f5 # v13.10.6
+    with:
+      dir: .agents/skills
+      # These are development skills our own agents use, not skills KSail publishes. Marking
+      # them internal after every update keeps `npx skills add devantler-tech/ksail` offering
+      # only the ksail skill (#6221).
+      mark-internal: true
+      # Open the PR with a GitHub App token so the caller's `on: pull_request`
+      # CI runs (a PR opened with GITHUB_TOKEN does not trigger workflows, so
+      # the required `CI - Required Checks` never reports and the PR stays
+      # blocked — see #5223). Matches platform + plugins, the other consumers.
+      use-app-token: true
+    secrets:
+      APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}

@@ -1,0 +1,55 @@
+name: GDELT Sync
+
+# ──────────────────────────────────────────────────────────────
+# GDELT 2.0 GKG forward 일별 (Phase D). syncGdeltBackfill 를 forward 모드로 —
+# yesterday(완성된 UTC 일) 까지 N일 lookback upsert(직전 run 누락 자가복구) → newsGdelt HF push.
+# 5년 백필은 syncGdeltBackfill.py workflow_dispatch(start/end 범위) 로 별도 수행.
+#
+# concurrency group `hf-news-push` 로 News Archive Sync 와 직렬화(같은 repo news/ push, 412 회피).
+# cron 0 6 UTC = KST 15:00 — yesterday(UTC) 가 6시간 전 마감돼 완성. News 08:00 cron 보다 앞.
+# ──────────────────────────────────────────────────────────────
+
+on:
+  schedule:
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+    inputs:
+      lookback_days:
+        description: 'yesterday 까지 lookback 일수 (upsert)'
+        default: '2'
+        type: string
+      step_minutes:
+        description: 'GDELT 슬롯 간격 (15 전수 / 60 시간 / 360 6h / 1440 일)'
+        default: '360'
+        type: string
+
+permissions:
+  contents: read  # HF push 만(HF_TOKEN). 최소권한.
+
+jobs:
+  gdelt-forward:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    # job 레벨 concurrency 를 쓴다. 워크플로 레벨은 run 생성 즉시 큐를 점유하고, GitHub 은
+    # 그룹당 pending 을 1 개만 유지해 새 트리거가 오면 기존 pending 을 취소한다
+    # (cancel-in-progress 와 무관한 기본 동작). 2026-08 hf-dart-push 에서 대기 중이던 run
+    # 8 건이 job 0 개인 채 취소됐다. 같은 그룹을 2 개 이상이 공유하면 같은 위험을 진다.
+    concurrency:
+      group: hf-news-push
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+      - name: Set up Python
+        run: uv python install 3.12
+      - name: Install dependencies
+        run: uv sync
+      - name: Smoke import
+        run: uv run python -c "import dartlab; print('dartlab', getattr(dartlab, '__version__', 'dev'))"
+      - name: GDELT GKG forward (yesterday 까지 lookback upsert) + HF push
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          GDELT_LOOKBACK_DAYS: ${{ github.event.inputs.lookback_days || '2' }}
+          GDELT_STEP_MINUTES: ${{ github.event.inputs.step_minutes || '360' }}
+        run: uv run python -X utf8 -m dartlab.pipeline gdeltForward

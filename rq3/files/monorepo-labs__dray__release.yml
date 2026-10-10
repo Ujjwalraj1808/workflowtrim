@@ -1,0 +1,310 @@
+name: Release
+
+# A tag is the whole trigger, and its shape picks the channel: `v0.3.0` is
+# stable, `v0.3.0-beta.1` is beta. Semver's own prerelease rule is what makes
+# that work end to end — the updater compares versions, and `0.3.0-beta.1` is
+# older than `0.3.0`, so a beta user lands on the stable release when it ships.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  # Part of the cache key's environment, so it has to match warm-cache.yml.
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  # Apple stops notarizing whenever it updates the developer agreement until
+  # the Account Holder accepts it, and the build only finds out ~30 minutes in.
+  # Any notarytool call answers the same 403, so ask before building.
+  notary-check:
+    runs-on: macos-latest
+    steps:
+      - run: xcrun notarytool history --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID" >/dev/null
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+
+  build:
+    needs: notary-check
+    runs-on: macos-latest
+    outputs:
+      channel: ${{ steps.channel.outputs.channel }}
+      dmg: ${{ steps.mirror.outputs.dmg }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # The manifest's version is the app's, not the tag's — a tag that names a
+      # version the conf doesn't carry publishes a manifest no client considers
+      # newer, and the release silently reaches nobody. Fail loudly instead.
+      - run: |
+          V="$(jq -r .version apps/desktop/src-tauri/tauri.conf.json)"
+          if [ "v$V" != "${GITHUB_REF_NAME}" ]; then
+            echo "tag ${GITHUB_REF_NAME} does not match tauri.conf.json version v$V" >&2
+            exit 1
+          fi
+
+      - id: channel
+        run: |
+          if [[ "${GITHUB_REF_NAME}" == *-* ]]; then
+            echo "channel=beta" >> "$GITHUB_OUTPUT"
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "channel=stable" >> "$GITHUB_OUTPUT"
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # The release notes are read from CHANGELOG.md rather than written a
+      # second time here. GitHub appends its generated commit list underneath,
+      # so the hand-written part stays a summary and the file stays the source.
+      #
+      # A heading carries a date and a notify mark after the version, and
+      # media paths are relative to the file, so both are rewritten for GitHub.
+      - id: notes
+        run: |
+          V="$(jq -r .version apps/desktop/src-tauri/tauri.conf.json)"
+          BODY="$(awk -v want="## $V" '
+            $0 == want || index($0, want " ·") == 1 { found = 1; next }
+            found && /^## / { exit }
+            found { print }
+          ' apps/desktop/CHANGELOG.md)"
+          BODY="$(printf '%s\n' "$BODY" | sed 's#](changelog/#](https://www.drayhq.com/changelog/#g')"
+
+          # A stable release with no section would publish notes saying nothing,
+          # which is worth stopping for — same reason the version guard above
+          # is fatal. A prerelease is allowed to ship without one.
+          if [ -z "$(printf '%s' "$BODY" | tr -d '[:space:]')" ]; then
+            if [ "${{ steps.channel.outputs.channel }}" = "stable" ]; then
+              echo "apps/desktop/CHANGELOG.md has no '## $V' section" >&2
+              exit 1
+            fi
+            BODY=""
+          fi
+
+          {
+            echo "body<<CHANGELOG_EOF"
+            printf '%s\n' "$BODY"
+            echo "CHANGELOG_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      # Restores the cache warm-cache.yml wrote on `main`; see the action for
+      # why the two share it.
+      - uses: ./.github/actions/desktop-setup
+
+      # The helper apps are signed by cef-helpers.sh, which the cef overlay
+      # runs as `beforeBundleCommand` — after the CLI's own cargo build, before
+      # its bundler — with the same identity the bundler puts on the app around
+      # them. `bundle.macOS.files` copies and signs nothing, and codesign
+      # refuses an app whose nested bundles carry no signature. Their
+      # entitlements differ from the app's too — V8 in the renderer wants JIT —
+      # so a `--deep` sign would be the wrong shape even if the bundler offered
+      # one. The bundler imports the certificate only once it starts signing,
+      # which is after the hook, so it is imported here first.
+      #
+      # It used to run as its own step ahead of the action, with a cargo build
+      # of its own. See the script for why that compiled the tree twice.
+      - uses: apple-actions/import-codesign-certs@v3
+        with:
+          p12-file-base64: ${{ secrets.APPLE_CERTIFICATE }}
+          p12-password: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Signs the updater bundle. Separate from Apple's signature and not
+          # optional: without it the client refuses the download.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # Apple's, which is what stops macOS blocking the download outright.
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          # PostHog's write-only project key, read by `option_env!` at compile
+          # time. Unset is not fatal — the build ships with analytics inert,
+          # which is also what a local build does. `POSTHOG_HOST` is only needed
+          # if the project moves off US cloud; unset takes the default.
+          POSTHOG_KEY: ${{ secrets.POSTHOG_KEY }}
+          POSTHOG_HOST: ${{ vars.POSTHOG_HOST }}
+        with:
+          # The Tauri project no longer sits at the repo root.
+          projectPath: apps/desktop
+          tagName: ${{ github.ref_name }}
+          releaseName: ${{ github.ref_name }}
+          prerelease: ${{ steps.channel.outputs.prerelease }}
+          releaseBody: ${{ steps.notes.outputs.body }}
+          generateReleaseNotes: true
+          # One bundle for both architectures. The action expands the universal
+          # entry into per-arch keys in `latest.json`, so a client asking for
+          # `darwin-aarch64` finds it. `cef` turns the browser on, and the
+          # overlay config puts the helper apps in Contents/Frameworks.
+          args: --target universal-apple-darwin --features cef --config src-tauri/tauri.cef.conf.json
+
+      # The bundler *warns* and carries on when notarization credentials are
+      # missing or rejected — only an absent team id is fatal. So a release
+      # that quietly shipped unnotarized looks exactly like one that worked,
+      # until a user's Mac refuses to open it. `stapler validate` is what tells
+      # the two apart: it fails unless a ticket is actually attached.
+      - name: Verify the bundle is notarized
+        run: |
+          APP="apps/desktop/src-tauri/target/universal-apple-darwin/release/bundle/macos/$(jq -r .productName apps/desktop/src-tauri/tauri.conf.json).app"
+          xcrun stapler validate "$APP"
+          spctl --assess --verbose=2 --type exec "$APP"
+
+      # The browser's half of the same question. The helpers have to be
+      # there and signed with library validation off, or the downloaded
+      # framework is refused at load; and the framework itself must *not*
+      # be there, or the bundle just grew by 300MB and every update with it.
+      - name: Verify the browser helpers
+        run: |
+          APP="apps/desktop/src-tauri/target/universal-apple-darwin/release/bundle/macos/$(jq -r .productName apps/desktop/src-tauri/tauri.conf.json).app"
+          test ! -e "$APP/Contents/Frameworks/Chromium Embedded Framework.framework"
+          for h in "" " (GPU)" " (Renderer)" " (Plugin)" " (Alerts)"; do
+            HELPER="$APP/Contents/Frameworks/Dray Helper$h.app"
+            codesign --verify --strict "$HELPER"
+            codesign -d --entitlements - "$HELPER" 2>&1 | grep -q disable-library-validation
+          done
+          codesign -d --entitlements - "$APP" 2>&1 | grep -q disable-library-validation
+
+      # Downloads are served from R2, not the release: GitHub's asset CDN has
+      # had whole afternoons of a 42MB dmg taking 45 minutes. Versioned keys
+      # are immutable and back the updater manifest; the site's versionless
+      # dmg is moved by the manifest job, behind its semver guard. A missing
+      # secret fails the release rather than shipping a manifest whose URLs
+      # point at nothing.
+      - name: Mirror to R2
+        id: mirror
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          # R2 refuses the checksum headers newer CLIs send by default.
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_BUCKET: ${{ vars.R2_BUCKET }}
+        run: |
+          set -euo pipefail
+          : "${AWS_ACCESS_KEY_ID:?}" "${R2_ACCOUNT_ID:?}" "${R2_BUCKET:?}"
+          BUNDLE=apps/desktop/src-tauri/target/universal-apple-darwin/release/bundle
+          put() {
+            aws s3 cp "$1" "s3://${R2_BUCKET}/$2" \
+              --endpoint-url "https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com" \
+              --cache-control "public, max-age=31536000, immutable"
+          }
+          DMG="$(ls "$BUNDLE"/dmg/*.dmg)"
+          put "$DMG" "${GITHUB_REF_NAME}/$(basename "$DMG")"
+          # The bundler writes `Dray.app.tar.gz`; tauri-action renames it on
+          # upload, and the manifest names the renamed one.
+          put "$(ls "$BUNDLE"/macos/*.app.tar.gz)" "${GITHUB_REF_NAME}/Dray_universal.app.tar.gz"
+          echo "dmg=$(basename "$DMG")" >> "$GITHUB_OUTPUT"
+
+  # The manifests live on a branch rather than in the release, because
+  # `/releases/latest/` skips prereleases — so beta would have no fixed URL.
+  # GitHub Pages serves this branch; the artifact URLs inside are rewritten
+  # onto the R2 mirror the build job uploaded to.
+  manifest:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: updates
+          fetch-depth: 1
+
+      - env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DOWNLOADS_URL: ${{ vars.DOWNLOADS_URL }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_BUCKET: ${{ vars.R2_BUCKET }}
+          DMG: ${{ needs.build.outputs.dmg }}
+        run: |
+          set -euo pipefail
+          : "${DOWNLOADS_URL:?}" "${DMG:?}"
+          gh release download "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --pattern latest.json --output release.json --clobber
+
+          # The signature covers the bytes, not the URL, so moving the host
+          # changes nothing the client verifies.
+          jq --arg from "https://github.com/${GITHUB_REPOSITORY}/releases/download/" \
+             --arg to "${DOWNLOADS_URL%/}/" \
+             '.platforms |= map_values(.url |= sub($from; $to))' \
+             release.json > manifest.json
+          rm release.json
+          # A rewrite matching nothing is what a changed URL shape looks like.
+          if jq -e '[.platforms[].url] | any(startswith("https://github.com/"))' manifest.json >/dev/null; then
+            echo "manifest still points at GitHub" >&2
+            exit 1
+          fi
+
+          # Writes the release over a channel manifest unless that would move
+          # the channel *backwards*. A stable release still serves both
+          # channels — someone on beta should be offered the newer stable — but
+          # a beta line runs ahead of stable for its whole life, so a stable
+          # hotfix shipped while one is open must not clobber it: existing beta
+          # users would see nothing (the client never downgrades), and a fresh
+          # beta opt-in could never reach the beta at all. An equal version
+          # rewrites, so re-running a release republishes its own manifest; a
+          # missing or unreadable manifest is written, never an error.
+          #
+          # node-semver's own comparison, prerelease rules included — the one
+          # the updater plugin makes. Not `sort -V`, which puts 0.9.4-beta.2
+          # *above* 0.9.4. `-p` lets a prerelease satisfy the range. Installed
+          # up front so a registry failure fails the job rather than reading
+          # as "not newer" and overwriting.
+          npm install --global semver
+          NEW="$(jq -r .version manifest.json)"
+          promote() {
+            cur="$(jq -r '.version // empty' "$1" 2>/dev/null || true)"
+            if [ -n "$cur" ] && semver -p -r ">$NEW" "$cur" >/dev/null; then
+              echo "keeping $1 at $cur — $NEW is older"
+            else
+              cp manifest.json "$1"
+            fi
+          }
+
+          promote beta.json
+          if [ "${{ needs.build.outputs.channel }}" = "stable" ]; then
+            promote stable.json
+          fi
+          rm manifest.json
+
+          # Pages would otherwise run these through Jekyll.
+          touch .nojekyll
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          # A release that moved no manifest — a re-tag older than every
+          # channel — leaves nothing staged, and an empty commit would fail
+          # the job over a push that had nothing to say.
+          git diff --cached --quiet || {
+            git commit -m "release ${GITHUB_REF_NAME}"
+            git push
+          }
+
+          # The site's download button follows stable.json, so the same guard
+          # that keeps the manifest from moving backwards keeps it too — and
+          # only after the push landed, since a push lost to a concurrent
+          # release means this one did not win. A server-side copy of the key
+          # the build job uploaded; nothing is re-sent.
+          if [ "$(jq -r '.version // empty' stable.json 2>/dev/null)" = "$NEW" ]; then
+            aws s3 cp "s3://${R2_BUCKET}/${GITHUB_REF_NAME}/${DMG}" "s3://${R2_BUCKET}/Dray_universal.dmg" \
+              --endpoint-url "https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com" \
+              --metadata-directive REPLACE \
+              --content-type application/x-apple-diskimage \
+              --cache-control "public, max-age=300"
+          fi

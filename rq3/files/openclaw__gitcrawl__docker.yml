@@ -1,0 +1,27 @@
+name: docker
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Build image
+        run: docker build --pull -t gitcrawl:ci .
+
+      - name: Smoke test image
+        run: |
+          set -euo pipefail
+          docker run --rm gitcrawl:ci --version
+          docker run --rm gitcrawl:ci --help
+          docker run --rm gitcrawl:ci metadata --json | grep -q '"commands"'
+          docker run --rm --entrypoint git gitcrawl:ci --version

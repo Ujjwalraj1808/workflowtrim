@@ -1,0 +1,36 @@
+name: Submodule Check
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  check-submodule:
+    if: github.event.pull_request.draft == false
+    name: Check Submodule Up-to-Date
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: recursive
+    - name: Verify proto-tools points to latest main
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        PINNED=$(git ls-tree HEAD proto-tools | awk '{print $3}')
+        LATEST=$(gh api repos/evo-design/proto-tools/commits/main --jq '.sha')
+        echo "Pinned commit: $PINNED"
+        echo "Latest main:   $LATEST"
+        if [ "$PINNED" != "$LATEST" ]; then
+          STATUS=$(gh api "repos/evo-design/proto-tools/compare/$LATEST...$PINNED" --jq '.status')
+          if [ "$STATUS" != "ahead" ]; then
+            echo "::error::proto-tools submodule is neither latest main nor a descendant of latest main. Run 'git submodule update --remote' and commit the result."
+            exit 1
+          fi
+          echo "Submodule is ahead of latest main; treating as a stacked PR pin."
+        fi
+        echo "Submodule is up-to-date."

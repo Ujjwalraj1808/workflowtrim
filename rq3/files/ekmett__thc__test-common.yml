@@ -1,0 +1,115 @@
+# SPDX-FileCopyrightText: 2026 Edward Kmett
+# SPDX-License-Identifier: UPL-1.0 AND BSD-3-Clause
+
+name: Platform build and tests
+on:
+  workflow_call:
+    inputs:
+      os:
+        type: string
+        required: true
+      expected_sha:
+        type: string
+        required: true
+      cadence:
+        type: string
+        required: true
+    outputs:
+      matrix:
+        description: Scheduled test groups for this platform
+        value: ${{ jobs.compile.outputs.matrix }}
+permissions:
+  contents: read
+  actions: read
+jobs:
+  compile:
+    name: ${{ inputs.cadence == 'commit' && 'Build and test' || 'Compile shared tools' }} (${{ inputs.os }})
+    runs-on: ${{ inputs.os }}
+    timeout-minutes: ${{ inputs.cadence == 'commit' && 18 || 60 }}
+    outputs:
+      matrix: ${{ steps.inventory.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          submodules: false
+          fetch-depth: 32
+          persist-credentials: false
+      - name: Check dispatched revision before setup
+        env:
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+      - name: Stop commit builds when Hourly is failing
+        if: inputs.cadence == 'commit'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/hourly_health.py
+      - uses: ./.github/actions/setup
+        with:
+          cache-cabal-project: 'true'
+      - name: Verify source and complete fixture ownership
+        id: inventory
+        env:
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
+          CI_CADENCE: ${{ inputs.cadence }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+          matrix=$(python3 .github/scripts/fast_select.py --matrix --cadence "$CI_CADENCE")
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+      - name: Verify pinned toolchain
+        if: inputs.cadence == 'commit'
+        shell: bash
+        run: |
+          test "$(ghc --numeric-version)" = 9.14.1
+          test "$(ghc-pkg --version)" = 'GHC package manager version 9.14.1'
+          case "$(cabal --numeric-version)" in 3.16.*) ;; *) exit 1 ;; esac
+          java --version
+      - name: Compile and package the application
+        if: inputs.cadence != 'commit'
+        run: |
+          python3 .github/scripts/fast_ci.py start --report-dir build/ci/common-results
+          python3 .github/scripts/fast_ci.py compile-common --reuse-daemon --report-dir build/ci/common-results
+      - name: Compile shared test classes and fixture tools without running tests
+        if: inputs.cadence != 'commit'
+        run: python3 .github/scripts/fast_ci.py compile-test-support --reuse-daemon --report-dir build/ci/common-results
+      - name: Pack common compilation for scheduled groups
+        if: inputs.cadence != 'commit'
+        run: python3 .github/scripts/fast_ci.py pack-common --archive build/ci/common.tar.gz
+      - name: Build and check declared dependencies with Ninja
+        if: inputs.cadence == 'commit'
+        env:
+          FAST_BASE_SHA: ${{ github.event.before || '' }}
+          FAST_HEAD_SHA: ${{ github.sha }}
+        run: python3 .github/scripts/fast_ci.py commit-checks --report-dir build/ci/common-results
+      - name: Stop the job's Gradle worker
+        if: always() && env.JAVA_HOME != ''
+        run: ./gradlew --stop
+      - name: Preserve common compilation and commit test output
+        if: always()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: common-build-logs-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            build/ci/setup-results/
+            build/ci/common-results/
+            build/ci/group-results/
+            build/ci/check-results/
+            build/ci/graph/.ninja_log
+            build/reports/profile/
+            build/test-results/testDefault/
+            build/test-results/testDense/
+            build/reports/tests/testDefault/
+            build/reports/tests/testDense/
+          retention-days: 7
+      - name: Share only this platform's common compile outputs
+        if: inputs.cadence != 'commit'
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: common-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: build/ci/common.tar.gz
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 7

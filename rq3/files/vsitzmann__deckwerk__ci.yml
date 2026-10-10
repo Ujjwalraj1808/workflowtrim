@@ -1,0 +1,79 @@
+# Per-push gate: deterministic checks block merges; real Electron suites still
+# run and report regressions without making runner-load/input-driver flakes the
+# repository's required status check.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Keep this job id stable: branch protection requires the `test` context.
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Unit tests
+        run: npm run test:unit
+
+  # These jobs launch real Electron under Xvfb. They are valuable integration
+  # signals, but the input, focus, IME, clipboard, and compositor paths are not
+  # deterministic enough on shared Linux runners to block every merge.
+  browser:
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install system dependencies (Electron + ffmpeg)
+        uses: ./.github/actions/electron-system-deps
+      - run: npm ci
+      - name: Configure Electron's SUID sandbox helper
+        run: |
+          sudo chown root:root node_modules/electron/dist/chrome-sandbox
+          sudo chmod 4755 node_modules/electron/dist/chrome-sandbox
+      - name: Browser tests (advisory)
+        env:
+          # Bare Xvfb has no compositor. Pixel-capture suites use this to skip
+          # instead of waiting forever for a frame that cannot be produced.
+          CI_NO_WINDOW_MANAGER: "1"
+        run: xvfb-run -a --server-args="-screen 0 2560x1440x24" npm run test:browser
+
+  serial:
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install system dependencies (Electron + ffmpeg)
+        uses: ./.github/actions/electron-system-deps
+      - run: npm ci
+      - name: Configure Electron's SUID sandbox helper
+        run: |
+          sudo chown root:root node_modules/electron/dist/chrome-sandbox
+          sudo chmod 4755 node_modules/electron/dist/chrome-sandbox
+      - name: Serial tests (advisory)
+        env:
+          CI_NO_WINDOW_MANAGER: "1"
+        run: xvfb-run -a --server-args="-screen 0 2560x1440x24" npm run test:serial

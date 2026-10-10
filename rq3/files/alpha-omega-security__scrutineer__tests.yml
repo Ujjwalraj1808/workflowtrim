@@ -1,0 +1,264 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+defaults:
+  run:
+    shell: bash -euo pipefail {0}
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  release-logic:
+    name: release logic
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Set up Git repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Test release resolver
+        run: scripts/release-resolver_test.sh
+
+      - name: Test runner image resolver
+        run: scripts/wait-for-runner-image_test.sh
+
+      - name: Test build-command retries
+        run: scripts/retry-build-command_test.sh
+
+      - name: Test runner CLI version pins
+        run: scripts/check-runner-cli-version-pins_test.sh
+
+  tests:
+    name: tests (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: ["ubuntu-24.04", "macos-26", "windows-latest"]
+    runs-on: ${{ matrix.platform }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      # Git for Windows refuses paths past 260 characters unless core.longpaths
+      # is on; the per-scan cache paths the worker tests build under TempDir go
+      # well past that.
+      - name: Configure Git for Windows
+        if: runner.os == 'Windows'
+        run: git config --global core.longpaths true
+
+      - name: Set up Git repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      # Restore on every run, but save only on pushes to main (see the save step
+      # below). A pull request reuses main's cache without writing a branch-scoped
+      # entry that no other ref can restore and that evicts the shared cache.
+      - name: Restore Go caches
+        id: go-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          # ~/.cache/go-build is Go's build cache on Linux, ~/Library/Caches/go-build
+          # its macOS equivalent and ~/AppData/Local/go-build the Windows one. Paths
+          # that don't exist on a platform are skipped.
+          path: |
+            ~/.cache/go-build
+            ~/Library/Caches/go-build
+            ~/AppData/Local/go-build
+            ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ github.job }}-${{ hashFiles('go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-${{ github.job }}-
+
+      - name: Verify Go modules are tidy
+        run: go mod tidy -diff
+
+      - name: Vet
+        run: go vet ./...
+
+      # modernc.org/sqlite is machine-transpiled C and does unsafe.Pointer
+      # arithmetic on every VDBE step; -race enables checkptr, and validating
+      # those conversions dominates the DB-heavy packages' runtime. Disabling
+      # checkptr for that tree keeps TSAN's data-race detection while dropping
+      # the per-op pointer validation the transpiler already guarantees.
+      - name: Test
+        run: go test -race -gcflags='modernc.org/...=-d=checkptr=0' ./...
+
+      # The deterministic eval harness is behind //go:build evals. Live model
+      # runs remain disabled unless SCRUTINEER_RUN_EVALS is explicitly set.
+      - name: Vet skill eval harness
+        run: go vet -tags evals ./internal/evals/...
+
+      - name: Test skill eval harness
+        run: go test -race -tags evals ./internal/evals/...
+
+      # The podman integration tests are behind //go:build podman and are not
+      # built by the steps above; vet them under the tag so they can't silently
+      # rot (podman itself is not needed -- the tests skip at run time without it).
+      - name: Vet podman integration tests
+        run: go vet -tags podman ./...
+
+      # The release artifact for Windows is cross-compiled on Linux, so this is
+      # the only leg that runs scrutineer.exe on a Windows host at all.
+      - name: Smoke-test the Windows binary
+        if: runner.os == 'Windows'
+        run: |
+          go build -o "${RUNNER_TEMP}/scrutineer.exe" ./cmd/scrutineer
+          "${RUNNER_TEMP}/scrutineer.exe" --version | grep -F 'scrutineer '
+
+      - name: Save Go caches
+        if: github.event_name == 'push' && steps.go-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/Library/Caches/go-build
+            ~/AppData/Local/go-build
+            ~/go/pkg/mod
+          key: ${{ steps.go-cache.outputs.cache-primary-key }}
+
+  lint:
+    name: lint
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Set up Git repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Restore Go caches
+        id: go-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ github.job }}-${{ hashFiles('go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-${{ github.job }}-
+
+      - name: Run golangci-lint
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+
+      - name: Save Go caches
+        if: github.event_name == 'push' && steps.go-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: ${{ steps.go-cache.outputs.cache-primary-key }}
+
+  vuln:
+    name: vuln
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Set up Git repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Restore Go caches
+        id: go-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ github.job }}-${{ hashFiles('go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-${{ github.job }}-
+
+      - name: Install govulncheck
+        run: sh scripts/retry-build-command.sh go install golang.org/x/vuln/cmd/govulncheck@v1.8.0
+
+      - name: Scan for known vulnerabilities
+        run: govulncheck ./...
+
+      - name: Save Go caches
+        if: github.event_name == 'push' && steps.go-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: ${{ steps.go-cache.outputs.cache-primary-key }}
+
+  zizmor:
+    name: zizmor
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Set up Git repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install zizmor
+        run: pipx install zizmor==1.30.1
+
+      - name: Audit GitHub Actions
+        run: zizmor --persona auditor .github/
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  conclusion:
+    name: conclusion
+    needs: [release-logic, tests, lint, vuln, zizmor]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-slim
+    timeout-minutes: 15
+    permissions: {}
+    steps:
+      - name: Result
+        env:
+          RELEASE_LOGIC_RESULT: ${{ needs.release-logic.result }}
+          TESTS_RESULT: ${{ needs.tests.result }}
+          LINT_RESULT: ${{ needs.lint.result }}
+          VULN_RESULT: ${{ needs.vuln.result }}
+          ZIZMOR_RESULT: ${{ needs.zizmor.result }}
+        run: |
+          [[ "${RELEASE_LOGIC_RESULT}" == success ]]
+          [[ "${TESTS_RESULT}" == success ]]
+          [[ "${LINT_RESULT}" == success ]]
+          [[ "${VULN_RESULT}" == success ]]
+          [[ "${ZIZMOR_RESULT}" == success ]]

@@ -1,0 +1,71 @@
+name: Run Feeds
+
+on:
+  schedule:
+    - cron: "0 * * * *"
+  workflow_dispatch:
+    inputs:
+      feed:
+        description: "Optional registry name to verify one feed"
+        required: false
+        type: string
+
+concurrency:
+  group: request-feeds
+  cancel-in-progress: true
+
+jobs:
+  run-feeds:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.0.1
+        with:
+          enable-cache: true
+
+      - name: Install dependencies and run feeds
+        id: generate
+        timeout-minutes: 20
+        env:
+          FEED: ${{ inputs.feed }}
+        run: |
+          set -e
+          uv sync
+          if [ -n "$FEED" ]; then
+            uv run feed_generators/run_all_feeds.py --feed "$FEED"
+          else
+            uv run feed_generators/run_all_feeds.py --skip-selenium
+          fi
+
+      - name: Commit and push feeds
+        if: ${{ !cancelled() && github.ref == 'refs/heads/main' && (steps.generate.outcome == 'success' || steps.generate.outcome == 'failure') }}
+        run: |
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+          uv run feed_generators/validate_feeds.py
+          git add feeds/*.xml
+          if git diff --staged --quiet; then
+            echo "No validated feed updates to publish"
+            exit 0
+          fi
+          git stash
+          git pull --rebase || { echo "Rebase failed, aborting and retrying with merge"; git rebase --abort 2>/dev/null; git pull; }
+          git stash pop
+          uv run feed_generators/validate_feeds.py
+          git add feeds/*.xml
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m 'Update RSS feeds'
+            git push || { git pull --rebase && git push; }
+          fi

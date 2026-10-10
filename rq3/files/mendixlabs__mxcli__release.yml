@@ -1,0 +1,39 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.2'
+      - uses: oven-sh/setup-bun@v2
+      - name: Cache ANTLR4 JAR
+        uses: actions/cache@v6
+        with:
+          path: ~/.m2/repository/org/antlr/antlr4
+          key: antlr4-4.13.2
+      - name: Install ANTLR4
+        run: pip install 'antlr4-tools==0.2.2'
+      - name: Generate parser
+        run: make grammar
+        env:
+          ANTLR4_TOOLS_ANTLR_VERSION: '4.13.2'
+      - name: Build release binaries
+        run: make release
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          generate_release_notes: true
+          files: bin/mxcli-*

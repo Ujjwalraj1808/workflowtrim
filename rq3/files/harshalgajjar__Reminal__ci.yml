@@ -1,0 +1,64 @@
+# Nothing ran the tests before this. Pushing to main ran nothing, and tagging a
+# release built and published without them — so a change that compiled but broke
+# a test shipped, and the first sign of it was somebody using the thing.
+#
+# Deliberately NOT wired into the release yet. It has never run, and a release
+# blocked by an untested gate is worse than a release that is merely untested.
+# Once this has been green over a few pushes, adding `needs: test` to the
+# release job is the point of having it.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: true
+
+      - name: Formatting
+        run: |
+          unformatted="$(gofmt -l ./cmd ./internal)"
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt would change these files:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test ./...
+
+      # The window mirror carries state shared between the capture loop, the
+      # daemon's per-connection goroutines and a geometry probe, so races here
+      # are the kind that surface as a frozen picture rather than a crash.
+      - name: Test with the race detector
+        run: go test -race ./...
+
+  # Releases build one platform per job, so a break on a platform this machine
+  # is not gets found at tag time, when the fix costs a re-tag. Compile them all
+  # on every push instead.
+  crosscompile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: true
+      - name: Build every release target
+        run: |
+          set -e
+          for pair in darwin/arm64 darwin/amd64 linux/amd64 linux/arm64 windows/amd64 windows/arm64; do
+            echo "  building ${pair}"
+            GOOS="${pair%/*}" GOARCH="${pair#*/}" go build ./...
+          done

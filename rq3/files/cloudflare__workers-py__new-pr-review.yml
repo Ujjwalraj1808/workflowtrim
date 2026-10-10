@@ -1,0 +1,60 @@
+name: New PR Review
+
+on:
+  pull_request:
+    types: [opened]
+
+jobs:
+  review:
+    if: github.event.pull_request.head.repo.full_name == github.event.pull_request.base.repo.full_name
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+      cancel-in-progress: false
+    permissions:
+      id-token: write
+      contents: read
+      issues: write
+      pull-requests: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 30 # Fetch some history; not all of it
+
+      - name: Load review prompt
+        id: prompt
+        run: |
+          {
+            echo 'value<<EOF'
+            echo "You are reviewing PR #${{ github.event.pull_request.number }} on ${{ github.repository }}."
+            echo ""
+            cat .github/bonk_reviewer.md
+            echo EOF
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Run Bonk
+        uses: Cloudflare-Studio/ask-bonk/github@main
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CF_AI_GATEWAY_ACCOUNT_ID }}
+          CLOUDFLARE_GATEWAY_ID: ${{ secrets.CF_AI_GATEWAY_NAME }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_AI_GATEWAY_TOKEN }}
+          # Paths outside the checkout are denied, not prompted: nobody can answer a prompt in CI.
+          OPENCODE_CONFIG_CONTENT: '{"permission":{"external_directory":{"*":"deny","/home/runner/work/**":"allow"},"question":"deny","doom_loop":"deny"}}'
+        with:
+          # Stop Bonk before the job's timeout-minutes so it can report the outcome itself.
+          timeout: '25m'
+          oidc_base_url: https://ask-bonk.cloudflare-exponent.workers.dev/auth
+          model: 'cloudflare-ai-gateway/openai/gpt-5.6-terra'
+          forks: 'false'
+          variant: 'high'
+          permissions: write
+          opencode_dev: true
+          opencode_version: "latest"
+          # The auto-reviewer must never push to PR branches. Its prompt
+          # (bonk_reviewer.md) already forbids git write ops, but NO_PUSH
+          # enforces that at the token level so it holds even if the model
+          # ignores the instruction.
+          token_permissions: 'NO_PUSH'
+          prompt: ${{ steps.prompt.outputs.value }}

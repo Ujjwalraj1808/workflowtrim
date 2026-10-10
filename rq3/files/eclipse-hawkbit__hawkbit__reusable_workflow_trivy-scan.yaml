@@ -1,0 +1,180 @@
+name: Trivy Scan (Reusable Workflow)
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: 'The branch, tag or SHA to checkout, e.g. master'
+        type: string
+        default: 'master'
+      upload:
+        description: 'If to upload the scan results, e.g. true or false'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  # needed for trivy scans upload
+  security-events: write
+
+jobs:
+  trivy-scan:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Get checked-out SHA
+        id: get-sha
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Derive branch ref for SARIF upload
+        id: upload-ref
+        run: |
+          R="${{ inputs.ref }}"
+          R="${R#refs/heads/}"                              # strip refs/heads/ if present
+          R="${R#refs/tags/}"                               # strip refs/tags/ if present
+          if [[ "$R" =~ ^([0-9]+\.[0-9]+)\.[0-9]+(-.+)?$ ]]; then
+            BRANCH="${BASH_REMATCH[1]}"                     # 1.1.0 -> 1.1, 2.0.0-M1 -> 2.0
+          else
+            BRANCH="$R"                                     # master, 1.0, 1.1 pass through
+          fi
+          echo "ref=refs/heads/$BRANCH" >> "$GITHUB_OUTPUT"
+
+      - name: Set up JDK
+        uses: actions/setup-java@v6.0.1
+        with:
+          distribution: "temurin"
+          java-version: 21
+          cache: "maven"
+
+      - name: Create hawkBit container images
+        run: |
+          mvn clean install -DskipTests -DskipJavadoc && \
+          cd docker/build && \
+          chmod +x build_dev.sh && \
+          ./build_dev.sh && \
+          cd ../../..
+
+      - name: Create scan output directory
+        run: mkdir -p scans
+
+      - name: Scan hawkbit-ddi-server
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: 'hawkbit/hawkbit-ddi-server:latest'
+          ignore-unfixed: true
+          trivyignores: .github/workflows/.trivyignore
+          severity: 'HIGH,CRITICAL'
+          vuln-type: 'library'
+          format: 'sarif'
+          output: 'scans/hawkbit-ddi-server.sarif'
+
+      - name: Scan hawkbit-dmf-server
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: 'hawkbit/hawkbit-dmf-server:latest'
+          ignore-unfixed: true
+          trivyignores: .github/workflows/.trivyignore
+          severity: 'HIGH,CRITICAL'
+          vuln-type: 'library'
+          format: 'sarif'
+          output: 'scans/hawkbit-dmf-server.sarif'
+
+      - name: Scan hawkbit-mgmt-server
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: 'hawkbit/hawkbit-mgmt-server:latest'
+          ignore-unfixed: true
+          trivyignores: .github/workflows/.trivyignore
+          severity: 'HIGH,CRITICAL'
+          vuln-type: 'library'
+          format: 'sarif'
+          output: 'scans/hawkbit-mgmt-server.sarif'
+
+      - name: Scan hawkbit-ui
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: 'hawkbit/hawkbit-ui:latest'
+          ignore-unfixed: true
+          trivyignores: .github/workflows/.trivyignore
+          severity: 'HIGH,CRITICAL'
+          vuln-type: 'library'
+          format: 'sarif'
+          output: 'scans/hawkbit-ui.sarif'
+
+      - name: Scan hawkbit-update-server
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: 'hawkbit/hawkbit-update-server:latest'
+          ignore-unfixed: true
+          trivyignores: .github/workflows/.trivyignore
+          severity: 'HIGH,CRITICAL'
+          vuln-type: 'library'
+          format: 'sarif'
+          output: 'scans/hawkbit-update-server.sarif'
+
+      - name: Scan hawkbit-repository-jpa-init
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: 'hawkbit/hawkbit-repository-jpa-init:latest'
+          ignore-unfixed: true
+          trivyignores: .github/workflows/.trivyignore
+          severity: 'HIGH,CRITICAL'
+          vuln-type: 'library'
+          format: 'sarif'
+          output: 'scans/hawkbit-repository-jpa-init.sarif'
+
+      - name: Upload Docker image scan results to GitHub Security tab hawkbit-ddi-server
+        if: ${{ inputs.upload }}
+        uses: github/codeql-action/upload-sarif@v4.38.2
+        with:
+          ref: ${{ steps.upload-ref.outputs.ref }}
+          sha: ${{ steps.get-sha.outputs.sha }}
+          sarif_file: 'scans/hawkbit-ddi-server.sarif'
+          category: "Container Images (hawkbit-ddi-server) [${{ inputs.ref }}]"
+      - name: Upload Docker image scan results to GitHub Security tab hawkbit-dmf-server
+        if: ${{ inputs.upload }}
+        uses: github/codeql-action/upload-sarif@v4.38.2
+        with:
+          ref: ${{ steps.upload-ref.outputs.ref }}
+          sha: ${{ steps.get-sha.outputs.sha }}
+          sarif_file: 'scans/hawkbit-dmf-server.sarif'
+          category: "Container Images (hawkbit-dmf-server) [${{ inputs.ref }}]"
+      - name: Upload Docker image scan results to GitHub Security tab hawkbit-mgmt-server
+        if: ${{ inputs.upload }}
+        uses: github/codeql-action/upload-sarif@v4.38.2
+        with:
+          ref: ${{ steps.upload-ref.outputs.ref }}
+          sha: ${{ steps.get-sha.outputs.sha }}
+          sarif_file: 'scans/hawkbit-mgmt-server.sarif'
+          category: "Container Images (hawkbit-mgmt-server) [${{ inputs.ref }}]"
+      - name: Upload Docker image scan results to GitHub Security tab hawkbit-ui
+        if: ${{ inputs.upload }}
+        uses: github/codeql-action/upload-sarif@v4.38.2
+        with:
+          ref: ${{ steps.upload-ref.outputs.ref }}
+          sha: ${{ steps.get-sha.outputs.sha }}
+          sarif_file: 'scans/hawkbit-ui.sarif'
+          category: "Container Images (hawkbit-ui) [${{ inputs.ref }}]"
+
+      - name: Upload Docker image scan results to GitHub Security tab hawkbit-update-server
+        if: ${{ inputs.upload }}
+        uses: github/codeql-action/upload-sarif@v4.38.2
+        with:
+          ref: ${{ steps.upload-ref.outputs.ref }}
+          sha: ${{ steps.get-sha.outputs.sha }}
+          sarif_file: 'scans/hawkbit-update-server.sarif'
+          category: "Container Images (hawkbit-update-server) [${{ inputs.ref }}]"
+
+      - name: Upload Docker image scan results to GitHub Security tab hawkbit-repository-jpa-init
+        if: ${{ inputs.upload }}
+        uses: github/codeql-action/upload-sarif@v4.38.2
+        with:
+          ref: ${{ steps.upload-ref.outputs.ref }}
+          sha: ${{ steps.get-sha.outputs.sha }}
+          sarif_file: 'scans/hawkbit-repository-jpa-init.sarif'
+          category: "Container Images (hawkbit-repository-jpa-init) [${{ inputs.ref }}]"

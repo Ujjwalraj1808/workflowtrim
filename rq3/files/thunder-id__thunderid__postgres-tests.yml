@@ -1,0 +1,202 @@
+# This workflow runs PostgreSQL integration tests
+# Triggers:
+#   - On demand (workflow_dispatch)
+#   - Daily at 12 AM Local Time(SL)
+#   - During release (when release workflow completes)
+
+name: 🐘 PostgreSQL Integration Tests
+
+on:
+  workflow_dispatch:
+    inputs:
+      distribution-url:
+        description: 'URL to download Distribution (optional, will build if not provided)'
+        required: false
+        type: string
+      version:
+        description: 'Version to test (optional, defaults to latest)'
+        required: false
+        type: string
+  schedule:
+    # Run daily at 12 AM Local Time(SL)
+    - cron: '30 18 * * *'
+  workflow_run:
+    workflows: ["🚀 Release Builder"]
+    types: [completed]
+    branches: [main]
+
+env:
+  GOFLAGS: "-mod=readonly"
+  PRODUCT_NAME: "ThunderID"
+  PRODUCT_NAME_LOWER: "thunderid"
+
+jobs:
+  build-if-needed:
+    name: 🔨 Build Distribution (if needed)
+    runs-on: ubuntu-latest
+    if: ${{ github.event.inputs.distribution-url == '' || github.event.inputs.distribution-url == null }}
+    outputs:
+      distribution-path: ${{ steps.build.outputs.distribution-path }}
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: ⚙️ Set up Go Environment
+        uses: ./.github/actions/setup-go
+
+      - name: 📦 Install Dependencies
+        run: |
+          cd backend
+          go mod download
+          cd ../tests/integration
+          go mod download
+
+      - name: 🏷️ Set Version (if provided)
+        if: ${{ github.event.inputs.version != '' && github.event.inputs.version != null }}
+        run: |
+          VERSION="${{ github.event.inputs.version }}"
+          echo "$VERSION" > version.txt
+          echo "Set version to: $VERSION"
+
+      - name: 🧹 Clean Previous Builds
+        run: make clean
+
+      - name: 🔨 Build Product with Coverage
+        id: build
+        run: |
+          set -e
+          make build_with_coverage_only OS=$(go env GOOS) ARCH=$(go env GOARCH)
+          
+          # Find the built distribution
+          DIST_PATH=$(find target/dist -name "$PRODUCT_NAME_LOWER-*.zip" | head -1)
+          echo "distribution-path=$DIST_PATH" >> $GITHUB_OUTPUT
+          echo "Built distribution: $DIST_PATH"
+
+      - name: 📦 Upload Built Distribution
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: product-distribution
+          path: target/dist/*.zip
+          if-no-files-found: error
+
+  download-distribution:
+    name: 📥 Download Distribution
+    runs-on: ubuntu-latest
+    if: ${{ github.event.inputs.distribution-url != '' && github.event.inputs.distribution-url != null }}
+    outputs:
+      distribution-path: ${{ steps.download.outputs.distribution-path }}
+    steps:
+      - name: 📥 Download Distribution
+        id: download
+        run: |
+          DIST_URL="${{ github.event.inputs.distribution-url }}"
+          DIST_FILENAME="product-distribution.zip"
+          
+          echo "Downloading distribution from: $DIST_URL"
+          curl -L -o "$DIST_FILENAME" "$DIST_URL"
+          
+          # Verify the download
+          if [ ! -f "$DIST_FILENAME" ]; then
+            echo "❌ Failed to download distribution"
+            exit 1
+          fi
+          
+          echo "✅ Distribution downloaded successfully"
+          echo "distribution-path=$DIST_FILENAME" >> $GITHUB_OUTPUT
+
+  test-postgres:
+    name: 🧪 PostgreSQL Integration Tests
+    runs-on: ubuntu-latest
+    needs: [build-if-needed, download-distribution]
+    if: always() && (needs.build-if-needed.result == 'success' || needs.download-distribution.result == 'success')
+    services:
+      postgres:
+        image: postgres:latest
+        env:
+          POSTGRES_USER: dbuser
+          POSTGRES_PASSWORD: dbpassword
+          POSTGRES_DB: postgredb
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: ⚙️ Set up Go Environment
+        uses: ./.github/actions/setup-go
+
+      - name: 📥 Download Built Distribution
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: product-distribution
+          path: target/dist/
+
+      - name: 📦 Install Dependencies
+        run: |
+          cd backend
+          go mod download
+          cd ../tests/integration
+          go mod download
+
+      - name: 📝 Configure Test Database
+        run: |
+          chmod +x tests/integration/resources/scripts/setup-test-config.sh
+          ./tests/integration/resources/scripts/setup-test-config.sh
+        env:
+          DB_TYPE: postgres
+
+      - name: 🧪 Run PostgreSQL Integration Tests
+        uses: ./.github/actions/run-integration-tests
+        with:
+          database-type: postgres
+          coverage-enabled: true
+
+      - name: 📊 Upload Coverage Report
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: postgres-coverage-report
+          path: |
+            target/coverage_integration_postgres.out
+            target/coverage_integration_postgres.html
+          if-no-files-found: ignore
+
+  notify-results:
+    name: 📢 Notify Test Results
+    runs-on: ubuntu-latest
+    needs: [test-postgres]
+    if: always()
+    steps:
+      - name: 📢 Notify Success
+        if: needs.test-postgres.result == 'success'
+        run: |
+          echo "✅ PostgreSQL integration tests completed successfully!"
+          echo "Triggered by: ${{ github.event_name }}"
+          if [ "${{ github.event_name }}" == "schedule" ]; then
+            echo "📅 Daily PostgreSQL test run completed"
+          elif [ "${{ github.event_name }}" == "workflow_run" ]; then
+            echo "🚀 PostgreSQL tests completed after release"
+          else
+            echo "🔧 Manual PostgreSQL test run completed"
+          fi
+
+      - name: 📢 Notify Failure
+        if: needs.test-postgres.result == 'failure'
+        run: |
+          echo "❌ PostgreSQL integration tests failed!"
+          echo "Triggered by: ${{ github.event_name }}"
+          if [ "${{ github.event_name }}" == "schedule" ]; then
+            echo "📅 Daily PostgreSQL test run failed"
+          elif [ "${{ github.event_name }}" == "workflow_run" ]; then
+            echo "🚀 PostgreSQL tests failed after release"
+          else
+            echo "🔧 Manual PostgreSQL test run failed"
+          fi
+          exit 1

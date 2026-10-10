@@ -1,0 +1,54 @@
+name: Release Check
+
+on:
+  push:
+    branches:
+      - 'release/**'
+      - 'hotfix/**'
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  JAVA_DIST: 'temurin'
+  JAVA_VERSION: 26
+
+permissions:
+  contents: read
+
+jobs:
+  check-preconditions:
+    name: Validate commits pushed to release/hotfix branch to fulfill release requirements
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Setup Java
+        uses: actions/setup-java@ad2b38190b15e4d6bdf0c97fb4fca8412226d287 # v5.3.0
+        with:
+          distribution: ${{ env.JAVA_DIST }}
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: 'maven'
+      - id: validate-pom-version
+        name: Validate POM version
+        run: |
+          if [[ $GITHUB_REF =~ refs/heads/(hotfix|release)/[0-9]+\.[0-9]+\.[0-9]+.* ]]; then
+            SEM_VER_STR=${GITHUB_REF##*/}
+          else
+            echo "Failed to parse version"
+            exit 1
+          fi
+
+          if [[ ${SEM_VER_STR} == `./mvnw help:evaluate -Dexpression=project.version -q -DforceStdout` ]]; then
+            echo "semVerStr=${SEM_VER_STR}" >> $GITHUB_OUTPUT
+          else
+            echo "Version not set in POM"
+            exit 1
+          fi
+      - name: Validate release in org.cryptomator.Cryptomator.metainfo.xml file
+        if: ${{ ! (contains(github.event.head_commit.message, '[skip metadata check]') || contains(github.event.head_commit.message, '[metadata check skip]')) }}
+        run: |
+          if ! grep -q "<release date=\".*\" version=\"${{ steps.validate-pom-version.outputs.semVerStr }}\">" dist/linux/common/org.cryptomator.Cryptomator.metainfo.xml; then
+            echo "Release not set in dist/linux/common/org.cryptomator.Cryptomator.metainfo.xml"
+            exit 1
+          fi

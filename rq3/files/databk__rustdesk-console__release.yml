@@ -1,0 +1,193 @@
+name: Release
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.changelog.outputs.version }}
+      skipped: ${{ steps.changelog.outputs.skipped }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version-file: '.nvmrc'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run linter
+        run: npm run lint
+
+      - name: Build application
+        run: npm run build
+
+      - name: Generate App Token
+        uses: actions/create-github-app-token@v3
+        id: app-token
+        with:
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+
+      - name: Get GitHub App User ID
+        id: get-user-id
+        run: echo "user-id=$(gh api '/users/${{ steps.app-token.outputs.app-slug }}[bot]' --jq .id)" >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+
+      - name: Generate changelog
+        uses: TriPSs/conventional-changelog-action@v6
+        id: changelog
+        with:
+          github-token: ${{ steps.app-token.outputs.token }}
+          git-user-name: '${{ steps.app-token.outputs.app-slug }}[bot]'
+          git-user-email: '${{ steps.get-user-id.outputs.user-id }}+${{ steps.app-token.outputs.app-slug }}[bot]@users.noreply.github.com'
+          tag-prefix: ''
+          version-file: './package.json,./package-lock.json'
+
+      - name: Build and push Docker images
+        if: ${{ steps.changelog.outputs.skipped == 'false' }}
+        run: |
+          VERSION=${{ steps.changelog.outputs.version }}
+          MAJOR=$(echo $VERSION | cut -d. -f1)
+          MINOR=$(echo $VERSION | cut -d. -f2)
+          MAJOR_MINOR="${MAJOR}.${MINOR}"
+          
+          docker buildx create --use
+          
+          # Login to Docker Hub
+          echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login -u "${{ secrets.DOCKERHUB_USERNAME }}" --password-stdin
+          
+          # Login to GitHub Container Registry
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+          
+          # Build and push to Docker Hub and GitHub Container Registry
+          docker buildx build --push \
+            --platform linux/amd64,linux/arm64 \
+            --build-arg APP_VERSION=$VERSION \
+            --tag databk/rustdesk-console:latest \
+            --tag databk/rustdesk-console:$VERSION \
+            --tag databk/rustdesk-console:$MAJOR_MINOR \
+            --tag databk/rustdesk-console:$MAJOR \
+            --tag ghcr.io/databk/rustdesk-console:latest \
+            --tag ghcr.io/databk/rustdesk-console:$VERSION \
+            --tag ghcr.io/databk/rustdesk-console:$MAJOR_MINOR \
+            --tag ghcr.io/databk/rustdesk-console:$MAJOR \
+            --cache-from type=gha \
+            --cache-to type=gha,mode=max \
+            .
+
+      - name: Create GitHub Release
+        if: ${{ steps.changelog.outputs.skipped == 'false' }}
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ steps.changelog.outputs.version }}
+          name: ${{ steps.changelog.outputs.version }}
+          body: ${{ steps.changelog.outputs.clean_changelog }}
+          draft: false
+          prerelease: false
+
+  sea-build:
+    name: Build SEA (${{ matrix.target }})
+    needs: release
+    if: ${{ needs.release.outputs.skipped == 'false' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x64
+            os: ubuntu-latest
+          - target: linux-arm64
+            os: ubuntu-24.04-arm
+          - target: win-x64
+            os: windows-latest
+          - target: macos-x64
+            os: macos-26-intel
+          - target: macos-arm64
+            os: macos-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.release.outputs.version }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version-file: '.nvmrc'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build SEA executable
+        run: npm run build:sea
+
+      - name: Create archive (tar.gz)
+        if: runner.os != 'Windows'
+        run: |
+          cd dist-sea
+          tar czf ../rustdesk-console-${{ matrix.target }}.tar.gz .
+
+      - name: Create archive (zip)
+        if: runner.os == 'Windows'
+        run: Compress-Archive -Path dist-sea/* -DestinationPath rustdesk-console-${{ matrix.target }}.zip
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ needs.release.outputs.version }}
+          files: |
+            rustdesk-console-${{ matrix.target }}.tar.gz
+            rustdesk-console-${{ matrix.target }}.zip
+          fail_on_unmatched_files: false
+
+  sea-build-musl:
+    name: Build SEA (${{ matrix.target }})
+    needs: release
+    if: ${{ needs.release.outputs.skipped == 'false' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x64-musl
+            os: ubuntu-latest
+          - target: linux-arm64-musl
+            os: ubuntu-24.04-arm
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.release.outputs.version }}
+
+      - name: Build SEA in Alpine container
+        run: |
+          docker run --rm \
+            -v "$PWD":/workspace \
+            -w /workspace \
+            node:24-alpine \
+            sh -c 'apk add --no-cache python3 make g++ bash tar && npm ci && npm run build:sea && cd dist-sea && tar czf ../rustdesk-console-${{ matrix.target }}.tar.gz .'
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ needs.release.outputs.version }}
+          files: |
+            rustdesk-console-${{ matrix.target }}.tar.gz
+          fail_on_unmatched_files: false

@@ -1,0 +1,82 @@
+name: JavaScript Call Completions
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - modules/helpers/ubs_core/analyzers/taint_js.py
+      - modules/helpers/ubs_core/js_modules.py
+      - test-suite/js/test_taint_call_completions.py
+      - .github/workflows/javascript-call-completions.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  completion-regressions:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+      UBS_NO_AUTO_UPDATE: '1'
+      UBS_TAINT_E2E: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Verify committed runtime and complete integrity chain
+        run: |
+          ./scripts/verify_checksums.sh
+          ./scripts/verify_sha256sums.sh
+          python3 scripts/update_checksums.py
+          git diff --exit-code
+      - name: Install native scanner and independent language controls
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq ripgrep rsync shellcheck
+          npm install --global @ast-grep/cli typescript@5.8.3
+      - name: Test call completions, cross-file flows, and heap mutation without skips
+        run: |
+          command -v ast-grep
+          command -v node
+          command -v tsc
+          python3 - <<'PY'
+          import importlib.util
+          import unittest
+          for path in ('test-suite/js/test_taint_call_completions.py',
+                       'test-suite/quality/test_taint_js_modules.py',
+                       'test-suite/quality/test_taint_js_commonjs.py',
+                       'test-suite/quality/test_taint_js_heap.py'):
+              spec = importlib.util.spec_from_file_location('regressions', path)
+              module = importlib.util.module_from_spec(spec)
+              spec.loader.exec_module(module)
+              result = unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromModule(module))
+              assert result.wasSuccessful() and not result.skipped, (path, result.failures, result.errors, result.skipped)
+              print('JS_COMPLETION_TEST_PASS', path, result.testsRun, flush=True)
+          PY
+          python3 test-suite/js/test_taint_domains.py
+          python3 test-suite/js/test_taint_scopes.py
+          python3 test-suite/js/test_taint_effects.py
+          python3 -m unittest discover -s test-suite/quality -p '*js*.py' -v
+          shellcheck -S warning ubs modules/ubs-*.sh scripts/new-module.sh
+          for file in ubs modules/ubs-*.sh modules/lib/ubs-common.sh scripts/new-module.sh; do bash -n "$file"; done
+      - name: Verify deterministic integrity after scanner execution
+        run: |
+          python3 scripts/update_checksums.py
+          ./scripts/verify_checksums.sh
+          ./scripts/verify_sha256sums.sh
+          git diff --exit-code
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: javascript-call-completion-validation
+          path: |
+            test-suite/artifacts/javascript-call-completions/
+            test-suite/artifacts/javascript-modules/
+            test-suite/artifacts/javascript-commonjs/
+            test-suite/artifacts/javascript-heap/
+          retention-days: 3

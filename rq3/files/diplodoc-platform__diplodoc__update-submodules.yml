@@ -1,0 +1,86 @@
+name: Update Submodules
+
+on:
+  push:
+    branches:
+      - master
+  schedule:
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+
+jobs:
+  update-submodules:
+    # Skip push events triggered by bots (this workflow's own App commits and
+    # sync-packages-list.yml commits) to avoid a feedback loop: bot pushes to
+    # master → re-triggers this workflow → finds no changes → stops. Schedule
+    # and workflow_dispatch are unaffected; human pushes still run.
+    if: github.event_name != 'push' || !contains(github.actor, '[bot]')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Generate App token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.INFRA_APP_ID }}
+          private-key: ${{ secrets.INFRA_APP_PRIVATE_KEY }}
+          owner: diplodoc-platform
+
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Setup Node.js
+        uses: diplodoc-platform/setup-node-action@v1
+        with:
+          node-version: ${{ vars.NODE_VERSION || '24' }}
+          registry-url: 'https://registry.npmjs.org'
+          cache: ''
+          run-install: 'false'
+
+      - name: Update submodules to remote HEAD
+        run: |
+          git submodule sync --recursive
+          # Drop any local changes that могут появиться из-за EOL/smudge-фильтров
+          # и блокировать checkout (например, перезаписанный CONTRIBUTING.md).
+          git submodule foreach --recursive 'git reset --hard && git clean -fdx'
+          git submodule update --init --recursive --remote --force
+
+      - name: Install js-yaml
+        run: npm install js-yaml@4 --no-save
+
+      # Regenerate the committed dependency graph from the freshly-updated
+      # submodule package.json files. deps-graph.json is the single source of
+      # truth for the release train (config.js reads it via loadDepsGraph),
+      # and the release-train workflow checks out with submodules: false, so it
+      # can never rebuild the graph itself. Regenerating here — where
+      # submodules are present — keeps deps-graph.json in sync with the actual
+      # submodule set/pins on every change.
+      - name: Regenerate deps-graph.json
+        run: npm run deps-graph
+
+      - name: Check if there are changes
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add .
+            git commit -m "chore: update submodules to latest"
+          else
+            echo "No changes to commit."
+          fi
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+
+      - name: Push changes
+        if: always()
+        run: |
+          if [ -n "$(git log -1 --pretty=%B | grep 'chore: update submodules')" ]; then
+            git push origin HEAD:${{ github.ref_name }}
+          fi
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}

@@ -1,0 +1,42 @@
+name: Post New Release Notes to Discord
+# Posts a release's notes to a Discord webhook. Fires automatically when a
+# GitHub release is published, and can still be run manually from the Actions
+# tab. Gated on DISCORD_RELEASE_WEBHOOK_URL being present so operators without
+# a webhook configured get a clean no-op instead of a red run.
+# (Same pattern as dockerhub-description.yml — backports CWA #1254's
+# "don't fail on missing CI creds" intent; issue #152.)
+
+on:
+  workflow_dispatch:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  github-releases-to-discord:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Probe Discord webhook secret
+        id: probe
+        env:
+          WEBHOOK_URL: ${{ secrets.DISCORD_RELEASE_WEBHOOK_URL }}
+        run: |
+          if [ -n "$WEBHOOK_URL" ]; then
+            echo "have_webhook=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "have_webhook=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::DISCORD_RELEASE_WEBHOOK_URL not set; skipping Discord post."
+          fi
+      - name: Checkout
+        if: steps.probe.outputs.have_webhook == 'true'
+        uses: actions/checkout@v7  # @v3 is deprecated (Node 16 runtime removed from GitHub runners); @v4 still on Node 20
+      - name: Releases To Discord
+        if: steps.probe.outputs.have_webhook == 'true'
+        uses: sillyangel/releases-to-discord@v1
+        with:
+          webhook_url: ${{ secrets.DISCORD_RELEASE_WEBHOOK_URL }}
+          username: "Calibre-Web-NextGen Release Changelog Bot"
+          avatar_url: "https://raw.githubusercontent.com/new-usemame/Calibre-Web-NextGen/main/README_images/cwa-logo-round-light.png"

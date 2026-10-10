@@ -1,0 +1,35 @@
+#
+#  SPDX-License-Identifier: Apache-2.0
+#
+#  Copyright The original authors
+#
+#  Licensed under the Apache Software License version 2.0, available at http://www.apache.org/licenses/LICENSE-2.0
+#
+
+name: Trigger documentation publish
+
+# Refreshes the `dev` docs after a successful Main Build on main. Versioned
+# release docs are published manually via docs-publish.yml once any post-
+# release follow-ups (blog post link, etc.) have been added.
+
+on:
+  workflow_run:
+    workflows: [Main Build]
+    types: [completed]
+    branches: [main]
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    if: github.event.workflow_run.conclusion == 'success'
+
+    steps:
+      - name: Fire repository_dispatch to site repo
+        env:
+          GH_TOKEN: ${{ secrets.DOCS_DISPATCH_TOKEN }}
+          SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          jq -n \
+            --arg ref "$SHA" \
+            '{event_type: "publish-docs", client_payload: {source_ref: $ref, version: "dev", update_latest: false}}' \
+          | gh api repos/hardwood-hq/hardwood-hq.github.io/dispatches --input -

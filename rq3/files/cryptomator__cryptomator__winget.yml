@@ -1,0 +1,29 @@
+name: Publish  MSI to winget-pkgs
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag'
+        required: true
+
+permissions: {}
+
+jobs:
+  winget:
+    name: Publish winget package
+    runs-on: windows-latest
+    steps:
+      - name: Sync winget-pkgs fork
+        run: |
+          gh repo sync cryptomator/winget-pkgs -b master --force
+        env:
+          GH_TOKEN: ${{ secrets.CRYPTOBOT_PR_TOKEN }}
+      - name: Submit package
+        uses: vedantmgoyal2009/winget-releaser@7bd472be23763def6e16bd06cc8b1cdfab0e2fd5 # no_specific_version
+        with:
+          identifier: Cryptomator.Cryptomator
+          version: ${{ inputs.tag }}
+          release-tag: ${{ inputs.tag }}
+          installers-regex: '-x64\.msi$'
+          token: ${{ secrets.CRYPTOBOT_PR_TOKEN }}

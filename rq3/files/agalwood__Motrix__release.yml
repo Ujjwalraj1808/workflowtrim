@@ -1,0 +1,2611 @@
+# Motrix — native multi-platform build and release
+#
+# A tag push builds each platform on a native runner, assembles the five
+# independently produced artifact sets, validates their updater metadata, and
+# publishes exactly once. A manual dispatch exercises the same build and
+# assembly path without signing or publishing.
+#
+# Release-enabled targets are the current intersection of:
+#   - a locked scripts/engine.lock.json aria2 asset;
+#   - an Electron 44 / electron-builder package target;
+#   - a native GitHub-hosted runner;
+#   - a packages/native-host/build.mjs Rust target.
+#
+# The Linux AppImage is published for x64 and arm64 with the static AppImage
+# runtime and per-architecture native zsync metadata. It self-integrates its
+# desktop entry and URL-scheme handlers at runtime under the user's XDG data
+# tree (src/main/platform/appimage-integration.ts). Snap has its own
+# strict-confinement build and Store promotion workflows. Flatpak reuses its
+# native build and installed-payload checks and joins both Linux release sets.
+# 32-bit targets remain
+# unsupported. Windows arm64 remains reserved until the aria2 lock supplies that
+# architecture.
+
+name: Build/Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    name: Validate release source
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.metadata.outputs.version }}
+      prerelease: ${{ steps.metadata.outputs.prerelease }}
+      channel: ${{ steps.metadata.outputs.channel }}
+      release_notes_path: ${{ steps.release_notes.outputs.path }}
+      container_version: ${{ steps.container.outputs.container_version }}
+      container_prerelease: ${{ steps.container.outputs.container_prerelease }}
+      container_dockerhub_repository: ${{ steps.container.outputs.container_dockerhub_repository }}
+      container_ghcr_repository: ${{ steps.container.outputs.container_ghcr_repository }}
+      container_immutable_tags: ${{ steps.container.outputs.container_immutable_tags }}
+      container_floating_tags: ${{ steps.container.outputs.container_floating_tags }}
+      container_labels: ${{ steps.container.outputs.container_labels }}
+    steps:
+      - name: Checkout release source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Validate release metadata
+        id: metadata
+        env:
+          RELEASE_EVENT_NAME: ${{ github.event_name }}
+          RELEASE_REF_NAME: ${{ github.ref_name }}
+          RELEASE_REF_PROTECTED: ${{ github.ref_protected }}
+        run: >-
+          node scripts/release-metadata.mjs
+          --package-json package.json
+          --github-output "$GITHUB_OUTPUT"
+
+      - name: Validate release notes
+        id: release_notes
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ steps.metadata.outputs.version }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$RELEASE_VERSION" =~ ^[0-9A-Za-z.+-]+$ ]] ||
+            [[ "$RELEASE_VERSION" == *'..'* ]]; then
+            printf 'Unsafe release version for release-notes path: %s\n' \
+              "$RELEASE_VERSION" >&2
+            exit 1
+          fi
+          release_notes_path="docs/release-notes/${RELEASE_VERSION}.md"
+          if [[ ! -f "$release_notes_path" ]]; then
+            printf 'Missing release notes: %s\n' "$release_notes_path" >&2
+            exit 1
+          fi
+          printf 'path=%s\n' "$release_notes_path" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve container release metadata
+        id: container
+        env:
+          RELEASE_VERSION: ${{ steps.metadata.outputs.version }}
+          RELEASE_REVISION: ${{ github.sha }}
+        run: >-
+          node scripts/container-release-metadata.mjs
+          --version "$RELEASE_VERSION"
+          --revision "$RELEASE_REVISION"
+          --github-output "$GITHUB_OUTPUT"
+
+      - name: Verify tag commit is on main
+        if: github.event_name == 'push'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin \
+            refs/heads/main:refs/remotes/origin/main
+          git merge-base --is-ancestor \
+            "$GITHUB_SHA" refs/remotes/origin/main
+
+  build:
+    name: Build / ${{ matrix.target }}
+    needs: preflight
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    environment:
+      name: release-build
+      deployment: false
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: darwin-arm64
+            os: macos-26
+            platform: darwin
+            arch: arm64
+            rust_target: aarch64-apple-darwin
+            electron_builder_args: --mac --arm64
+            resources_dir: release/mac-arm64/Motrix.app/Contents/Resources
+            app_path: release/mac-arm64/Motrix.app
+          - target: darwin-x64
+            os: macos-26-intel
+            platform: darwin
+            arch: x64
+            rust_target: x86_64-apple-darwin
+            electron_builder_args: --mac --x64
+            resources_dir: release/mac/Motrix.app/Contents/Resources
+            app_path: release/mac/Motrix.app
+          - target: linux-x64
+            os: ubuntu-22.04
+            platform: linux
+            arch: x64
+            rust_target: x86_64-unknown-linux-musl
+            electron_builder_args: --linux deb rpm pacman AppImage --x64
+            resources_dir: release/linux-unpacked/resources
+            app_path: release/linux-unpacked
+          - target: linux-arm64
+            os: ubuntu-22.04-arm
+            platform: linux
+            arch: arm64
+            rust_target: aarch64-unknown-linux-musl
+            electron_builder_args: --linux deb rpm pacman AppImage --arm64
+            resources_dir: release/linux-arm64-unpacked/resources
+            app_path: release/linux-arm64-unpacked
+          - target: win32-x64
+            os: windows-2025
+            platform: win32
+            arch: x64
+            rust_target: x86_64-pc-windows-msvc
+            electron_builder_args: --win --x64
+            resources_dir: release/win-unpacked/resources
+            app_path: release/win-unpacked
+
+    # rustc's musl std is self-contained; overriding the linker with Ubuntu's
+    # musl-gcc mixes CRTs and produces binaries that SIGSEGV at load (see
+    # ci.yml package-targets).
+    env:
+      # Electron 44 requires macOS 13 even though the locked aria2 binaries
+      # themselves are built with an 11.0 deployment target.
+      MACOSX_DEPLOYMENT_TARGET: ${{ matrix.platform == 'darwin' && '13.0' || '' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          version: 12.8.1
+          run_install: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install Linux packaging tools
+        if: matrix.platform == 'linux'
+        run: |
+          sudo apt-get update
+          # squashfs-tools provides `unsquashfs`, used by
+          # verify-appimage-artifact.mjs to read the AppImage's embedded
+          # desktop entry. zsync provides the canonical `zsyncmake` generator.
+          sudo apt-get install --yes rpm squashfs-tools zsync zstd libarchive-tools
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: 1.94.1
+          targets: ${{ matrix.rust_target }}
+
+      - name: Test native host target
+        run: >-
+          cargo test
+          --manifest-path packages/native-host/Cargo.toml
+          --locked
+          --target ${{ matrix.rust_target }}
+
+      - name: Test finalize filesystem target
+        run: >-
+          cargo test
+          --manifest-path packages/finalize-fs/Cargo.toml
+          --locked
+          --target ${{ matrix.rust_target }}
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+        env:
+          # Fetching the package target is explicit in the next step.
+          MOTRIX_SKIP_ENGINE_FETCH: '1'
+          MOTRIX_SKIP_ELECTRON_REBUILD: '1'
+
+      # Electron does not declare a postinstall script, so pnpm install
+      # does not hydrate dist/ with the runtime and license payload.
+      - name: Ensure Electron runtime payload
+        run: node node_modules/electron/install.js
+
+      - name: Fetch target aria2
+        run: >-
+          pnpm run fetch:engine
+          --platform ${{ matrix.platform }}
+          --arch ${{ matrix.arch }}
+
+      - name: Third-party notice contract
+        run: pnpm run check:third-party-notices
+
+      # Build each target on a runner with the same native CPU architecture.
+      - name: Build
+        run: |
+          pnpm run build:builtin
+          pnpm run build:native-host -- --platform ${{ matrix.platform }} --arch ${{ matrix.arch }}
+          pnpm run build:finalize-fs -- --platform ${{ matrix.platform }} --arch ${{ matrix.arch }}
+
+      - name: Finalize filesystem runtime integration
+        env:
+          MOTRIX_FINALIZE_FS_TEST_BIN: packages/finalize-fs/dist/${{ matrix.platform }}-${{ matrix.arch }}/${{ matrix.platform == 'win32' && 'motrix-finalize-fs.exe' || 'motrix-finalize-fs' }}
+        run: >-
+          pnpm exec vitest run
+          src/core/plugin/finalize/native-artifact-operations.integration.test.ts
+          src/core/plugin/finalize/finalize-adversarial.integration.test.ts
+          src/core/plugin/finalize/finalize-smb-recovery.integration.test.ts
+          --reporter=verbose
+
+      - name: Test and build Safari desktop helpers
+        if: matrix.platform == 'darwin'
+        run: |
+          pnpm exec vitest run tests/scripts/safari-desktop-package.test.ts
+          swift test --package-path packages/safari-bootstrap
+          pnpm run build:safari-bootstrap -- --arch ${{ matrix.arch }} --test
+
+      # SQLite integration tests above use Node. Rebuild for Electron before
+      # staging, so the packaged native dependency retains the correct ABI.
+      - name: Build Electron application
+        run: |
+          pnpm run build:electron
+          pnpm run stage:electron -- --platform ${{ matrix.platform }} --arch ${{ matrix.arch }}
+
+      # Tagged macOS and Windows outputs are deliberately unsigned here. A
+      # fresh, no-checkout job finalizes only the verified data artifact below,
+      # applying platform signing when it is required or configured.
+      - name: Electron Builder (macOS)
+        if: matrix.platform == 'darwin'
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+        run: >-
+          pnpm exec electron-builder
+          ${{ matrix.electron_builder_args }}
+          -c.mac.bundleVersion=${{ github.run_number }}.${{ github.run_attempt }}.0
+          --publish never
+
+      - name: Electron Builder (Linux)
+        if: matrix.platform == 'linux'
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+        run: >-
+          pnpm exec electron-builder
+          ${{ matrix.electron_builder_args }}
+          --publish never
+
+      - name: Electron Builder (Windows)
+        if: matrix.platform == 'win32'
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+        run: >-
+          pnpm exec electron-builder
+          ${{ matrix.electron_builder_args }}
+          --publish never
+
+      - name: Verify Electron package
+        run: >-
+          node scripts/verify-electron-package.mjs
+          --app-dir "${{ matrix.app_path }}"
+          --platform ${{ matrix.platform }}
+          --arch ${{ matrix.arch }}
+          --report "release/size-reports/${{ matrix.target }}.json"
+
+      - name: Verify Windows native host runtime imports
+        if: matrix.platform == 'win32'
+        shell: pwsh
+        run: >-
+          ./scripts/verify-windows-native-host-dependencies.ps1
+          -Binary
+          "${{ matrix.resources_dir }}/bin/motrix-native-host.exe"
+
+      - name: Verify packaged resources
+        shell: node {0}
+        env:
+          PACKAGED_RESOURCES: ${{ matrix.resources_dir }}
+          TARGET_PLATFORM: ${{ matrix.platform }}
+          TARGET_ARCH: ${{ matrix.arch }}
+        run: |
+          const fs = require('node:fs')
+          const path = require('node:path')
+          const host =
+            process.env.TARGET_PLATFORM === 'win32'
+              ? 'motrix-native-host.exe'
+              : 'motrix-native-host'
+          const engine =
+            process.env.TARGET_PLATFORM === 'win32' ? 'aria2c.exe' : 'aria2c'
+          const finalize =
+            process.env.TARGET_PLATFORM === 'win32'
+              ? 'motrix-finalize-fs.exe'
+              : 'motrix-finalize-fs'
+          const resources = process.env.PACKAGED_RESOURCES
+          const required = [
+            'app.asar',
+            'THIRD_PARTY_NOTICES.md',
+            'THIRD_PARTY_NOTICES.zh-CN.md',
+            path.join('THIRD_PARTY_LICENSES', 'aria2-COPYING'),
+            path.join('legal', 'THIRD_PARTY_DEPENDENCIES.md'),
+            path.join('legal', 'THIRD_PARTY_LICENSES.txt'),
+            path.join('legal', 'sbom.spdx.json'),
+            path.join('bin', host),
+            path.join('bin', finalize),
+            path.join(
+              'extra',
+              process.env.TARGET_PLATFORM,
+              process.env.TARGET_ARCH,
+              engine
+            ),
+          ]
+          for (const relative of required) {
+            const file = path.join(resources, relative)
+            const info = fs.statSync(file)
+            if (!info.isFile()) throw new Error(`not a file: ${file}`)
+            if (
+              process.env.TARGET_PLATFORM !== 'win32' &&
+              relative !== 'app.asar' &&
+              !relative.startsWith('THIRD_PARTY_') &&
+              !relative.startsWith(`legal${path.sep}`)
+            ) {
+              fs.accessSync(file, fs.constants.X_OK)
+            }
+          }
+
+      - name: Verify staged Windows aria2 WebSocket contract
+        if: matrix.platform == 'win32'
+        env:
+          MOTRIX_ARIA2_TEST_BIN: ${{ matrix.resources_dir }}/extra/win32/${{ matrix.arch }}/aria2c.exe
+        run: >-
+          pnpm exec vitest run
+          src/core/engine/aria2/engine-websocket-contract.integration.test.ts
+          --reporter=verbose
+
+      - name: Create isolated signing input
+        if: >-
+          github.event_name == 'push' &&
+          startsWith(github.ref, 'refs/tags/v') &&
+          (matrix.platform == 'darwin' || matrix.platform == 'win32')
+        run: >-
+          node scripts/release-signing-input.mjs
+          --mode create
+          --directory "release/signing-input-${{ matrix.target }}"
+          --platform ${{ matrix.platform }}
+          --arch ${{ matrix.arch }}
+          --commit "${{ github.sha }}"
+          --archive "release/signing-input-${{ matrix.target }}.tar"
+
+      - name: Upload isolated signing input
+        if: >-
+          github.event_name == 'push' &&
+          startsWith(github.ref, 'refs/tags/v') &&
+          (matrix.platform == 'darwin' || matrix.platform == 'win32')
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: signing-input-${{ matrix.target }}
+          path: release/signing-input-${{ matrix.target }}.tar
+          if-no-files-found: error
+          retention-days: 2
+
+      - name: Verify Linux package formats
+        if: matrix.platform == 'linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          debs=(release/*.deb)
+          rpms=(release/*.rpm)
+          pacmans=(release/*.pacman)
+          appimages=(release/*.AppImage)
+          if (( ${#debs[@]} != 1 || ${#rpms[@]} != 1 || ${#pacmans[@]} != 1 || ${#appimages[@]} != 1 )); then
+            echo "Expected one deb, rpm, pacman, and AppImage for ${{ matrix.target }}" >&2
+            exit 1
+          fi
+          dpkg-deb --info "${debs[0]}"
+          rpm -qip "${rpms[0]}"
+
+      - name: Verify Arch Linux package
+        if: matrix.platform == 'linux'
+        run: >-
+          node scripts/verify-pacman-artifact.mjs
+          --dir release
+          --version "${{ needs.preflight.outputs.version }}"
+          --arch ${{ matrix.arch }}
+
+      - name: Smoke test Arch Linux installation
+        if: matrix.target == 'linux-x64'
+        run: bash scripts/smoke-pacman-package.sh release
+
+      - name: Verify AppImage artifact
+        if: matrix.platform == 'linux'
+        run: >-
+          node scripts/verify-appimage-artifact.mjs
+          --dir release
+          --version "${{ needs.preflight.outputs.version }}"
+          --arch ${{ matrix.arch }}
+
+      - name: Smoke test AppImage without system FUSE2
+        if: matrix.platform == 'linux'
+        shell: bash
+        env:
+          RELEASE_CHANNEL: ${{ needs.preflight.outputs.channel }}
+          RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
+          TARGET_ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          case "$TARGET_ARCH" in
+            x64) artifact_arch='x86_64' ;;
+            arm64) artifact_arch='arm64' ;;
+            *) echo "Unsupported AppImage arch: $TARGET_ARCH" >&2; exit 1 ;;
+          esac
+          case "$RELEASE_CHANNEL" in
+            stable) native_release='latest' ;;
+            beta) native_release='latest-pre' ;;
+            *) echo "Unsupported release channel: $RELEASE_CHANNEL" >&2; exit 1 ;;
+          esac
+          appimage="Motrix-${RELEASE_VERSION}-${artifact_arch}.AppImage"
+          update_info="gh-releases-zsync|agalwood|Motrix|${native_release}|Motrix-*-${artifact_arch}.AppImage.zsync"
+          docker run --rm --network none \
+            --mount "type=bind,src=$PWD/release,dst=/artifacts,readonly" \
+            --workdir /tmp \
+            --env "APPIMAGE_FILE=/artifacts/${appimage}" \
+            --env "EXPECTED_UPDATE=${update_info}" \
+            ubuntu:24.04 \
+            bash -eu -o pipefail -c '
+              [[ ! -e /dev/fuse ]]
+              if find /lib /usr/lib -name "libfuse.so.2*" -print -quit |
+                grep -q .; then
+                echo "Clean container unexpectedly contains libfuse.so.2" >&2
+                exit 1
+              fi
+              actual="$($APPIMAGE_FILE --appimage-updateinformation)"
+              [[ "$actual" == "$EXPECTED_UPDATE" ]]
+              "$APPIMAGE_FILE" --appimage-extract \
+                motrix.desktop >/tmp/appimage-extract.log
+              test -f squashfs-root/motrix.desktop
+            '
+
+      - name: Package Flatpak native host companion
+        if: matrix.platform == 'linux'
+        env:
+          COMPANION_ARCH: ${{ matrix.arch }}
+          COMPANION_VERSION: ${{ needs.preflight.outputs.version }}
+          SOURCE_DATE_EPOCH: '0'
+        run: >-
+          pnpm run package:flatpak-native-host --
+          --version "$COMPANION_VERSION"
+          --arch "$COMPANION_ARCH"
+          --output-dir release
+
+      - name: Verify Flatpak native host companion archive
+        if: matrix.platform == 'linux'
+        shell: bash
+        env:
+          COMPANION_ARCH: ${{ matrix.arch }}
+          COMPANION_VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          archives=(release/Motrix-Native-Host-*.tar.gz)
+          if (( ${#archives[@]} != 1 )); then
+            echo "Expected exactly one Flatpak companion archive for ${{ matrix.target }}" >&2
+            exit 1
+          fi
+          root="Motrix-Native-Host-${COMPANION_VERSION}-linux-${COMPANION_ARCH}"
+          archive="release/${root}.tar.gz"
+          if [[ "${archives[0]}" != "$archive" ]]; then
+            echo "Unexpected Flatpak companion archive: ${archives[0]}" >&2
+            exit 1
+          fi
+          expected=(
+            "${root}/"
+            "${root}/motrix-flatpak-native-host"
+            "${root}/README.md"
+            "${root}/README.zh-CN.md"
+            "${root}/LICENSE"
+            "${root}/THIRD_PARTY_NOTICES.md"
+            "${root}/THIRD_PARTY_NOTICES.zh-CN.md"
+            "${root}/THIRD_PARTY_LICENSES/"
+          )
+          while IFS= read -r -d '' source_license; do
+            relative="${source_license#THIRD_PARTY_LICENSES/}"
+            if [[ -d "$source_license" ]]; then
+              expected+=("${root}/THIRD_PARTY_LICENSES/${relative}/")
+            elif [[ -f "$source_license" ]]; then
+              expected+=("${root}/THIRD_PARTY_LICENSES/${relative}")
+            else
+              echo "Unexpected third-party license entry: $source_license" >&2
+              exit 1
+            fi
+          done < <(
+            find THIRD_PARTY_LICENSES -mindepth 1 -print0 |
+              LC_ALL=C sort -z
+          )
+          mapfile -t actual < <(tar -tzf "$archive")
+          if ! diff -u \
+            <(printf '%s\n' "${expected[@]}" | LC_ALL=C sort) \
+            <(printf '%s\n' "${actual[@]}" | LC_ALL=C sort); then
+            echo "Unexpected Flatpak companion archive contents" >&2
+            exit 1
+          fi
+
+      - name: Upload target release input
+        if: >-
+          matrix.platform == 'linux' ||
+          github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-input-${{ matrix.target }}
+          path: |
+            release/*.AppImage
+            release/*.AppImage.zsync
+            release/*.blockmap
+            release/beta*.yml
+            release/*.deb
+            release/*.dmg
+            release/*.exe
+            release/*.rpm
+            release/*.pacman
+            release/*.tar.gz
+            release/latest*.yml
+            release/size-reports/${{ matrix.target }}.json
+            release/*.zip
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload build diagnostics
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: build-diagnostics-${{ matrix.target }}
+          path: |
+            release/
+            dist/
+            .vite/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  sign:
+    name: Finalize / ${{ matrix.target }}
+    needs: [preflight, build]
+    if: >-
+      github.event_name == 'push' &&
+      startsWith(github.ref, 'refs/tags/v')
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    environment:
+      name: ${{ matrix.signing_environment }}
+      deployment: false
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: darwin-arm64
+            os: macos-26
+            platform: darwin
+            arch: arm64
+            signing_environment: macos-release-signing
+            electron_builder_args: --mac --arm64
+            resources_dir: release/mac-arm64/Motrix.app/Contents/Resources
+            app_path: release/mac-arm64/Motrix.app
+            electron_sha256: 2a1d54d0c4c5fd0b16c9627e8d6cd5730ae564f0f3a0bdda7c7f97391069e552
+          - target: darwin-x64
+            os: macos-26-intel
+            platform: darwin
+            arch: x64
+            signing_environment: macos-release-signing
+            electron_builder_args: --mac --x64
+            resources_dir: release/mac/Motrix.app/Contents/Resources
+            app_path: release/mac/Motrix.app
+            electron_sha256: a7c09e80e349ac9efc452c1cf6ae481eae22c3cc0421795a7f520c6086ffc0fb
+          - target: win32-x64
+            os: windows-2025
+            platform: win32
+            arch: x64
+            signing_environment: windows-release-signing
+            electron_builder_args: --win --x64
+            resources_dir: release/win-unpacked/resources
+            app_path: release/win-unpacked
+            electron_sha256: b3405d8847bc5054cd16272f538d22ba5b73032945e85cef26241f7135035278
+    env:
+      CUSTOM_DMGBUILD_PATH: ''
+      ELECTRON_BUILDER_7ZIP_PATH: ''
+      ELECTRON_BUILDER_BINARIES_ALLOW_HTTP: ''
+      ELECTRON_BUILDER_BINARIES_CUSTOM_DIR: ''
+      ELECTRON_BUILDER_BINARIES_DOWNLOAD_OVERRIDE_URL: ''
+      ELECTRON_BUILDER_BINARIES_MIRROR: ''
+      ELECTRON_BUILDER_NSIS_DIR: ''
+      ELECTRON_BUILDER_NSIS_RESOURCES_DIR: ''
+      ELECTRON_BUILDER_OSSL_SIGNCODE_PATH: ''
+      ELECTRON_BUILDER_RCEDIT_PATH: ''
+      ELECTRON_BUILDER_WINDOWS_KITS_PATH: ''
+      MACOSX_DEPLOYMENT_TARGET: ${{ matrix.platform == 'darwin' && '13.0' || '' }}
+      NPM_CONFIG_ELECTRON_BUILDER_BINARIES_CUSTOM_DIR: ''
+      NPM_CONFIG_ELECTRON_BUILDER_BINARIES_MIRROR: ''
+      SIGNTOOL_PATH: ''
+      USE_SYSTEM_OSSLSIGNCODE: ''
+      USE_SYSTEM_SIGNCODE: ''
+
+    # Deliberately no checkout and no project package-manager install. The
+    # digest-complete data artifact is verified before any additional pinned
+    # finalization tooling is installed, and secrets are introduced only after
+    # that tooling is ready.
+    steps:
+      - name: Download isolated signing input
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: signing-input-${{ matrix.target }}
+          path: signing-transport
+
+      - name: Safely extract bounded signing input
+        shell: node {0}
+        env:
+          EXPECTED_ARCH: ${{ matrix.arch }}
+          EXPECTED_PLATFORM: ${{ matrix.platform }}
+        run: |
+          const fs = require('node:fs')
+          const path = require('node:path')
+          const decoder = new TextDecoder('utf-8', { fatal: true })
+          const limits = {
+            archiveBytes: 1024 * 1024 * 1024,
+            inputBytes: 768 * 1024 * 1024,
+            fileBytes: 512 * 1024 * 1024,
+            files: 50_000,
+            pathBytes: 4096,
+          }
+          const archive = path.resolve(
+            'signing-transport',
+            `signing-input-${process.env.EXPECTED_PLATFORM}-${process.env.EXPECTED_ARCH}.tar`
+          )
+          const archiveInfo = fs.lstatSync(archive)
+          if (
+            !archiveInfo.isFile() ||
+            archiveInfo.size < 1024 ||
+            archiveInfo.size > limits.archiveBytes ||
+            archiveInfo.size % 512 !== 0
+          ) {
+            throw new Error('signing input tar violates archive size limits')
+          }
+          const root = path.resolve('signing-input')
+          fs.mkdirSync(root, { recursive: false, mode: 0o700 })
+          const handle = fs.openSync(archive, 'r')
+          const readExactly = (offset, length) => {
+            const output = Buffer.alloc(length)
+            let read = 0
+            while (read < length) {
+              const count = fs.readSync(
+                handle,
+                output,
+                read,
+                length - read,
+                offset + read
+              )
+              if (count === 0) throw new Error('truncated signing input tar')
+              read += count
+            }
+            return output
+          }
+          const textField = (header, offset, length) => {
+            const field = header.subarray(offset, offset + length)
+            const nul = field.indexOf(0)
+            const end = nul < 0 ? field.length : nul
+            if (
+              nul >= 0 &&
+              field.subarray(nul).some((value) => value !== 0)
+            ) {
+              throw new Error('non-canonical tar text field')
+            }
+            return decoder.decode(field.subarray(0, end))
+          }
+          const octalField = (header, offset, length) => {
+            const value = decoder.decode(
+              header.subarray(offset, offset + length)
+            )
+            const match = /^([0-7]+)(?:\0[ \0]*| +)$/.exec(value)
+            if (!match) {
+              throw new Error('invalid tar numeric field')
+            }
+            const parsed = Number.parseInt(match[1], 8)
+            if (!Number.isSafeInteger(parsed)) {
+              throw new Error('tar numeric field exceeds safe integer range')
+            }
+            return parsed
+          }
+          const validatePath = (value) => {
+            const segments = value.split('/')
+            if (
+              !value ||
+              value.includes('\\') ||
+              /[\u0000-\u001f\u007f:]/u.test(value) ||
+              Buffer.byteLength(value) > limits.pathBytes ||
+              path.posix.normalize(value) !== value ||
+              path.posix.isAbsolute(value) ||
+              value === '..' ||
+              value.startsWith('../') ||
+              segments.some(
+                (segment) =>
+                  !segment ||
+                  /[ .]$/u.test(segment) ||
+                  /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/iu.test(
+                    segment
+                  )
+              )
+            ) {
+              throw new Error(`unsafe tar path: ${value}`)
+            }
+            return value
+          }
+          const parsePaxPath = (bytes) => {
+            const record = decoder.decode(bytes)
+            const match = /^([0-9]+) path=([^\n]+)\n$/.exec(record)
+            if (!match || Number(match[1]) !== bytes.length) {
+              throw new Error('unsupported pax header')
+            }
+            return validatePath(match[2])
+          }
+          const allZero = (bytes) =>
+            bytes.every((value) => value === 0)
+          const seen = new Set()
+          let fileCount = 0
+          let inputBytes = 0
+          let offset = 0
+          let paxPath
+          let ended = false
+          try {
+            while (offset < archiveInfo.size) {
+              const header = readExactly(offset, 512)
+              if (allZero(header)) {
+                const second = readExactly(offset + 512, 512)
+                if (!allZero(second)) {
+                  throw new Error('tar requires two zero end blocks')
+                }
+                offset += 1024
+                if (offset !== archiveInfo.size) {
+                  throw new Error('tar contains trailing bytes')
+                }
+                ended = true
+                break
+              }
+              const storedChecksum = octalField(header, 148, 8)
+              const checksumHeader = Buffer.from(header)
+              checksumHeader.fill(0x20, 148, 156)
+              const actualChecksum = checksumHeader.reduce(
+                (total, value) => total + value,
+                0
+              )
+              if (storedChecksum !== actualChecksum) {
+                throw new Error('tar header checksum mismatch')
+              }
+              if (
+                textField(header, 257, 6) !== 'ustar' ||
+                textField(header, 263, 2) !== '00' ||
+                textField(header, 345, 155) !== ''
+              ) {
+                throw new Error('unsupported tar header format')
+              }
+              const type = textField(header, 156, 1) || '0'
+              const size = octalField(header, 124, 12)
+              const mode = octalField(header, 100, 8) & 0o777
+              if (size > limits.fileBytes) {
+                throw new Error('tar entry exceeds per-file limit')
+              }
+              const dataStart = offset + 512
+              const dataEnd = dataStart + size
+              const next = dataStart + Math.ceil(size / 512) * 512
+              if (next > archiveInfo.size) {
+                throw new Error('truncated tar entry')
+              }
+              const padding = readExactly(dataEnd, next - dataEnd)
+              if (!allZero(padding)) {
+                throw new Error('tar entry has non-zero padding')
+              }
+              if (type === 'x') {
+                if (
+                  paxPath !== undefined ||
+                  mode !== 0o644 ||
+                  size > limits.pathBytes + 32
+                ) {
+                  throw new Error('invalid pax header')
+                }
+                paxPath = parsePaxPath(readExactly(dataStart, size))
+              } else if (type === '0') {
+                const headerPath = validatePath(textField(header, 0, 100))
+                const relative = paxPath ?? headerPath
+                paxPath = undefined
+                if (seen.has(relative)) {
+                  throw new Error(`duplicate tar path: ${relative}`)
+                }
+                if (![0o644, 0o755].includes(mode)) {
+                  throw new Error(`unexpected tar mode: ${relative}`)
+                }
+                fileCount += 1
+                inputBytes += size
+                if (
+                  fileCount > limits.files ||
+                  inputBytes > limits.inputBytes
+                ) {
+                  throw new Error('tar exceeds input limits')
+                }
+                const destination = path.resolve(root, relative)
+                if (!destination.startsWith(`${root}${path.sep}`)) {
+                  throw new Error(`tar path escapes root: ${relative}`)
+                }
+                fs.mkdirSync(path.dirname(destination), {
+                  recursive: true,
+                  mode: 0o700,
+                })
+                const output = fs.openSync(destination, 'wx', mode)
+                try {
+                  let copied = 0
+                  const buffer = Buffer.alloc(1024 * 1024)
+                  while (copied < size) {
+                    const length = Math.min(buffer.length, size - copied)
+                    const count = fs.readSync(
+                      handle,
+                      buffer,
+                      0,
+                      length,
+                      dataStart + copied
+                    )
+                    if (count === 0) {
+                      throw new Error('truncated tar file contents')
+                    }
+                    fs.writeSync(output, buffer, 0, count)
+                    copied += count
+                  }
+                  fs.fchmodSync(output, mode)
+                } finally {
+                  fs.closeSync(output)
+                }
+                seen.add(relative)
+              } else {
+                throw new Error(`unsupported tar entry type: ${type}`)
+              }
+              offset = next
+            }
+          } finally {
+            fs.closeSync(handle)
+          }
+          if (
+            !ended ||
+            paxPath !== undefined ||
+            fileCount === 0 ||
+            !seen.has('signing-input-manifest.json') ||
+            !seen.has('scripts/release-signing-input.mjs')
+          ) {
+            throw new Error('incomplete signing input tar')
+          }
+
+      - name: Verify signing input before secrets
+        shell: node {0}
+        env:
+          EXPECTED_ARCH: ${{ matrix.arch }}
+          EXPECTED_COMMIT: ${{ github.sha }}
+          EXPECTED_PLATFORM: ${{ matrix.platform }}
+          # Updated only after reviewing the verifier source itself.
+          VERIFIER_SHA256: a2b60948ca04baa0c0e90435da6ccd74e67e8b3b249a19a7576456a8045ff845
+        run: |
+          const crypto = require('node:crypto')
+          const fs = require('node:fs')
+          const { spawnSync } = require('node:child_process')
+          const verifier = 'signing-input/scripts/release-signing-input.mjs'
+          const actual = crypto
+            .createHash('sha256')
+            .update(fs.readFileSync(verifier))
+            .digest('hex')
+          if (actual !== process.env.VERIFIER_SHA256) {
+            throw new Error('signing input verifier digest mismatch')
+          }
+          const result = spawnSync(
+            process.execPath,
+            [
+              verifier,
+              '--mode',
+              'verify',
+              '--directory',
+              'signing-input',
+              '--platform',
+              process.env.EXPECTED_PLATFORM,
+              '--arch',
+              process.env.EXPECTED_ARCH,
+              '--commit',
+              process.env.EXPECTED_COMMIT,
+            ],
+            { stdio: 'inherit' }
+          )
+          if (result.status !== 0) {
+            throw new Error('signing input verification failed')
+          }
+
+      - name: Install exact signing dependency closure
+        id: signing-tool-runtime
+        shell: node {0}
+        env:
+          SIGNING_TOOL_PARENT: ${{ runner.temp }}
+          SIGNING_TOOL_TARGET: ${{ matrix.target }}
+        run: |
+          const fs = require('node:fs')
+          const path = require('node:path')
+          const { spawnSync } = require('node:child_process')
+          const { pathToFileURL } = require('node:url')
+          const parent = path.resolve(process.env.SIGNING_TOOL_PARENT)
+          const target = process.env.SIGNING_TOOL_TARGET
+          if (!target || !/^[a-z0-9-]+$/u.test(target)) {
+            throw new Error('invalid signing tool target')
+          }
+          const root = fs.mkdtempSync(
+            path.join(parent, `motrix-signing-tool-${target}-`)
+          )
+          fs.chmodSync(root, 0o700)
+          fs.appendFileSync(
+            process.env.GITHUB_OUTPUT,
+            `root=${root}\n`,
+            'utf8'
+          )
+          for (const name of ['package.json', 'package-lock.json']) {
+            fs.copyFileSync(
+              path.join('signing-input', 'signing-tool', name),
+              path.join(root, name),
+              fs.constants.COPYFILE_EXCL
+            )
+          }
+          const npmArgs = [
+            'ci',
+            '--prefix',
+            root,
+            '--ignore-scripts',
+            '--no-audit',
+            '--no-fund',
+            '--registry',
+            'https://registry.npmjs.org/',
+          ]
+          const windows = process.platform === 'win32'
+          const command = windows ? process.env.ComSpec || 'cmd.exe' : 'npm'
+          const args = windows
+            ? ['/d', '/s', '/c', 'npm.cmd', ...npmArgs]
+            : npmArgs
+          const install = spawnSync(command, args, {
+            stdio: 'inherit',
+            shell: false,
+          })
+          if (install.error || install.status !== 0) {
+            throw new Error('signing tool dependency installation failed')
+          }
+          const pkg = JSON.parse(
+            fs.readFileSync(
+              path.join(root, 'node_modules', 'electron-builder', 'package.json'),
+              'utf8'
+            )
+          )
+          if (pkg.version !== '26.15.7') {
+            throw new Error('unexpected electron-builder version')
+          }
+          const cli = path.join(
+            root,
+            'node_modules',
+            'electron-builder',
+            'out',
+            'cli',
+            'cli.js'
+          )
+          const cliInfo = fs.lstatSync(cli)
+          if (!cliInfo.isFile()) {
+            throw new Error('electron-builder CLI is not a file')
+          }
+          const verifierDirectory = path.join(root, 'scripts')
+          fs.mkdirSync(verifierDirectory, { mode: 0o700 })
+          fs.chmodSync(verifierDirectory, 0o700)
+          for (const name of [
+            'electron-package-size-budgets.json',
+            'electron-package-utils.mjs',
+            'native-binary-target.mjs',
+            'verify-electron-package.mjs',
+          ]) {
+            const source = path.join('signing-input', 'scripts', name)
+            const sourceInfo = fs.lstatSync(source)
+            if (!sourceInfo.isFile()) {
+              throw new Error(`package verifier input is not a file: ${name}`)
+            }
+            const destination = path.join(verifierDirectory, name)
+            fs.copyFileSync(source, destination, fs.constants.COPYFILE_EXCL)
+            fs.chmodSync(destination, 0o600)
+          }
+          const verifier = fs.realpathSync(
+            path.join(verifierDirectory, 'verify-electron-package.mjs')
+          )
+          const verifierImport = spawnSync(
+            process.execPath,
+            [
+              '--input-type=module',
+              '--eval',
+              `await import(${JSON.stringify(pathToFileURL(verifier).href)})`,
+            ],
+            { stdio: 'inherit' }
+          )
+          if (verifierImport.error || verifierImport.status !== 0) {
+            throw new Error('package verifier dependency import failed')
+          }
+          fs.appendFileSync(
+            process.env.GITHUB_OUTPUT,
+            `cli=${cli}\nverifier=${verifier}\n`,
+            'utf8'
+          )
+
+      - name: Download digest-pinned Electron distribution
+        shell: bash
+        env:
+          ELECTRON_SHA256: ${{ matrix.electron_sha256 }}
+        run: |
+          set -euo pipefail
+          mkdir -p signing-input/trusted
+          cp \
+            signing-input/signing-policy/installer.nsh \
+            signing-input/trusted/installer.nsh
+          url="https://github.com/electron/electron/releases/download/v44.5.0/electron-v44.5.0-${{ matrix.platform }}-${{ matrix.arch }}.zip"
+          curl --fail --location --proto '=https' --tlsv1.2 \
+            "$url" --output signing-input/trusted/electron.zip
+          node - <<'NODE'
+          const crypto = require('node:crypto')
+          const fs = require('node:fs')
+          const actual = crypto
+            .createHash('sha256')
+            .update(fs.readFileSync('signing-input/trusted/electron.zip'))
+            .digest('hex')
+          if (actual !== process.env.ELECTRON_SHA256) {
+            throw new Error('Electron distribution digest mismatch')
+          }
+          NODE
+
+      - name: Validate macOS release credentials
+        if: matrix.platform == 'darwin'
+        shell: bash
+        env:
+          MAC_CERTS: ${{ secrets.MAC_CERTS }}
+          MAC_CERTS_PASSWORD: ${{ secrets.MAC_CERTS_PASSWORD }}
+          API_KEY: ${{ secrets.API_KEY }}
+          API_KEY_ID: ${{ secrets.API_KEY_ID }}
+          API_KEY_ISSUER_ID: ${{ secrets.API_KEY_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          for name in MAC_CERTS MAC_CERTS_PASSWORD API_KEY API_KEY_ID API_KEY_ISSUER_ID; do
+            [[ -n "${!name:-}" ]] || { echo "Missing $name" >&2; exit 1; }
+          done
+
+      - name: Prepare Apple API Key
+        id: apple-api-key
+        if: matrix.platform == 'darwin'
+        shell: bash
+        env:
+          APPLE_API_KEY_CONTENT: ${{ secrets.API_KEY }}
+          APPLE_API_KEY_ID_VALUE: ${{ secrets.API_KEY_ID }}
+        run: |
+          set -euo pipefail
+          key_path="${RUNNER_TEMP}/AuthKey_${APPLE_API_KEY_ID_VALUE}.p8"
+          echo "path=${key_path}" >> "$GITHUB_OUTPUT"
+          printf '%s\n' "$APPLE_API_KEY_CONTENT" > "$key_path"
+          chmod 600 "$key_path"
+
+      - name: Prepare isolated macOS signing certificate
+        id: mac-certificate
+        if: matrix.platform == 'darwin'
+        shell: node {0}
+        env:
+          MAC_CERTS_BASE64: ${{ secrets.MAC_CERTS }}
+          CERTIFICATE_PARENT: ${{ runner.temp }}
+        run: |
+          const fs = require('node:fs')
+          const path = require('node:path')
+          const encoded = process.env.MAC_CERTS_BASE64
+          const maximumEncodedBytes = 128 * 1024
+          const maximumCertificateBytes = 96 * 1024
+          if (
+            !encoded ||
+            encoded.length > maximumEncodedBytes ||
+            !/^[A-Za-z0-9+/]+={0,2}$/u.test(encoded)
+          ) {
+            throw new Error(
+              'macOS signing certificate must be bounded standard base64'
+            )
+          }
+          const unpadded = encoded.replace(/=+$/u, '')
+          const remainder = unpadded.length % 4
+          if (remainder === 1) {
+            throw new Error('macOS signing certificate has invalid base64 length')
+          }
+          const padding = remainder === 2 ? '==' : remainder === 3 ? '=' : ''
+          const normalized = `${unpadded}${padding}`
+          if (
+            (encoded.includes('=') && encoded !== normalized) ||
+            Buffer.from(normalized, 'base64').toString('base64') !== normalized
+          ) {
+            throw new Error('macOS signing certificate is not canonical base64')
+          }
+          const certificate = Buffer.from(normalized, 'base64')
+          if (
+            certificate.length < 7 ||
+            certificate.length > maximumCertificateBytes ||
+            certificate[0] !== 0x30
+          ) {
+            throw new Error('macOS signing certificate is not a bounded P12')
+          }
+          const derLength = (bytes, offset) => {
+            const first = bytes[offset]
+            if (first === undefined || first === 0x80) {
+              throw new Error('macOS signing certificate has invalid DER')
+            }
+            if (first < 0x80) return { bytes: 1, value: first }
+            const width = first & 0x7f
+            if (
+              width < 1 ||
+              width > 4 ||
+              offset + width >= bytes.length ||
+              bytes[offset + 1] === 0
+            ) {
+              throw new Error('macOS signing certificate has invalid DER')
+            }
+            let value = 0
+            for (let index = 1; index <= width; index += 1) {
+              value = value * 256 + bytes[offset + index]
+            }
+            if (value < 0x80) {
+              throw new Error('macOS signing certificate has non-canonical DER')
+            }
+            return { bytes: width + 1, value }
+          }
+          const sequenceLength = derLength(certificate, 1)
+          const contentOffset = 1 + sequenceLength.bytes
+          const contentEnd = contentOffset + sequenceLength.value
+          if (
+            contentEnd !== certificate.length ||
+            certificate[contentOffset] !== 0x02 ||
+            certificate[contentOffset + 1] !== 0x01 ||
+            certificate[contentOffset + 2] !== 0x03 ||
+            certificate[contentOffset + 3] !== 0x30
+          ) {
+            throw new Error('macOS signing certificate is not a P12 container')
+          }
+          const parent = path.resolve(process.env.CERTIFICATE_PARENT)
+          const directory = fs.mkdtempSync(
+            path.join(parent, 'motrix-mac-certificate-')
+          )
+          fs.chmodSync(directory, 0o700)
+          const certificatePath = path.join(directory, 'identity.p12')
+          fs.appendFileSync(
+            process.env.GITHUB_OUTPUT,
+            `directory=${directory}\npath=${certificatePath}\n`,
+            'utf8'
+          )
+          fs.writeFileSync(certificatePath, certificate, {
+            flag: 'wx',
+            mode: 0o600,
+          })
+          fs.chmodSync(certificatePath, 0o600)
+
+      - name: Prepare isolated macOS signing keychain
+        id: mac-keychain
+        if: matrix.platform == 'darwin'
+        shell: node {0}
+        env:
+          MAC_CERTIFICATE_PATH: ${{ steps.mac-certificate.outputs.path }}
+          MAC_CERTS_PASSWORD: ${{ secrets.MAC_CERTS_PASSWORD }}
+          KEYCHAIN_PARENT: ${{ runner.temp }}
+        run: |
+          const { spawnSync } = require('node:child_process')
+          const crypto = require('node:crypto')
+          const fs = require('node:fs')
+          const path = require('node:path')
+          const parent = fs.realpathSync(process.env.KEYCHAIN_PARENT)
+          const certificatePath = fs.realpathSync(
+            process.env.MAC_CERTIFICATE_PATH
+          )
+          const certificateRelative = path.relative(parent, certificatePath)
+          if (
+            !certificateRelative ||
+            certificateRelative === '..' ||
+            certificateRelative.startsWith(`..${path.sep}`) ||
+            path.isAbsolute(certificateRelative)
+          ) {
+            throw new Error('macOS signing certificate is outside runner temp')
+          }
+          const certificatePassword = process.env.MAC_CERTS_PASSWORD
+          if (!certificatePassword) {
+            throw new Error('macOS signing certificate password is missing')
+          }
+          const directory = fs.mkdtempSync(
+            path.join(parent, 'motrix-mac-keychain-')
+          )
+          fs.chmodSync(directory, 0o700)
+          const keychainPath = path.join(directory, 'signing.keychain-db')
+          const originalListPath = path.join(directory, 'original-keychains.json')
+          fs.appendFileSync(
+            process.env.GITHUB_OUTPUT,
+            `directory=${directory}\npath=${keychainPath}\noriginal_list=${originalListPath}\n`,
+            'utf8'
+          )
+          const security = (args, operation) => {
+            const result = spawnSync('/usr/bin/security', args, {
+              encoding: 'utf8',
+              maxBuffer: 1024 * 1024,
+              shell: false,
+            })
+            if (result.error || result.status !== 0) {
+              throw new Error(`macOS signing keychain ${operation} failed`)
+            }
+            return result.stdout
+          }
+          const originalKeychains = security(
+            ['list-keychains', '-d', 'user'],
+            'inventory'
+          )
+            .split('\n')
+            .map((line) => line.trim())
+            .filter(Boolean)
+            .map((line) =>
+              line.startsWith('"') && line.endsWith('"')
+                ? line.slice(1, -1)
+                : line
+            )
+          fs.writeFileSync(originalListPath, JSON.stringify(originalKeychains), {
+            flag: 'wx',
+            mode: 0o600,
+          })
+          let keychainPassword
+          do {
+            keychainPassword = crypto.randomBytes(48).toString('base64url')
+          } while (keychainPassword === certificatePassword)
+          security(
+            ['create-keychain', '-p', keychainPassword, keychainPath],
+            'creation'
+          )
+          security(
+            ['unlock-keychain', '-p', keychainPassword, keychainPath],
+            'unlock'
+          )
+          security(
+            ['set-keychain-settings', '-lut', '21600', keychainPath],
+            'settings'
+          )
+          security(
+            [
+              'import',
+              certificatePath,
+              '-k',
+              keychainPath,
+              '-T',
+              '/usr/bin/codesign',
+              '-T',
+              '/usr/bin/productbuild',
+              '-P',
+              certificatePassword,
+            ],
+            'certificate import'
+          )
+          security(
+            [
+              'set-key-partition-list',
+              '-S',
+              'apple-tool:,apple:',
+              '-s',
+              '-k',
+              keychainPassword,
+              keychainPath,
+            ],
+            'partition configuration'
+          )
+          security(
+            [
+              'list-keychains',
+              '-d',
+              'user',
+              '-s',
+              keychainPath,
+              ...originalKeychains,
+            ],
+            'search-list configuration'
+          )
+          const identities = security(
+            ['find-identity', '-v', '-p', 'codesigning', keychainPath],
+            'identity verification'
+          )
+          if (!/Developer ID Application:/u.test(identities)) {
+            throw new Error('macOS signing identity is unavailable')
+          }
+
+      - name: Electron Builder (macOS signing boundary)
+        if: matrix.platform == 'darwin'
+        shell: bash
+        working-directory: signing-input
+        env:
+          ELECTRON_BUILDER_CACHE: ${{ runner.temp }}/motrix-signing-cache
+          ELECTRON_DOWNLOAD_CACHE_MODE: '1'
+          ELECTRON_BUILDER_CLI: ${{ steps.signing-tool-runtime.outputs.cli }}
+          CSC_KEYCHAIN: ${{ steps.mac-keychain.outputs.path }}
+          CSC_IDENTITY_AUTO_DISCOVERY: 'true'
+          APPLE_API_KEY: ${{ steps.apple-api-key.outputs.path }}
+          APPLE_API_KEY_ID: ${{ secrets.API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.API_KEY_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          unset ELECTRON_BUILDER_BINARIES_CUSTOM_DIR
+          unset NPM_CONFIG_ELECTRON_BUILDER_BINARIES_CUSTOM_DIR
+          unset npm_config_electron_builder_binaries_custom_dir
+          unset npm_package_config_electron_builder_binaries_custom_dir
+          unset CSC_LINK
+          unset CSC_KEY_PASSWORD
+          node "$ELECTRON_BUILDER_CLI" \
+            --config electron-builder.signing.json \
+            ${{ matrix.electron_builder_args }} \
+            -c.mac.bundleVersion=${{ github.run_number }}.${{ github.run_attempt }}.0 \
+            --publish never
+
+      - name: Electron Builder (Windows finalization boundary)
+        if: matrix.platform == 'win32'
+        shell: pwsh
+        working-directory: signing-input
+        env:
+          ELECTRON_BUILDER_CACHE: ${{ runner.temp }}/motrix-signing-cache
+          ELECTRON_DOWNLOAD_CACHE_MODE: '1'
+          ELECTRON_BUILDER_CLI: ${{ steps.signing-tool-runtime.outputs.cli }}
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+        run: |
+          Remove-Item Env:\ELECTRON_BUILDER_BINARIES_CUSTOM_DIR -ErrorAction SilentlyContinue
+          Remove-Item Env:\NPM_CONFIG_ELECTRON_BUILDER_BINARIES_CUSTOM_DIR -ErrorAction SilentlyContinue
+          Remove-Item Env:\npm_config_electron_builder_binaries_custom_dir -ErrorAction SilentlyContinue
+          Remove-Item Env:\npm_package_config_electron_builder_binaries_custom_dir -ErrorAction SilentlyContinue
+          Remove-Item Env:\CSC_LINK -ErrorAction SilentlyContinue
+          Remove-Item Env:\CSC_KEY_PASSWORD -ErrorAction SilentlyContinue
+          node $env:ELECTRON_BUILDER_CLI `
+            --config electron-builder.signing.json `
+            ${{ matrix.electron_builder_args }} `
+            --publish never
+
+      - name: Remove finalization credentials
+        if: always()
+        shell: node {0}
+        env:
+          APPLE_API_KEY_PATH: ${{ steps.apple-api-key.outputs.path }}
+          MAC_CERTIFICATE_DIRECTORY: ${{ steps.mac-certificate.outputs.directory }}
+          MAC_CERTIFICATE_PATH: ${{ steps.mac-certificate.outputs.path }}
+          MAC_KEYCHAIN_DIRECTORY: ${{ steps.mac-keychain.outputs.directory }}
+          MAC_KEYCHAIN_PATH: ${{ steps.mac-keychain.outputs.path }}
+          MAC_ORIGINAL_KEYCHAIN_LIST: ${{ steps.mac-keychain.outputs.original_list }}
+          TEMPORARY_ROOT: ${{ runner.temp }}
+        run: |
+          const { spawnSync } = require('node:child_process')
+          const fs = require('node:fs')
+          const path = require('node:path')
+          const root = path.resolve(process.env.TEMPORARY_ROOT)
+          const insideRoot = (value) => {
+            if (!value) return undefined
+            const candidate = path.resolve(value)
+            const relative = path.relative(root, candidate)
+            if (
+              !relative ||
+              relative === '..' ||
+              relative.startsWith(`..${path.sep}`) ||
+              path.isAbsolute(relative)
+            ) {
+              throw new Error('refusing to clean a path outside runner temp')
+            }
+            return candidate
+          }
+          const failures = []
+          const security = (args, operation) => {
+            const result = spawnSync('/usr/bin/security', args, {
+              encoding: 'utf8',
+              maxBuffer: 1024 * 1024,
+              shell: false,
+            })
+            if (result.error || result.status !== 0) {
+              failures.push(operation)
+            }
+          }
+          const keychainPath = insideRoot(process.env.MAC_KEYCHAIN_PATH)
+          const originalListPath = insideRoot(
+            process.env.MAC_ORIGINAL_KEYCHAIN_LIST
+          )
+          if (keychainPath) {
+            if (originalListPath && fs.existsSync(originalListPath)) {
+              let originalKeychains
+              try {
+                originalKeychains = JSON.parse(
+                  fs.readFileSync(originalListPath, 'utf8')
+                )
+                if (
+                  !Array.isArray(originalKeychains) ||
+                  originalKeychains.some((value) => typeof value !== 'string')
+                ) {
+                  throw new Error('invalid keychain inventory')
+                }
+                security(
+                  ['list-keychains', '-d', 'user', '-s', ...originalKeychains],
+                  'keychain search-list restoration'
+                )
+              } catch {
+                failures.push('keychain inventory restoration')
+              }
+            } else if (fs.existsSync(keychainPath)) {
+              failures.push('keychain inventory restoration')
+            }
+          }
+          if (keychainPath && fs.existsSync(keychainPath)) {
+            security(
+              ['delete-keychain', keychainPath],
+              'isolated keychain deletion'
+            )
+          }
+          for (const value of [
+            process.env.APPLE_API_KEY_PATH,
+            process.env.MAC_CERTIFICATE_PATH,
+            process.env.MAC_ORIGINAL_KEYCHAIN_LIST,
+          ]) {
+            const candidate = insideRoot(value)
+            if (candidate) {
+              try {
+                fs.rmSync(candidate, { force: true })
+              } catch {
+                failures.push('temporary credential deletion')
+              }
+            }
+          }
+          for (const value of [
+            process.env.MAC_CERTIFICATE_DIRECTORY,
+            process.env.MAC_KEYCHAIN_DIRECTORY,
+          ]) {
+            const candidate = insideRoot(value)
+            if (candidate) {
+              try {
+                fs.rmSync(candidate, { recursive: true, force: true })
+              } catch {
+                failures.push('temporary credential directory deletion')
+              }
+            }
+          }
+          if (failures.length > 0) {
+            throw new Error('finalization credential cleanup failed')
+          }
+
+      - name: Verify macOS signatures
+        if: matrix.platform == 'darwin'
+        shell: bash
+        working-directory: signing-input
+        run: |
+          set -euo pipefail
+          codesign --verify --deep --strict --verbose=2 "${{ matrix.app_path }}"
+          codesign --verify --strict --verbose=2 \
+            "${{ matrix.resources_dir }}/bin/motrix-native-host"
+          xcrun stapler validate "${{ matrix.app_path }}"
+
+      - name: Verify finalized Electron package
+        working-directory: signing-input
+        run: >-
+          node "${{ steps.signing-tool-runtime.outputs.verifier }}"
+          --app-dir "${{ matrix.app_path }}"
+          --platform ${{ matrix.platform }}
+          --arch ${{ matrix.arch }}
+          --report "release/size-reports/${{ matrix.target }}.json"
+
+      - name: Remove isolated signing runtime
+        if: always()
+        shell: node {0}
+        env:
+          SIGNING_TOOL_ROOT: ${{ steps.signing-tool-runtime.outputs.root }}
+          TEMPORARY_ROOT: ${{ runner.temp }}
+        run: |
+          const fs = require('node:fs')
+          const path = require('node:path')
+          const root = path.resolve(process.env.TEMPORARY_ROOT)
+          const value = process.env.SIGNING_TOOL_ROOT
+          if (!value) process.exit(0)
+          const candidate = path.resolve(value)
+          const relative = path.relative(root, candidate)
+          if (
+            !relative ||
+            relative === '..' ||
+            relative.startsWith(`..${path.sep}`) ||
+            path.isAbsolute(relative)
+          ) {
+            throw new Error('refusing to clean a path outside runner temp')
+          }
+          fs.rmSync(candidate, { recursive: true, force: true })
+
+      - name: Upload finalized release input
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-input-${{ matrix.target }}
+          path: |
+            signing-input/release/*.blockmap
+            signing-input/release/beta*.yml
+            signing-input/release/*.dmg
+            signing-input/release/*.exe
+            signing-input/release/latest*.yml
+            signing-input/release/size-reports/${{ matrix.target }}.json
+            signing-input/release/*.zip
+          if-no-files-found: error
+          retention-days: 7
+
+  flatpak:
+    name: Build and validate Flatpak
+    needs: preflight
+    uses: ./.github/workflows/flatpak.yml
+    with:
+      release-version: ${{ needs.preflight.outputs.version }}
+
+  assemble:
+    name: Assemble and validate release
+    needs: [preflight, build, sign, flatpak]
+    if: >-
+      always() &&
+      needs.preflight.result == 'success' &&
+      needs.build.result == 'success' &&
+      needs.flatpak.result == 'success' &&
+      (
+        (github.event_name == 'push' && needs.sign.result == 'success') ||
+        (github.event_name == 'workflow_dispatch' && needs.sign.result == 'skipped')
+      )
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    env:
+      RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
+      RELEASE_CHANNEL: ${{ needs.preflight.outputs.channel }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          version: 12.8.1
+          run_install: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install validation dependencies
+        run: pnpm install --frozen-lockfile --ignore-scripts
+
+      - name: Download target release inputs
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: release-input-*
+          path: release-input
+
+      - name: Download verified x86_64 Flatpak
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: flatpak-release-x64
+          path: release-input/release-input-linux-x64/flatpak
+
+      - name: Download verified aarch64 Flatpak
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: flatpak-release-arm64
+          path: release-input/release-input-linux-arm64/flatpak
+
+      - name: Assemble release artifacts
+        run: >-
+          node scripts/assemble-release-artifacts.mjs
+          --input release-input
+          --output release
+          --version "$RELEASE_VERSION"
+          --channel "$RELEASE_CHANNEL"
+
+      - name: Verify update artifacts
+        run: >-
+          pnpm --config.verify-deps-before-run=false run check:update-artifacts
+          -- --version "$RELEASE_VERSION"
+          --dir release
+          --channel "$RELEASE_CHANNEL"
+          --require-all
+
+      - name: Upload validated release
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-bundle
+          path: release/*
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Publish validated GitHub Release
+    needs: [preflight, assemble]
+    if: >-
+      github.event_name == 'push' &&
+      startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    environment: github-release
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout release source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download validated release
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-bundle
+          path: release
+
+      - name: Publish validated GitHub Release
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
+        with:
+          body_path: ${{ needs.preflight.outputs.release_notes_path }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          prerelease: ${{ needs.preflight.outputs.prerelease }}
+          files: release/*
+
+  plan-container-publication:
+    name: Inspect Server container publication state
+    needs: [preflight, publish]
+    if: >-
+      github.event_name == 'push' &&
+      startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      action: ${{ steps.publication-state.outputs.publication_action }}
+      digest: ${{ steps.publication-state.outputs.publication_digest }}
+      copy_source: ${{ steps.publication-state.outputs.copy_source }}
+      copy_target: ${{ steps.publication-state.outputs.copy_target }}
+    env:
+      CONTAINER_VERSION: ${{ needs.preflight.outputs.container_version }}
+      DOCKERHUB_REPOSITORY: ${{ needs.preflight.outputs.container_dockerhub_repository }}
+      GHCR_REPOSITORY: ${{ needs.preflight.outputs.container_ghcr_repository }}
+    steps:
+      - name: Checkout release source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Inspect existing immutable tags
+        shell: bash
+        env:
+          DOCKERHUB_SNAPSHOT: ${{ runner.temp }}/dockerhub-immutable.json
+          GHCR_SNAPSHOT: ${{ runner.temp }}/ghcr-immutable.json
+        run: |
+          set -euo pipefail
+          inspect_tag() {
+            local ref="$1"
+            local target="$2"
+            local detail
+            if detail="$(docker buildx imagetools inspect \
+              "$ref" --format '{{json .}}' 2>&1)"; then
+              printf '%s\n' "$detail" > "$target"
+              return
+            fi
+            if grep -Eiq \
+              'not found|manifest unknown|name unknown|does not exist' \
+              <<< "$detail"; then
+              printf 'null\n' > "$target"
+              return
+            fi
+            printf '%s\n' "$detail" >&2
+            exit 1
+          }
+          inspect_tag \
+            "${DOCKERHUB_REPOSITORY}:${CONTAINER_VERSION}" \
+            "$DOCKERHUB_SNAPSHOT"
+          inspect_tag \
+            "${GHCR_REPOSITORY}:${CONTAINER_VERSION}" \
+            "$GHCR_SNAPSHOT"
+
+      - name: Resolve immutable publication state
+        id: publication-state
+        env:
+          DOCKERHUB_SNAPSHOT: ${{ runner.temp }}/dockerhub-immutable.json
+          GHCR_SNAPSHOT: ${{ runner.temp }}/ghcr-immutable.json
+        run: >-
+          node scripts/container-publication-state.mjs
+          --docker-hub-snapshot "$DOCKERHUB_SNAPSHOT"
+          --ghcr-snapshot "$GHCR_SNAPSHOT"
+          --version "$CONTAINER_VERSION"
+          --revision "$GITHUB_SHA"
+          --github-output "$GITHUB_OUTPUT"
+
+  build-container-platform:
+    name: Build Server / ${{ matrix.platform }}
+    needs: [preflight, publish, plan-container-publication]
+    if: needs.plan-container-publication.outputs.action == 'build'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    environment: container-release
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            os: ubuntu-22.04
+            runner_arch: X64
+            artifact: container-build-linux-amd64
+            metadata_file: linux-amd64.json
+          - platform: linux/arm64
+            os: ubuntu-22.04-arm
+            runner_arch: ARM64
+            artifact: container-build-linux-arm64
+            metadata_file: linux-arm64.json
+    env:
+      CONTAINER_VERSION: ${{ needs.preflight.outputs.container_version }}
+      DOCKERHUB_REPOSITORY: ${{ needs.preflight.outputs.container_dockerhub_repository }}
+      GHCR_REPOSITORY: ${{ needs.preflight.outputs.container_ghcr_repository }}
+    steps:
+      - name: Checkout release source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Require native GitHub-hosted Linux runner
+        shell: bash
+        env:
+          EXPECTED_RUNNER_ARCH: ${{ matrix.runner_arch }}
+          RUNNER_ARCH_VALUE: ${{ runner.arch }}
+          RUNNER_ENVIRONMENT_VALUE: ${{ runner.environment }}
+          RUNNER_OS_VALUE: ${{ runner.os }}
+        run: |
+          set -euo pipefail
+          [[ "$RUNNER_ENVIRONMENT_VALUE" == 'github-hosted' ]]
+          [[ "$RUNNER_OS_VALUE" == 'Linux' ]]
+          [[ "$RUNNER_ARCH_VALUE" == "$EXPECTED_RUNNER_ARCH" ]]
+
+      - name: Validate container release credentials
+        shell: bash
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          missing=()
+          for name in DOCKERHUB_USERNAME DOCKERHUB_TOKEN; do
+            if [[ -z "${!name:-}" ]]; then
+              missing+=("$name")
+            fi
+          done
+          if (( ${#missing[@]} > 0 )); then
+            echo "Missing required container-release secrets: ${missing[*]}" >&2
+            exit 1
+          fi
+          curl --fail --silent --show-error \
+            https://hub.docker.com/v2/repositories/motrixapp/motrix-server/ \
+            > /dev/null
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Login to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Build and push native platform digest
+        id: platform-build
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          target: runtime
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,"name=${{ env.DOCKERHUB_REPOSITORY }},${{ env.GHCR_REPOSITORY }}",oci-artifact=true,push-by-digest=true,name-canonical=true,push=true
+          labels: ${{ needs.preflight.outputs.container_labels }}
+          build-args: |
+            OCI_REVISION=${{ github.sha }}
+            OCI_VERSION=${{ needs.preflight.outputs.container_version }}
+          cache-from: type=gha,scope=motrix-server-release-${{ matrix.runner_arch }}
+          cache-to: type=gha,mode=max,scope=motrix-server-release-${{ matrix.runner_arch }}
+          provenance: mode=max
+          sbom: true
+
+      - name: Inspect staged platform digests
+        shell: bash
+        env:
+          PLATFORM_DIGEST: ${{ steps.platform-build.outputs.digest }}
+          SNAPSHOT_DIRECTORY: ${{ runner.temp }}/container-platform
+        run: |
+          set -euo pipefail
+          [[ "$PLATFORM_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          mkdir -p "$SNAPSHOT_DIRECTORY"
+          snapshot_platform() {
+            local name="$1"
+            local repository="$2"
+            docker buildx imagetools inspect \
+              "${repository}@${PLATFORM_DIGEST}" \
+              --format '{{json .}}' \
+              > "$SNAPSHOT_DIRECTORY/${name}-inspect.json"
+            docker buildx imagetools inspect \
+              "${repository}@${PLATFORM_DIGEST}" --raw \
+              > "$SNAPSHOT_DIRECTORY/${name}-index.json"
+          }
+          snapshot_platform docker-hub "$DOCKERHUB_REPOSITORY"
+          snapshot_platform ghcr "$GHCR_REPOSITORY"
+
+      - name: Prepare anonymous registry client
+        shell: bash
+        env:
+          ANONYMOUS_DOCKER_CONFIG: ${{ runner.temp }}/anonymous-docker
+        run: |
+          set -euo pipefail
+          mkdir -p "$ANONYMOUS_DOCKER_CONFIG"
+          printf '{"auths":{}}\n' > "$ANONYMOUS_DOCKER_CONFIG/config.json"
+
+      - name: Smoke anonymous staged platform digests
+        shell: bash
+        env:
+          DOCKER_CONFIG: ${{ runner.temp }}/anonymous-docker
+          PLATFORM_DIGEST: ${{ steps.platform-build.outputs.digest }}
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          set -euo pipefail
+          for repository in "$DOCKERHUB_REPOSITORY" "$GHCR_REPOSITORY"; do
+            node scripts/smoke-server-image.mjs \
+              --image "${repository}@${PLATFORM_DIGEST}" \
+              --platform "$PLATFORM" \
+              --timeout-ms 180000
+          done
+
+      - name: Write immutable platform build metadata
+        shell: bash
+        env:
+          BUILDER_RUN_ID: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          METADATA_FILE: ${{ runner.temp }}/${{ matrix.metadata_file }}
+          PLATFORM_DIGEST: ${{ steps.platform-build.outputs.digest }}
+          SNAPSHOT_DIRECTORY: ${{ runner.temp }}/container-platform
+        run: >-
+          node scripts/container-platform-metadata.mjs create
+          --platform "${{ matrix.platform }}"
+          --digest "$PLATFORM_DIGEST"
+          --version "$CONTAINER_VERSION"
+          --revision "$GITHUB_SHA"
+          --builder-run-id "$BUILDER_RUN_ID"
+          --builder-attempt "$GITHUB_RUN_ATTEMPT"
+          --runner-arch "${{ runner.arch }}"
+          --runner-environment "${{ runner.environment }}"
+          --runner-os "${{ runner.os }}"
+          --docker-hub-inspect "$SNAPSHOT_DIRECTORY/docker-hub-inspect.json"
+          --docker-hub-index "$SNAPSHOT_DIRECTORY/docker-hub-index.json"
+          --ghcr-inspect "$SNAPSHOT_DIRECTORY/ghcr-inspect.json"
+          --ghcr-index "$SNAPSHOT_DIRECTORY/ghcr-index.json"
+          --output "$METADATA_FILE"
+
+      - name: Upload immutable platform build metadata
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ runner.temp }}/${{ matrix.metadata_file }}
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 7
+
+  publish-container:
+    name: Finalize and publish verified Server index
+    needs:
+      [preflight, publish, plan-container-publication, build-container-platform]
+    if: >-
+      always() &&
+      github.event_name == 'push' &&
+      startsWith(github.ref, 'refs/tags/v') &&
+      needs.preflight.result == 'success' &&
+      needs.publish.result == 'success' &&
+      needs.plan-container-publication.result == 'success' &&
+      (
+        (
+          needs.plan-container-publication.outputs.action == 'build' &&
+          needs.build-container-platform.result == 'success'
+        ) ||
+        (
+          needs.plan-container-publication.outputs.action != 'build' &&
+          needs.build-container-platform.result == 'skipped'
+        )
+      )
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    environment: container-release
+    permissions:
+      contents: read
+      id-token: write
+      packages: write
+    outputs:
+      digest: ${{ steps.immutable-publication.outputs.publication_digest }}
+    env:
+      CONTAINER_VERSION: ${{ needs.preflight.outputs.container_version }}
+      DOCKERHUB_REPOSITORY: ${{ needs.preflight.outputs.container_dockerhub_repository }}
+      GHCR_REPOSITORY: ${{ needs.preflight.outputs.container_ghcr_repository }}
+    steps:
+      - name: Checkout release source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Validate container release credentials
+        shell: bash
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          missing=()
+          for name in DOCKERHUB_USERNAME DOCKERHUB_TOKEN; do
+            if [[ -z "${!name:-}" ]]; then
+              missing+=("$name")
+            fi
+          done
+          if (( ${#missing[@]} > 0 )); then
+            echo "Missing required container-release secrets: ${missing[*]}" >&2
+            exit 1
+          fi
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Login to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Download amd64 platform build metadata
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: container-build-linux-amd64
+          path: ${{ runner.temp }}/container-build-metadata/amd64
+
+      - name: Download arm64 platform build metadata
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: container-build-linux-arm64
+          path: ${{ runner.temp }}/container-build-metadata/arm64
+
+      - name: Verify complete platform build set
+        id: platform-builds
+        shell: bash
+        env:
+          BUILDER_RUN_ID: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          METADATA_DIRECTORY: ${{ runner.temp }}/container-build-metadata
+          VERIFIED_METADATA: ${{ runner.temp }}/verified-container-builds.json
+        run: >-
+          node scripts/container-platform-metadata.mjs verify-set
+          --metadata-dir "$METADATA_DIRECTORY"
+          --version "$CONTAINER_VERSION"
+          --revision "$GITHUB_SHA"
+          --builder-run-id "$BUILDER_RUN_ID"
+          --builder-attempt "$GITHUB_RUN_ATTEMPT"
+          --output "$VERIFIED_METADATA"
+          --github-output "$GITHUB_OUTPUT"
+
+      - name: Revalidate immutable tags before finalization
+        shell: bash
+        env:
+          DOCKERHUB_SNAPSHOT: ${{ runner.temp }}/dockerhub-immutable.json
+          GHCR_SNAPSHOT: ${{ runner.temp }}/ghcr-immutable.json
+        run: |
+          set -euo pipefail
+          inspect_tag() {
+            local ref="$1"
+            local target="$2"
+            local detail
+            if detail="$(docker buildx imagetools inspect \
+              "$ref" --format '{{json .}}' 2>&1)"; then
+              printf '%s\n' "$detail" > "$target"
+              return
+            fi
+            if grep -Eiq \
+              'not found|manifest unknown|name unknown|does not exist' \
+              <<< "$detail"; then
+              printf 'null\n' > "$target"
+              return
+            fi
+            printf '%s\n' "$detail" >&2
+            exit 1
+          }
+          inspect_tag \
+            "${DOCKERHUB_REPOSITORY}:${CONTAINER_VERSION}" \
+            "$DOCKERHUB_SNAPSHOT"
+          inspect_tag \
+            "${GHCR_REPOSITORY}:${CONTAINER_VERSION}" \
+            "$GHCR_SNAPSHOT"
+
+      - name: Resolve finalization state
+        id: finalization-state
+        env:
+          DOCKERHUB_SNAPSHOT: ${{ runner.temp }}/dockerhub-immutable.json
+          GHCR_SNAPSHOT: ${{ runner.temp }}/ghcr-immutable.json
+        run: >-
+          node scripts/container-publication-state.mjs
+          --docker-hub-snapshot "$DOCKERHUB_SNAPSHOT"
+          --ghcr-snapshot "$GHCR_SNAPSHOT"
+          --version "$CONTAINER_VERSION"
+          --revision "$GITHUB_SHA"
+          --github-output "$GITHUB_OUTPUT"
+
+      - name: Prepare anonymous registry client
+        shell: bash
+        env:
+          ANONYMOUS_DOCKER_CONFIG: ${{ runner.temp }}/anonymous-docker
+        run: |
+          set -euo pipefail
+          mkdir -p "$ANONYMOUS_DOCKER_CONFIG"
+          printf '{"auths":{}}\n' > "$ANONYMOUS_DOCKER_CONFIG/config.json"
+
+      - name: Verify partial immutable source before repair
+        if: steps.finalization-state.outputs.publication_action == 'copy'
+        shell: bash
+        env:
+          COPY_SOURCE: ${{ steps.finalization-state.outputs.copy_source }}
+          DOCKER_CONFIG: ${{ runner.temp }}/anonymous-docker
+          EXPECTED_BUILDER_RUN: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          MAXIMUM_BUILDER_ATTEMPT: ${{ github.run_attempt }}
+          SOURCE_SNAPSHOT_DIRECTORY: ${{ runner.temp }}/container-repair-source
+          VERIFIED_METADATA: ${{ runner.temp }}/verified-container-builds.json
+        run: |
+          set -euo pipefail
+          mkdir -p "$SOURCE_SNAPSHOT_DIRECTORY"
+          source_repository="${COPY_SOURCE%@*}"
+          docker buildx imagetools inspect "$COPY_SOURCE" \
+            --format '{{json .}}' \
+            > "$SOURCE_SNAPSHOT_DIRECTORY/inspect.json"
+          docker buildx imagetools inspect "$COPY_SOURCE" --raw \
+            > "$SOURCE_SNAPSHOT_DIRECTORY/index.json"
+          docker buildx imagetools inspect "$COPY_SOURCE" \
+            --format '{{json .SBOM}}' \
+            > "$SOURCE_SNAPSHOT_DIRECTORY/sbom.json"
+          docker buildx imagetools inspect "$COPY_SOURCE" \
+            --format '{{json .Provenance}}' \
+            > "$SOURCE_SNAPSHOT_DIRECTORY/provenance.json"
+          node scripts/verify-container-publication.mjs \
+            --repository "$source_repository" \
+            --inspect "$SOURCE_SNAPSHOT_DIRECTORY/inspect.json" \
+            --index "$SOURCE_SNAPSHOT_DIRECTORY/index.json" \
+            --sbom "$SOURCE_SNAPSHOT_DIRECTORY/sbom.json" \
+            --provenance "$SOURCE_SNAPSHOT_DIRECTORY/provenance.json" \
+            --platform-metadata "$VERIFIED_METADATA" \
+            --builder-run-id "$EXPECTED_BUILDER_RUN" \
+            --maximum-builder-attempt "$MAXIMUM_BUILDER_ATTEMPT" \
+            --version "$CONTAINER_VERSION" \
+            --revision "$GITHUB_SHA"
+
+      - name: Create immutable multi-platform indexes
+        if: steps.finalization-state.outputs.publication_action == 'build'
+        shell: bash
+        env:
+          AMD64_DIGEST: ${{ steps.platform-builds.outputs.amd64_digest }}
+          ARM64_DIGEST: ${{ steps.platform-builds.outputs.arm64_digest }}
+        run: |
+          set -euo pipefail
+          for repository in "$DOCKERHUB_REPOSITORY" "$GHCR_REPOSITORY"; do
+            docker buildx imagetools create \
+              --tag "${repository}:${CONTAINER_VERSION}" \
+              "${repository}@${AMD64_DIGEST}" \
+              "${repository}@${ARM64_DIGEST}"
+          done
+
+      - name: Repair partial immutable publication
+        if: steps.finalization-state.outputs.publication_action == 'copy'
+        shell: bash
+        env:
+          COPY_SOURCE: ${{ steps.finalization-state.outputs.copy_source }}
+          COPY_TARGET: ${{ steps.finalization-state.outputs.copy_target }}
+        run: >-
+          docker buildx imagetools create
+          --tag "$COPY_TARGET"
+          "$COPY_SOURCE"
+
+      - name: Reinspect immutable tags
+        shell: bash
+        env:
+          DOCKERHUB_SNAPSHOT: ${{ runner.temp }}/dockerhub-immutable.json
+          GHCR_SNAPSHOT: ${{ runner.temp }}/ghcr-immutable.json
+        run: |
+          set -euo pipefail
+          docker buildx imagetools inspect \
+            "${DOCKERHUB_REPOSITORY}:${CONTAINER_VERSION}" \
+            --format '{{json .}}' > "$DOCKERHUB_SNAPSHOT"
+          docker buildx imagetools inspect \
+            "${GHCR_REPOSITORY}:${CONTAINER_VERSION}" \
+            --format '{{json .}}' > "$GHCR_SNAPSHOT"
+
+      - name: Verify immutable publication state
+        id: immutable-publication
+        env:
+          DOCKERHUB_SNAPSHOT: ${{ runner.temp }}/dockerhub-immutable.json
+          GHCR_SNAPSHOT: ${{ runner.temp }}/ghcr-immutable.json
+        run: >-
+          node scripts/container-publication-state.mjs
+          --docker-hub-snapshot "$DOCKERHUB_SNAPSHOT"
+          --ghcr-snapshot "$GHCR_SNAPSHOT"
+          --version "$CONTAINER_VERSION"
+          --revision "$GITHUB_SHA"
+          --github-output "$GITHUB_OUTPUT"
+
+      - name: Refuse a non-resumable immutable result
+        shell: bash
+        env:
+          EXPECTED_ACTION: ${{ steps.immutable-publication.outputs.publication_action }}
+        run: |
+          set -euo pipefail
+          if [[ "$EXPECTED_ACTION" != 'resume' ]]; then
+            echo "Immutable publication did not converge: $EXPECTED_ACTION" >&2
+            exit 1
+          fi
+
+      - name: Verify anonymous multi-platform index artifacts before signing
+        shell: bash
+        env:
+          DOCKER_CONFIG: ${{ runner.temp }}/anonymous-docker
+          EXPECTED_BUILDER_RUN: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          MAXIMUM_BUILDER_ATTEMPT: ${{ github.run_attempt }}
+          PUBLISHED_DIGEST: ${{ steps.immutable-publication.outputs.publication_digest }}
+          SNAPSHOT_DIRECTORY: ${{ runner.temp }}/container-publication
+          VERIFIED_METADATA: ${{ runner.temp }}/verified-container-builds.json
+        run: |
+          set -euo pipefail
+          mkdir -p "$SNAPSHOT_DIRECTORY"
+          snapshot_artifact() {
+            local name="$1"
+            local reference="$2"
+            docker buildx imagetools inspect "$reference" \
+              --format '{{json .}}' \
+              > "$SNAPSHOT_DIRECTORY/${name}-inspect.json"
+            docker buildx imagetools inspect "$reference" --raw \
+              > "$SNAPSHOT_DIRECTORY/${name}-index.json"
+            docker buildx imagetools inspect "$reference" \
+              --format '{{json .SBOM}}' \
+              > "$SNAPSHOT_DIRECTORY/${name}-sbom.json"
+            docker buildx imagetools inspect "$reference" \
+              --format '{{json .Provenance}}' \
+              > "$SNAPSHOT_DIRECTORY/${name}-provenance.json"
+          }
+          snapshot_artifact \
+            docker-hub "${DOCKERHUB_REPOSITORY}@${PUBLISHED_DIGEST}"
+          snapshot_artifact ghcr "${GHCR_REPOSITORY}@${PUBLISHED_DIGEST}"
+          node scripts/verify-container-publication.mjs \
+            --docker-hub-inspect \
+              "$SNAPSHOT_DIRECTORY/docker-hub-inspect.json" \
+            --docker-hub-index \
+              "$SNAPSHOT_DIRECTORY/docker-hub-index.json" \
+            --docker-hub-sbom \
+              "$SNAPSHOT_DIRECTORY/docker-hub-sbom.json" \
+            --docker-hub-provenance \
+              "$SNAPSHOT_DIRECTORY/docker-hub-provenance.json" \
+            --ghcr-inspect "$SNAPSHOT_DIRECTORY/ghcr-inspect.json" \
+            --ghcr-index "$SNAPSHOT_DIRECTORY/ghcr-index.json" \
+            --ghcr-sbom "$SNAPSHOT_DIRECTORY/ghcr-sbom.json" \
+            --ghcr-provenance "$SNAPSHOT_DIRECTORY/ghcr-provenance.json" \
+            --platform-metadata "$VERIFIED_METADATA" \
+            --builder-run-id "$EXPECTED_BUILDER_RUN" \
+            --maximum-builder-attempt "$MAXIMUM_BUILDER_ATTEMPT" \
+            --version "$CONTAINER_VERSION" \
+            --revision "$GITHUB_SHA"
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Sign immutable digests with GitHub OIDC
+        shell: bash
+        env:
+          PUBLISHED_DIGEST: ${{ steps.immutable-publication.outputs.publication_digest }}
+        run: |
+          set -euo pipefail
+          for repository in "$DOCKERHUB_REPOSITORY" "$GHCR_REPOSITORY"; do
+            cosign sign --yes "${repository}@${PUBLISHED_DIGEST}"
+          done
+
+      - name: Verify immutable signatures
+        shell: bash
+        env:
+          COSIGN_VERIFY_ERROR: ${{ runner.temp }}/cosign-verify-error.log
+          DOCKER_CONFIG: ${{ runner.temp }}/anonymous-docker
+          PUBLISHED_DIGEST: ${{ steps.immutable-publication.outputs.publication_digest }}
+        run: |
+          set -euo pipefail
+          identity="https://github.com/agalwood/Motrix/.github/workflows/release.yml@refs/tags/${GITHUB_REF_NAME}"
+          verify_signature() {
+            local repository="$1"
+            local max_attempts=18
+            local retry_delay_seconds=10
+            local attempt
+            for (( attempt = 1; attempt <= max_attempts; attempt += 1 )); do
+              if cosign verify \
+                --certificate-identity "$identity" \
+                --certificate-oidc-issuer \
+                  'https://token.actions.githubusercontent.com' \
+                "${repository}@${PUBLISHED_DIGEST}" \
+                > /dev/null 2> "$COSIGN_VERIFY_ERROR"; then
+                return 0
+              fi
+              if (( attempt == max_attempts )); then
+                cat "$COSIGN_VERIFY_ERROR" >&2
+                return 1
+              fi
+              echo "Signature is not yet visible for ${repository}; retrying (${attempt}/${max_attempts})"
+              sleep "$retry_delay_seconds"
+            done
+          }
+          for repository in "$DOCKERHUB_REPOSITORY" "$GHCR_REPOSITORY"; do
+            verify_signature "$repository"
+          done
+
+  verify-container-runtime:
+    name: Verify Server runtime / ${{ matrix.platform }}
+    needs: [preflight, publish-container]
+    if: >-
+      github.event_name == 'push' &&
+      startsWith(github.ref, 'refs/tags/v')
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            os: ubuntu-22.04
+            runner_arch: X64
+          - platform: linux/arm64
+            os: ubuntu-22.04-arm
+            runner_arch: ARM64
+    env:
+      DOCKERHUB_REPOSITORY: ${{ needs.preflight.outputs.container_dockerhub_repository }}
+      GHCR_REPOSITORY: ${{ needs.preflight.outputs.container_ghcr_repository }}
+      PUBLISHED_DIGEST: ${{ needs.publish-container.outputs.digest }}
+    steps:
+      - name: Checkout release source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Require native GitHub-hosted Linux runner
+        shell: bash
+        env:
+          EXPECTED_RUNNER_ARCH: ${{ matrix.runner_arch }}
+          RUNNER_ARCH_VALUE: ${{ runner.arch }}
+          RUNNER_ENVIRONMENT_VALUE: ${{ runner.environment }}
+          RUNNER_OS_VALUE: ${{ runner.os }}
+        run: |
+          set -euo pipefail
+          [[ "$RUNNER_ENVIRONMENT_VALUE" == 'github-hosted' ]]
+          [[ "$RUNNER_OS_VALUE" == 'Linux' ]]
+          [[ "$RUNNER_ARCH_VALUE" == "$EXPECTED_RUNNER_ARCH" ]]
+
+      - name: Prepare anonymous registry client
+        shell: bash
+        env:
+          ANONYMOUS_DOCKER_CONFIG: ${{ runner.temp }}/anonymous-docker
+        run: |
+          set -euo pipefail
+          mkdir -p "$ANONYMOUS_DOCKER_CONFIG"
+          printf '{"auths":{}}\n' > "$ANONYMOUS_DOCKER_CONFIG/config.json"
+
+      - name: Smoke immutable public index on native platform
+        shell: bash
+        env:
+          DOCKER_CONFIG: ${{ runner.temp }}/anonymous-docker
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          set -euo pipefail
+          [[ "$PUBLISHED_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          for repository in "$DOCKERHUB_REPOSITORY" "$GHCR_REPOSITORY"; do
+            node scripts/smoke-server-image.mjs \
+              --image "${repository}@${PUBLISHED_DIGEST}" \
+              --platform "$PLATFORM" \
+              --timeout-ms 180000
+          done
+
+  promote-container-aliases:
+    name: Promote verified stable Server aliases
+    needs: [preflight, publish-container, verify-container-runtime]
+    if: >-
+      github.event_name == 'push' &&
+      startsWith(github.ref, 'refs/tags/v') &&
+      needs.preflight.outputs.container_prerelease != 'true'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    environment: container-release
+    permissions:
+      contents: read
+      packages: write
+    env:
+      CONTAINER_VERSION: ${{ needs.preflight.outputs.container_version }}
+      DOCKERHUB_REPOSITORY: ${{ needs.preflight.outputs.container_dockerhub_repository }}
+      GHCR_REPOSITORY: ${{ needs.preflight.outputs.container_ghcr_repository }}
+      PUBLISHED_DIGEST: ${{ needs.publish-container.outputs.digest }}
+    steps:
+      - name: Validate container release credentials
+        shell: bash
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          [[ -n "$DOCKERHUB_USERNAME" ]]
+          [[ -n "$DOCKERHUB_TOKEN" ]]
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Login to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Revalidate immutable inputs before alias promotion
+        shell: bash
+        env:
+          ANONYMOUS_DOCKER_CONFIG: ${{ runner.temp }}/anonymous-docker
+        run: |
+          set -euo pipefail
+          mkdir -p "$ANONYMOUS_DOCKER_CONFIG"
+          printf '{"auths":{}}\n' > "$ANONYMOUS_DOCKER_CONFIG/config.json"
+          identity="https://github.com/agalwood/Motrix/.github/workflows/release.yml@refs/tags/${GITHUB_REF_NAME}"
+          for repository in "$DOCKERHUB_REPOSITORY" "$GHCR_REPOSITORY"; do
+            observed="$(DOCKER_CONFIG="$ANONYMOUS_DOCKER_CONFIG" \
+              docker buildx imagetools inspect \
+              "${repository}:${CONTAINER_VERSION}" \
+              --format '{{json .}}' | jq -er '.manifest.digest')"
+            [[ "$observed" == "$PUBLISHED_DIGEST" ]]
+            DOCKER_CONFIG="$ANONYMOUS_DOCKER_CONFIG" cosign verify \
+              --certificate-identity "$identity" \
+              --certificate-oidc-issuer \
+                'https://token.actions.githubusercontent.com' \
+              "${repository}@${PUBLISHED_DIGEST}" > /dev/null
+          done
+
+      - name: Promote and verify stable container aliases last
+        shell: bash
+        env:
+          FLOATING_TAGS: ${{ needs.preflight.outputs.container_floating_tags }}
+        run: |
+          set -euo pipefail
+          dockerhub_tags=()
+          ghcr_tags=()
+          all_tags=()
+          while IFS= read -r tag; do
+            [[ -z "$tag" ]] && continue
+            all_tags+=("$tag")
+            case "$tag" in
+              docker.io/*) dockerhub_tags+=(--tag "$tag") ;;
+              ghcr.io/*) ghcr_tags+=(--tag "$tag") ;;
+              *) echo "Unexpected container tag: $tag" >&2; exit 1 ;;
+            esac
+          done <<< "$FLOATING_TAGS"
+          (( ${#dockerhub_tags[@]} == 8 ))
+          (( ${#ghcr_tags[@]} == 8 ))
+          docker buildx imagetools create \
+            "${dockerhub_tags[@]}" \
+            "${DOCKERHUB_REPOSITORY}@${PUBLISHED_DIGEST}"
+          docker buildx imagetools create \
+            "${ghcr_tags[@]}" \
+            "${GHCR_REPOSITORY}@${PUBLISHED_DIGEST}"
+          for tag in "${all_tags[@]}"; do
+            observed="$(docker buildx imagetools inspect "$tag" \
+              --format '{{json .}}' | jq -er '.manifest.digest')"
+            [[ "$observed" == "$PUBLISHED_DIGEST" ]]
+          done
+
+  publish-feed:
+    name: Publish dl.motrix.app update feed
+    needs: [preflight, assemble, publish]
+    if: >-
+      github.event_name == 'push' &&
+      startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    environment: app-update-feed
+    permissions:
+      contents: read
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: auto
+      AWS_EC2_METADATA_DISABLED: 'true'
+      RELEASE_CHANNEL: ${{ needs.preflight.outputs.channel }}
+      R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+      R2_BUCKET: ${{ secrets.R2_BUCKET }}
+    steps:
+      - name: Download validated release
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-bundle
+          path: release
+
+      - name: Validate update feed credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+          missing=()
+          for name in \
+            AWS_ACCESS_KEY_ID \
+            AWS_SECRET_ACCESS_KEY \
+            R2_ACCOUNT_ID \
+            R2_BUCKET
+          do
+            if [[ -z "${!name:-}" ]]; then
+              missing+=("$name")
+            fi
+          done
+          if (( ${#missing[@]} > 0 )); then
+            echo "Missing required app-update-feed secrets: ${missing[*]}" >&2
+            exit 1
+          fi
+          if [[ ! "$R2_ACCOUNT_ID" =~ ^[0-9a-f]{32}$ ]]; then
+            echo 'R2_ACCOUNT_ID must be a 32-character lowercase hexadecimal account ID' >&2
+            exit 1
+          fi
+          if [[ "$R2_BUCKET" != 'motrix-releases' ]]; then
+            echo 'R2_BUCKET must match the dl Worker RELEASES binding: motrix-releases' >&2
+            exit 1
+          fi
+          aws --version
+
+      # The generic provider cannot publish itself. GitHub Release is the
+      # archive; the R2 bucket root is the sole feed embedded in app-update.yml.
+      # Upload versioned assets first and mutable channel manifests last so a
+      # manifest never references an asset that is not already available.
+      - name: Upload versioned update assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          endpoint="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          aws s3 cp release "s3://${R2_BUCKET}/" \
+            --recursive \
+            --exclude '*.yml' \
+            --cache-control 'public,max-age=31536000,immutable' \
+            --endpoint-url "$endpoint"
+
+      - name: Publish channel manifests
+        shell: bash
+        run: |
+          set -euo pipefail
+          endpoint="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          aws s3 cp release "s3://${R2_BUCKET}/" \
+            --recursive \
+            --exclude '*' \
+            --include 'latest*.yml' \
+            --include 'beta*.yml' \
+            --content-type 'application/yaml' \
+            --cache-control 'no-cache, no-store, must-revalidate' \
+            --endpoint-url "$endpoint"
+
+      - name: Verify channel manifests through dl.motrix.app
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          endpoint="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          manifests=(release/latest*.yml release/beta*.yml)
+          case "$RELEASE_CHANNEL" in
+            beta) expected_count=4 ;;
+            stable) expected_count=8 ;;
+            *)
+              echo "Unsupported release channel: ${RELEASE_CHANNEL}" >&2
+              exit 1
+              ;;
+          esac
+          if (( ${#manifests[@]} != expected_count )); then
+            echo "Expected ${expected_count} ${RELEASE_CHANNEL} update manifests, found ${#manifests[@]}" >&2
+            exit 1
+          fi
+          for manifest in "${manifests[@]}"; do
+            name="$(basename "$manifest")"
+            aws s3api head-object \
+              --bucket "$R2_BUCKET" \
+              --key "$name" \
+              --endpoint-url "$endpoint" \
+              > /dev/null
+            expected="$(sha256sum "$manifest" | cut -d ' ' -f 1)"
+            downloaded="${RUNNER_TEMP}/${name}"
+            matched='false'
+            for attempt in {1..12}; do
+              if curl \
+                --fail \
+                --location \
+                --silent \
+                --show-error \
+                "https://dl.motrix.app/releases/${name}?release=${GITHUB_SHA}&attempt=${attempt}" \
+                --output "$downloaded"
+              then
+                actual="$(sha256sum "$downloaded" | cut -d ' ' -f 1)"
+                if [[ "$actual" == "$expected" ]]; then
+                  matched='true'
+                  break
+                fi
+              fi
+              sleep 5
+            done
+            if [[ "$matched" != 'true' ]]; then
+              echo "Published manifest did not converge at dl.motrix.app: ${name}" >&2
+              exit 1
+            fi
+          done
+
+      - name: Verify native AppImage update metadata distribution
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          endpoint="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          zsyncs=(release/*.AppImage.zsync)
+          if (( ${#zsyncs[@]} != 2 )); then
+            echo "Expected two architecture-specific zsync assets" >&2
+            exit 1
+          fi
+          for zsync in "${zsyncs[@]}"; do
+            name="$(basename "$zsync")"
+            expected="$(sha256sum "$zsync" | cut -d ' ' -f 1)"
+            aws s3api head-object \
+              --bucket "$R2_BUCKET" \
+              --key "$name" \
+              --endpoint-url "$endpoint" \
+              > /dev/null
+            for provider in generic github; do
+              downloaded="${RUNNER_TEMP}/${provider}-${name}"
+              matched='false'
+              for attempt in {1..12}; do
+                case "$provider" in
+                  generic)
+                    url="https://dl.motrix.app/releases/${name}?release=${GITHUB_SHA}&attempt=${attempt}"
+                    ;;
+                  github)
+                    url="https://github.com/agalwood/Motrix/releases/download/${GITHUB_REF_NAME}/${name}?attempt=${attempt}"
+                    ;;
+                esac
+                if curl --fail --location --silent --show-error \
+                  "$url" --output "$downloaded"; then
+                  actual="$(sha256sum "$downloaded" | cut -d ' ' -f 1)"
+                  if [[ "$actual" == "$expected" ]]; then
+                    matched='true'
+                    break
+                  fi
+                fi
+                sleep 5
+              done
+              if [[ "$matched" != 'true' ]]; then
+                echo "Published zsync did not converge via ${provider}: ${name}" >&2
+                exit 1
+              fi
+            done
+          done

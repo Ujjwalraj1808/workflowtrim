@@ -1,0 +1,91 @@
+name: Dependabot auto-merge
+
+# Auto-merge low-risk Dependabot PRs (npm patch/minor and github-actions
+# patch/minor) once required CI checks pass. Higher-risk bumps — major
+# updates, Docker base-image bumps (e.g. node 22 → 25), or any major bump
+# of a GitHub Action (deploy, scp, etc.) — are labelled `needs-review` and
+# left for a human.
+#
+# Safety model:
+#   - Uses `gh pr merge --auto`, which only fires once GitHub's required
+#     status checks are green. This relies on branch protection being
+#     configured on `main` with the CI jobs marked as required.
+#   - Without branch protection, --auto still works but merges immediately
+#     after CI without waiting for review. Still safer than today (nothing
+#     gets merged at all) but less defensive.
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize, ready_for_review]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  triage:
+    if: github.event.pull_request.user.login == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch Dependabot metadata
+        id: meta
+        uses: dependabot/fetch-metadata@v3
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Decide whether to auto-merge
+        id: decide
+        env:
+          UPDATE_TYPE: ${{ steps.meta.outputs.update-type }}
+          ECOSYSTEM: ${{ steps.meta.outputs.package-ecosystem }}
+          DEP_NAMES: ${{ steps.meta.outputs.dependency-names }}
+        run: |
+          set -euo pipefail
+          echo "update-type=$UPDATE_TYPE"
+          echo "ecosystem=$ECOSYSTEM"
+          echo "deps=$DEP_NAMES"
+
+          # Default: do not auto-merge.
+          AUTO=false
+          REASON="default-deny"
+
+          # Allow patch+minor for npm and github-actions.
+          if [[ "$UPDATE_TYPE" == "version-update:semver-patch" \
+             || "$UPDATE_TYPE" == "version-update:semver-minor" ]]; then
+            if [[ "$ECOSYSTEM" == "npm_and_yarn" || "$ECOSYSTEM" == "github_actions" ]]; then
+              AUTO=true
+              REASON="patch-or-minor-on-low-risk-ecosystem"
+            else
+              REASON="ecosystem-not-allowlisted ($ECOSYSTEM)"
+            fi
+          else
+            REASON="not-patch-or-minor ($UPDATE_TYPE)"
+          fi
+
+          echo "auto=$AUTO" >> "$GITHUB_OUTPUT"
+          echo "reason=$REASON" >> "$GITHUB_OUTPUT"
+
+      - name: Enable auto-merge
+        if: steps.decide.outputs.auto == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+        run: |
+          # No review step: `main` requires 0 approving reviews, so approval is
+          # unnecessary — and GitHub forbids GITHUB_TOKEN-backed Actions from
+          # approving PRs ("GitHub Actions is not permitted to approve pull
+          # requests"), which previously failed this step under `set -e` and
+          # stopped the merge command from ever running.
+          # `gh pr merge --auto` enables auto-merge; GitHub completes it once
+          # the required Backend/Frontend checks pass and the branch is
+          # up to date (Dependabot keeps its PRs rebased).
+          gh pr merge --auto --squash "$PR_URL"
+
+      - name: Label as needs-review
+        if: steps.decide.outputs.auto != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+        run: |
+          gh pr edit "$PR_URL" --add-label "needs-review" || true
+          gh pr comment "$PR_URL" --body "Skipping auto-merge: ${{ steps.decide.outputs.reason }}. A human should review this bump."

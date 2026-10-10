@@ -1,0 +1,356 @@
+name: Draft release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        type: string
+        required: true
+  pull_request_target:
+    types:
+      - closed
+    branches:
+      - main
+
+permissions:
+  contents: write # For creating releases.
+  discussions: write #  For creating a discussion.
+
+# Cancel in-progress runs for pull requests when developers push
+# additional changes
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  package-linux:
+    name: ${{ format('linux-{0}', matrix.vscode_arch) }}
+    runs-on: ubuntu-22.04
+    if: >-
+      (github.event_name == 'workflow_dispatch') ||
+      (github.event_name == 'pull_request_target' && github.event.pull_request.merged == true && startsWith(github.head_ref, 'update/'))
+
+    strategy:
+      matrix:
+        include:
+          - npm_arch: x64
+            vscode_arch: x64
+            package_arch: amd64
+          - npm_arch: arm64
+            vscode_arch: arm64
+            package_arch: arm64
+
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      ELECTRON_SKIP_BINARY_DOWNLOAD: 1
+      PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: 1
+      TAG: ${{ inputs.version || github.event.pull_request.head.ref || github.ref_name }}
+      # Set release package name.
+      ARCH: ${{ matrix.package_arch }}
+      # Cross-compile target.
+      VSCODE_ARCH: ${{ matrix.vscode_arch }}
+      npm_config_arch: ${{ matrix.npm_arch }}
+      # Ensure native modules are built from source to avoid prebuilds and use
+      # the correct version of glibc.
+      npm_config_build_from_source: true
+      # Gulp target name.
+      # TODO: Pull from VSCODE_ARCH instead.
+      VSCODE_TARGET: ${{ format('linux-{0}', matrix.vscode_arch) }}
+
+    steps:
+      - run: sudo apt update && sudo apt install -y libkrb5-dev
+      - uses: awalsh128/cache-apt-pkgs-action@553a35bb8ebd9fcabcb1c9451aa4c98e1b4ca8a9 # latest
+        with:
+          packages: quilt
+          version: 1.0
+      - name: Install nfpm
+        run: |
+          mkdir -p ~/.local/bin
+          curl -sSfL https://github.com/goreleaser/nfpm/releases/download/v2.3.1/nfpm_2.3.1_`uname -s`_`uname -m`.tar.gz | tar -C ~/.local/bin -zxv nfpm
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: Strip update/ and v from tag and set major version
+        run: |
+          version=${TAG#update/}
+          version=${version#v}
+          version=4${version:1}
+          echo "VERSION=$version" >> $GITHUB_ENV
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          submodules: true
+          # When an update/ branch is merged, a release is automatically created
+          # which requires secrets.
+          allow-unsafe-pr-checkout: true
+      - run: quilt push -a
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+        with:
+          node-version-file: .node-version
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            test/package-lock.json
+
+      - name: Build
+        run: |
+          cd lib/vscode/build
+          npm ci
+          cd ..
+          source ./build/azure-pipelines/linux/setup-env.sh
+          # Run preinstall script before root dependencies are installed
+          # so that v8 headers are patched correctly for native modules.
+          node build/npm/preinstall.ts
+          cd ../..
+          npm ci
+          npm run build
+          npm run build:vscode
+
+      # Platform-agnostic NPM package.
+      - run: npm run release
+        if: ${{ matrix.vscode_arch == 'x64' }}
+      - run: tar -czf package.tar.gz release
+        if: ${{ matrix.vscode_arch == 'x64' }}
+      - run: |
+          sed "/^## Unreleased/,/^## / ! d" CHANGELOG.md | head -n -2 | tail -n +3 > .cache/release-notes
+        if: ${{ matrix.vscode_arch == 'x64' }}
+      - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        if: ${{ matrix.vscode_arch == 'x64' }}
+        with:
+          draft: true
+          discussion_category_name: "📣 Announcements"
+          files: package.tar.gz
+          tag_name: v${{ env.VERSION }}
+          name: v${{ env.VERSION }}
+          body_path: .cache/release-notes
+
+      # Platform-specific release.
+      - run: KEEP_MODULES=1 npm run release
+      - run: npm run package
+      - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          draft: true
+          discussion_category_name: "📣 Announcements"
+          files: ./release-packages/*
+          tag_name: v${{ env.VERSION }}
+          name: v${{ env.VERSION }}
+
+  package-macos:
+    name: ${{ matrix.vscode_target }}
+    runs-on: ${{ matrix.os }}
+    if: >-
+      (github.event_name == 'workflow_dispatch') ||
+      (github.event_name == 'pull_request_target' && github.event.pull_request.merged == true && startsWith(github.head_ref, 'update/'))
+    strategy:
+      matrix:
+        include:
+          - os: macos-15-intel
+            vscode_target: darwin-x64
+          - os: macos-latest
+            vscode_target: darwin-arm64
+    env:
+      VSCODE_TARGET: ${{ matrix.vscode_target }}
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TAG: ${{ inputs.version || github.event.pull_request.head.ref || github.ref_name }}
+      # Ensure native modules are built from source to avoid prebuilds.
+      npm_config_build_from_source: true
+
+    steps:
+      # The version of node-gyp we use depends on distutils but it was removed
+      # in Python 3.12.  It seems to be fixed in the latest node-gyp so when we
+      # next update Node we can probably remove this.  For now, install
+      # setuptools since it contains distutils.
+      - run: brew install python-setuptools quilt
+      - name: Install nfpm
+        run: |
+          mkdir -p ~/.local/bin
+          curl -sSfL https://github.com/goreleaser/nfpm/releases/download/v2.3.1/nfpm_2.3.1_`uname -s`_`uname -m`.tar.gz | tar -C ~/.local/bin -zxv nfpm
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: Strip update/ and v from tag and set major version
+        run: |
+          version=${TAG#update/}
+          version=${version#v}
+          version=4${version:1}
+          echo "VERSION=$version" >> $GITHUB_ENV
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          submodules: true
+          # When an update/ branch is merged, a release is automatically created
+          # which requires secrets.
+          allow-unsafe-pr-checkout: true
+      - run: quilt push -a
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+        with:
+          node-version-file: .node-version
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            test/package-lock.json
+
+      - run: npm ci
+      - run: npm run build
+      - run: npm run build:vscode
+      - run: KEEP_MODULES=1 npm run release
+      - run: npm run test:native
+
+      - run: npm run package
+      - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          draft: true
+          discussion_category_name: "📣 Announcements"
+          files: ./release-packages/*
+          tag_name: v${{ env.VERSION }}
+          name: v${{ env.VERSION }}
+
+  package-windows:
+    name: win32-x64
+    runs-on: windows-2022
+    if: >-
+      (github.event_name == 'workflow_dispatch') ||
+      (github.event_name == 'pull_request_target' && github.event.pull_request.merged == true && startsWith(github.head_ref, 'update/'))
+
+    defaults:
+      run:
+        shell: bash
+
+    env:
+      VSCODE_TARGET: win32-x64
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TAG: ${{ inputs.version || github.event.pull_request.head.ref || github.ref_name }}
+      # Ensure native modules are built from source to avoid prebuilds.
+      npm_config_build_from_source: true
+      OS: windows
+
+    steps:
+      # Git rewrites line endings on windows by default, which turns every
+      # shell script the build is made of into one bash cannot read, and
+      # every name in patches/series into one with a stray return.
+      - name: Keep line endings as they are in the repository
+        run: git config --global core.autocrlf false
+
+      - name: Strip update/ and v from tag and set major version
+        run: |
+          version=${TAG#update/}
+          version=${version#v}
+          version=4${version:1}
+          echo "VERSION=$version" >> $GITHUB_ENV
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          submodules: true
+          # When an update/ branch is merged, a release is automatically created
+          # which requires secrets.
+          allow-unsafe-pr-checkout: true
+
+      # quilt has no windows build. The patches are ordinary -p1 diffs
+      # against the repository root, so git applies them in series order.
+      - name: Apply patches
+        run: |
+          while read -r patch; do
+            case "$patch" in '' | '#'*) continue ;; esac
+            echo "applying $patch"
+            git apply --whitespace=nowarn "patches/$patch"
+          done < patches/series
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+        with:
+          node-version-file: .node-version
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            test/package-lock.json
+
+      # npm hands every script it runs to cmd, which cannot run the shell
+      # scripts this repository is built out of. Point it at the same bash
+      # the steps here use rather than at a path, which moves between
+      # images.
+      - name: Let npm run shell scripts
+        run: echo "npm_config_script_shell=$(cygpath -w "$(command -v bash)")" >> $GITHUB_ENV
+
+      # The build merges json by handing jq a process substitution, which
+      # bash presents as a file under /dev/fd. The jq on this image is a
+      # windows program and cannot open those, so it reads the second input
+      # as nothing and the merge fails. Both the product and the package
+      # merge go through here.
+      - name: Let jq read what bash hands it
+        run: |
+          mkdir -p "$RUNNER_TEMP/shim"
+          cat > "$RUNNER_TEMP/shim/jq" <<'SHIM'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          args=()
+          for arg in "$@"; do
+            case $arg in
+              /dev/fd/* | /proc/*/fd/*)
+                copy=$(mktemp)
+                cat "$arg" > "$copy"
+                args+=("$copy")
+                ;;
+              *) args+=("$arg") ;;
+            esac
+          done
+          exec jq.exe "${args[@]}"
+          SHIM
+          chmod +x "$RUNNER_TEMP/shim/jq"
+          echo "$RUNNER_TEMP/shim" >> $GITHUB_PATH
+
+      # Stamping version details into the native binaries clears any
+      # signature they arrived with and asks signtool whether there is one.
+      # That only reads and removes, so it wants no certificate and signs
+      # nothing. It just has to be findable, and the sdk carrying it is not
+      # on the path.
+      - name: Put signtool on the path
+        run: |
+          sdk=$(ls -d "/c/Program Files (x86)/Windows Kits/10/bin"/*/x64 | sort -V | tail -1)
+          test -x "$sdk/signtool.exe"
+          cygpath -w "$sdk" >> $GITHUB_PATH
+
+      # build-release.sh copies the tree with rsync, which neither windows
+      # nor the git bash on this image has. MSYS2 is already here, just not
+      # on the path.
+      - name: Install rsync
+        shell: cmd
+        run: C:\msys64\usr\bin\pacman -Sy --noconfirm --needed rsync
+
+      # Only rsync crosses over. Putting msys2's /usr/bin in front instead
+      # breaks the release step: npm on the path is a shell script whose
+      # shebang reads /usr/bin/env bash, so with msys2 first it is msys2's
+      # bash that runs it, and crossing into a second msys runtime does not
+      # carry the environment. npm then sees no script-shell and falls back
+      # to cmd, which cannot run ./ci/build/build-release.sh, and
+      # KEEP_MODULES is dropped on the way. A forwarder avoids the whole
+      # class: rsync is a native exe that loads its runtime from beside
+      # itself, and nothing else on the path moves.
+      - name: Reach rsync without moving the path
+        run: |
+          cat > "$RUNNER_TEMP/shim/rsync" <<'SHIM'
+          #!/usr/bin/env bash
+          exec /c/msys64/usr/bin/rsync.exe "$@"
+          SHIM
+          chmod +x "$RUNNER_TEMP/shim/rsync"
+
+      - run: npm ci
+      - run: npm run build
+      - run: npm run build:vscode
+      - run: KEEP_MODULES=1 npm run release
+
+      # Of the two tars on this image it is git bash's GNU one that can
+      # rename the tree's top directory as it archives; the windows bsdtar
+      # is built without substitution support. Asserted rather than
+      # assumed, since the two are interchangeable everywhere except here.
+      - name: Package
+        run: |
+          case "$(tar --version | head -1)" in
+            *GNU*) ;;
+            *) echo "expected GNU tar for --transform, got $(tar --version | head -1)" >&2; exit 1 ;;
+          esac
+          npm run package
+
+      - uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
+        with:
+          draft: true
+          discussion_category_name: "📣 Announcements"
+          files: ./release-packages/*
+          tag_name: v${{ env.VERSION }}
+          name: v${{ env.VERSION }}

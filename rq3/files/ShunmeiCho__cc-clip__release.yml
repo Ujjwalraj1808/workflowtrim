@@ -1,0 +1,47 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+# Read by default; only the publishing job is granted write.
+permissions:
+  contents: read
+
+jobs:
+  # A tag push does not trigger ci.yml, which fires on pull_request and push to
+  # main only. Without this the release commit was published having run nothing
+  # but `make test` — no race detector, no staticcheck, no govulncheck, and
+  # none of the repo policy checks.
+  checks:
+    uses: ./.github/workflows/checks.yml
+
+  release:
+    needs: checks
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version-file: go.mod
+
+      # The user-facing notes are written and committed before the tag, and
+      # they become the release body. Writing them after publishing was a
+      # manual step that got skipped (v0.11.1 shipped with only the commit
+      # list), so a tag without notes now fails here, before anything is
+      # published.
+      - name: Release notes exist for this tag
+        run: make release-notes-check V="$GITHUB_REF_NAME"
+
+      - uses: goreleaser/goreleaser-action@1a80836c5c9d9e5755a25cb59ec6f45a3b5f41a8 # v7.2.1
+        with:
+          version: "~> v2"
+          args: release --clean --release-notes docs/release-notes/${{ github.ref_name }}.md
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,802 @@
+# CLEO release pipeline — Prepare bump-PR workflow.
+#
+# Generated from packages/cleo/templates/workflows/release-prepare.yml.tmpl by
+# `cleo init --workflows` (T9531). DO NOT EDIT the rendered file directly —
+# extend via `.workflow-overrides.yml` per SPEC-T9345 R-260.
+#
+# Implements SPEC-T9345-release-pipeline-v2.md §5.1 (R-200 — R-210, R-260 —
+# R-263). Triggers ONLY on workflow_dispatch; runs preflight (lint +
+# typecheck + test + build) BEFORE creating any commit; prepares the
+# release/<version> branch and opens the bump-PR via `gh pr create`.
+#
+# Placeholders (replaced at scaffold time — see workflows/README.md):
+#   <NODE_VERSION>     Node.js version    (e.g. "22.x")
+#   <INSTALL_CMD>      Install command    (e.g. "pnpm install --frozen-lockfile")
+#   <LINT_CMD>         tool:lint          (ADR-061 resolved)
+#   <TYPECHECK_CMD>    tool:typecheck     (ADR-061 resolved)
+#   <TEST_CMD>         tool:test          (ADR-061 resolved)
+#   <BUILD_CMD>        tool:build         (ADR-061 resolved)
+#   <BRANCH_PREFIX>    Release branch prefix (default: "release")
+#   <PR_LABEL>         GitHub label applied to bump-PR (default: "release")
+# (Angle-brackets in this doc comment are intentional — they avoid being
+#  substituted by the {{...}} regex pass. The placeholders below use {{...}}.)
+
+name: Release Prepare
+
+# R-200: workflow_dispatch only — MUST NOT trigger on push to any branch.
+# R-201: required input `version`; optional `plan-blob-sha256`, `epic`, `channel`.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release (e.g. v2026.6.0)'
+        type: string
+        required: true
+      plan-blob-sha256:
+        description: 'SHA256 of pre-computed plan JSON (optional)'
+        type: string
+        required: false
+      epic:
+        description: 'Epic task ID (e.g. T9999) used by `cleo release plan`'
+        type: string
+        required: false
+      tasks:
+        description: 'Comma-separated task IDs (e.g. T101,T102) used by `cleo release plan` when the release is task-scoped rather than epic-scoped'
+        type: string
+        required: false
+      channel:
+        description: 'Release channel'
+        type: choice
+        required: false
+        default: latest
+        options:
+          - latest
+          - beta
+          - alpha
+          - rc
+      skip-tests:
+        description: 'Skip the Linux test shards in Preflight (use when main CI is already green for this commit — `cleo release open` sets it after checking). Lint, typecheck and build still run.'
+        type: boolean
+        required: false
+        default: false
+      skip-macos-tests:
+        description: 'Skip the macOS test shards in Preflight (set by `cleo release open` only when the nightly macOS run for this exact commit is green).'
+        type: boolean
+        required: false
+        default: false
+      verified-sha:
+        description: 'Commit the skip-tests / skip-macos-tests decisions were verified against. REQUIRED for any skip: when empty, or when the run checks out a different commit (main moved after the check), every skip is ignored and all tests run.'
+        type: string
+        required: false
+      skip-reason:
+        description: 'Why the caller skipped test suites; recorded in the run summary.'
+        type: string
+        required: false
+
+# R-202: contents:write (commit + branch), pull-requests:write (gh pr create),
+# id-token:write (signed tags only). MUST NOT request packages:write — npm
+# publish belongs to release.yml after the explicit release tag push.
+permissions:
+  contents: write
+  pull-requests: write
+  id-token: write
+  # T12094: `actions: write` is required to CREATE a workflow_dispatch event.
+  # Without it the "Trigger CI for the bump-PR" step gets
+  #   HTTP 403: Resource not accessible by integration
+  # and the bump-PR opens with no checks — the exact failure this step exists to
+  # prevent. Measured on the v2026.8.5 dispatch, which is why the step warns
+  # instead of failing: the release still completed and told us precisely why.
+  actions: write
+
+# R-207: concurrent prepare runs against the same version queue rather than
+# collide. cancel-in-progress=false preserves in-flight work.
+concurrency:
+  group: release-prepare-${{ inputs.version }}
+  cancel-in-progress: false
+
+# R-262: bash everywhere — no cross-platform shell drift.
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # R-204: lint + typecheck + test + build BEFORE any commit. Failure here
+  # MUST fail the workflow and prevent `prepare` from running.
+  #
+  # T11490 — DHQ-042: the full unsharded test suite can exceed 10 min and
+  # time out the preflight. Two mitigations:
+  #   (a) `skip-tests` input (default false) — when the caller knows main CI
+  #       is already green, tests can be skipped to avoid the redundant run.
+  #   (b) The test step is sharded across 8 parallel matrix workers, keeping
+  #       each shard under 10 min even without skipping.
+  # T12309: a dispatch that CANNOT succeed must not cost a full preflight.
+  #
+  # The "Resolve release plan" step has two branches. The committed-plan branch
+  # verifies a plan file by sha256 and works. The regenerate branch runs
+  # `cleo release plan --tasks|--epic` ON THIS RUNNER, and the task store
+  # (`.cleo/cleo.db`) is deliberately untracked (ADR-013 section 9, Runtime Data
+  # Safety), so a fresh checkout has zero tasks and the command exits
+  # `E_NOT_FOUND: One or more --tasks IDs were not found`.
+  #
+  # That failure landed in `prepare`, which needs all three preflight jobs, so
+  # ~20 minutes of lint, typecheck, two test shards and a build were spent
+  # proving a tree healthy before anyone learned the dispatch had been
+  # impossible from its first second. This job asks that question first.
+  dispatch-preconditions:
+    name: Dispatch preconditions
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    outputs:
+      run-linux-tests: ${{ steps.tests.outputs.linux }}
+      run-macos-tests: ${{ steps.tests.outputs.macos }}
+    steps:
+      - uses: actions/checkout@v4
+      # The ONE place that decides which preflight test suites run, so the
+      # test jobs and the run summary can never disagree. A skip is honoured
+      # only for the commit it was verified against: `cleo release open`
+      # checks CI for main's HEAD, and if main moves between that check and
+      # this checkout, the green result belongs to a different tree.
+      - name: Decide which preflight test suites run
+        id: tests
+        env:
+          SKIP_TESTS: ${{ inputs.skip-tests }}
+          SKIP_MACOS_TESTS: ${{ inputs.skip-macos-tests }}
+          VERIFIED_SHA: ${{ inputs.verified-sha }}
+          SKIP_REASON: ${{ inputs.skip-reason }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          linux=true
+          macos=true
+          note=""
+          skip_requested=false
+          if [ "$SKIP_TESTS" = "true" ] || [ "$SKIP_MACOS_TESTS" = "true" ]; then skip_requested=true; fi
+          if [ "$skip_requested" = "true" ] && [ -z "$VERIFIED_SHA" ]; then
+            # A skip is a claim that CI already tested THIS tree. Without the
+            # commit it was verified against, nothing ties the claim to what
+            # this run checked out, so it is refused rather than trusted.
+            note="A test skip was requested without verified-sha, so it cannot be tied to the commit this run checked out ($HEAD_SHA). Ignoring it: every suite runs."
+          elif [ -n "$VERIFIED_SHA" ] && [ "$VERIFIED_SHA" != "$HEAD_SHA" ]; then
+            note="Skips were verified against $VERIFIED_SHA, but this run checked out $HEAD_SHA (main moved after the check). Ignoring them: every suite runs."
+          else
+            if [ "$SKIP_TESTS" = "true" ]; then linux=false; fi
+            if [ "$SKIP_MACOS_TESTS" = "true" ]; then macos=false; fi
+          fi
+          echo "linux=$linux" >> "$GITHUB_OUTPUT"
+          echo "macos=$macos" >> "$GITHUB_OUTPUT"
+          describe() { if [ "$1" = "true" ]; then echo "runs"; else echo "skipped"; fi; }
+          {
+            echo "## Preflight test decision"
+            echo ""
+            echo "| suite | decision |"
+            echo "|---|---|"
+            echo "| Linux test shards | $(describe "$linux") |"
+            echo "| macOS test shards | $(describe "$macos") |"
+            echo ""
+            echo "Commit: \`$HEAD_SHA\`"
+            if [ -n "$VERIFIED_SHA" ]; then echo "Skips verified against: \`$VERIFIED_SHA\`"; fi
+            if [ -n "$SKIP_REASON" ]; then echo ""; echo "Reason: $SKIP_REASON"; fi
+            if [ -n "$note" ]; then echo ""; echo "**$note**"; fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "linux tests: $(describe "$linux"); macOS tests: $(describe "$macos")"
+          if [ -n "$note" ]; then echo "::warning::$note"; fi
+      - name: A scoped dispatch needs a committed plan
+        run: |
+          if [ -n "${{ inputs.plan-blob-sha256 }}" ]; then
+            echo "plan-blob-sha256 supplied - the committed-plan branch will be used."
+            exit 0
+          fi
+          if [ -z "${{ inputs.epic }}" ] && [ -z "${{ inputs.tasks }}" ]; then
+            echo "::error::No release scope supplied. Dispatch with 'epic' or 'tasks', or pass 'plan-blob-sha256' with a committed plan file."
+            exit 1
+          fi
+          if [ -f .cleo/cleo.db ]; then
+            echo "Task store present in the checkout - the regenerate branch can resolve the scope."
+            exit 0
+          fi
+          echo "::error::This dispatch cannot succeed. It supplies a scope (epic/tasks) but no 'plan-blob-sha256', so the workflow would regenerate the plan by running 'cleo release plan' here - and .cleo/cleo.db is untracked (ADR-013 section 9), so this checkout has no tasks to resolve."
+          echo "::error::Fix: run 'cleo release open <version>' locally. It commits the plan file (git add -f past the .cleo/ ignore), verifies it is on the branch this workflow checks out, and forwards its sha256 as 'plan-blob-sha256'. That is the default as of T12309."
+          exit 1
+
+  preflight-lint-typecheck:
+    name: Preflight (lint + typecheck)
+    needs: [dispatch-preconditions]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      # R-263: third-party Actions pinned to major+minor.
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+        timeout-minutes: 5
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        timeout-minutes: 2
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+        timeout-minutes: 3
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+        timeout-minutes: 5
+
+      - name: Lint
+        run: pnpm biome check .
+        timeout-minutes: 5
+
+      - name: Typecheck
+        run: pnpm run typecheck
+        timeout-minutes: 5
+
+  # T11490 — DHQ-042: test shards run in parallel to stay under 10 min.
+  # Skipped when skip-tests=true (e.g. dispatched after a green main CI for
+  # this exact commit) — see "Decide which preflight test suites run".
+  preflight-test:
+    name: Preflight (test shard ${{ matrix.shard }}/8)
+    if: ${{ needs.dispatch-preconditions.outputs.run-linux-tests == 'true' }}
+    needs: [dispatch-preconditions]
+    runs-on: ubuntu-latest
+    # T12309: the job ceiling has to clear the step ceiling it contains. The
+    # step now gets 55 minutes (matching ci.yml); 30 here would have killed the
+    # job first and reported it as a job timeout rather than a slow suite.
+    timeout-minutes: 60
+    strategy:
+      fail-fast: true
+      matrix:
+        # 8 shards, matching ci.yml's ubuntu sweep (#1716, T13143).
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+        timeout-minutes: 5
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        timeout-minutes: 2
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+        timeout-minutes: 3
+
+      - name: Build worktree-napi native addon BEFORE pnpm install (T9982)
+        # Must run before `pnpm install --frozen-lockfile` so that the file:
+        # link to crates/worktree-napi picks up the .node binary into the
+        # pnpm-managed copy under node_modules/.pnpm/@cleocode+worktree-napi@*.
+        # The crate's package.json declares "files": ["worktree-napi.*.node"]
+        # so pnpm only copies in artifacts that exist at install time.
+        shell: bash
+        run: |
+          cargo build --release -p worktree-napi
+          case "${{ runner.os }}" in
+            Linux)
+              triple="linux-x64-gnu"
+              if [[ "$(uname -m)" == "aarch64" ]]; then
+                triple="linux-arm64-gnu"
+              fi
+              cp target/release/libworktree_napi.so "crates/worktree-napi/worktree-napi.${triple}.node"
+              ;;
+            macOS)
+              triple="darwin-x64"
+              if [[ "$(uname -m)" == "arm64" ]]; then
+                triple="darwin-arm64"
+              fi
+              cp target/release/libworktree_napi.dylib "crates/worktree-napi/worktree-napi.${triple}.node"
+              ;;
+            Windows)
+              triple="win32-x64-msvc"
+              if [[ "${PROCESSOR_ARCHITECTURE:-}" == "ARM64" ]]; then
+                triple="win32-arm64-msvc"
+              fi
+              cp target/release/worktree_napi.dll "crates/worktree-napi/worktree-napi.${triple}.node"
+              ;;
+          esac
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+        timeout-minutes: 5
+
+      - name: Install ripgrep (required for T1605 callsite-coverage validator)
+        uses: ./.github/actions/install-ripgrep
+
+      - name: Build cant-napi native addon for CANT tests (T12382)
+        # The committed linux .node was removed in T12382; the CANT test files
+        # need the host-platform addon, exactly as ci.yml builds it.
+        shell: bash
+        run: pnpm --filter @cleocode/cant run build:napi
+        timeout-minutes: 15
+
+      - name: Build packages (required for cross-package imports)
+        run: pnpm run build
+        timeout-minutes: 10
+
+      - name: Generate SvelteKit type stubs (required for studio tests)
+        # packages/studio/tsconfig.json extends .svelte-kit/tsconfig.json which
+        # is generated by svelte-kit sync. Must run after build and before tests.
+        run: pnpm --filter @cleocode/studio exec svelte-kit sync
+        timeout-minutes: 2
+
+      - name: Test (shard ${{ matrix.shard }}/8)
+        run: pnpm exec vitest run --shard=${{ matrix.shard }}/8
+        # T12309: was 20, against a sweep that does not fit in it. ci.yml gives
+        # the same suite 55 minutes and a shard measured 17m04s there; this step
+        # timed out at 20:00 on a tree whose CI was fully green, so a release
+        # could not be prepared from a release-ready commit.
+        timeout-minutes: 55
+
+  # macOS runs on nightly + release instead of on every push to main, so the
+  # release is where a macOS regression must be caught before it ships. Runs
+  # even when the Linux shards are skipped, unless the nightly macOS run for
+  # this exact commit is already green (skip-macos-tests, set and verified by
+  # `cleo release open`). macOS runners are ~2x slower than Linux, hence 4
+  # shards and a generous ceiling; retry=2 matches ci.yml's macOS shards.
+  preflight-test-macos:
+    name: Preflight (macOS test shard ${{ matrix.shard }}/8)
+    if: ${{ needs.dispatch-preconditions.outputs.run-macos-tests == 'true' }}
+    needs: [dispatch-preconditions]
+    runs-on: macos-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: true
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+        timeout-minutes: 5
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        timeout-minutes: 2
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+        timeout-minutes: 3
+
+      - name: Build worktree-napi native addon BEFORE pnpm install (T9982)
+        # Same reason as the Linux shards: the file: link to crates/worktree-napi
+        # only copies .node artifacts that exist at install time.
+        shell: bash
+        run: |
+          cargo build --release -p worktree-napi
+          triple="darwin-x64"
+          if [[ "$(uname -m)" == "arm64" ]]; then
+            triple="darwin-arm64"
+          fi
+          cp target/release/libworktree_napi.dylib "crates/worktree-napi/worktree-napi.${triple}.node"
+        timeout-minutes: 20
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+        timeout-minutes: 10
+
+      - name: Install ripgrep (required for T1605 callsite-coverage validator)
+        uses: ./.github/actions/install-ripgrep
+
+      - name: Build cant-napi native addon for CANT tests (T12382)
+        shell: bash
+        run: pnpm --filter @cleocode/cant run build:napi
+        timeout-minutes: 20
+
+      - name: Build packages (required for cross-package imports)
+        run: pnpm run build
+        timeout-minutes: 15
+
+      - name: Generate SvelteKit type stubs (required for studio tests)
+        run: pnpm --filter @cleocode/studio exec svelte-kit sync
+        timeout-minutes: 2
+
+      - name: Test macOS (shard ${{ matrix.shard }}/8)
+        run: pnpm exec vitest run --shard=${{ matrix.shard }}/8 --retry=2
+        timeout-minutes: 75
+
+  preflight-build:
+    name: Preflight (build)
+    runs-on: ubuntu-latest
+    needs: [preflight-lint-typecheck]
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+        timeout-minutes: 5
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        timeout-minutes: 2
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+        timeout-minutes: 3
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+        timeout-minutes: 5
+
+      - name: Build
+        run: pnpm run build
+        timeout-minutes: 10
+
+      # R-208: status check `release-prepare/preflight` is reported by GitHub
+      # automatically against the bump-PR head SHA once the PR is open. No
+      # extra step is required — branch protection MUST require this check.
+
+  # R-203: prepare needs preflight.
+  # R-205: plan resolution → version bump → CHANGELOG → commit → push → bump-PR.
+  # T11490: needs both lint/typecheck and build to pass; test shards are
+  # independent (always() used so prepare can run even when tests are skipped).
+  # A skipped suite is accepted only because dispatch-preconditions decided to
+  # skip it; a failed or cancelled one blocks the bump-PR.
+  prepare:
+    name: Prepare bump-PR
+    runs-on: ubuntu-latest
+    needs:
+      - dispatch-preconditions
+      - preflight-lint-typecheck
+      - preflight-test
+      - preflight-test-macos
+      - preflight-build
+    if: |
+      always() &&
+      needs.dispatch-preconditions.result == 'success' &&
+      needs.preflight-lint-typecheck.result == 'success' &&
+      needs.preflight-build.result == 'success' &&
+      (needs.preflight-test.result == 'success' || needs.preflight-test.result == 'skipped') &&
+      (needs.preflight-test-macos.result == 'success' || needs.preflight-test-macos.result == 'skipped')
+    timeout-minutes: 20
+    outputs:
+      branch: ${{ steps.branch.outputs.name }}
+      branch_created: ${{ steps.push.outputs.created }}
+    env:
+      # R-210: only GITHUB_TOKEN required. NPM_TOKEN is publish-only.
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+        timeout-minutes: 5
+
+      - name: Configure git identity
+        run: |
+          git config user.email "actions@github.com"
+          git config user.name "GitHub Actions"
+        timeout-minutes: 1
+
+      - name: Cut release branch
+        id: branch
+        run: |
+          BRANCH="release/${{ inputs.version }}"
+          git checkout -b "$BRANCH"
+          echo "name=$BRANCH" >> "$GITHUB_OUTPUT"
+        timeout-minutes: 2
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        timeout-minutes: 2
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+        timeout-minutes: 3
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+        timeout-minutes: 5
+
+      - name: Build CLI
+        run: pnpm run build
+        timeout-minutes: 15
+
+      - name: Link cleo CLI
+        run: |
+          chmod +x packages/cleo/bin/cleo.js
+          ln -sf "$PWD/packages/cleo/bin/cleo.js" /usr/local/bin/cleo
+        timeout-minutes: 1
+
+      # R-205(a)/(b): resolve plan — call `cleo release plan` if sha is empty,
+      # otherwise verify the existing plan blob via sha256.
+      - name: Resolve release plan
+        id: plan
+        run: |
+          mkdir -p .cleo/release
+
+          # gh#1370 (T12187): the plan file is NAMED BY THE COMMAND, not by us.
+          # `cleo release plan` resolves the version through `normalizeVersion`,
+          # which ADDS a leading `v` — every plan on disk is
+          # `v<version>.plan.json`. Building this path from the raw input meant
+          # a dispatch of `2026.9.1` had the command write `v2026.9.1.plan.json`
+          # while this step read `2026.9.1.plan.json`. Normalise identically.
+          RAW_VERSION="${{ inputs.version }}"
+          case "$RAW_VERSION" in
+            v*) PLAN_VERSION="$RAW_VERSION" ;;
+            *) PLAN_VERSION="v$RAW_VERSION" ;;
+          esac
+          PLAN_FILE=".cleo/release/${PLAN_VERSION}.plan.json"
+          PLAN_LOG="${RUNNER_TEMP:-/tmp}/${PLAN_VERSION}.plan.stdout.log"
+
+          # gh#1370: a release plan is a PLAN, not a summary envelope.
+          #
+          # `release plan` WRITES the plan file itself (R-030) and prints only a
+          # SUMMARY on stdout — version, taskCount, evidenceComplete,
+          # changelogWritten, planPath — with no `tasks` array. So anything that
+          # lands a stdout capture at the plan's path still parses as JSON and
+          # still hashes cleanly, and `plan-blob-sha256` downstream would then
+          # certify the integrity of the wrong artifact. Assert the SHAPE before
+          # any hash is taken over it, on BOTH branches.
+          ASSERT_PLAN="${RUNNER_TEMP:-/tmp}/assert-release-plan.cjs"
+          cat > "$ASSERT_PLAN" <<'ASSERT_PLAN_EOF'
+          const { readFileSync } = require('node:fs');
+          const target = process.argv[2];
+          let plan;
+          try {
+            plan = JSON.parse(readFileSync(target, 'utf8'));
+          } catch (err) {
+            console.error('::error::' + target + ' is not valid JSON: ' + err.message);
+            console.error('A prose-prefixed summary envelope is not a release plan (gh#1370).');
+            process.exit(1);
+          }
+          if (!Array.isArray(plan.tasks)) {
+            const keys = Object.keys(plan).join(', ');
+            console.error('::error::' + target + ' has no "tasks" array. Top-level keys: ' + keys);
+            console.error('A summary envelope is not a release plan (gh#1370).');
+            process.exit(1);
+          }
+          if (plan.tasks.length === 0) {
+            console.error('::error::' + target + ' has an EMPTY "tasks" array — refusing to release nothing.');
+            process.exit(1);
+          }
+          console.log('plan OK: ' + plan.tasks.length + ' tasks, resolvedVersion=' + (plan.resolvedVersion || '<absent>'));
+          ASSERT_PLAN_EOF
+
+          if [ -z "${{ inputs.plan-blob-sha256 }}" ]; then
+            echo "No plan-blob-sha256 input — generating fresh plan."
+            # T12089: `cleo release plan` REQUIRES a scope (--saga | --epic |
+            # --tasks). This branch previously passed none whenever `epic` was
+            # empty, so `plan` exited 2 and every release died here at
+            # "Prepare bump-PR" — after a full green preflight. Forward whichever
+            # scope the dispatcher supplied, and if none was, say so plainly
+            # instead of surfacing an argparse error from a nested command.
+            SCOPE_ARGS=()
+            if [ -n "${{ inputs.epic }}" ]; then
+              SCOPE_ARGS+=(--epic "${{ inputs.epic }}")
+            fi
+            if [ -n "${{ inputs.tasks }}" ]; then
+              SCOPE_ARGS+=(--tasks "${{ inputs.tasks }}")
+            fi
+            if [ ${#SCOPE_ARGS[@]} -eq 0 ]; then
+              echo "::error::No release scope supplied. Dispatch with 'epic' or 'tasks' (cleo release plan requires --saga, --epic or --tasks), or pass plan-blob-sha256 with a committed plan file."
+              exit 1
+            fi
+            # gh#1370: do NOT redirect stdout onto "$PLAN_FILE". The command
+            # writes that file itself; the redirect aimed a second writer at the
+            # same path and whichever landed last became the artifact hashed
+            # below. Capture stdout to a log and surface it only on failure.
+            if ! cleo release plan "$RAW_VERSION" "${SCOPE_ARGS[@]}" --json > "$PLAN_LOG" 2>&1; then
+              echo "::error::cleo release plan failed — output follows"
+              cat "$PLAN_LOG"
+              exit 1
+            fi
+            if [ ! -f "$PLAN_FILE" ]; then
+              echo "::error::cleo release plan reported success but $PLAN_FILE does not exist. Plan command output:"
+              cat "$PLAN_LOG"
+              exit 1
+            fi
+            node "$ASSERT_PLAN" "$PLAN_FILE"
+          else
+            echo "Verifying pre-computed plan against sha256=${{ inputs.plan-blob-sha256 }}"
+            if [ ! -f "$PLAN_FILE" ]; then
+              echo "::error::Plan file $PLAN_FILE not found — cannot verify sha256"
+              exit 1
+            fi
+            ACTUAL=$(sha256sum "$PLAN_FILE" | awk '{print $1}')
+            if [ "$ACTUAL" != "${{ inputs.plan-blob-sha256 }}" ]; then
+              echo "::error::Plan sha256 mismatch — expected ${{ inputs.plan-blob-sha256 }}, got $ACTUAL"
+              exit 1
+            fi
+            # gh#1370: a matching sha proves the file is UNCHANGED, never that
+            # it is a plan. A committed summary envelope hashes just as well.
+            node "$ASSERT_PLAN" "$PLAN_FILE"
+          fi
+          echo "plan_file=$PLAN_FILE" >> "$GITHUB_OUTPUT"
+        timeout-minutes: 5
+
+      # R-205(c): bump every package.json to the release version.
+      #
+      # T12093: this step used to run `cleo version-bump`, a command that has
+      # NEVER existed — the verb is absent from the CLI manifest, so the step
+      # died with `Unknown command version-bump` (exit 127) on every dispatch,
+      # always AFTER a full green preflight (~20 min). The real bumper is
+      # `scripts/version-all.mjs`, exposed as `pnpm run version:bump`, which now
+      # normalises the tag's leading `v` itself rather than pushing that onto
+      # every caller's shell quoting.
+      - name: Bump version
+        run: |
+          VERSION="${{ inputs.version }}"
+          node scripts/version-all.mjs --set "$VERSION"
+        timeout-minutes: 3
+
+      # R-205(d): CHANGELOG.md.
+      #
+      # T12093: this step used to run `cleo release changelog`, which also does
+      # not exist (`cleo release` has no `changelog` sub-verb). CHANGELOG.md is
+      # written by `cleo release plan` itself (T9838), so there is nothing to
+      # regenerate here — the correct action is to VERIFY the section is present
+      # and fail loudly if it is not, rather than silently ship a release whose
+      # notes were never written.
+      - name: Verify CHANGELOG section
+        run: cleo release validate-changelog "${{ inputs.version }}"
+        timeout-minutes: 3
+
+      # R-205(e): commit with the canonical subject line.
+      #
+      # T12093: `git commit` exits 1 on an empty index, so an already-prepared
+      # version failed here with a bare "nothing to commit" and no explanation.
+      # An empty prepare cannot become a PR either (`gh pr create` rejects a head
+      # with no commits ahead of base), so say what state the repo is in and what
+      # to do next instead of pushing a branch that cannot open.
+      - name: Commit prepare
+        run: |
+          git add -A
+          if git diff --cached --quiet; then
+            echo "::error::Nothing to commit — every package.json and CHANGELOG.md already match ${{ inputs.version }} on main. This release is already prepared; tag it directly (git tag -a ${{ inputs.version }} && git push origin ${{ inputs.version }}) instead of re-running prepare."
+            exit 1
+          fi
+          git commit -m "release: prepare ${{ inputs.version }}"
+        timeout-minutes: 2
+
+      - name: Push branch
+        id: push
+        run: |
+          git push origin "${{ steps.branch.outputs.name }}"
+          echo "created=true" >> "$GITHUB_OUTPUT"
+        timeout-minutes: 5
+
+      # R-205(f): open the bump-PR via `gh pr create`.
+      #
+      # T12093: the body was `--body-file <plan>.json`, so every bump-PR opened
+      # with a raw schema envelope as its description. The plan already carries
+      # the rendered notes at `meta.releaseNotes` (the same text that lands in
+      # CHANGELOG.md) — use that, and fall back to the JSON only if absent.
+      - name: Render PR body
+        id: body
+        run: |
+          node -e '
+            const fs = require("node:fs");
+            const plan = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+            const notes = plan?.meta?.releaseNotes;
+            fs.writeFileSync(
+              "/tmp/bump-pr-body.md",
+              typeof notes === "string" && notes.trim().length > 0
+                ? notes
+                : "```json\n" + JSON.stringify(plan, null, 2) + "\n```\n",
+            );
+          ' "${{ steps.plan.outputs.plan_file }}"
+        timeout-minutes: 2
+
+      - name: Open bump-PR
+        run: |
+          gh pr create \
+            --base main \
+            --head "${{ steps.branch.outputs.name }}" \
+            --title "release: prepare ${{ inputs.version }}" \
+            --label "release" \
+            --body-file /tmp/bump-pr-body.md
+        timeout-minutes: 5
+
+      # R-205(g) / T12094: trigger CI for the bump-PR.
+      #
+      # GitHub deliberately does NOT run workflows for events caused by
+      # GITHUB_TOKEN, so the `git push` and `gh pr create` above produce NO
+      # checks. Branch protection on `main` requires the `CI` context, so the
+      # bump-PR could never become mergeable — both previous releases needed a
+      # human to push a commit to the branch just to wake CI up.
+      #
+      # Dispatching CI against the branch produces check runs on the branch-tip
+      # SHA, which IS the PR head commit, so protection is satisfied. A
+      # workflow_dispatch run is itself GITHUB_TOKEN-initiated, but explicit
+      # dispatch is exempt from the recursion guard — that is the whole point of
+      # the trigger existing.
+      - name: Trigger CI for the bump-PR
+        run: |
+          BRANCH="${{ steps.branch.outputs.name }}"
+          # The worktree-napi prebuild must be dispatched too. CI's "Worktree NAPI
+          # Prebuild Gate" looks for a prebuild run on this branch's SHA, and a
+          # run created by the GITHUB_TOKEN pull_request event comes back with
+          # conclusion `action_required` — queued pending human approval — which
+          # the gate reads as a failure. An explicit dispatch is not gated on
+          # approval, so it produces a real result.
+          if gh workflow run worktree-napi-prebuild.yml --ref "$BRANCH" 2>/dev/null; then
+            echo "Dispatched worktree-napi prebuild for $BRANCH."
+          else
+            echo "::warning::Could not dispatch worktree-napi-prebuild.yml for $BRANCH; the NAPI gate may block the bump-PR pending approval."
+          fi
+          if gh workflow run ci.yml --ref "$BRANCH"; then
+            echo "Dispatched CI for $BRANCH."
+          else
+            echo "::warning::Could not dispatch ci.yml for $BRANCH. The bump-PR will have no checks and cannot merge until CI is started (push any commit to the branch, or re-run: gh workflow run ci.yml --ref $BRANCH)."
+          fi
+        timeout-minutes: 3
+
+      # R-209(c): emit recovery hint into the job summary artifact.
+      - name: Emit recovery hint to job summary
+        if: always()
+        run: |
+          {
+            echo "## Release Prepare — ${{ inputs.version }}"
+            echo ""
+            echo "Branch: \`${{ steps.branch.outputs.name }}\`"
+            echo ""
+            echo "**Recovery command** (if anything went wrong):"
+            echo ""
+            echo "\`\`\`"
+            echo "cleo release plan ${{ inputs.version }} --epic ${{ inputs.epic }}; cleo release open ${{ inputs.version }}"
+            echo "\`\`\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+        timeout-minutes: 1
+
+  # R-209(a)(b): on failure, delete the half-cut release branch and print
+  # the recovery command. continue-on-error so cleanup itself cannot fail
+  # the workflow further.
+  cleanup-on-failure:
+    name: Cleanup on failure
+    runs-on: ubuntu-latest
+    needs:
+      - preflight-lint-typecheck
+      - preflight-test
+      - preflight-test-macos
+      - preflight-build
+      - prepare
+    if: failure()
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+        timeout-minutes: 5
+
+      - name: Delete release branch (best-effort)
+        continue-on-error: true
+        run: |
+          BRANCH="release/${{ inputs.version }}"
+          if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+            echo "Deleting remote branch $BRANCH"
+            git push origin --delete "$BRANCH" || true
+          else
+            echo "No remote branch $BRANCH to delete."
+          fi
+        timeout-minutes: 5
+
+      - name: Print recovery command
+        run: |
+          echo "::notice::Recovery: cleo release plan ${{ inputs.version }} --epic ${{ inputs.epic }}; cleo release open ${{ inputs.version }}"
+          {
+            echo "## Release Prepare FAILED — ${{ inputs.version }}"
+            echo ""
+            echo "Run this to recover:"
+            echo ""
+            echo "\`\`\`"
+            echo "cleo release plan ${{ inputs.version }} --epic ${{ inputs.epic }}; cleo release open ${{ inputs.version }}"
+            echo "\`\`\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+        timeout-minutes: 1

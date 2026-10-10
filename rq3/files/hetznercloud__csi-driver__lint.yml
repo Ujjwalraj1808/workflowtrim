@@ -1,0 +1,70 @@
+name: Lint
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  helm:
+    runs-on: ubuntu-latest
+    name: Helm Validation ${{ matrix.helm }}
+    strategy:
+      matrix:
+        helm:
+          - v3.19.2 # renovate: datasource=github-releases depName=helm/helm versioning=same-major
+          - v4.0.0 # renovate: datasource=github-releases depName=helm/helm versioning=same-major
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: 3.x
+
+      - uses: yokawasa/action-setup-kube-tools@b16d49b2c459d33cf9d4c300a220ef0bcdbc730a # v0.14.0
+        with:
+          setup-tools: |
+            helm
+          helm: ${{ matrix.helm }}
+
+      - uses: pre-commit/action@2c7b3805fd2a0fd8c1884dcaebf91fc102a13ecd # v3.0.1
+        with:
+          extra_args: none || true # Install pre-commit without running any hooks
+
+      # Run with pre-commit to get diff check
+      - name: helm-validation
+        run: |
+          pre-commit run helm-lint --all
+          pre-commit run helm-snapshots --all
+          pre-commit run deploy-manifests --all
+
+  pre-commit:
+    runs-on: ubuntu-latest
+    env:
+      # Helm lints are executed in a separate action with a version matrix
+      SKIP: "helm-lint,helm-snapshots,deploy-manifests"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: 3.x
+
+      - uses: yokawasa/action-setup-kube-tools@b16d49b2c459d33cf9d4c300a220ef0bcdbc730a # v0.14.0
+        with:
+          # helm is needed to generate chart snapshots
+          setup-tools: |
+            helm
+          helm: v4.3.0 # renovate: datasource=github-releases depName=helm/helm
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: ~/.cache/golangci-lint
+          key: pre-commit-golangci-lint|${{ env.pythonLocation }}|${{ hashFiles('.pre-commit-config.yaml') }}|${{ hashFiles('**/*.go') }}
+          restore-keys: |
+            pre-commit-golangci-lint|${{ env.pythonLocation }}|${{ hashFiles('.pre-commit-config.yaml') }}|
+            pre-commit-golangci-lint|${{ env.pythonLocation }}|
+            pre-commit-golangci-lint|
+
+      - uses: pre-commit/action@2c7b3805fd2a0fd8c1884dcaebf91fc102a13ecd # v3.0.1

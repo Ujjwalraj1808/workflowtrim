@@ -1,0 +1,131 @@
+name: Release bytecode
+
+on: pull_request
+
+jobs:
+   generate:
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      matrix:
+        include:
+          - platform: emscripten-wasm32
+            os: ubuntu-latest
+
+          - platform: emscripten-asmjs
+            os: ubuntu-latest
+
+          - platform: linux-amd64
+            os: ubuntu-latest
+
+          - platform: linux-arm64
+            os: ubuntu-24.04-arm
+
+          - platform: macosx-amd64
+            os: macos-latest
+
+          # TODO: Run checks on Windows binaries too
+
+    env:
+      PLATFORM: ${{ matrix.platform }}
+
+    steps:
+      - uses: actions/setup-node@v4
+
+      - name: Free Disk Space Before Build
+        if: "env.PLATFORM == 'macosx-amd64'"
+        run: |
+          df -h /
+          sudo rm -rf /Applications/Xcode_14.3.1.app
+          sudo rm -rf /Applications/Xcode_15.0.1.app
+          sudo rm -rf /Applications/Xcode_15.1.app
+          sudo rm -rf /Applications/Xcode_15.2.app
+          sudo rm -rf /Applications/Xcode_15.3.app
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY" \
+            /opt/google/chrome \
+            /opt/microsoft/msedge \
+            /opt/microsoft/powershell \
+            /opt/pipx \
+            /usr/lib/mono \
+            /usr/local/julia* \
+            /usr/local/lib/android \
+            /usr/local/lib/node_modules \
+            /usr/local/share/chromium \
+            /usr/local/share/powershell \
+            /usr/share/dotnet
+          df -h /
+
+      - name: Symlink solc-bin to /mnt/solc-bin
+        # It's now too big to fit on the main partition on Ubuntu. macOS runners are fine since
+        # they apparently have >70 GB available, but on Ubuntu it's mostly filled with software.
+        # NOTE: We don't clone to /mnt/solc-bin directly because the checkout action does not support that.
+        # See https://github.com/actions/checkout/issues/197
+        if: "env.PLATFORM != 'macosx-amd64'"
+        run: |
+          sudo mkdir /mnt/solc-bin/
+          sudo chown "$USER" /mnt/solc-bin/
+          ln -s /mnt/solc-bin/ solc-bin
+
+      - uses: actions/setup-python@v5
+        with:
+          # Use the latest minor release of Python 3. prepare_report.py requires Python >= 3.7
+          python-version: '3.x'
+
+      - uses: actions/checkout@v4
+        with:
+          repository: 'argotorg/solidity'
+          path: 'solidity/'
+          # bytecode_reports_for_modified_binaries.sh requires access to a working copy with full history
+          fetch-depth: 0
+          submodules: 'recursive'
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.GITHUB_REF }}
+          path: 'solc-bin/'
+          # We need more than just a single revision to be able to use diff
+          fetch-depth: 0
+
+      - name: Generate reports from matching release binaries
+        run: |
+          base_dir="$PWD"
+
+          mkdir reports/
+          cd reports/
+
+          "${base_dir}/solidity/scripts/solc-bin/bytecode_reports_for_modified_binaries.sh" \
+            "$PLATFORM" \
+            "origin/${{ github.base_ref }}" \
+            "origin/${GITHUB_HEAD_REF}" \
+            "$base_dir/solc-bin" \
+            "$base_dir/solidity"
+
+      - name: Upload reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.platform }}
+          path: reports/*
+
+   compare:
+    runs-on: ubuntu-latest
+    needs: generate
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: 'argotorg/solidity'
+          path: 'solidity/'
+          submodules: 'recursive'
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: reports/
+
+      - name: Compare
+        run: |
+          # This can happen if the PR does not touch any release binaries.
+          [[ -d reports/ ]] || { echo "No reports found."; exit 0; }
+
+          cd reports/
+          ../solidity/scripts/solc-bin/compare_bytecode_reports.sh

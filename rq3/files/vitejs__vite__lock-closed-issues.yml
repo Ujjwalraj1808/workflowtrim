@@ -1,0 +1,19 @@
+name: Lock Closed Issues
+
+on:
+  schedule:
+    - cron: "0 0 * * *"
+
+permissions:
+  issues: write # for actions/issues-helper to update issues
+
+jobs:
+  action:
+    if: github.repository == 'vitejs/vite'
+    runs-on: ubuntu-slim
+    steps:
+      - uses: $/.github/actions/issues-helper
+        with:
+          actions: "lock-closed-issues"
+          token: ${{ secrets.GITHUB_TOKEN }}
+          inactive-day: 14

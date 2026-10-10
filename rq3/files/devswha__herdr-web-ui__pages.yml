@@ -1,0 +1,92 @@
+name: Website
+# Builds site/ into the GitHub Pages site (https://herdrweb.dev/) on every push to
+# main: the page, and the browser demo, which is the app itself, so any client change is a site
+# change. README.md is a source too: the page's top video and feature clips are the README's
+# (docs/development.md, "README media").
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: pages
+  cancel-in-progress: false
+jobs:
+  validate:
+    name: Validate source
+    if: github.ref == 'refs/heads/main'
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+  build:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      sha: ${{ steps.source.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      # poster frames and scaled stills (scripts/build-site.ts); the runner image has no ffmpeg
+      - run: sudo bash scripts/ci-bounded-retry.sh 600 bash -c 'apt-get update -qq && apt-get install -y -qq --no-install-recommends ffmpeg'
+      # the demo is a Vite build of the client
+      - run: bun install --frozen-lockfile
+      - run: bun scripts/build-site.ts
+      - id: source
+        name: Record built SHA
+        run: echo "sha=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: _site
+  deploy:
+    if: github.ref == 'refs/heads/main'
+    needs: [validate, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Verify deployment SHA is current
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_SHA: ${{ github.sha }}
+          BUILT_SHA: ${{ needs.build.outputs.sha }}
+        run: |
+          set -euo pipefail
+          if [[ "$BUILT_SHA" != "$EXPECTED_SHA" ]]; then
+            echo "Built SHA $BUILT_SHA does not match validated SHA $EXPECTED_SHA" >&2
+            exit 1
+          fi
+          latest_sha="$(gh api "repos/${GITHUB_REPOSITORY}/commits/main" --jq '.sha')"
+          if [[ ! "$latest_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "GitHub returned an invalid main SHA: $latest_sha" >&2
+            exit 1
+          fi
+          if [[ "$latest_sha" != "$EXPECTED_SHA" ]]; then
+            echo "Refusing to deploy outdated SHA $EXPECTED_SHA; main is now $latest_sha" >&2
+            exit 1
+          fi
+      - id: deployment
+        uses: actions/deploy-pages@v5
+      - name: Summarize deployment
+        if: success()
+        env:
+          VALIDATED_SHA: ${{ github.sha }}
+          BUILT_SHA: ${{ needs.build.outputs.sha }}
+          DEPLOYED_SHA: ${{ github.sha }}
+        run: |
+          {
+            printf 'Validated SHA: `%s`\n' "$VALIDATED_SHA"
+            printf 'Built SHA: `%s`\n' "$BUILT_SHA"
+            printf 'Deployed SHA: `%s`\n' "$DEPLOYED_SHA"
+          } >> "$GITHUB_STEP_SUMMARY"

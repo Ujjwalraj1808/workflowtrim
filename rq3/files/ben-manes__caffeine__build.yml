@@ -1,0 +1,471 @@
+name: Build
+permissions: {}
+on:
+  pull_request: {}
+  push:
+    branches: [master, v3.dev]
+  workflow_dispatch: {}
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ github.run_attempt }}
+  cancel-in-progress: true
+env:
+  DEVELOCITY_ACCESS_KEY: ${{ secrets.DEVELOCITY_ACCESS_KEY }}
+  ALLOWED_ENDPOINTS: >-
+    *.actions.githubusercontent.com:443
+    api.adoptium.net:443
+    api.foojay.io:443
+    api.github.com:443
+    api.snapcraft.io:443
+    caffeine.develocity.cloud:443
+    cdn.azul.com:443
+    cloudflare.com:443
+    corretto.aws:443
+    corretto.github.io:443
+    docker.io:443
+    docs.oracle.com:443
+    download.java.net:443
+    download.oracle.com:443
+    downloads.gradle.org:443
+    downloads.gradle-dn.com:443
+    errorprone.info:443
+    gds.oracle.com:443
+    ghcr.io:443
+    github.com:443
+    guava.dev:443
+    jdk.java.net:443
+    jspecify.dev:443
+    lightbend.github.io:443
+    maven-central.storage-download.googleapis.com:443
+    objects.githubusercontent.com:443
+    oss.sonatype.org:443
+    plugins.gradle.org:443
+    plugins-artifacts.gradle.org:443
+    raw.githubusercontent.com:443
+    registry.npmjs.org:443
+    release-assets.githubusercontent.com:443
+    repo.gradle.org:443
+    repo.maven.apache.org:443
+    repo1.maven.org:443
+    scans-in.gradle.com:443
+    services.gradle.org:443
+    schemastore.org:443
+    www.graalvm.org:443
+  MINIMUM_JDK: 11
+  LATEST_JDK: 26
+
+jobs:
+  compile:
+    name: Compile
+    timeout-minutes: 15
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      matrix:
+        java: [ 11, 26, 28-ea ]
+    env:
+      JAVA_VERSION: ${{ matrix.java }}
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          disable-sudo-and-containers: true
+          egress-policy: block
+          allowed-endpoints: ${{ env.ALLOWED_ENDPOINTS }}
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Compile
+        uses: $/.github/actions/run-gradle
+        with:
+          attempt-limit: 2
+          attempt-delay: 30
+          arguments: resolveExternalDependencies assemble
+          java: ${{ env.JAVA_VERSION }}
+          cache-encryption-key: ${{ secrets.GRADLE_ENCRYPTION_KEY }}
+
+  setup:
+    name: Setup Matrix
+    runs-on: ubuntu-latest
+    outputs:
+      suites: ${{ steps.set-matrix.outputs.suites }}
+    steps:
+      - id: set-matrix
+        env:
+          TOTAL_SHARDS: 40
+          ADDITIONAL_SUITES: |
+            caffeine:fuzzTest --tests FrequencySketchFuzzer
+            caffeine:fuzzTest --tests CaffeineSpecFuzzer*
+            caffeine:fuzzTest --tests WindowClimberFuzzer
+            caffeine:fuzzTest --tests LinkedDequeFuzzer
+            caffeine:fuzzTest --tests TimerWheelFuzzer
+            caffeine:fuzzTest --tests PacerFuzzer*
+            caffeine:fuzzTest --tests CacheFuzzer
+            caffeine:lincheckTest
+            caffeine:eclipseTest
+            caffeine:jctoolsTest
+            caffeine:openjdkTest
+            caffeine:apacheTest
+            caffeine:googleTest
+            caffeine:jsr166Test
+            caffeine:moduleTest
+            caffeine:frayTest
+            caffeine:osgiTest
+            simulator:check
+            jcache:check
+            guava:check
+        run: |
+          SHARDS=$(seq 0 $((TOTAL_SHARDS - 1)) \
+            | jq -R -c --arg count "$TOTAL_SHARDS" \
+              '"caffeine:test -PshardCount=" + $count + " -PshardIndex=" + .' \
+            | jq -s -c '.')
+          ADDITIONAL_SUITES_JSON=$(echo "$ADDITIONAL_SUITES" \
+            | jq -R -s -c 'split("\n") | map(select(length > 0))')
+          COMBINED=$(echo "$SHARDS" "$ADDITIONAL_SUITES_JSON" \
+            | jq -s 'add' -c)
+          echo "suites=$COMBINED" >> $GITHUB_OUTPUT
+          echo "$COMBINED" | jq
+
+  tests-minimum:
+    name: Tests (Minimum JDK)
+    timeout-minutes: 60
+    runs-on: ubuntu-latest
+    needs: [compile, setup]
+    permissions:
+      contents: read
+    strategy:
+      matrix:
+        suite: ${{ fromJson(needs.setup.outputs.suites) }}
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          disable-sudo-and-containers: true
+          egress-policy: block
+          allowed-endpoints: ${{ env.ALLOWED_ENDPOINTS }}
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Run tests
+        uses: $/.github/actions/run-gradle
+        with:
+          attempt-limit: 2
+          attempt-delay: 30
+          local-cache-read-only: true
+          java: ${{ env.MINIMUM_JDK }}
+          arguments: ${{ matrix.suite }}
+          cache-encryption-key: ${{ secrets.GRADLE_ENCRYPTION_KEY }}
+      - name: Format Test Artifact Name
+        if: always()
+        id: format_artifact
+        env:
+          INPUTS_ARGUMENTS: ${{ matrix.suite }}
+        shell: bash
+        run: |
+          RAW_NAME=$INPUTS_ARGUMENTS-$MINIMUM_JDK
+          ARTIFACT_NAME=$(echo $RAW_NAME | tr -c '[:alnum:]_.-' '-' | sed 's/^-//')
+          echo "name=$ARTIFACT_NAME" >> $GITHUB_OUTPUT
+      - name: Compress test results
+        if: always()
+        env:
+          ARTIFACT_NAME: ${{ steps.format_artifact.outputs.name }}
+        shell: bash
+        run: >
+          find . -path '*/jacoco/*.exec' -o -path '*/test-results/*.xml'
+          | tar czf $ARTIFACT_NAME.tar.gz --files-from -
+      - name: Upload test results
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          retention-days: 1
+          name: ${{ steps.format_artifact.outputs.name }}-results
+          path: ${{ steps.format_artifact.outputs.name }}.tar.gz
+
+  tests-latest:
+    name: Tests (Latest JDK)
+    timeout-minutes: 60
+    runs-on: ubuntu-latest
+    needs: [compile, setup]
+    if: >
+      github.event_name == 'push'
+      && github.event.repository.fork == false
+      && github.ref_name == github.event.repository.default_branch
+    permissions:
+      contents: read
+    strategy:
+      matrix:
+        suite: ${{ fromJson(needs.setup.outputs.suites) }}
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          disable-sudo-and-containers: true
+          egress-policy: block
+          allowed-endpoints: ${{ env.ALLOWED_ENDPOINTS }}
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Run tests
+        uses: $/.github/actions/run-gradle
+        with:
+          attempt-limit: 2
+          attempt-delay: 30
+          local-cache-read-only: true
+          java: ${{ env.LATEST_JDK }}
+          arguments: ${{ matrix.suite }}
+          cache-encryption-key: ${{ secrets.GRADLE_ENCRYPTION_KEY }}
+
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-latest
+    needs: tests-minimum
+    permissions:
+      contents: read
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          disable-sudo-and-containers: true
+          egress-policy: block
+          allowed-endpoints: >
+            ${{ env.ALLOWED_ENDPOINTS }}
+            artifacts.codacy.com:443
+            api.codacy.com:443
+            api.sonarcloud.io:443
+            cli.codecov.io:443
+            codecov.io:443
+            coveralls.io:443
+            fastly.com:443
+            keybase.io:443
+            ingest.codecov.io:443
+            nodejs.org:443
+            sonarcloud.io:443
+            scanner.sonarcloud.io:443
+            storage.googleapis.com:443
+            uploader.codecov.io:443
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Download Tests Results
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - name: Decompress
+        run: find . -type f -name '*.tar.gz' -exec sh -c 'tar -zxf {} --one-top-level' \;
+      - name: Prepare Jacoco Reports
+        uses: $/.github/actions/run-gradle
+        with:
+          arguments: assemble
+          local-cache-read-only: true
+          java: ${{ env.MINIMUM_JDK }}
+          cache-encryption-key: ${{ secrets.GRADLE_ENCRYPTION_KEY }}
+      - name: Combine Jacoco Reports
+        uses: $/.github/actions/run-gradle
+        with:
+          arguments: jacocoFullReport
+          local-cache-read-only: true
+          java: ${{ env.MINIMUM_JDK }}
+          cache-encryption-key: ${{ secrets.GRADLE_ENCRYPTION_KEY }}
+      - name: Check file existence
+        id: check_files
+        uses: andstor/file-existence-action@558493d6c74bf472d87c84eab196434afc2fa029 # v3.1.0
+        with:
+          files: ./build/reports/jacoco/jacocoFullReport/jacocoFullReport.xml
+      - name: Upload Jacoco Full Report
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: steps.check_files.outputs.files_exists == 'true'
+        with:
+          retention-days: 1
+          name: jacoco-report
+          path: ./build/reports/jacoco/jacocoFullReport
+      - name: Publish to Coveralls
+        uses: $/.github/actions/run-gradle
+        if: >
+          (github.event_name == 'push')
+          && (github.event.repository.fork == false)
+          && (steps.check_files.outputs.files_exists == 'true')
+        env:
+          COVERALLS_REPO_TOKEN: ${{ secrets.COVERALLS_REPO_TOKEN }}
+        with:
+          local-cache-read-only: true
+          java: ${{ env.MINIMUM_JDK }}
+          arguments: coverallsJacoco --no-configuration-cache
+          cache-encryption-key: ${{ secrets.GRADLE_ENCRYPTION_KEY }}
+        continue-on-error: true
+      - name: Publish to Codecov
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        if: >
+          (github.event_name == 'push')
+          && (github.event.repository.fork == false)
+          && (steps.check_files.outputs.files_exists == 'true')
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+      - name: Publish to Codacy
+        uses: codacy/codacy-coverage-reporter-action@89d6c85cfafaec52c72b6c5e8b2878d33104c699 # v1.3.0
+        if: >
+          (github.event_name == 'push')
+          && (github.event.repository.fork == false)
+          && (steps.check_files.outputs.files_exists == 'true')
+        with:
+          project-token: ${{ secrets.CODACY_PROJECT_TOKEN }}
+        continue-on-error: true
+      - name: Publish to SonarQube
+        uses: $/.github/actions/run-gradle
+        if: >
+          github.event_name == 'push'
+          && github.event.repository.fork == false
+          && (steps.check_files.outputs.files_exists == 'true')
+          && github.ref_name == github.event.repository.default_branch
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        with:
+          local-cache-read-only: true
+          java: ${{ env.MINIMUM_JDK }}
+          cache-encryption-key: ${{ secrets.GRADLE_ENCRYPTION_KEY }}
+          arguments: sonar -Dsonar.branch.name=${{ github.ref_name }} --no-parallel
+        continue-on-error: true
+
+  test-results:
+    name: Test Results
+    runs-on: ubuntu-latest
+    needs: tests-minimum
+    permissions:
+      contents: read
+      checks: write # Needed to annotate commit
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          disable-sudo: true
+          egress-policy: block
+          allowed-endpoints: >
+            ${{ env.ALLOWED_ENDPOINTS }}
+            cli.codecov.io:443
+            codecov.io:443
+            img.shields.io:443
+            ingest.codecov.io:443
+            keybase.io:443
+            uploader.codecov.io:443
+      - name: Download Tests
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - name: Decompress
+        run: find . -type f -name '*.tar.gz' -exec sh -c 'tar -zxf {} --one-top-level' \;
+      - name: Publish Test Results
+        uses: EnricoMi/publish-unit-test-result-action@d0a4676d0e0b938bc201470d88276b7c74c712b3 # v2.24.0
+        continue-on-error: true
+        id: test-results
+        with:
+          json_thousands_separator: ','
+          files: '**/TEST-*.xml'
+          comment_mode: off
+          ignore_runs: true
+          job_summary: true
+      - name: Create badge
+        id: test-badge
+        env:
+          LABEL: tests
+          COLOR: 31c653
+          STATUS: ${{ fromJSON(steps.test-results.outputs.json).formatted.stats.runs }}
+        continue-on-error: true
+        run: curl -s -f https://img.shields.io/badge/$LABEL-$STATUS-$COLOR > badge.svg
+      - name: Upload badge to Gist
+        uses: popsiclestick/gist-sync-action@88f8633178625914f2a01abf1a765f7272a580fa # v1.2.0
+        if: >
+          github.event_name == 'push'
+          && github.event.repository.fork == false
+          && steps.test-badge.outcome == 'success'
+          && github.ref_name == github.event.repository.default_branch
+        with:
+          gist_title: badge.svg
+          github_file: badge.svg
+          gist_description: Test Results
+          auth: ${{ secrets.GIST_TOKEN }}
+          gist_url: https://gist.githubusercontent.com/ben-manes/c20eb418f0e0bd6dfe1c25beb35faae4
+      - name: Publish to Codecov
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        if: >
+          github.event_name == 'push'
+          && github.event.repository.fork == false
+          && github.ref_name == github.event.repository.default_branch
+        with:
+          report_type: test_results
+          token: ${{ secrets.CODECOV_TOKEN }}
+
+  reproducibility:
+    name: Reproducibility
+    runs-on: ubuntu-latest
+    if: >
+      github.event_name == 'push'
+      && github.event.repository.fork == false
+      && github.ref_name == github.event.repository.default_branch
+    permissions:
+      contents: read
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          disable-sudo-and-containers: true
+          egress-policy: block
+          allowed-endpoints: ${{ env.ALLOWED_ENDPOINTS }}
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Setup Gradle
+        uses: $/.github/actions/run-gradle
+        with:
+          local-cache-read-only: true
+          java: ${{ env.MINIMUM_JDK }}
+          cache-encryption-key: ${{ secrets.GRADLE_ENCRYPTION_KEY }}
+      - name: Verify Build Reproducibility
+        env:
+          ORG_GRADLE_PROJECT_javaVersion: ${{ env.MINIMUM_JDK }}
+        shell: bash
+        run: ./.github/scripts/checkBuildReproducibility.sh
+
+  publish-snapshot:
+    name: Publish Snapshot
+    runs-on: ubuntu-latest
+    needs: [reproducibility, tests-minimum, tests-latest]
+    if: >
+      github.event_name == 'push'
+      && github.event.repository.fork == false
+      && github.ref_name == github.event.repository.default_branch
+    permissions:
+      contents: read
+      id-token: write # Needed for signing
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          disable-sudo-and-containers: true
+          egress-policy: block
+          allowed-endpoints: >
+            ${{ env.ALLOWED_ENDPOINTS }}
+            fulcio.sigstore.dev:443
+            central.sonatype.com:443
+            oauth2.sigstore.dev:443
+            rekor.sigstore.dev:443
+            tuf-repo-cdn.sigstore.dev:443
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Publish Snapshot
+        uses: $/.github/actions/run-gradle
+        env:
+          ORG_GRADLE_PROJECT_signingKey: ${{ secrets.OSSRH_GPG_SECRET_KEY }}
+          ORG_GRADLE_PROJECT_signingKeyId: ${{ secrets.OSSRH_GPG_SECRET_KEY_ID }}
+          ORG_GRADLE_PROJECT_signingPassword: ${{ secrets.OSSRH_GPG_SECRET_KEY_PASSWORD }}
+          ORG_GRADLE_PROJECT_centralPortalUsername: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
+          ORG_GRADLE_PROJECT_centralPortalPassword: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
+        with:
+          attempt-delay: 2
+          attempt-limit: 3
+          java: ${{ env.MINIMUM_JDK }}
+          arguments: publishAggregationToCentralSnapshots
+          cache-encryption-key: ${{ secrets.GRADLE_ENCRYPTION_KEY }}

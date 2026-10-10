@@ -1,0 +1,195 @@
+name: Docker Publish
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  build:
+    name: Build (${{ matrix.image.short }}/${{ matrix.platform.arch }})
+    runs-on: ${{ matrix.platform.runner }}
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - name: windshiftapp/windshift
+            dockerfile: Dockerfile
+            short: windshift
+          - name: windshiftapp/ws-carrier
+            dockerfile: deploy/coding-agent/Dockerfile
+            short: ws-carrier
+          - name: windshiftapp/windshift-runner
+            dockerfile: deploy/windshift-runner/Dockerfile
+            short: windshift-runner
+        platform:
+          - os: linux/amd64
+            runner: ubuntu-latest
+            arch: amd64
+          - os: linux/arm64
+            runner: ubuntu-24.04-arm
+            arch: arm64
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f  # v3.12.0
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9  # v3.7.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051  # v5.10.0
+        with:
+          images: ${{ env.REGISTRY }}/${{ matrix.image.name }}
+
+      - name: Compute build metadata
+        id: build_meta
+        shell: bash
+        run: |
+          version="dev"
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            version="$GITHUB_REF_NAME"
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "commit=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          echo "date=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push per-arch staging tag
+        id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8  # v6.19.2
+        with:
+          context: .
+          file: ${{ matrix.image.dockerfile }}
+          # The platform always matches the runner's native arch, so BuildKit
+          # never reaches for QEMU — but it MUST be passed explicitly: without
+          # --platform, TARGETOS/TARGETARCH stay unset and Dockerfile ARG
+          # defaults decide what the Go cross-compile targets. That once put
+          # x86_64 binaries inside the arm64 runner image, silently emulated
+          # via qemu binfmt on the host (WI-394). Each arch is pushed under its
+          # own per-commit staging TAG; the merge job combines the two into the
+          # real tags.
+          platforms: ${{ matrix.platform.os }}
+          # We push by tag, NOT push-by-digest, on purpose: buildkit's
+          # default provenance makes even a single-platform build a manifest
+          # index, and the index digest from steps.build.outputs.digest was not
+          # resolvable at merge time for the large server image
+          # (docker/build-push-action#755). A registry tag always resolves, so
+          # the merge is reliable — and provenance/attestations are preserved.
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.image.short }}-${{ matrix.platform.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image.short }}-${{ matrix.platform.arch }}
+          build-args: |
+            VERSION=${{ steps.build_meta.outputs.version }}
+            RELEASE_NAME=
+            COMMIT=${{ steps.build_meta.outputs.commit }}
+            BUILD_DATE=${{ steps.build_meta.outputs.date }}
+          tags: ${{ env.REGISTRY }}/${{ matrix.image.name }}:stage-${{ github.sha }}-${{ matrix.platform.arch }}
+          push: true
+
+  merge:
+    name: Merge Manifests (${{ matrix.image.short }})
+    runs-on: ubuntu-latest
+    needs: build
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      # One image's merge hiccup must not cancel the others' publishes.
+      fail-fast: false
+      matrix:
+        image:
+          - name: windshiftapp/windshift
+            short: windshift
+          - name: windshiftapp/ws-carrier
+            short: ws-carrier
+          - name: windshiftapp/windshift-runner
+            short: windshift-runner
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f  # v3.12.0
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9  # v3.7.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051  # v5.10.0
+        with:
+          images: ${{ env.REGISTRY }}/${{ matrix.image.name }}
+          tags: |
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref, '-dev') && !contains(github.ref, '-test') && !contains(github.ref, '-rc') }}
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}},enable=${{ !startsWith(github.ref, 'refs/tags/v0.') }}
+            type=sha,prefix=
+
+      - name: Create manifest list from per-arch staging tags
+        env:
+          IMG: ${{ env.REGISTRY }}/${{ matrix.image.name }}
+          STAGE: stage-${{ github.sha }}
+        run: |
+          # Combine the two per-arch staging tags into the final tags. Tags
+          # always resolve in the registry (unlike a by-digest index digest),
+          # so this is reliable. A short retry covers transient registry blips.
+          create() {
+            docker buildx imagetools create \
+              $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+              "${IMG}:${STAGE}-amd64" "${IMG}:${STAGE}-arm64"
+          }
+          for attempt in 1 2 3; do
+            if create; then
+              echo "manifest created (attempt ${attempt})"
+              exit 0
+            fi
+            echo "imagetools create failed (attempt ${attempt}); retrying in 10s..."
+            sleep 10
+          done
+          echo "imagetools create still failing after retries"
+          exit 1
+
+      - name: Inspect image
+        run: |
+          docker buildx imagetools inspect ${{ env.REGISTRY }}/${{ matrix.image.name }}:${{ steps.meta.outputs.version }}
+
+      - name: Prune per-arch staging tags
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PKG: ${{ matrix.image.short }}
+        run: |
+          # Best-effort cleanup: delete the two ephemeral stage-<sha>-<arch>
+          # tags now that the real multi-arch manifest is published. Never fails
+          # the job — leftover staging tags are harmless if this can't run.
+          for arch in amd64 arm64; do
+            tag="stage-${{ github.sha }}-${arch}"
+            vid=$(gh api --paginate "/orgs/windshiftapp/packages/container/${PKG}/versions" \
+              --jq ".[] | select(.metadata.container.tags | index(\"${tag}\")) | .id" | head -n1)
+            if [ -n "$vid" ]; then
+              gh api --method DELETE "/orgs/windshiftapp/packages/container/${PKG}/versions/${vid}" \
+                && echo "pruned ${tag} (version ${vid})" || echo "could not prune ${tag}"
+            else
+              echo "no version found for ${tag}"
+            fi
+          done

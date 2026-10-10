@@ -1,0 +1,68 @@
+name: Release
+# Installs discover Git tags directly. Never create a tag until its exact commit passes CI.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version already merged into main (X.Y.Z, without v)'
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: release
+  cancel-in-progress: false
+jobs:
+  preflight:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require main
+        env:
+          RELEASE_REF: ${{ github.ref }}
+        run: test "$RELEASE_REF" = refs/heads/main
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - name: Validate version, notes and unused tag
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          bun scripts/release-notes.ts "$RELEASE_VERSION"
+          if git show-ref --verify --quiet "refs/tags/v$RELEASE_VERSION"; then
+            echo 'This version already has a tag; choose a new version.' >&2
+            exit 1
+          fi
+  validate:
+    needs: preflight
+    uses: ./.github/workflows/ci.yml
+  publish:
+    needs: validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - name: Publish the validated commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          git fetch origin main --tags
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+          bun scripts/release-notes.ts "$RELEASE_VERSION" > "$RUNNER_TEMP/release-notes.md"
+          if git show-ref --verify --quiet "refs/tags/v$RELEASE_VERSION"; then
+            echo 'Tag appeared during validation; refusing to publish it.' >&2
+            exit 1
+          fi
+          gh release create "v$RELEASE_VERSION" --target "$GITHUB_SHA" --title "herdr web ui v$RELEASE_VERSION" --notes-file "$RUNNER_TEMP/release-notes.md"

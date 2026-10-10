@@ -1,0 +1,26 @@
+name: new PR greeter
+on:
+  pull_request_target:
+    types: [opened,reopened]
+
+jobs:
+  new_pr_greeter:
+    if: github.event.comment.author_association == 'MEMBER' ||
+      github.event.comment.author_association == 'COLLABORATOR'
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Add comment to PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+
+            const body = `Welcome ${{ github.actor }}, you can run extended openstack test with **/test-osp-extended** comment`;
+
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body
+            })

@@ -1,0 +1,41 @@
+name: docs
+
+on: 
+  push:
+    paths:
+      - 'docs/**'
+  pull_request:
+    paths:
+      - 'docs/**'
+
+jobs:
+  docs:
+    runs-on: ubuntu-latest
+    name: build up document and deploy
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+
+    # The docs are hand-written rst with no autodoc directives, so building
+    # them does not require manimlib or any of its runtime dependencies.
+    - name: Install sphinx
+      run: pip install -r docs/requirements.txt
+
+    - name: Build document with Sphinx
+      run: |
+        cd docs
+        make html
+        
+    - name: Deploy to GitHub pages
+      if: ${{ github.event_name == 'push' }}
+      uses: JamesIves/github-pages-deploy-action@3.7.1
+      with:
+        ACCESS_TOKEN: ${{ secrets.DOC_DEPLOY_TOKEN }}
+        BRANCH: gh-pages
+        FOLDER: docs/build/html

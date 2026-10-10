@@ -1,0 +1,34 @@
+---
+name: Ansible verification
+
+on:
+  pull_request:
+    paths:
+      - 'ansible/**'
+  workflow_dispatch:
+
+env:
+  YAMLLINT_VERSION: 1.38.0
+  ANSIBLE_LINT_VERSION: 26.6.0
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.x'
+
+      - name: Install dependencies
+        run: pip3 install yamllint==$YAMLLINT_VERSION ansible-lint==$ANSIBLE_LINT_VERSION --only-binary ':all:'
+
+      - name: Run Ansible linter
+        working-directory: ./ansible
+        run: |
+          yamllint .
+          ansible-lint .

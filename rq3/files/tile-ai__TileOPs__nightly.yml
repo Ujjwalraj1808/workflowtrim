@@ -1,0 +1,528 @@
+name: Nightly
+
+permissions: read-all
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: nightly-${{ github.ref }}
+  cancel-in-progress: false
+
+# ---------------------------------------------------------------------------
+# All nightly jobs run on a containerized self-hosted runner (label: shared, or bench).
+# The runner container is provisioned by the host with GPU access, persistent
+# cache mounts, and the runtime environment variables below.
+# ---------------------------------------------------------------------------
+
+env:
+  TILELANG_CACHE_DIR: /ci-cache/tilelang
+  TILELANG_TMP_DIR: /ci-cache/tilelang/tmp
+  TRITON_CACHE_DIR: /ci-cache/triton
+  TORCHINDUCTOR_CACHE_DIR: /ci-cache/torchinductor
+  PIP_CACHE_DIR: /ci-cache/pip
+  MAX_JOBS: "64"
+
+jobs:
+  validate-refs:
+    if: ${{ github.repository == 'tile-ai/TileOPs' && (github.event_name == 'schedule' || github.ref == 'refs/heads/main') }}
+    timeout-minutes: 15
+    runs-on: [self-hosted, tile-ops, shared]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify nightly runner environment
+        run: bash scripts/ci/verify_nightly_runner.sh
+
+      - name: Install TileOPs (image-baked stack, --no-deps)
+        run: bash scripts/ci/install_tileops.sh
+
+      - name: Validate all registered reference APIs
+        run: python3 scripts/validate_manifest.py --levels refs --verbose
+
+  # =========================================================================
+  # Phase 1 — Benchmark (exclusive GPU access for accurate profiling)
+  #
+  # The persistent /ci-cache (TILELANG_CACHE_DIR) carries compiled kernels and
+  # autotuner results across runs; benchmark setup repopulates it on a cold key
+  # (e.g. after a tilelang bump). No separate warmup phase. For a one-off cold
+  # cache, run scripts/warmup_kernel_cache.py manually.
+  # =========================================================================
+  benchmark:
+    if: ${{ github.repository == 'tile-ai/TileOPs' && (github.event_name == 'schedule' || github.ref == 'refs/heads/main') }}
+    # Six-hour safety ceiling, plus time to retain reports and artifacts.
+    timeout-minutes: 380
+    runs-on: [self-hosted, tile-ops, bench]
+    env:
+      BENCH_WARN_SECONDS: ${{ vars.NIGHTLY_BENCH_WARN_SECONDS || '7200' }}
+      # Keep the long benchmark suite from fragmenting CUDA allocator segments
+      # before late large MoE input tensors allocate 14-21 GiB weight blocks.
+      PYTORCH_ALLOC_CONF: expandable_segments:True
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify nightly runner environment
+        run: scripts/ci/verify_nightly_runner.sh
+        shell: bash
+
+      - name: Install TileOPs (image-baked stack, --no-deps)
+        run: bash scripts/ci/install_tileops.sh
+        shell: bash
+
+      # Keep this out of the benchmark step below: that step sets
+      # continue-on-error, which would swallow a failure here.
+      - name: Validate GPU exclusivity and clock
+        run: |
+          set -euo pipefail
+
+          if ! command -v nvidia-smi >/dev/null 2>&1; then
+            echo "::error::nvidia-smi is not available on this runner"
+            exit 1
+          fi
+
+          # The benchmark needs exclusive access to one card. A second visible
+          # GPU means the container is misprovisioned, and work landing on it
+          # perturbs these timings.
+          # Count non-blank rows rather than newlines: output without a trailing
+          # newline undercounts, which would let a second card pass. Counted in
+          # the shell so gpu_count is always a number — a pipeline here could
+          # fail into an empty value, and the comparison below would then error
+          # out inside an `if`, where set -e does not fire, and pass the guard.
+          if ! gpu_indices=$(nvidia-smi --query-gpu=index --format=csv,noheader); then
+            echo "::error::nvidia-smi failed to report GPU indices"
+            exit 1
+          fi
+          gpu_count=0
+          while IFS= read -r gpu_row; do
+            if [ -n "${gpu_row//[[:space:]]/}" ]; then
+              gpu_count=$((gpu_count + 1))
+            fi
+          done <<< "${gpu_indices}"
+          if [ "${gpu_count}" -ne 1 ]; then
+            echo "::error::expected exactly 1 visible GPU, found ${gpu_count}"
+            nvidia-smi --query-gpu=index,name --format=csv,noheader
+            exit 1
+          fi
+
+          # The runner is ephemeral, so this log is the only record of which
+          # card the job got.
+          echo "GPU under test:"
+          nvidia-smi --query-gpu=uuid,compute_mode,memory.used --format=csv
+
+          compute_mode=$(nvidia-smi --query-gpu=compute_mode --format=csv,noheader | xargs)
+          if [ "${compute_mode}" != "Exclusive_Process" ]; then
+            echo "::error::expected compute mode Exclusive_Process, found ${compute_mode}"
+            exit 1
+          fi
+
+          # Read memory, not --query-compute-apps: the container's PID namespace
+          # makes process queries come back empty even for a busy card.
+          MAX_USED_MIB=64
+          mem_used=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits | xargs)
+          # A non-numeric reading ([N/A], empty) would make the comparison below
+          # error out, and an error inside `if` does not trip set -e: the guard
+          # would pass. Reject it here so an unreadable GPU fails closed.
+          case "${mem_used}" in
+            ''|*[!0-9]*)
+              echo "::error::could not read GPU memory use, got '${mem_used}'"
+              exit 1
+              ;;
+          esac
+          if [ "${mem_used}" -gt "${MAX_USED_MIB}" ]; then
+            echo "::error::GPU is not idle: ${mem_used} MiB in use, limit ${MAX_USED_MIB} MiB"
+            nvidia-smi
+            exit 1
+          fi
+
+          TARGET_CLOCK_MHZ=1500
+          RETRIES=5
+          for i in $(seq 1 "${RETRIES}"); do
+            gpu_clock=$(nvidia-smi --query-gpu=clocks.current.graphics --format=csv,noheader,nounits | xargs)
+            echo "GPU clock: ${gpu_clock} MHz (attempt ${i}/${RETRIES})"
+            if [ "${gpu_clock}" = "${TARGET_CLOCK_MHZ}" ]; then break; fi
+            if [ "${i}" -eq "${RETRIES}" ]; then
+              echo "::error::GPU frequency validation failed. Expected ${TARGET_CLOCK_MHZ} MHz, got ${gpu_clock} MHz."
+              exit 1
+            fi
+            sleep 2
+          done
+        shell: bash
+
+      # Each case checks its warmup outputs before sampling; there is no second sweep.
+      - name: Run benchmark ops
+        id: benchmark_tests
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+
+          export PYTHONPATH="${GITHUB_WORKSPACE}${PYTHONPATH:+:$PYTHONPATH}"
+          echo "Runtime cache env:"
+          echo "TILELANG_CACHE_DIR=${TILELANG_CACHE_DIR:-}"
+          echo "TILELANG_TMP_DIR=${TILELANG_TMP_DIR:-}"
+          echo "TRITON_CACHE_DIR=${TRITON_CACHE_DIR:-}"
+
+          # One pytest process per bench file: a native hang / segfault / OOM
+          # kill costs only that file's results. py-spy captures the stack of
+          # a hung child before the runner kills it.
+          # Bound stalled cases separately from the total sweep budget.
+          set -o pipefail
+          # Best-effort: on a network failure the run proceeds without stack
+          # dumps (the runner records the absence) instead of dying here.
+          python3 -m pip install -q -c constraints.txt py-spy \
+            || echo "::warning::py-spy install failed; hang stack dumps disabled"
+          python3 scripts/ci/run_benchmarks.py benchmarks/ops \
+            --junit-xml bench_results.xml \
+            --stall-timeout 900 \
+            --warn-after "${BENCH_WARN_SECONDS}" \
+            --total-budget 21600 \
+            --dump-dir bench_stack_dumps | tee tileops_benchmarks.log
+
+          if [ -f profile_run.log ]; then
+            { echo; echo "===== profile_run.log summary ====="; cat profile_run.log; } >> tileops_benchmarks.log
+          else
+            echo "::warning::profile_run.log not found; benchmark may have failed partially" >> tileops_benchmarks.log
+          fi
+        shell: bash
+
+      - name: Check benchmark coverage
+        id: bench_coverage
+        if: ${{ always() }}
+        run: |
+          set -euo pipefail
+          export PYTHONPATH="${GITHUB_WORKSPACE}${PYTHONPATH:+:$PYTHONPATH}"
+          # Which op each bench file measured is read off the run's own report:
+          # a benchmark that passes without benchmarking the op its manifest
+          # entry declares is a coverage gap no static check can see.
+          python3 scripts/check_bench_coverage.py \
+            --bench-xml bench_results.xml \
+            --output bench_coverage.md
+        shell: bash
+
+      - name: Record the run environment
+        if: ${{ always() }}
+        run: |
+          set -euo pipefail
+          export PYTHONPATH="${GITHUB_WORKSPACE}${PYTHONPATH:+:$PYTHONPATH}"
+          python3 scripts/ci/collect_env.py > env.json
+          cat env.json
+        shell: bash
+
+      # Two attempts, neither fatal: this job's conclusion states whether the
+      # benchmark passed. A snapshot that never reaches the artifact API fails
+      # `publish-bench-data`, where the missing data is what the failure names.
+      - name: Upload benchmark artifacts
+        id: upload_bench
+        uses: actions/upload-artifact@v4
+        if: ${{ always() }}
+        continue-on-error: true
+        with:
+          name: tileops_benchmark_${{ github.run_id }}_${{ github.run_attempt }}
+          path: |
+            tileops_benchmarks.log
+            bench_results.xml
+            bench_coverage.md
+            env.json
+            bench_stack_dumps/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Wait out the reset before retrying the upload
+        if: ${{ always() && steps.upload_bench.outcome == 'failure' }}
+        run: sleep 30
+        shell: bash
+
+      - name: Upload benchmark artifacts (retry)
+        uses: actions/upload-artifact@v4
+        if: ${{ always() && steps.upload_bench.outcome == 'failure' }}
+        continue-on-error: true
+        with:
+          name: tileops_benchmark_${{ github.run_id }}_${{ github.run_attempt }}
+          # A create request whose response was lost may still have created the
+          # artifact, and v4 names are immutable: without this the retry is
+          # rejected for the name the failed attempt left behind.
+          overwrite: true
+          path: |
+            tileops_benchmarks.log
+            bench_results.xml
+            bench_coverage.md
+            env.json
+            bench_stack_dumps/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Fail benchmark job if pytest or the coverage check failed
+        if: >-
+          ${{ always() && (steps.benchmark_tests.outcome == 'failure'
+          || steps.bench_coverage.outcome == 'failure') }}
+        run: exit 1
+        shell: bash
+
+  # =========================================================================
+  # Phase 2 — Op correctness tests (serial after benchmark for GPU exclusivity)
+  #
+  # Runs the `full` and `nightly` tiers. The `smoke` tier is the PR critical
+  # path and is already validated by every PR and every push-to-main gpu-smoke
+  # (-m "smoke or full"), so re-running it here is pure duplication. `nightly`
+  # is the heavy tier that runs nowhere else; `full` stays as a scheduled
+  # regression / environment-drift net.
+  # =========================================================================
+  op_test:
+    if: ${{ always() && github.repository == 'tile-ai/TileOPs' && (github.event_name == 'schedule' || github.ref == 'refs/heads/main') }}
+    needs: [benchmark]
+    timeout-minutes: 180
+    runs-on: [self-hosted, tile-ops, shared]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify nightly runner environment
+        run: scripts/ci/verify_nightly_runner.sh
+        shell: bash
+
+      - name: Install TileOPs (image-baked stack, --no-deps)
+        run: bash scripts/ci/install_tileops.sh
+        shell: bash
+
+      - name: Run full op tests
+        id: op_tests
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+
+          export PYTHONPATH="${GITHUB_WORKSPACE}${PYTHONPATH:+:$PYTHONPATH}"
+          echo "Runtime cache env:"
+          echo "TILELANG_CACHE_DIR=${TILELANG_CACHE_DIR:-}"
+          echo "TILELANG_TMP_DIR=${TILELANG_TMP_DIR:-}"
+          echo "TRITON_CACHE_DIR=${TRITON_CACHE_DIR:-}"
+
+          set -o pipefail
+          python3 -m pip install -q -c constraints.txt pytest-timeout pytest-cov
+          # Coverage reflects the full/nightly tiers only. Smoke-only cases run in
+          # gpu-smoke.yml and their code reads as untested here.
+          python3 -m pytest tests/ -m "full or nightly" -v --tb=short --timeout=900 --timeout-method=thread --junit-xml=test_results.xml --cov=tileops --cov-branch --cov-report=html:htmlcov --cov-report=xml:coverage.xml | tee tileops_op_test.log
+        shell: bash
+
+      - name: Download benchmark artifacts
+        uses: actions/download-artifact@v4
+        if: ${{ always() }}
+        with:
+          name: tileops_benchmark_${{ github.run_id }}_${{ github.run_attempt }}
+        continue-on-error: true
+
+      - name: Build the perf history window
+        if: ${{ always() }}
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          mkdir -p .perf_history
+          python3 scripts/build_perf_history.py \
+            --url https://github.com/tile-ai/TileOPs-nightly.git \
+            --out .perf_history/perf_history.json
+        shell: bash
+
+
+      - name: Generate nightly report
+        if: ${{ always() }}
+        run: |
+          set -euo pipefail
+
+          export PYTHONPATH="${GITHUB_WORKSPACE}${PYTHONPATH:+:$PYTHONPATH}"
+
+          HISTORY_ARGS=()
+          if [ -f .perf_history/perf_history.json ]; then
+            HISTORY_ARGS=(--history .perf_history/perf_history.json)
+          fi
+
+          python3 scripts/nightly_report.py \
+            --test-xml test_results.xml \
+            --bench-xml bench_results.xml \
+            "${HISTORY_ARGS[@]}" \
+            --output nightly_report.md \
+            --coverage-xml coverage.xml \
+            || echo "::warning::nightly_report.py failed"
+        shell: bash
+
+      - name: Post nightly report to step summary
+        if: ${{ always() && hashFiles('nightly_report.md') != '' }}
+        run: cat nightly_report.md >> "$GITHUB_STEP_SUMMARY"
+        shell: bash
+
+      - name: Upload op test artifacts
+        uses: actions/upload-artifact@v4
+        if: ${{ always() }}
+        with:
+          name: tileops_op_test_${{ github.run_id }}_${{ github.run_attempt }}
+          path: |
+            test_results.xml
+            coverage.xml
+            tileops_op_test.log
+            nightly_report.md
+            htmlcov/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Fail op test job if pytest failed
+        if: ${{ always() && steps.op_tests.outcome == 'failure' }}
+        run: exit 1
+        shell: bash
+
+  # =========================================================================
+  # Phase 2b — Publish benchmark data to the nightly-bench orphan branch
+  # Consumed by tile-ai/TileOPs.github.io to render the docs Benchmarks page.
+  # Runs on a github-hosted runner (no GPU needed) and uses the default token
+  # to force-push the day's XML snapshot, mirroring the manifest-stats pattern.
+  # =========================================================================
+  publish-bench-data:
+    if: ${{ always() && github.repository == 'tile-ai/TileOPs' && (github.event_name == 'schedule' || github.ref == 'refs/heads/main') }}
+    needs: [op_test]
+    runs-on: ubuntu-latest
+    # The data goes elsewhere now, under a token of its own.
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Download benchmark artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: tileops_benchmark_${{ github.run_id }}_${{ github.run_attempt }}
+          path: _bench
+        continue-on-error: true
+
+      - name: Download op test artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: tileops_op_test_${{ github.run_id }}_${{ github.run_attempt }}
+          path: _optest
+        continue-on-error: true
+
+      - name: Assemble publish payload
+        id: assemble
+        run: |
+          set -euo pipefail
+          mkdir -p _publish
+          ok=1
+          if [ -f _bench/bench_results.xml ]; then
+            cp _bench/bench_results.xml _publish/bench_results.xml
+          else
+            echo "bench_results.xml missing; skipping nightly-bench publish"
+            ok=0
+          fi
+          if [ -f _optest/test_results.xml ]; then
+            cp _optest/test_results.xml _publish/test_results.xml
+          else
+            echo "::warning::test_results.xml missing; page will render without test status"
+          fi
+          if [ -f _optest/coverage.xml ]; then
+            cp _optest/coverage.xml _publish/coverage.xml
+          fi
+          if [ "$ok" -eq 1 ]; then
+            # The environment the benchmark job read off its own machine.
+            python3 scripts/ci/publish_meta.py \
+              --env-json _bench/env.json \
+              --commit "${GITHUB_SHA}" \
+              --run-id "${GITHUB_RUN_ID}" \
+              --date "$(date -u +%Y-%m-%d)" \
+              --out _publish/meta.json
+            cat _publish/meta.json
+          fi
+          echo "ok=${ok}" >> "$GITHUB_OUTPUT"
+        shell: bash
+
+      # One commit per run, kept. On a branch of this repository the history
+      # would cost 314 KB a night packed — 112 MB a year against a 9 MB
+      # repository that everyone clones.
+      - name: Publish the snapshot to TileOPs-nightly
+        if: ${{ steps.assemble.outputs.ok == '1' }}
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          # GITHUB_TOKEN cannot reach another repository.
+          personal_token: ${{ secrets.BENCH_ARCHIVE_TOKEN }}
+          external_repository: tile-ai/TileOPs-nightly
+          # Not main: that branch is the repository's own. Everything not in
+          # _publish is deleted here, so a stale test_results.xml cannot pass
+          # for tonight's.
+          publish_branch: snapshots
+          publish_dir: _publish
+          # The action writes .nojekyll otherwise, which means nothing here.
+          disable_nojekyll: true
+          full_commit_message: "bench: ${{ github.sha }} (run ${{ github.run_id }})"
+          user_name: "github-actions[bot]"
+          user_email: "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Fail when tonight's benchmark data was not published
+        if: ${{ steps.assemble.outputs.ok != '1' }}
+        run: |
+          echo "::error::bench_results.xml is missing, so the snapshot still shows the previous run. Check whether the benchmark job produced it and whether its artifact upload reached GitHub."
+          exit 1
+        shell: bash
+
+  # =========================================================================
+  # Phase 3 — Packaging and smoke test
+  # =========================================================================
+  packaging:
+    if: ${{ always() && github.repository == 'tile-ai/TileOPs' && (github.event_name == 'schedule' || github.ref == 'refs/heads/main') }}
+    needs: [op_test]
+    runs-on: [self-hosted, tile-ops, shared]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          # setuptools-scm needs full history; a shallow clone yields the fallback.
+          fetch-depth: 0
+
+      - name: Verify nightly runner environment
+        run: scripts/ci/verify_nightly_runner.sh
+        shell: bash
+
+      - name: Build and test wheel package
+        run: |
+          set -euo pipefail
+          exec > >(tee packaging.log) 2>&1
+
+          python3 -m pip install -c constraints.txt build
+          python3 -m build --wheel
+          ls -lh dist/*.whl
+
+          echo "=== Runtime cache env ==="
+          echo "TILELANG_CACHE_DIR=${TILELANG_CACHE_DIR:-}"
+          echo "TILELANG_TMP_DIR=${TILELANG_TMP_DIR:-}"
+          echo "TRITON_CACHE_DIR=${TRITON_CACHE_DIR:-}"
+
+          # torch and tilelang come from the image; the release workflow runs the same
+          # script with --deps pypi.
+          bash scripts/ci/verify_installed_wheel.sh \
+            --wheel "$(ls dist/*.whl)" --deps image --work-dir packaging-verify
+        shell: bash
+
+      - name: Upload wheel artifact
+        if: ${{ success() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: tileops-wheel-${{ github.sha }}_${{ github.run_attempt }}
+          path: dist/*.whl
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload packaging logs
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: packaging-logs-${{ github.sha }}_${{ github.run_attempt }}
+          path: |
+            packaging.log
+            packaging-verify/packaging.xml
+            packaging-verify/env.json
+          if-no-files-found: warn
+          retention-days: 14

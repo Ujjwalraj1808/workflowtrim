@@ -1,0 +1,377 @@
+# E2E Tests for Usage Limit Detection System
+# Bead: bd-1xn3e
+#
+# These tests verify the robot mode commands work correctly with real tmux sessions.
+# In CI, tests run in mock mode. For local testing with real agents, omit E2E_MOCK_MODE.
+#
+# Local full-suite usage with real agents:
+#   go test -v -tags=e2e ./e2e/... -timeout 45m
+#
+# CI mock mode:
+#   E2E_MOCK_MODE=1 go test -v -tags=e2e ./e2e/... \
+#     -run '^(TestRCHHookStdinProtocol|TestE2E_SessionNotFoundError|TestE2ECanonicalPaneContract|TestE2EProjectSendCancellationAggregation|TestE2ECanonicalReplayJSONContract|TestE2ECanonicalReplayCancellationNoPostReturnEnter|TestE2ECodexGoalSendJSONContract|TestE2EAtomic.*|TestE2EResumeInjectUnifiedDispatch|TestE2ESpawn.*|TestE2ERobotAssignTerminalContractsBuiltBinary|TestE2EJSONCommandTerminalContractsBuiltBinary|TestE2ERobotSpawnTerminalContractsBuiltBinary|TestE2ERobotCapabilitiesBuiltBinaryBudgets|TestE2ERobotTerminalErrorContractsBuiltBinary|TestE2EHealthAutoRestartUsesEffectiveAgentConfig|TestE2EUpgradeJSONRequiresCheckBuiltBinary|TestE2EGlobalJSONOverridesLocalFormatsBuiltBinary|TestE2ELocalJSONSessionInferenceBuiltBinary|TestE2ERobotReplayBuiltBinaryRealTmuxDeliversExactlyOnce|TestE2ERobotInterruptFollowUpRedactionBuiltBinaryRealTmux|TestE2ERobotBeadClaimBuiltBinaryRealBR|TestE2E_RobotFormatSelection|TestE2E_RobotBulkAssign_StrategyFlagsBuiltProcess|TestE2ERobotBulkAssignInvalidInputsAreSingleFailureDocuments|TestE2ERobotBulkAssignMissingDependenciesAreTyped|TestBrennerbotIncidentPipelineRunsEndToEndAgainstMocks)$' -timeout 45m
+#   E2E_MOCK_MODE=1 go test -v -tags=e2e ./e2e/... \
+#     -run '^TestE2E_RobotBulkAssign_.*$' -timeout 20m
+
+name: E2E Tests
+
+on:
+  # Main is the only long-lived branch, so every landed change must run the
+  # same hardening matrix that pull requests and the nightly schedule run.
+  push:
+    branches: ["main"]
+    paths:
+      - 'e2e/**'
+      - 'cmd/ntm/**'
+      - 'internal/**'
+      - 'tests/**'
+      - 'Makefile'
+      - 'go.mod'
+      - 'go.sum'
+      - '.github/workflows/ci.yml'
+      - '.github/workflows/e2e-tests.yml'
+
+  # Manual trigger for full E2E testing
+  workflow_dispatch:
+    inputs:
+      mock_mode:
+        description: 'Run in mock mode (no real agents)'
+        required: false
+        default: 'true'
+        type: boolean
+      test_filter:
+        description: 'Tagged E2E test filter (defaults to the hermetic CI smoke set)'
+        required: false
+        default: ''
+        type: string
+
+  # Run on PRs that touch e2e or robot code
+  pull_request:
+    branches: ["main"]
+    paths:
+      - 'e2e/**'
+      - 'cmd/ntm/**'
+      - 'internal/**'
+      - 'tests/**'
+      - 'Makefile'
+      - 'go.mod'
+      - 'go.sum'
+      - '.github/workflows/ci.yml'
+      - '.github/workflows/e2e-tests.yml'
+
+  # Nightly scheduled run
+  schedule:
+    - cron: '0 4 * * *'  # 4 AM UTC daily
+
+concurrency:
+  group: e2e-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  GO_VERSION: "1.26.3"
+
+jobs:
+  # ============================================================================
+  # Hermetic E2E Tests - mock-backed and isolated real-tmux coverage
+  # ============================================================================
+  e2e-mock:
+    name: Hermetic E2E Tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Install tmux
+        run: sudo apt-get update && sudo apt-get install -y tmux
+
+      - name: Install br
+        env:
+          BR_VERSION: "0.2.16"
+          BR_SHA256: "9ee22d340b56dacfb20460d8e4b2a0065fb66f161910472285d55f51e04512b0"
+        run: |
+          archive="$RUNNER_TEMP/br-${BR_VERSION}-linux_amd64.tar.gz"
+          curl -fsSL \
+            "https://github.com/Dicklesworthstone/beads_rust/releases/download/v${BR_VERSION}/br-${BR_VERSION}-linux_amd64.tar.gz" \
+            -o "$archive"
+          echo "$BR_SHA256  $archive" | sha256sum --check
+          tar -xzf "$archive" -C "$RUNNER_TEMP" br
+          sudo install -m 0755 "$RUNNER_TEMP/br" /usr/local/bin/br
+          br --version
+
+      - name: Install bv
+        env:
+          BV_VERSION: "0.18.0"
+          BV_SHA256: "b8df409c380cc4db9f07cf0329ee8a4d8e669be812528ef1b3b2e0b1260e9145"
+        run: |
+          archive="$RUNNER_TEMP/bv_linux_amd64.tar.gz"
+          curl -fsSL \
+            "https://github.com/Dicklesworthstone/beads_viewer/releases/download/v${BV_VERSION}/bv_linux_amd64.tar.gz" \
+            -o "$archive"
+          echo "$BV_SHA256  $archive" | sha256sum --check
+          tar -xzf "$archive" -C "$RUNNER_TEMP" bv
+          sudo install -m 0755 "$RUNNER_TEMP/bv" /usr/local/bin/bv
+          bv --version
+
+      - name: Build ntm
+        run: |
+          go build -o ntm ./cmd/ntm
+          sudo mv ntm /usr/local/bin/
+
+      - name: Verify ntm installed
+        run: ntm version
+
+      - name: Run E2E Tests (Mock Mode)
+        env:
+          E2E_MOCK_MODE: ${{ (github.event_name != 'workflow_dispatch' || inputs.mock_mode) && '1' || '0' }}
+          CAUT_MOCK_FILE: "e2e/fixtures/caut_mock.json"
+          E2E_LOG_DIR: "/tmp/e2e-logs"
+          E2E_TEST_FILTER: ${{ inputs.test_filter || '' }}
+          E2E_PRIMARY_FILTER: '^(TestRCHHookStdinProtocol|TestOverlayFeed.*|TestE2E_SessionNotFoundError|TestE2ECanonicalPaneContract|TestE2EProjectSendCancellationAggregation|TestE2ECanonicalReplayJSONContract|TestE2ECanonicalReplayCancellationNoPostReturnEnter|TestE2ECodexGoalSendJSONContract|TestE2EAtomic.*|TestE2EResumeInjectUnifiedDispatch|TestE2ESpawn.*|TestE2ERobotAssignTerminalContractsBuiltBinary|TestE2EJSONCommandTerminalContractsBuiltBinary|TestE2ERobotSpawnTerminalContractsBuiltBinary|TestE2ERobotCapabilitiesBuiltBinaryBudgets|TestE2ERobotTerminalErrorContractsBuiltBinary|TestE2EHealthAutoRestartUsesEffectiveAgentConfig|TestE2EUpgradeJSONRequiresCheckBuiltBinary|TestE2EGlobalJSONOverridesLocalFormatsBuiltBinary|TestE2ELocalJSONSessionInferenceBuiltBinary|TestE2ERobotReplayBuiltBinaryRealTmuxDeliversExactlyOnce|TestE2ERobotInterruptFollowUpRedactionBuiltBinaryRealTmux|TestE2ERobotBeadClaimBuiltBinaryRealBR|TestE2E_RobotFormatSelection|TestE2E_RobotBulkAssign_StrategyFlagsBuiltProcess|TestE2ERobotBulkAssignInvalidInputsAreSingleFailureDocuments|TestE2ERobotBulkAssignMissingDependenciesAreTyped|TestBrennerbotIncidentPipelineRunsEndToEndAgainstMocks)$'
+          E2E_LEGACY_BULK_FILTER: '^TestE2E_RobotBulkAssign_.*$'
+        run: |
+          mkdir -p "$E2E_LOG_DIR"
+
+          if [ -n "$E2E_TEST_FILTER" ]; then
+            go test -v -count=1 -tags=e2e ./e2e/... -run "$E2E_TEST_FILTER" -timeout 45m \
+              2>&1 | tee e2e-requested-output.txt
+          else
+            # New functionality crosses the built binary, real tmux, real br,
+            # concurrent processes, and durable assignment/replay state.
+            go test -v -count=1 -tags=e2e ./e2e/... -run "$E2E_PRIMARY_FILTER" -timeout 45m \
+              2>&1 | tee e2e-primary-output.txt
+
+            # Keep the long legacy bulk contract independent so its failures
+            # and timeout budget cannot obscure the primary hardening matrix.
+            go test -v -count=1 -tags=e2e ./e2e/... -run "$E2E_LEGACY_BULK_FILTER" -timeout 20m \
+              2>&1 | tee e2e-legacy-bulk-output.txt
+          fi
+
+      - name: Run real-Beads assignment transaction tests
+        run: go test -v -count=1 ./internal/bv -timeout 15m
+
+      - name: Upload E2E Logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: e2e-logs-mock
+          path: |
+            /tmp/e2e-logs/
+            e2e-*-output.txt
+          retention-days: 7
+
+  # ============================================================================
+  # E2E Infrastructure Tests - Verify test suite compiles and runs basic checks
+  # ============================================================================
+  e2e-infra:
+    name: E2E Infrastructure Check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Install tmux
+        run: sudo apt-get update && sudo apt-get install -y tmux
+
+      - name: Build and vet E2E tests
+        run: |
+          go test -tags=e2e ./e2e/... -run '^$'
+          go vet -tags=e2e ./e2e/...
+
+      - name: List E2E tests
+        run: go test -tags=e2e ./e2e/... -list '.*' -count=1
+
+      - name: Run session-not-found test (no agents required)
+        run: |
+          go build -o ntm ./cmd/ntm
+          sudo mv ntm /usr/local/bin/
+          go test -v -tags=e2e ./e2e/... -run TestE2E_SessionNotFoundError -timeout 2m
+
+  # ============================================================================
+  # E2E Robot Mode Validation
+  # ============================================================================
+  e2e-robot-mode:
+    name: Robot Mode Commands
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Install tmux
+        run: sudo apt-get update && sudo apt-get install -y tmux
+
+      - name: Build ntm
+        run: |
+          go build -o ntm ./cmd/ntm
+          sudo mv ntm /usr/local/bin/
+
+      - name: Create test tmux session
+        run: |
+          tmux new-session -d -s test_session -x 200 -y 50
+          # Give tmux time to initialize
+          sleep 2
+          tmux list-sessions
+
+      - name: Test --robot-is-working (empty session)
+        run: |
+          echo "Testing --robot-is-working on empty session..."
+          ntm --robot-is-working=test_session --panes=0 | jq .
+
+      - name: Test --robot-agent-health (empty session)
+        run: |
+          echo "Testing --robot-agent-health on empty session..."
+          ntm --robot-agent-health=test_session --panes=0 | jq .
+
+      - name: Test --robot-smart-restart dry-run
+        run: |
+          echo "Testing --robot-smart-restart with --dry-run..."
+          ntm --robot-smart-restart=test_session --panes=0 --dry-run | jq .
+
+      - name: Test error handling (non-existent session)
+        run: |
+          echo "Testing error handling for non-existent session..."
+          # Should return valid JSON with success=false
+          output=$(ntm --robot-is-working=nonexistent_session_xyz 2>&1 || true)
+          echo "$output" | jq -e '.success == false' || {
+            echo "Expected success=false for non-existent session"
+            echo "Output: $output"
+            exit 1
+          }
+
+      - name: Cleanup
+        if: always()
+        run: tmux kill-server 2>/dev/null || true
+
+  # ============================================================================
+  # macOS real-tool E2E - exercise tmux + br + bv together on Darwin
+  # ============================================================================
+  e2e-macos-bv:
+    name: macOS Real br+bv E2E
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Install tmux
+        run: brew install tmux
+
+      - name: Install br
+        env:
+          BR_VERSION: "0.2.16"
+        run: |
+          case "$(uname -m)" in
+            arm64)
+              asset="darwin_arm64"
+              checksum="43c2d38e8e550737e15e35e8eb1d804e726b85842ea02dc8ff02c3c50d4c2b81"
+              ;;
+            x86_64)
+              asset="darwin_amd64"
+              checksum="b154ebf279dccc8d671e69ddce0fa7cdee4ea72144a0cd4209a7afe044c54219"
+              ;;
+            *)
+              echo "Unsupported macOS architecture: $(uname -m)" >&2
+              exit 1
+              ;;
+          esac
+          archive="$RUNNER_TEMP/br-${BR_VERSION}-${asset}.tar.gz"
+          curl -fsSL \
+            "https://github.com/Dicklesworthstone/beads_rust/releases/download/v${BR_VERSION}/br-${BR_VERSION}-${asset}.tar.gz" \
+            -o "$archive"
+          echo "$checksum  $archive" | shasum -a 256 --check
+          tar -xzf "$archive" -C "$RUNNER_TEMP" br
+          sudo install -m 0755 "$RUNNER_TEMP/br" /usr/local/bin/br
+          br --version
+
+      - name: Install bv
+        env:
+          BV_VERSION: "0.18.0"
+        run: |
+          case "$(uname -m)" in
+            arm64)
+              asset="darwin_arm64"
+              checksum="eba2639a9be382dd9fe4dff04489fc84720363815e26d5883fdbfb02c12ffb80"
+              ;;
+            x86_64)
+              asset="darwin_amd64"
+              checksum="c1a33ea9a74b4fc67f796c83c67ea3f0be4a6f5d9eac7f4072f945118e31e779"
+              ;;
+            *)
+              echo "Unsupported macOS architecture: $(uname -m)" >&2
+              exit 1
+              ;;
+          esac
+          archive="$RUNNER_TEMP/bv_${asset}.tar.gz"
+          curl -fsSL \
+            "https://github.com/Dicklesworthstone/beads_viewer/releases/download/v${BV_VERSION}/bv_${asset}.tar.gz" \
+            -o "$archive"
+          echo "$checksum  $archive" | shasum -a 256 --check
+          tar -xzf "$archive" -C "$RUNNER_TEMP" bv
+          sudo install -m 0755 "$RUNNER_TEMP/bv" /usr/local/bin/bv
+          bv --version
+
+      - name: Build ntm
+        run: |
+          go build -o ntm ./cmd/ntm
+          sudo mv ntm /usr/local/bin/
+
+      - name: Run real from-BV E2E
+        env:
+          E2E_MOCK_MODE: "1"
+        run: |
+          go test -v -count=1 -tags=e2e ./e2e/... \
+            -run '^TestE2E_RobotBulkAssign_WithFromBV$' -timeout 10m
+
+  # ============================================================================
+  # Summary
+  # ============================================================================
+  e2e-success:
+    name: E2E Success
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    needs: [e2e-mock, e2e-infra, e2e-robot-mode, e2e-macos-bv]
+    if: always()
+    steps:
+      - name: Check all E2E jobs passed
+        run: |
+          if [ "${{ needs.e2e-mock.result }}" != "success" ] || \
+             [ "${{ needs.e2e-infra.result }}" != "success" ] || \
+             [ "${{ needs.e2e-robot-mode.result }}" != "success" ] || \
+             [ "${{ needs.e2e-macos-bv.result }}" != "success" ]; then
+            echo "One or more E2E jobs failed"
+            exit 1
+          fi
+          echo "All E2E checks passed!"

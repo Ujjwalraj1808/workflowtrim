@@ -1,0 +1,277 @@
+---
+name: Tests
+on:
+  pull_request: {}
+  push:
+    branches: [main]
+jobs:
+  unit:
+    name: unit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: go.mod
+
+      - run: go test -v -race -coverprofile=coverage.txt ./...
+
+      - uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7
+        if: >
+          !startsWith(github.head_ref, 'renovate/') &&
+          !startsWith(github.head_ref, 'releaser-pleaser--')
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          flags: unit
+
+  cloud:
+    name: e2e k8s-${{ matrix.k3s }}
+    runs-on: ubuntu-latest
+
+    permissions:
+      id-token: write
+
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref }}-${{ matrix.k3s }}
+      cancel-in-progress: true
+
+    strategy:
+      fail-fast: false # Continue tests matrix if a flaky run occurs.
+      matrix:
+        k3s:
+          - v1.34
+          - v1.35
+          - v1.36
+          - v1.37
+
+    env:
+      K3S_CHANNEL: ${{ matrix.k3s }}
+      ENV: gha-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.k3s }}
+
+      # Domain must be available in the account running the tests. This domain is available in the account
+      # running the public integration tests.
+      CERT_DOMAIN: hc-integrations-test.de
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: go.mod
+
+      - uses: hetznercloud/setup-hcloud@28cdd3fc4a4a8013e86d57c7254be72df92fcc02 # v2
+
+      - uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4 # v2
+        with:
+          tofu_version: v1.13.1 # renovate: datasource=github-releases depName=opentofu/opentofu
+          tofu_wrapper: false
+
+      - uses: yokawasa/action-setup-kube-tools@b16d49b2c459d33cf9d4c300a220ef0bcdbc730a # v0.14.0
+        with:
+          setup-tools: |
+            helm
+            kubectl
+            skaffold
+          helm: v4.3.0 # renovate: datasource=github-releases depName=helm/helm
+          kubectl: v1.37.1 # renovate: datasource=github-releases depName=kubernetes/kubernetes
+          skaffold: v2.25.0 # renovate: datasource=github-releases depName=GoogleContainerTools/skaffold
+
+      - name: Setup k3sup
+        env:
+          K3SUP_VERSION: 0.13.13 # renovate: datasource=github-releases depName=alexellis/k3sup
+        run: |
+          curl https://github.com/alexellis/k3sup/releases/download/$K3SUP_VERSION/k3sup -sSL -o /usr/local/bin/k3sup
+          chmod +x /usr/local/bin/k3sup
+
+      - uses: hetznercloud/tps-action@5bfcef547f41c44aa626d0474c0491a1dbda792a # main
+        with:
+          token: ${{ secrets.HCLOUD_TOKEN  }}
+
+      - name: Setup environment
+        run: make -C dev up
+
+      - name: Run skaffold
+        run: |
+          source dev/files/env.sh
+          skaffold run
+
+      - name: Run tests
+        run: |
+          source dev/files/env.sh
+          go test ./tests/e2e -tags e2e -v -race -timeout 60m
+
+      - name: Fetch coverage data
+        run: |
+          source dev/files/env.sh
+          bash scripts/get-coverage-from-k8s.sh
+
+      - name: Upload coverage reports to Codecov
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7
+        if: >
+          !startsWith(github.head_ref, 'renovate/') &&
+          !startsWith(github.head_ref, 'releaser-pleaser--')
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: ./coverage/coverage.txt
+          flags: e2e
+
+      - name: Dump logs & events
+        if: always()
+        continue-on-error: true
+        run: |
+          source dev/files/env.sh
+          mkdir debug-logs
+
+          echo "::group::hccm.log"
+          kubectl logs \
+            --namespace kube-system \
+            --selector app.kubernetes.io/name=hcloud-cloud-controller-manager \
+            --all-containers \
+            --prefix=true \
+            --tail=-1 \
+            | tee debug-logs/hccm.log
+          echo "::endgroup::"
+
+          echo "::group::events.yaml"
+          kubectl get events \
+            --all-namespaces \
+            --sort-by=.firstTimestamp \
+            --output yaml \
+            | tee debug-logs/events.yaml
+          echo "::endgroup::"
+
+      - name: Cleanup
+        if: always()
+        continue-on-error: true
+        run: make -C dev down
+
+      - name: Persist debug artifacts
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: debug-logs-${{ env.ENV }}
+          path: debug-logs/
+
+  robot:
+    name: e2e robot
+    runs-on: ubuntu-latest
+
+    permissions:
+      id-token: write
+
+    # Make sure that only one job is using the server at a time
+    concurrency: robot
+    environment: e2e-robot
+
+    env:
+      K3S_CHANNEL: v1.37
+      ENV: gha-${{ github.run_id }}-${{ github.run_attempt }}-robot
+
+      ROBOT_ENABLED: "true"
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: go.mod
+
+      - uses: hetznercloud/setup-hcloud@28cdd3fc4a4a8013e86d57c7254be72df92fcc02 # v2
+
+      - uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4 # v2
+        with:
+          tofu_version: v1.13.1 # renovate: datasource=github-releases depName=opentofu/opentofu
+          tofu_wrapper: false
+
+      - uses: yokawasa/action-setup-kube-tools@b16d49b2c459d33cf9d4c300a220ef0bcdbc730a # v0.14.0
+        with:
+          setup-tools: |
+            helm
+            kubectl
+            skaffold
+          helm: v4.3.0 # renovate: datasource=github-releases depName=helm/helm
+          kubectl: v1.37.1 # renovate: datasource=github-releases depName=kubernetes/kubernetes
+          skaffold: v2.25.0 # renovate: datasource=github-releases depName=GoogleContainerTools/skaffold
+
+      - name: Install k3sup
+        run: |
+          curl -sLS https://get.k3sup.dev | sh
+
+      - uses: hetznercloud/tps-action@5bfcef547f41c44aa626d0474c0491a1dbda792a # main
+        with:
+          token: ${{ secrets.HCLOUD_TOKEN  }}
+
+      - name: Setup environment
+        env:
+          ROBOT_SSH_KEY: ${{ secrets.ROBOT_SSH_KEY }}
+          ROBOT_USER: ${{ secrets.ROBOT_USER }}
+          ROBOT_PASSWORD: ${{ secrets.ROBOT_PASSWORD }}
+        run: |
+          dev/robot/with-ssh-agent make -C dev up
+
+      - name: Run skaffold
+        run: |
+          source dev/files/env.sh
+          skaffold run --profile=robot
+
+      - name: Run tests
+        env:
+          ROBOT_USER: ${{ secrets.ROBOT_USER }}
+          ROBOT_PASSWORD: ${{ secrets.ROBOT_PASSWORD }}
+        run: |
+          source dev/files/env.sh
+          go test ./tests/e2e -tags e2e,robot -v -timeout 60m
+
+      - name: Fetch coverage data
+        run: |
+          source dev/files/env.sh
+          bash scripts/get-coverage-from-k8s.sh
+
+      - name: Upload coverage reports to Codecov
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7
+        if: >
+          !startsWith(github.head_ref, 'renovate/') &&
+          !startsWith(github.head_ref, 'releaser-pleaser--')
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: ./coverage/coverage.txt
+          flags: e2e
+
+      - name: Dump logs & events
+        if: always()
+        continue-on-error: true
+        run: |
+          source dev/files/env.sh
+          mkdir debug-logs
+
+          echo "::group::hccm.log"
+          kubectl logs \
+            --namespace kube-system \
+            --selector app.kubernetes.io/name=hcloud-cloud-controller-manager \
+            --all-containers \
+            --prefix=true \
+            --tail=-1 \
+            | tee debug-logs/hccm.log
+          echo "::endgroup::"
+
+          echo "::group::events.yaml"
+          kubectl get events \
+            --all-namespaces \
+            --sort-by=.firstTimestamp \
+            --output yaml \
+            | tee debug-logs/events.yaml
+          echo "::endgroup::"
+
+      - name: Cleanup
+        if: always()
+        continue-on-error: true
+        run: make -C dev down
+
+      - name: Persist debug artifacts
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: debug-logs-${{ env.ENV }}
+          path: debug-logs/

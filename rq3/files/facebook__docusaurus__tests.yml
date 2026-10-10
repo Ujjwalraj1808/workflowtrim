@@ -1,0 +1,78 @@
+name: Tests
+
+on:
+  pull_request:
+    branches:
+      - main
+      - docusaurus-v**
+    paths:
+      - package.json
+      - pnpm-lock.yaml
+      - vitest.config.ts
+      - test/**
+      - packages/**
+      - tsconfig.*.json
+      - .github/workflows/tests.yml
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Tests
+    timeout-minutes: 30
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node: ['24.21', '26']
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Install pnpm
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+      - name: Use Node.js ${{ matrix.node }}
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ matrix.node }}
+          cache: pnpm
+      - name: Installation
+        run: pnpm install --frozen-lockfile || pnpm install --frozen-lockfile || pnpm install --frozen-lockfile
+      - name: Test
+        run: pnpm test
+      - name: Remove Theme Internal Re-export
+        run: pnpm --filter @docusaurus/theme-common removeThemeInternalReexport
+      - name: Docusaurus Build
+        # We build 2 locales to ensure a localized site doesn't leak memory
+        # See https://github.com/facebook/docusaurus/issues/10944
+        run: pnpm build:website:fast --locale en --locale fr
+        env:
+          # Our website should build even with limited memory
+          # See https://github.com/facebook/docusaurus/pull/10590
+          NODE_OPTIONS: "--max-old-space-size=${{ matrix.node == '24.21' && 350 || 300 }}"
+          DOCUSAURUS_PERF_LOGGER: 'true'
+      - name: Docusaurus site CSS order
+        run: pnpm --filter website test:css-order
+
+      - name: TypeCheck website
+        # see https://github.com/facebook/docusaurus/pull/10486
+        run: pnpm --filter website typecheck
+
+      - name: TypeCheck website - min version - v6.0
+        # We call the "typescript" package compiler explicitly, because the
+        # root "tsc" bin comes from "@typescript/native" (pinned TS 7)
+        run: |
+          pnpm add typescript@6.0 --save-exact -D -w --ignore-scripts
+          node node_modules/typescript/bin/tsc --version
+          node node_modules/typescript/bin/tsc --project website/tsconfig.json
+
+      - name: TypeCheck website - max version - Latest
+        # For latest TS there are often lib check errors, so we disable it
+        # Details: https://github.com/facebook/docusaurus/pull/10486
+        run: |
+          pnpm add typescript@latest --save-exact -D -w --ignore-scripts
+          node node_modules/typescript/bin/tsc --version
+          node node_modules/typescript/bin/tsc --project website/tsconfig.skipLibCheck.json

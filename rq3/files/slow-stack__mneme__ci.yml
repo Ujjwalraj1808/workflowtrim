@@ -1,0 +1,164 @@
+name: CI
+
+# 优化版（对比原 test.yml）：
+# 1. 测试矩阵扩展为 OS（ubuntu/windows）× Node（22/24）——插件用 node:sqlite（≥22），
+#    且 npm publish 前要求双平台全量通过；fail-fast: false 保证一个平台的失败不掩盖另一个。
+# 2. 新增 src/↔lib/ 一致性守门（scripts/check-sync.js，v0.7.9 引入的发布前校验前置到 CI）。
+# 3. Codecov 只在 ubuntu+node24 一个分片跑一次（覆盖率无需每个组合都传）。
+# 4. node_modules 缓存（cache-dependency-path 指向子目录的 lockfile）。
+# 5. 宿主版本兼容腿 test-host-legacy：peer 声明的 0.1.x 两段各真跑一遍（见该作业注释）。
+# ⚠️ 需要 package.json 配合一处小改（跨平台通配符）：
+#    dsh-mneme/package.json 的 "test": "node --test test/*.test.js" 在 Windows 的 cmd 下
+#    不展开 glob。建议改为 "test": "node --test test/"（目录模式，全平台等价），
+#    "test:coverage" 同理（c8 node --test test/）。改动只影响脚本调用方式，用例不变。
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        node-version: [22, 24]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: dsh-mneme
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+          cache-dependency-path: dsh-mneme/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      # 发布守门前置：src/↔lib/ 漂移直接红（原来只在 prepack 时校验，PR 阶段发现不了）
+      - name: Sync check (src ↔ lib)
+        run: node scripts/check-sync.js
+
+      - name: Run full tests
+        run: npm test
+
+      # 跨包平价锁：mneme-memory（mcp/ 独立包）的 MCP_TOOLS 必须与插件 src/tools.js
+      # 逐字一致。该用例住在仓库根 test/，而根目录没有 package.json（v0.7.x 的编排壳
+      # 已删除），所以 npm test 的 glob 永远扫不到它——不显式跑就等于没有这道闸。
+      # 只跑一个代表分片：纯文本比对，与 OS / Node 版本无关。
+      - name: Cross-package MCP parity (mneme-memory ↔ src/tools.js)
+        if: matrix.os == 'ubuntu-latest' && matrix.node-version == 24
+        working-directory: .
+        run: node --test test/mcp-package.test.js
+
+      # 覆盖率与 Codecov 只跑一个代表分片，避免四份重复上报
+      - name: Coverage (ubuntu + node 24 shard only)
+        if: matrix.os == 'ubuntu-latest' && matrix.node-version == 24
+        run: npm run test:coverage
+
+      # v5：codecov-action v4 的引导期（下载/连接 codecov.io）TLS 失败不受
+      # fail_ci_if_error 约束，会把整条腿判死（2026-10-05 ubuntu+node24 连挂三次，
+      # 测试与覆盖率本身 fail 0）。v5 走新 CLI 且带 retry_count，引导/上传的
+      # 网络抖动可在步内消化——上报失败仍不应挡 merge。
+      - name: Upload coverage to Codecov
+        if: matrix.os == 'ubuntu-latest' && matrix.node-version == 24
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: dsh-mneme/coverage/lcov.info
+          fail_ci_if_error: false
+          retry_count: 3
+
+  # ── 宿主版本兼容腿：0.1.x 老内核 ───────────────────────────────────────────
+  # peerDependencies 声明覆盖三段（0.1.0-rc.6+ / 0.1.5-rc.0+ / 0.2.0-rc.0+），而
+  # test 腿只用 lockfile 里那一版（当前 0.2 线）——「声明支持却从没验证」正是 #344
+  # 的由来。这条腿把 0.1.x 的两段也真跑一遍。
+  #
+  # 为什么另开作业、而不是给 test 加一个 matrix 维度：test 的四个作业名
+  # （test (os, node)）是分支保护的 required status checks，加维度会让名字变成
+  # test (os, node, host)、原名消失 → 所有 PR 立刻被卡住无法合并。另开作业完全不
+  # 碰那四个必需检查；若要让这条腿也阻断合并，去 Settings → Branches 把
+  # test-host-legacy (*) 加进 required 即可。
+  #
+  # 为什么只跑 ubuntu + node 24 单分片：这条腿问的是「宿主 API 面是否还兼容」，
+  # 与 OS / Node 无关（那些由 test 腿的四个分片覆盖），单分片足够且最省。
+  test-host-legacy:
+    strategy:
+      fail-fast: false
+      matrix:
+        # 两个值分别落在 peer 范围的两段上：
+        #   0.1.0-rc.8 —— #344 之前本仓库实际开发/测试的那一版（0.1.0 段）
+        #   0.1.7-rc.2 —— 0.1 线最新（老桌面端 2.0.14 内置的 0.1.7-rc.1 属同一段）
+        host: ["0.1.0-rc.8", "0.1.7-rc.2"]
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: dsh-mneme
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: dsh-mneme/package-lock.json
+
+      # 换掉那四个宿主 devDeps 再重新解析。必须删掉 lockfile：带着 0.2 的锁降级
+      # 会被 peer 链拦死（dsh-tools 的 peer 要求同版本的 dsh-agent，而锁里是 0.2.x）。
+      # 因此这条腿的树是「全新解析」的——它只回答宿主 API 面是否兼容，不回答依赖
+      # 版本一致性（那由 test 腿的 npm ci 负责）。解析与安装分两步：解析失败
+      # （网络/元数据）与下载失败能区分开，且安装结果严格等于解析出的锁。
+      - name: Pin host packages to ${{ matrix.host }}
+        run: |
+          node -e '
+            const fs = require("fs");
+            const names = [
+              "@deepseek-ai/dsh-host-webserver",
+              "@deepseek-ai/dsh-llm",
+              "@deepseek-ai/dsh-system-prompt",
+              "@deepseek-ai/dsh-tools"
+            ];
+            const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
+            for (const name of names) pkg.devDependencies[name] = process.argv[1];
+            fs.writeFileSync("package.json", JSON.stringify(pkg, null, 2) + "\n");
+          ' "${{ matrix.host }}"
+          rm -f package-lock.json
+          npm install --package-lock-only
+          npm ci
+
+      # 断言目标版本真的装上了。解析漂移要在这里响亮地失败，而不是让后面的用例
+      # 给出一个「其实测的是别的版本」的假绿。
+      - name: Assert the legacy host actually landed
+        run: |
+          node -e '
+            const fs = require("fs");
+            const want = process.argv[1];
+            const names = ["dsh-host-webserver", "dsh-llm", "dsh-system-prompt", "dsh-tools"];
+            let bad = 0;
+            for (const name of names) {
+              const path = "node_modules/@deepseek-ai/" + name + "/package.json";
+              const got = JSON.parse(fs.readFileSync(path, "utf8")).version;
+              if (got !== want) { console.error("✖ " + name + " 装成了 " + got + "，期望 " + want); bad = 1; }
+            }
+            if (bad) process.exit(1);
+            console.log("✓ 四个宿主包都是 " + want);
+          ' "${{ matrix.host }}"
+
+      # 全新解析会把运行时闭包也换成当前最新，而 runtime-manifest.json 是从 lockfile
+      # 生成的 → 不重建的话「清单与 lockfile 一致」那条用例必红，且与本腿要问的问题
+      # 无关。清单一致性由 test 腿的 npm ci 负责。
+      - name: Rebuild runtime manifest for the synthetic tree
+        run: node scripts/build-runtime-manifest.mjs
+
+      - name: Run full tests
+        run: npm test

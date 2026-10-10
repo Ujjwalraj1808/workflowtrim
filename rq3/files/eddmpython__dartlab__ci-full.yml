@@ -1,0 +1,133 @@
+name: CI Full
+
+# Tier 2 — master push 직후 통합 회귀 (목표 ≤ 10분). PR 단계는 ci-fast 만.
+# 명령 SSOT = tests/run.py GATES. 신규 게이트는 GATES + matrix 양쪽 동시 추가.
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch: {}
+  workflow_call: {}
+
+# cancel-in-progress: false = 진행 중 run 은 완주하고, 대기열의 낡은 run 만 최신으로
+# 교체된다(GitHub concurrency 기본 동작). 실측(2026-08-03~04): 연속 push·머지가 35분짜리
+# full run 을 반복 취소해 "완주 그린" 이 한 번도 안 나오는 구간이 생겼다. 취소는 빠른
+# 신호용 ci-fast 만 유지한다(그쪽은 최신 head 신호가 목적이라 취소가 맞다).
+concurrency:
+  group: ci-full-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  gate:
+    runs-on: ${{ matrix.runner || 'ubuntu-latest' }}
+    timeout-minutes: ${{ matrix.timeout || 20 }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - gate: test-full
+            python: "3.12"
+            timeout: 60  # tests/run.py test-full 정본과 일치. coverage와 artifact cleanup까지 같은 예산으로 보장.
+            artifact_name: coverage-report
+            artifact_path: htmlcov/
+          - gate: test-full
+            python: "3.13"
+            timeout: 60
+          - gate: fixture-integration
+            timeout: 15
+          - gate: cross-os-smoke
+            runner: ubuntu-latest
+          - gate: cross-os-smoke
+            runner: windows-latest
+          - gate: cross-os-smoke
+            runner: macos-latest
+          - gate: product-smoke-wheel
+            timeout: 30
+            artifact_name: product-smoke-wheel-release
+            artifact_path: product-smoke-wheel-release.json
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: ${{ matrix.gate == 'test-full' && 0 || 1 }}
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python || '3.12' }}
+      - name: Run ${{ matrix.gate }}
+        shell: bash
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          DARTLAB_TEST_BASE: ${{ github.event_name == 'push' && github.event.before || '' }}
+        run: |
+          python -X utf8 tests/run.py gate ${{ matrix.gate }} \
+            ${{ matrix.python && format('--python {0}', matrix.python) || '' }}
+      - name: Upload coverage to Codecov
+        if: ${{ matrix.gate == 'test-full' && matrix.python == '3.12' }}
+        uses: codecov/codecov-action@v7
+        with:
+          files: coverage.xml
+          fail_ci_if_error: false
+          token: ${{ secrets.CODECOV_TOKEN }}
+      - name: Upload impacted test plan
+        if: ${{ always() && matrix.gate == 'test-full' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: impacted-test-plan-${{ matrix.python }}
+          path: impact-test-plan.json
+          if-no-files-found: error
+      - name: Upload artifact
+        if: ${{ always() && matrix.artifact_name }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.artifact_path }}
+          retention-days: 30
+
+  # realdata 는 path-diff 동적 matrix — plan 잡 결과를 suite 잡이 받아 fan-out.
+  realdata-plan:
+    runs-on: ubuntu-latest
+    outputs:
+      tests: ${{ steps.plan.outputs.tests }}
+      hasAny: ${{ steps.plan.outputs.hasAny }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - id: plan
+        env:
+          GITHUB_BASE_REF: ${{ github.event.pull_request.base.ref || '' }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: python -X utf8 tests/run.py gate realdata-plan
+      - name: Upload realdata scan prebuild
+        if: ${{ steps.plan.outputs.hasAny == 'true' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: realdata-scan-prebuild
+          path: tests/fixtures/dart/scan/
+          if-no-files-found: error
+
+  realdata-suite:
+    needs: realdata-plan
+    if: ${{ needs.realdata-plan.outputs.hasAny == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        test_file: ${{ fromJson(needs.realdata-plan.outputs.tests) }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: "pip"
+      - name: Download realdata scan prebuild
+        uses: actions/download-artifact@v8
+        with:
+          name: realdata-scan-prebuild
+          path: tests/fixtures/dart/scan/
+      - run: python -X utf8 tests/run.py gate realdata-suite --test ${{ matrix.test_file }}
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}

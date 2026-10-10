@@ -1,0 +1,557 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Deny by default, then grant per job. Nine of the eleven workflows already
+# DECLARE a block and four use exactly this `{}`-plus-per-job shape; `ci.yml`
+# declared none at all, and relied on the repository's
+# `default_workflow_permissions` setting being `read`. That is a setting a
+# maintainer can change from the web UI, which would silently widen every job
+# here -- including ones a FORK triggers through `pull_request`. An explicit
+# block cannot be widened from outside the file (issue go-to-k/cdkd#3229).
+permissions: {}
+
+jobs:
+  check-build-test:
+    runs-on: ubuntu-latest
+    # A RUNAWAY CAP, NOT A LATENCY TARGET. That reframing is the fix for an error
+    # this PR made four times: each revision set the bound from a sample MAXIMUM,
+    # and a sample maximum is always an UNDERESTIMATE of the true one, so every
+    # larger sample found a longer run and every headroom ratio published here
+    # was optimistic. The last round shipped `docs-deploy` at 15 minutes while a
+    # real 902 s build sat inside the very range the comment cited -- a bound
+    # BELOW a legitimate run, which is the failure go-to-k/cdkd#3229 exists to
+    # prevent, introduced by the change meant to prevent it.
+    #
+    # So the bounds are no longer derived from a max. Between "this job takes
+    # about twelve minutes" and the Actions default of 360 there is an enormous
+    # band, and choosing generously inside it costs nothing: a runaway is capped
+    # either way, and a slow runner is never killed. Figures below are stated as
+    # "observed at least X" -- a claim that stays true however incomplete the
+    # sample is, unlike "the maximum is X".
+    #
+    # NO PER-BOUND SAMPLE SIZE IS QUOTED. Three revisions quoted one and it was
+    # wrong three different ways -- a positional window, then a `--limit` cap
+    # read as a population, then counts double-added across two overlapping
+    # sample files, producing n's LARGER than the number of successful runs
+    # those workflows have ever had. The load-bearing claim is the lower bound
+    # and needs no n: "observed at least X" is true of one run or a thousand.
+    # (Population figures still appear where they are the POINT of a sentence --
+    # the 865 below, and `hooks.yml`'s 49 -- and an earlier version of this
+    # paragraph said "no sample size is quoted" while two sat within fifteen
+    # lines of it.)
+    #
+    # AND THE FIGURE MUST BE PER JOB, which is where three of them went wrong:
+    # `inherit`, `disarm` and `release-please` were briefly stated from a run's
+    # WALL CLOCK, taken from a review report while this token was rate-limited
+    # and published without re-deriving. A run includes queue time and every
+    # other job in it; `timeout-minutes` bounds neither. `disarm`'s run-level
+    # 235 s was a job that took 11 s.
+    #
+    # Every figure here is one MEASURED AT JOB LEVEL BY THIS BRANCH, and each is
+    # a LOWER BOUND: "observed at least X". Review briefly reported larger maxima
+    # for `disarm` and `release-please`; re-derivation from the reviewer's own
+    # wider data then matched these values, so nothing larger is quoted. The
+    # general rule stands regardless -- a weaker lower bound that was verified
+    # beats a stronger one that was not.
+    #
+    # Samples come from the closed range 2026-09-09..2026-09-15, UTC:
+    #
+    #   gh run list --workflow=<name>.yml --status=success \
+    #     --created 2026-09-09..2026-09-15 --limit 1000 --json databaseId
+    #   gh api repos/go-to-k/cdkd/actions/runs/<id>/jobs
+    #
+    # then difference `started_at` against `completed_at` per job. Note the
+    # `--limit`: at 50 it silently CAPS the sample (the range holds 865 `ci.yml`
+    # runs), which is how the 902 s build was missed.
+    #
+    # observed at least 823 s (13.7 min). This job is
+    # fork-reachable through `pull_request`, so it is the one the cap matters
+    # most for.
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      # `fetch-depth: 0` is load-bearing, not a default anyone forgot to trim:
+      # suites that compare this branch against `origin/main` cannot resolve
+      # that ref at the default depth 1, and a case that returns before
+      # asserting is the same green as one that passed.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          fetch-depth: 0
+
+      - uses: voidzero-dev/setup-vp@3754dd7dbdb32bd8f6d28b6043de13ad3a75f21f # v1
+        with:
+          node-version: "24"
+          cache: true
+          run-install: false
+
+      - run: vp install --frozen-lockfile
+      - run: vp run check
+      # Issue #1133 — `vp run check` type-checks tsconfig.json only (src/** +
+      # types/**), which excludes `**/*.test.ts`. Type-check the test project
+      # separately so a wrong `import type` or a stale mock shape in a test
+      # file fails CI instead of slipping through.
+      - run: vp run typecheck:test
+      # `build` runs BEFORE `test` on purpose. `dist/` is gitignored, and
+      # `tests/unit/cli/version.test.ts` skips itself when `dist/cli.js` is
+      # absent -- so with the old order its two fences (the entry-chunk bound
+      # and the command-tree-stub wiring fence added for issue #2002) were
+      # green-by-SKIP on every PR, i.e. the only coverage of the `--version`
+      # fast path never executed in CI. Measured with `dist/` absent:
+      # `Test Files 1 skipped (1) / Tests 3 skipped (3)`. The test also asserts
+      # loudly rather than skipping when `CI` is set, so a future reorder
+      # cannot silently re-disarm it -- the comment and the assertion are
+      # deliberately redundant, because the comment alone is what failed here.
+      - run: vp run build
+      # zsh for the paste harness (`tests/unit/utils/paste-harness.ts`), which
+      # runs every pasted span under bash AND zsh and FAILS under `CI` when zsh
+      # is missing (go-to-k/cdkd#3950): macOS pastes into zsh by default, and
+      # the two shells disagree on an unquoted `(` after a displayed value.
+      - name: install zsh for the paste harness
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq zsh
+      # CDKD_EXPECT_DIST is set ONLY here, because this is the only job that
+      # builds. `tests/unit/cli/version.test.ts` skips itself when `dist/` is
+      # absent -- correct for a contributor who has not built, and correct for
+      # the `once-leak-detect` / `runtime-compat` jobs, which do not build
+      # either. Keying the loud assertion on a bare `CI` reddened those two
+      # jobs; keying it on the build is what actually says "dist was produced,
+      # so a skip here means the step order regressed".
+      # Assert the suite actually RAN, not merely that the step exited 0.
+      # `vp run test` goes through the Vite+ task runner, and a task-runner
+      # failure that never reaches vitest exits 0 while printing no `Test Files`
+      # summary -- observed locally as a cache-encoder overflow
+      # (`Cache lookup failed: Encoded sequence length exceeded preallocation
+      # limit`) that ran nothing and looked green. The `test` task is now
+      # `cache: false`, which removes that particular path, but "the tests
+      # passed" and "the tests ran" are different claims and an exit code only
+      # ever carries the first.
+      - name: unit tests
+        run: |
+          set -o pipefail
+          vp run test 2>&1 | tee /tmp/unit-test.log
+          # Matched by CONTENT, not by line start, and not by a digit-free gap.
+          # Under CI the summary is ANSI coloured -- the real bytes are
+          # `\e[2m Test Files \e[22m \e[1m\e[32m845 passed` -- so a
+          # `^[[:space:]]*` anchor never matches (this step failed a green run
+          # that way), and a `[^0-9]*` gap stops inside `\e[22m`. Requiring a
+          # COUNT plus passed/failed after the phrase is what keeps prose that
+          # merely mentions it from satisfying the check.
+          if ! grep -qE 'Test Files.*[0-9]+ (passed|failed)' /tmp/unit-test.log; then
+            echo "::error::vitest printed no 'Test Files' summary — the suite did not run"
+            exit 1
+          fi
+        env:
+          CDKD_EXPECT_DIST: "1"
+
+      # ONE regeneration step for every generated matrix, module and ledger this
+      # repo commits (issues #399, #423, #1071, #1112, #1373, #1404, and the
+      # property / unsupported-type / enrichment / sdk-attr / update-wrap
+      # guards). `gen:all-matrices` in vite.config.ts is the single list of
+      # generators, and it is also what a contributor runs locally, so there is
+      # one place a new generator is registered rather than two that drift.
+      #
+      # The verdict is a NON-EMPTY `git diff` over the whole tree: a generator
+      # added to the aggregate is covered here the moment it is added, with no
+      # path list to keep in step. `--stat` names the stale files and the full
+      # diff shows what changed. `vp run format` runs inside the aggregate (the
+      # property-coverage codegen writes an unformatted shape), so a formatting
+      # drift reds here too.
+      #
+      # The `audit:*:check` CRITICS stay as their own steps below: they are
+      # pass/fail judgements with nothing to regenerate, and they must run
+      # AFTER this step so they read fresh data.
+      - name: generated matrices, modules and the integ ledger are up-to-date
+        run: |
+          vp run gen:all-matrices
+          stale=0
+          git diff --quiet || stale=1
+          # `git diff` cannot see an UNTRACKED file, so a generator that starts
+          # emitting a NEW output would pass here forever -- the same blind spot
+          # the ten per-path steps had, and a wider one now that this is the only
+          # staleness check in the job. `--exclude-standard` honours .gitignore,
+          # so `dist/` from the build step above does not trip it.
+          untracked=$(git ls-files --others --exclude-standard)
+          [ -z "$untracked" ] || stale=1
+          if [ "$stale" != 0 ]; then
+            echo "::error::a generated or unformatted file differs after \`vp run gen:all-matrices\` — run it and commit the files listed below"
+            git --no-pager diff --stat
+            git --no-pager diff
+            if [ -n "$untracked" ]; then
+              printf 'untracked files a generator produced:\n%s\n' "$untracked"
+            fi
+            exit 1
+          fi
+
+      # Issue #398 — fail CI when the cached three-tier provider-coverage
+      # audit (docs/_generated/provider-coverage.json) Tier 1 list drifts
+      # from src/provisioning/register-providers.ts. Offline check (<1s,
+      # no AWS calls — the full regeneration via
+      # `vp run audit:coverage:regenerate` would take 10-30 min + AWS
+      # CFn DescribeType throttling and stays a manual / future-cron job
+      # per issue #398 Option A). Catches the "added a new provider but
+      # forgot to regen the audit cache" case structurally.
+      - run: vp run audit:coverage:check
+
+      # Issue #2553 — fail CI when a tier-2 stateful CANDIDATE in
+      # docs/_generated/stateful-candidates.json is neither in STATEFUL_TYPES
+      # nor dispositioned in the derivation's NOT_GUARDED map (and when a
+      # NOT_GUARDED entry has stopped being proposed, so it disposes of
+      # nothing). Offline check (<1s, no AWS calls); the regeneration via
+      # `vp run audit:stateful-candidates:regenerate` issues a DescribeType per
+      # tier-2 type and stays manual for the same reason
+      # audit:coverage:regenerate does. Bare `run` like audit:coverage:check —
+      # the critic is pass/fail with nothing to regenerate.
+      - run: vp run audit:stateful-candidates:check
+
+      # Issue #2388 — fail CI when a file under src/ constructs an
+      # @aws-sdk/client-* client without spreading awsClientDefaults() first.
+      # The AWS SDK for JavaScript v3 does not read HTTPS_PROXY / HTTP_PROXY,
+      # so such a client cannot reach AWS behind a corporate proxy at all — and
+      # it fails at CREDENTIAL resolution, before any service call, with a
+      # certificate error naming neither the proxy nor the client. No test
+      # catches it, because no test runs behind a proxy. Bare `run` like
+      # audit:coverage:check: the critic is pass/fail with nothing to
+      # regenerate. Its allow-list (tests/aws-client-defaults-allowlist.json)
+      # may only shrink — a stale or dead entry fails too.
+      - run: vp run audit:aws-client-defaults:check
+
+      # go-to-k/cdkd#3479 — a file may not gain a logger call that interpolates
+      # a value raw instead of through safeMsg. Baseline:
+      # tests/raw-log-interpolation-baseline.json, lowered with --update.
+      - run: vp run audit:raw-log-interpolation:check
+
+      - run: vp run audit:enrichment-coverage:check
+
+      - run: vp run audit:sdk-attr-coverage:check
+
+      - run: vp run audit:update-wrap-coverage:check
+
+      - run: vp run audit:nested-key-coverage:check
+
+      - run: vp run audit:handled-property-wiring:check
+
+      # Issue #2040 — every provider `catch` site (and every `wrapError` helper a
+      # catch hands its binding to) must thread the caught AWS error as `cause`.
+      # `isTransientServerError` / `isThrottlingError` / `isMarkedNonRetryable`
+      # all locate their signal by walking `.cause`, so a wrapper that drops it
+      # makes all three inert and the SAME AWS failure becomes retryable in one
+      # provider and terminal in another. Unlike the matrix guards above there is
+      # nothing to regenerate — the critic is pass/fail — so it is a bare `run`
+      # like audit:coverage:check. It also self-probes its own classifier before
+      # reading the tree, so a degradation to "everything looks threaded" fails
+      # here rather than reporting a byte-identical green.
+      - run: vp run audit:provider-error-cause:check
+
+      # Issue #2802 — the same shape as the critic above, for the resolver's and
+      # template parser's bag reads. It self-probes against `origin/main` in its
+      # unit suite, where every site of the issue #2767 sweep is still
+      # unguarded, so a degradation to "everything looks guarded" fails there
+      # rather than reporting a byte-identical green here.
+      - run: vp run audit:template-keyed-bag-reads:check
+
+      # Issue #2228 — cdkd's `src/local/**` is half its own code and half a
+      # re-export surface over cdk-local, and the boundary between them has moved
+      # several times. A module that moves out does not stop compiling and does
+      # not stop being tested; it stops being CALLED, leaving a decoy at the path
+      # a grep lands on. #2203's fix landed in two such orphans, passed every gate
+      # and shipped as a no-op — a live probe returned the whole value it was
+      # meant to truncate. This critic requires every exported value symbol with a
+      # cdkd-authored body there to be reachable from a shipped entry point or to
+      # say at its declaration that it is not, and it fails on a STALE annotation
+      # too, so the annotations cannot rot. Re-export shims are exempt by
+      # construction (no body to edit), not by an allowlist. It self-probes its
+      # own classifier in both directions before reading the tree.
+      - run: vp run audit:local-reachability:check
+
+      # Issue #2053 — every `withRetry` under `src/provisioning/**` must thread
+      # `isInterrupted` / `onInterrupted`. It is the only wait in the codebase
+      # that polls an interrupt DURING a backoff, so an un-threaded call leaves
+      # Ctrl-C dead for minutes, and on the destroy path `withResourceTimeout`
+      # has already abandoned the promise — the loop keeps issuing writes behind
+      # a run the user was told had ended. Measured at filing: 11 sites under
+      # `providers/**` and one of them threaded. Pass/fail like the critic above,
+      # with nothing to regenerate, so it is a bare `run`; it self-probes its own
+      # classifier and re-audits its exemption list before reading the tree, so a
+      # degradation to "everything looks threaded" fails here instead of
+      # reporting a byte-identical green.
+      - run: vp run audit:withretry-interrupt:check
+
+      # Issue #2178 — a provider interpolating a `properties`-derived value into
+      # a message must mask it BEFORE `JSON.stringify`. The bag arrives RESOLVED,
+      # so a `{{resolve:secretsmanager:...}}` scalar is already plaintext, and
+      # masking the FINISHED message cannot recover it (stringify escapes the
+      # secret out of existence, and the message is too long for anything but
+      # the >= 4-character substring arm). The rule was prose from issue #1932
+      # and the issue #2176 sweep found it violated in files already hardened
+      # for it. Pass/fail with nothing to regenerate, so a bare `run`; the
+      # classifier is dataflow-aware (a mask upstream of the stringify passes),
+      # self-probes itself against fixed sources with known verdicts INCLUDING
+      # raw ones before reading the tree, and re-audits every exemption against
+      # its site's current VERDICT — an entry whose site disappeared, became
+      # MASKED upstream, or gained a same-spelled sibling fails — so a
+      # degradation to "everything looks masked" fails here rather than
+      # reporting a byte-identical green. It also REFUSES an identity masker:
+      # a `maskerOrIdentity(undefined)` binding fences nothing (issue #2007)
+      # and must not silence a site or count toward the masked floor.
+      # KNOWN BOUND (4), stated HERE too because this is the one file a reader
+      # meets the refusal in without the surrounding prose: the check is
+      # SYNTACTIC, so a no-op DECLARED to be the capability is believed
+      # (`const m: MaskerFn = someNoOp`, `{ maskSecrets: (t) => t }`). A green
+      # run means the value reached something DECLARED to be the project's
+      # masker -- NOT that the value is masked. Both spellings are pinned as
+      # self-probes expecting `masked`, so closing the bound fails loudly.
+      - run: vp run audit:provider-secret-mask:check
+
+  # Issue #1618 — run the unit suite a second time with the runtime
+  # `*Once`-leak detector armed, so a test that primes more mock responses than
+  # its code path consumes fails HERE instead of silently shifting every later
+  # test in its file by one response.
+  #
+  # A separate job rather than a step in check-build-test: it is a full second
+  # suite run (~3 min) and it must not delay the signal contributors actually
+  # wait on. It is also why the detector is env-gated OFF by default — the
+  # normal `vp run test` is byte-for-byte unaffected by this landing.
+  #
+  # The files in tests/once-leak-allowlist.json are grandfathered. Fixing one
+  # and dropping it from the list is the intended ratchet direction; adding a
+  # new entry is not, and a new test file that leaks fails this job.
+  once-leak-detect:
+    runs-on: ubuntu-latest
+    # observed at least 745 s. Same cap as
+    # check-build-test: it runs the same unit suite, so the two grow together.
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      # Same reason as check-build-test: this job runs the unit suite too, so it
+      # reaches the same `origin/main` projection and would fail closed without
+      # the full history.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          fetch-depth: 0
+
+      - uses: voidzero-dev/setup-vp@3754dd7dbdb32bd8f6d28b6043de13ad3a75f21f # v1
+        with:
+          node-version: "24"
+          cache: true
+          run-install: false
+
+      - run: vp install --frozen-lockfile
+      # zsh for the paste harness (`tests/unit/utils/paste-harness.ts`), which
+      # runs every pasted span under bash AND zsh and FAILS under `CI` when zsh
+      # is missing (go-to-k/cdkd#3950): macOS pastes into zsh by default, and
+      # the two shells disagree on an unquoted `(` after a displayed value.
+      - name: install zsh for the paste harness
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq zsh
+      - run: vp run test:once-leak
+
+      # Prove the detector still REJECTS, not just that it ran. With the
+      # grandfather list honoured, "the detector went dead" and "the tree is
+      # clean" produce the identical green result above — the vacuous pass
+      # .claude/rules/testing.md forbids for any checker. The canary suite
+      # leaks on purpose, so ignoring the allow-list MUST fail it.
+      - name: detector canary — a known leak must still be caught
+        run: |
+          set +e
+          vp run test:once-leak-canary > canary.log 2>&1
+          rc=$?
+          set -e
+          cat canary.log
+          # Assert on the detector's OWN message, not merely on a non-zero exit.
+          # A deleted or renamed canary file makes `vp test run <missing>` exit 1
+          # with "No test files found", and so does a syntax error or a failed
+          # install -- each of which would let this step pass while the detector
+          # is dead. That is the exact vacuous pass the step exists to close.
+          if [ "${rc}" -eq 0 ] || ! grep -q 'primed by an EARLIER test' canary.log; then
+            echo "::error::the *Once-leak detector did not report the deliberate leak in tests/unit/scripts/once-leak-canary.test.ts (exit ${rc}). Either the detector has gone dead (check @vitest/spy internals and the vi.fn patch in tests/setup.ts), or the canary file itself is missing / broken."
+            exit 1
+          fi
+
+  runtime-compat:
+    runs-on: ubuntu-latest
+    needs: check-build-test
+    # observed at least 110 s across the matrix legs. Dominated by install and
+    # build rather than by anything that scales with the repo.
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    strategy:
+      matrix:
+        # The first row is the EXACT published floor (`package.json`
+        # `engines.node`, as major.minor — Node 20 went EOL on 2026-04-30),
+        # so this smoke proves the promised minimum and not merely "some
+        # 22.x"; the rest are the later majors, the dev pin (`.node-version`)
+        # among them. Quoted so YAML keeps the spelling verbatim (an unquoted
+        # 22.10 would parse as the float 22.1). The matrix, the engines
+        # range, the `vp pack` target and the docs are pinned to one another
+        # by `tests/unit/scripts/node-floor-sync.test.ts`.
+        node-version: ['22.12', '24']
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+
+      - uses: voidzero-dev/setup-vp@3754dd7dbdb32bd8f6d28b6043de13ad3a75f21f # v1
+        with:
+          node-version: "24"
+          cache: true
+          run-install: false
+
+      - run: vp install --frozen-lockfile
+      - run: vp run build
+      - run: vp env exec --node ${{ matrix.node-version }} node dist/cli.js --version
+
+  # A stale standing release PR is MERGEABLE and silently reverts main.
+  # release-please does not rebuild a release PR whose computed release is
+  # unchanged — it logs `PR #N remained the same` and leaves the branch on the
+  # base it was cut from. A `chore:` / `ci:` / `docs:` commit produces no
+  # changelog entry, so it lands on main WITHOUT the release branch following;
+  # if it touched a file release-please owns, merging the PR takes the branch's
+  # older copy. GitHub reports MERGEABLE throughout — measured on
+  # go-to-k/cdkd#2503, which would have undone 285 CHANGELOG header
+  # conversions and was closed and recreated as #2508.
+  #
+  # The remedy has always been "close the PR, delete its branch, re-run
+  # release.yml"; what was missing is anything that makes the condition VISIBLE
+  # before the merge. A human reading the diff was that check. Auto-merge
+  # removes the human, so the check has to become a required status.
+  #
+  # `package.json` is deliberately NOT inspected: `chore(deps)` PRs touch it
+  # constantly, and release-please's own diff there is the `version` line
+  # alone — a three-way merge of that cannot revert a dependency line, so
+  # including it would block every release PR that is merely behind.
+  #
+  # A fork contributor can name a branch `release-please--x` and enter this job.
+  # That is harmless and deliberately not guarded against: the job reads only
+  # git ancestry and can do nothing but fail their own PR. Guarding on the PR
+  # author instead would add a SECOND way for the job to go silently inert,
+  # which is the failure mode `ci-ok-gate.test.ts` exists to prevent.
+  release-pr-not-stale:
+    if: startsWith(github.head_ref, 'release-please--')
+    runs-on: ubuntu-latest
+    # observed at least 13 s; the job is gated on a release-please
+    # branch, so it runs rarely.
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      # The PR HEAD, not the default `refs/pull/N/merge`. That ref has the base
+      # branch already merged into it, so every ancestry question below would
+      # answer "yes" no matter how stale the branch actually is — a vacuous
+      # pass, and the only way this job can be wrong in the unsafe direction.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+
+      - name: release-please-owned files on main must be ancestors of this branch
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --quiet origin main
+          stale=0
+          for f in CHANGELOG.md .release-please-manifest.json; do
+            tip=$(git rev-list -1 FETCH_HEAD -- "${f}")
+            # An empty answer means the file has no history on main at all —
+            # renamed, deleted, or never committed. The guard cannot answer the
+            # question it was added to answer, and "cannot answer" is a failure
+            # rather than a pass.
+            if [ -z "${tip}" ]; then
+              echo "::error::${f} has no commit history on main. This guard cannot evaluate staleness, so it fails closed. If the file was renamed, update this job."
+              exit 1
+            fi
+            if ! git merge-base --is-ancestor "${tip}" HEAD; then
+              echo "::error::${f} was last changed on main by ${tip}, which is NOT an ancestor of this release branch — the branch is stale and merging it would revert that change. Close this PR, delete its branch, and re-run release.yml via workflow_dispatch to recreate it from current main."
+              stale=1
+            fi
+          done
+          [ "${stale}" -eq 0 ]
+
+  # The only name THIS workflow contributes to the `main` branch ruleset's
+  # required checks — the ruleset also names `pr-content`, `check`,
+  # `prefix-scope`, `English-only (pull request)` and docs-deploy's `build`,
+  # which live in other workflows and cannot be reached from `needs:` here. It
+  # exists instead of the ruleset naming this file's real jobs for two reasons:
+  #
+  #   1. `runtime-compat` is a matrix. A required check has to match the
+  #      EXPANDED name (`runtime-compat (22.12)`), but a matrix job that never
+  #      starts — because `check-build-test` failed — reports under the
+  #      UNEXPANDED name (`runtime-compat`). Requiring either spelling leaves
+  #      the other permanently "Expected", which blocks the PR forever.
+  #   2. Adding or renaming a job above then needs a line in `needs:` here
+  #      rather than an edit to repository settings nothing in this tree can
+  #      review.
+  #
+  # `if: always()` is load-bearing. Without it this job is SKIPPED whenever an
+  # upstream job fails, and a skipped required check counts as PASSING — the
+  # gate would report green exactly when CI is red.
+  #
+  # What this check does and does not attest to, stated so the ruleset change is
+  # made with eyes open: on a `pull_request` trigger the workflow DEFINITION
+  # comes from the PR's own ref, so a fork author can rewrite this job to `exit
+  # 0` and the required check reports green. That is a property of every
+  # `pull_request`-based required check, not something aggregating into one name
+  # introduced — requiring `check-build-test` directly was defeatable the same
+  # way. The controls are unchanged: the edit is visible in the diff, a
+  # first-time contributor's run needs maintainer approval, and a fork token is
+  # read-only. Human review of a workflow diff remains the control.
+  #
+  # A `paths:`-filtered workflow does not START on every PR, and a required
+  # check that never reports sits at "Expected" forever — so such a check
+  # cannot be required, and is also unreachable from `needs:` here because
+  # `needs:` cannot cross workflows. Two were affected:
+  #   - `docs-deploy.yml` / `build` IS reachable by dependabot (`package.json`
+  #     and `pnpm-lock.yaml` were in its filter), so its `pull_request` filter
+  #     was REMOVED in the same change that added this job: it now runs on
+  #     every PR and is required by name. See that file.
+  #   - `hooks.yml` / `hook-suites` keeps its filter and stays unrequired. The
+  #     assumption that makes that acceptable is UNENFORCED and stated here so
+  #     it can be checked: auto-merge is only ever armed by hand, on a release
+  #     or a dependabot PR, and neither touches `.claude/hooks/**`. Arming it
+  #     on a hooks PR would merge over a red `hook-suites`. An agent merging by
+  #     hand is expected to read `gh pr checks` output, which shows every check
+  #     rather than only the required ones.
+  ci-ok:
+    if: always()
+    needs: [check-build-test, once-leak-detect, runtime-compat, release-pr-not-stale]
+    runs-on: ubuntu-latest
+    # observed at least 5 s -- a shell loop over four strings.
+    timeout-minutes: 10
+    permissions: {}
+    env:
+      # Through `env:` rather than inline in `run:`. The value space here is a
+      # closed enum so inline is safe today, but the repo's pattern is that
+      # expression data reaches a shell as a variable, never as source text.
+      RESULTS: ${{ join(needs.*.result, ' ') }}
+      # Must equal the length of `needs:` above. Both halves are read out of
+      # this file by tests/unit/scripts/ci-ok-gate.test.ts, which also asserts
+      # `needs:` covers every other job — so this cannot drift silently.
+      EXPECTED_UPSTREAM: '4'
+    steps:
+      - name: every upstream job succeeded or was skipped
+        run: |
+          set -euo pipefail
+          # `skipped` is accepted on purpose: release-pr-not-stale skips on
+          # every non-release PR, and a matrix job skipped because its `needs`
+          # failed is already reported by that failing job's own result.
+          echo "upstream results: ${RESULTS}"
+          seen=0
+          for r in ${RESULTS}; do
+            seen=$((seen + 1))
+            case "${r}" in
+              success | skipped) ;;
+              *)
+                echo "::error::an upstream CI job reported '${r}' — this gate is red. See the run summary for which job."
+                exit 1
+                ;;
+            esac
+          done
+          # Without this, "every result was good" and "there were no results"
+          # are the same exit 0: an empty render makes the loop above run zero
+          # times. This job is the SOLE required status check, so a vacuous
+          # green here is a merge gate that examined nothing.
+          if [ "${seen}" -ne "${EXPECTED_UPSTREAM}" ]; then
+            echo "::error::examined ${seen} upstream result(s), expected ${EXPECTED_UPSTREAM}. The needs list did not reach this step, so this gate attests to nothing and fails closed."
+            exit 1
+          fi

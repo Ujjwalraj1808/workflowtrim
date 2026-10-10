@@ -1,0 +1,201 @@
+name: Publish to PyPI
+
+on:
+  push:
+    tags:
+      - "v[0-9]*"
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  release-policy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Enforce published patch transition
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: python -X utf8 tests/audit/releasePolicy.py --tag "$RELEASE_TAG"
+
+  # CI Full 강제 게이트 — tag push 시점에 ci-full.yml 의 모든 잡 (test-full +
+  # fixture-integration + cross-os-smoke + realdata-suite) 통과 후에만 publish 진행.
+  # 2026-04-26 사고 (v0.9.25 ci-full fail 인데 PyPI 업로드됨) 재발 방지.
+  ci-full:
+    needs: release-policy
+    uses: ./.github/workflows/ci-full.yml
+
+  ci-nightly:
+    needs: release-policy
+    uses: ./.github/workflows/ci-nightly.yml
+    secrets: inherit
+
+  # Wheel packaging 게이트 — PyPI publish 전 반드시 통과해야 하는 필수 검증.
+  # 2026-04-19 사고 (0.9.15 wheel 에 parserMappings 누락) 같은 사고가 다시는
+  # 배포되지 않도록 publish 직전에 실제 wheel 을 격리 venv 에 설치하고 번들
+  # 리소스 + sections 런타임 초기화를 검증한다. 실패 시 publish 전체 중단.
+  wheel-smoke:
+    runs-on: ubuntu-latest
+    needs: [ci-full, ci-nightly]
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        run: pip install uv
+
+      - name: Build wheel + verify bundled resources
+        run: bash .github/scripts/testWheelSmoke.sh
+
+  build:
+    name: Build package
+    needs: [ci-full, ci-nightly, wheel-smoke]
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Verify version matches tag
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          PYPROJECT_VERSION=$(grep '^version = ' pyproject.toml | head -1 | cut -d'"' -f2)
+          if [ "$TAG_VERSION" != "$PYPROJECT_VERSION" ]; then
+            echo "::error::Version mismatch: tag=$TAG_VERSION, pyproject=$PYPROJECT_VERSION"
+            exit 1
+          fi
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "20"
+
+      - name: Build local UI (shared surfaces)
+        # 단계-10 wheel 전환: pip 번들 UI = ui/apps/local (SvelteKit 챗·터미널 셸, @dartlab/ui-surfaces
+        # 공유 surface 를 landing 과 동일 소비 — 터미널이 랜딩·로컬 단일 공유자산). 루트 npm ci 가
+        # 워크스페이스(landing·ui/packages/*·ui/apps/*) 전체를 설치하고 @dartlab/* 를 symlink 하므로
+        # ui/apps/local 는 워크스페이스 멤버라 별도 npm ci 불요 (옛 ui/web 은 워크스페이스 밖이라 별도
+        # npm ci 가 필요했다). adapter-static + vite 플러그인이 svelte-kit sync 자동 수행 →
+        # build/{index.html,_app}. 옛 React ui/web 은 DARTLAB_UI_LEGACY=1 가역 escape 로 잔존(_ui_path).
+        run: |
+          npm ci
+          npm run build -w @dartlab/ui-local
+
+      - name: Copy UI build into package
+        run: |
+          mkdir -p src/dartlab/ui/build
+          # 'build/.' 로 복사 — dotfile(.gitkeep 등)·중첩 _app/immutable 트리까지 누락 없이 옮긴다
+          # ('build/*' glob 은 dotfile 을 빠뜨린다).
+          cp -r ui/apps/local/build/. src/dartlab/ui/build/
+
+      - name: Install uv
+        run: pip install uv
+
+      - name: Build sdist and wheel
+        run: uv run --with build python -m build
+
+      # PyPI 에 업로드될 "바로 그" wheel 을 검증.
+      # .github/scripts/verifyWheel.py — ci.yml 의 wheel-smoke 잡과 공통 로직.
+      # 2026-04-19 사고 (wheel 간 drift) 재발 방지: 검증 코드 한 곳에만 있음.
+      - name: Verify published wheel (bundle + runtime)
+        run: |
+          set -euo pipefail
+          WHL=$(ls dist/*.whl | head -n1)
+          python -X utf8 .github/scripts/verifyWheel.py "$WHL" --require-ui
+
+      # 브라우저 dartlab 은 micropip.install("dartlab") 로 PyPI 최신을 받는다. wheel 의존성 마커가
+      # pyodide 를 깨면(예 marimo transitive msgspec) 브라우저가 조용히 죽는다. 발행 전에 그걸 잡는다.
+      - name: Pyodide smoke (브라우저 micropip.install 게이트)
+        run: |
+          set -euo pipefail
+          npm install --no-save pyodide@0.27.5
+          WHL=$(ls dist/*.whl | head -n1)
+          node .github/scripts/pyodideSmoke.mjs "$WHL"
+
+      - name: Generate SBOM
+        run: |
+          pip install cyclonedx-bom
+          cyclonedx-py environment --output-format json -o dartlab-sbom.json
+
+      - name: Upload dist artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: dist
+          path: dist
+
+      - name: Upload SBOM
+        uses: actions/upload-artifact@v7
+        with:
+          name: sbom
+          path: dartlab-sbom.json
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: dist/*.whl
+
+  publish:
+    name: Publish to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+
+    steps:
+      # checkout이 작업 폴더를 초기화하므로 검증 산출물을 받기 전에 실행한다.
+      - uses: actions/checkout@v6
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: sbom
+          path: sbom
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          skip-existing: true
+
+      - name: Extract changelog for this version
+        id: changelog
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          BODY=$(awk "/^## \\[${VERSION}\\]/{found=1; next} /^## \\[/{if(found) exit} found{print}" CHANGELOG.md)
+          if [ -z "$BODY" ]; then
+            echo "body=" >> "$GITHUB_OUTPUT"
+          else
+            {
+              echo "body<<CHANGELOG_EOF"
+              echo "$BODY"
+              echo "CHANGELOG_EOF"
+            } >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          body: ${{ steps.changelog.outputs.body }}
+          generate_release_notes: ${{ steps.changelog.outputs.body == '' }}
+          fail_on_unmatched_files: true
+          files: |
+            dist/*.whl
+            dist/*.tar.gz
+            sbom/dartlab-sbom.json

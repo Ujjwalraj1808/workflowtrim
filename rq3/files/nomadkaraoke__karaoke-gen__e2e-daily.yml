@@ -1,0 +1,632 @@
+name: E2E Daily Test (Payment + Happy Path)
+
+# Full production E2E: buy credits via real Stripe, then use them for karaoke generation.
+# Replaces the previous e2e-happy-path.yml with an additional payment stage.
+
+on:
+  schedule:
+    - cron: '0 6 * * *'
+
+  workflow_dispatch:
+    inputs:
+      debug_mode:
+        description: 'Enable debug mode (slower, more screenshots)'
+        required: false
+        default: 'false'
+        type: boolean
+      browser:
+        description: 'Browser to test with'
+        required: false
+        default: 'chromium'
+        type: choice
+        options:
+          - chromium
+          - firefox
+          - webkit
+      skip_payment:
+        description: 'Skip Stage 1 (payment) — use admin-granted credits for happy path only'
+        required: false
+        default: 'false'
+        type: boolean
+      use_test_token:
+        description: 'Skip signup entirely — use E2E_TEST_TOKEN (for quick iterations)'
+        required: false
+        default: 'false'
+        type: boolean
+      self_heal_force_llm:
+        description: 'Self-healing test: comma-separated Stripe step ids to force through the LLM fallback (e.g. selectCard). Learned recipes still open an auto-merge PR.'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  # =========================================================================
+  # Stage 1: Purchase credits via real Stripe Checkout
+  # =========================================================================
+  e2e-credit-purchase:
+    name: "Stage 1: Credit Purchase"
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    if: ${{ github.event.inputs.skip_payment != 'true' && github.event.inputs.use_test_token != 'true' }}
+    permissions:
+      contents: read
+      id-token: write  # keyless GCP auth, only to read the Gemini key for self-healing
+
+    outputs:
+      session_token: ${{ steps.extract_token.outputs.token }}
+      result: ${{ steps.test_result.outputs.result }}
+      failure_reason: ${{ steps.test_result.outputs.failure_reason }}
+      healed: ${{ steps.self_heal.outputs.healed }}
+    env:
+      HAS_GEMINI_SECRET: ${{ secrets.GEMINI_API_KEY != '' }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        working-directory: frontend
+        run: npm ci --legacy-peer-deps
+
+      - name: Install Playwright browsers
+        working-directory: frontend
+        run: npx playwright install --with-deps ${{ inputs.browser || 'chromium' }}
+
+      - name: Create test-results directory
+        working-directory: frontend
+        run: mkdir -p test-results
+
+      # ── Self-healing Stripe Checkout: LLM fallback key ───────────────────
+      # The Stripe step runner (frontend/e2e/helpers/self-healing) falls back
+      # to Gemini when every deterministic variant of a step fails. The key is
+      # the AI Studio key (billed outside the nomadkaraoke project). Prefer a
+      # GEMINI_API_KEY repo secret; otherwise read it from Secret Manager via
+      # keyless auth. All of this is best-effort: without a key the test runs
+      # deterministic-only, exactly as before.
+      - name: Authenticate to Google Cloud (Gemini key)
+        id: gcp_auth
+        if: ${{ env.HAS_GEMINI_SECRET != 'true' }}
+        continue-on-error: true
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        if: steps.gcp_auth.outcome == 'success'
+        continue-on-error: true
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Load Gemini key for self-healing fallback
+        continue-on-error: true
+        env:
+          GEMINI_SECRET: ${{ secrets.GEMINI_API_KEY }}
+          GCP_AUTHED: ${{ steps.gcp_auth.outcome == 'success' }}
+        run: |
+          KEY="$GEMINI_SECRET"
+          if [ -z "$KEY" ] && [ "$GCP_AUTHED" = "true" ]; then
+            KEY=$(gcloud secrets versions access latest --secret=gemini-api-key --project=nomadkaraoke 2>/dev/null || true)
+          fi
+          # Drop the deployer credentials before any test code runs.
+          if [ -n "${GOOGLE_GHA_CREDS_PATH:-}" ]; then rm -f "$GOOGLE_GHA_CREDS_PATH"; fi
+          if [ -n "${CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE:-}" ]; then rm -f "$CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE"; fi
+          if [ -n "$KEY" ]; then
+            echo "::add-mask::$KEY"
+            echo "GEMINI_API_KEY=$KEY" >> "$GITHUB_ENV"
+            echo "Self-healing LLM fallback: enabled"
+          else
+            echo "::warning::Self-healing LLM fallback disabled (no Gemini key) — Stripe steps run deterministic-only"
+          fi
+
+      - name: Ensure testmail.app domain is allowlisted
+        run: |
+          curl -sf -X POST \
+            "https://api.nomadkaraoke.com/api/admin/rate-limits/blocklists/allowlisted-domains" \
+            -H "X-Admin-Token: ${{ secrets.E2E_ADMIN_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d '{"domain": "inbox.testmail.app"}' || echo "Warning: allowlist may already exist"
+
+      - name: Run Credit Purchase Test
+        id: run_test
+        working-directory: frontend
+        env:
+          TESTMAIL_API_KEY: ${{ secrets.TESTMAIL_API_KEY }}
+          TESTMAIL_NAMESPACE: ${{ secrets.TESTMAIL_NAMESPACE }}
+          E2E_ADMIN_TOKEN: ${{ secrets.E2E_ADMIN_TOKEN }}
+          E2E_STRIPE_CARD_NUMBER: ${{ secrets.E2E_STRIPE_CARD_NUMBER }}
+          E2E_STRIPE_CARD_EXPIRY: ${{ secrets.E2E_STRIPE_CARD_EXPIRY }}
+          E2E_STRIPE_CARD_CVC: ${{ secrets.E2E_STRIPE_CARD_CVC }}
+          E2E_STRIPE_CARDHOLDER_NAME: ${{ secrets.E2E_STRIPE_CARDHOLDER_NAME }}
+          E2E_STRIPE_ZIP: ${{ secrets.E2E_STRIPE_ZIP }}
+          E2E_SELF_HEAL_FORCE_LLM: ${{ inputs.self_heal_force_llm || '' }}
+          # No real card available → 'checkout-only' (no charge). Set the repo variable
+          # E2E_REAL_PAYMENT=true to go back to buying a credit with E2E_STRIPE_CARD_*.
+          E2E_PAYMENT_MODE: ${{ vars.E2E_REAL_PAYMENT == 'true' && 'real' || 'checkout-only' }}
+          DEBUG_MODE: ${{ inputs.debug_mode || 'false' }}
+        run: |
+          echo "=== Stage 1: Credit Purchase via Real Stripe (mode: $E2E_PAYMENT_MODE) ==="
+          echo "Time: $(date)"
+          npx playwright test credit-purchase-real.spec.ts \
+            --config=playwright.production.config.ts \
+            --project=${{ inputs.browser || 'chromium' }} \
+            --reporter=list \
+            --timeout=600000 \
+            2>&1 | tee test-output-payment.log
+          # Capture Playwright's real exit code, not tee's (0) — the
+          # authoritative pass/fail signal. See Stage 2 for rationale.
+          echo "exit_code=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+        continue-on-error: true
+
+      - name: Check test result
+        id: test_result
+        run: |
+          if [ "${{ steps.run_test.outputs.exit_code }}" = "0" ]; then
+            echo "result=success" >> "$GITHUB_OUTPUT"
+          else
+            echo "result=failure" >> "$GITHUB_OUTPUT"
+            # A declined card is an issuer/card problem, not a broken checkout —
+            # say so in the alerts (marker comes from e2e/helpers/stripe-checkout.ts).
+            REASON=$(grep -m1 -o 'STRIPE_CARD_DECLINED:.*' frontend/test-output-payment.log 2>/dev/null | sed 's/ — .*//' | tr -d '"\\' || true)
+            if [ -n "$REASON" ]; then
+              echo "failure_reason=Test card declined, not a checkout bug (${REASON#STRIPE_CARD_DECLINED: }). Check the card/issuer for a fraud hold, then re-run." >> "$GITHUB_OUTPUT"
+              echo "::error::$REASON"
+            fi
+          fi
+
+      - name: Detect self-healed Stripe steps
+        id: self_heal
+        if: always()
+        working-directory: frontend
+        run: |
+          REPORT=test-results/self-heal/self-heal-report.json
+          LEARNED=test-results/self-heal/learned-variants.json
+          if [ -f "$REPORT" ]; then
+            {
+              echo "### Stripe Checkout self-healing"
+              echo '```json'
+              jq '{flowVerified, llmCalls, learnedWritten, added, outcomes: [.outcomes[] | {stepId, status, via, variant, model, reason}]}' "$REPORT"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          # Only promote recipes from a run whose purchase was verified server-side.
+          if [ "${{ steps.test_result.outputs.result }}" = "success" ] && [ -f "$LEARNED" ]; then
+            echo "healed=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::Stripe Checkout changed — LLM fallback healed it; an auto-merge PR will record the new variant"
+          else
+            echo "healed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload self-heal learned variants
+        if: steps.self_heal.outputs.healed == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: self-heal-learned-${{ github.run_number }}
+          path: frontend/test-results/self-heal/
+          retention-days: 30
+
+      - name: Extract session token
+        id: extract_token
+        if: steps.test_result.outputs.result == 'success'
+        working-directory: frontend
+        run: |
+          if [ -f test-results/e2e-session-token.txt ]; then
+            TOKEN=$(cat test-results/e2e-session-token.txt)
+            echo "::add-mask::$TOKEN"
+            echo "token=$TOKEN" >> $GITHUB_OUTPUT
+            echo "Session token extracted for Stage 2"
+          else
+            echo "No session token file found"
+            echo "token=" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Scrub secrets from artifacts (public repo)
+        id: scrub
+        if: always()
+        working-directory: frontend
+        env:
+          E2E_ADMIN_TOKEN: ${{ secrets.E2E_ADMIN_TOKEN }}
+          TESTMAIL_API_KEY: ${{ secrets.TESTMAIL_API_KEY }}
+          E2E_STRIPE_CARD_NUMBER: ${{ secrets.E2E_STRIPE_CARD_NUMBER }}
+          E2E_STRIPE_CARD_EXPIRY: ${{ secrets.E2E_STRIPE_CARD_EXPIRY }}
+          E2E_STRIPE_CARD_CVC: ${{ secrets.E2E_STRIPE_CARD_CVC }}
+          E2E_SESSION_TOKEN: ${{ steps.extract_token.outputs.token }}
+        run: node e2e/scripts/scrub-artifacts.mjs --drop-videos --blank-inputs test-results test-output-payment.log
+
+      - name: Upload artifacts
+        if: always() && steps.scrub.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-payment-results-${{ github.run_number }}
+          path: |
+            frontend/test-results/
+            frontend/test-output-payment.log
+          retention-days: 30
+
+      - name: Discord notification (failure)
+        if: steps.test_result.outputs.result == 'failure'
+        env:
+          # Via env + jq, never ${{ }} in the script: the reason contains Stripe's message text.
+          REASON: ${{ steps.test_result.outputs.failure_reason || 'Payment flow is broken. Customers may not be receiving credits.' }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          RUN_NUMBER: ${{ github.run_number }}
+          WEBHOOK: ${{ secrets.DISCORD_ALERT_WEBHOOK_URL }}
+        run: |
+          jq -n --arg reason "$REASON" --arg run "$RUN_NUMBER" --arg url "$RUN_URL" \
+            '{embeds: [{title: "🚨 E2E Daily Test FAILED — Stage 1: Credit Purchase", description: "\($reason)\n\n**Run:** #\($run)\n**Details:** \($url)", color: 15158332}]}' |
+            curl -s -H "Content-Type: application/json" -d @- "$WEBHOOK"
+
+      - name: Fail if test failed
+        if: steps.test_result.outputs.result == 'failure'
+        run: exit 1
+
+  # =========================================================================
+  # Self-heal: record LLM-discovered Stripe variants via an auto-merging PR
+  # =========================================================================
+  # One Stripe layout change → one LLM-healed run → one data-only PR (only
+  # learned-variants.json) that auto-merges, so the next run replays the
+  # recipe deterministically. No human in the loop.
+  #
+  # Merge gates for a bot PR (all verified live with #1117, 2026-10-03):
+  #  - its `pull_request` CI run is created "action_required" and, until run,
+  #    supersedes other CI Gate results → we approve it via the API;
+  #  - the `protect main` ruleset's require_extra_approval_for_unattributed_changes
+  #    (GitHub default true since ~Aug 2026) would demand a human review for
+  #    bot-authored changes → set to false on ruleset 11423976;
+  #  - review threads must be resolved → `@coderabbitai ignore` in the body.
+  self-heal-pr:
+    name: "Self-heal: auto-merge PR"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: e2e-credit-purchase
+    # Only learn from main — branch runs (e.g. testing self_heal_force_llm on a
+    # feature branch) must not open PRs against main.
+    if: always() && needs.e2e-credit-purchase.outputs.healed == 'true' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: write
+      pull-requests: write
+      actions: write
+    outputs:
+      pr_url: ${{ steps.pr.outputs.pr_url }}
+      unchanged: ${{ steps.pr.outputs.unchanged }}
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Download learned variants
+        uses: actions/download-artifact@v4
+        with:
+          name: self-heal-learned-${{ github.run_number }}
+          path: /tmp/self-heal
+
+      - name: Open auto-merge PR
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          TARGET=frontend/e2e/helpers/self-healing/learned-variants.json
+
+          # A bot-authored PR's `pull_request` CI run is created as
+          # "action_required" (awaiting approval) and, until it runs, supersedes
+          # any other CI Gate result for the ruleset. Approve it; succeed once a
+          # pull_request run exists that is past approval.
+          approve_ci() {
+            local branch=$1 runs pending active
+            for _ in $(seq 1 18); do
+              runs=$(gh run list --workflow ci.yml --branch "$branch" --event pull_request --json databaseId,status,conclusion) || { sleep 10; continue; }
+              pending=$(jq -r '.[] | select(.conclusion == "action_required" or .status == "waiting" or .status == "action_required") | .databaseId' <<<"$runs") || pending=""
+              active=$(jq '[.[] | select(.conclusion != "action_required" and .status != "waiting" and .status != "action_required")] | length' <<<"$runs") || active=0
+              for id in $pending; do
+                if gh api -X POST "repos/${{ github.repository }}/actions/runs/$id/approve" >/dev/null; then
+                  echo "Approved CI run $id"
+                else
+                  echo "::warning::Could not approve CI run $id with GITHUB_TOKEN"
+                fi
+              done
+              if [ -z "$pending" ] && [ "$active" -gt 0 ]; then
+                echo "CI is running for $branch"
+                return 0
+              fi
+              sleep 10
+            done
+            return 1
+          }
+          REPORT=/tmp/self-heal/self-heal-report.json
+
+          OPEN=$(gh pr list --label e2e-self-heal --state open --json url --jq '.[0].url // ""')
+          if [ -n "$OPEN" ]; then
+            echo "A self-heal PR is already open ($OPEN) — not opening another; making sure its CI can run"
+            echo "pr_url=$OPEN" >> "$GITHUB_OUTPUT"
+            OPEN_BRANCH=$(gh pr view "$OPEN" --json headRefName --jq .headRefName || true)
+            if [ -z "$OPEN_BRANCH" ] || ! approve_ci "$OPEN_BRANCH"; then
+              echo "ci_needs_approval=true" >> "$GITHUB_OUTPUT"
+            fi
+            exit 0
+          fi
+
+          cp /tmp/self-heal/learned-variants.json "$TARGET"
+          if git diff --quiet -- "$TARGET"; then
+            echo "learned-variants.json unchanged vs main — nothing to do"
+            echo "unchanged=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          STEPS=$(jq -r '[.outcomes[] | select(.status == "healed") | .stepId] | unique | join(", ")' "$REPORT")
+          BRANCH="self-heal/stripe-checkout-${{ github.run_id }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          git add "$TARGET"
+          git commit -m "test(e2e): self-heal Stripe Checkout steps: $STEPS" -m "Learned by the LLM fallback in $RUN_URL (purchase verified server-side)."
+          git push origin "$BRANCH"
+
+          gh label create e2e-self-heal --color FBCA04 --description "Auto-generated by the self-healing Stripe E2E" 2>/dev/null || true
+          {
+            echo "## 🩹 Stripe Checkout self-heal"
+            echo
+            echo "Stripe changed its hosted checkout page. In [run #${{ github.run_number }}]($RUN_URL) every deterministic variant of **$STEPS** failed; the Gemini fallback completed the step(s), and the purchase was then **verified server-side** (credit granted)."
+            echo
+            echo "This PR only adds the recipe(s) to \`learned-variants.json\`, so future runs replay them deterministically (no LLM). It auto-merges once CI passes."
+            echo
+            echo "### Learned recipes"
+            echo '```json'
+            jq '[.outcomes[] | select(.status == "healed") | {stepId, model, llmCalls, actions}]' "$REPORT"
+            echo '```'
+            echo
+            echo "@coderabbitai ignore"
+            echo
+            echo "🤖 Generated by the E2E Daily self-healing workflow"
+          } > /tmp/pr-body.md
+
+          PR_URL=$(gh pr create --base main --head "$BRANCH" --label e2e-self-heal \
+            --title "test(e2e): self-heal Stripe Checkout ($STEPS)" --body-file /tmp/pr-body.md)
+          echo "pr_url=$PR_URL" >> "$GITHUB_OUTPUT"
+          gh pr merge "$PR_URL" --auto --squash
+
+          if approve_ci "$BRANCH"; then
+            echo "Opened $PR_URL (auto-merge enabled, CI approved)"
+          else
+            # Fallback: dispatched CI (allowed from GITHUB_TOKEN) puts a CI Gate
+            # check on the head SHA if no pull_request run ever appears.
+            gh workflow run ci.yml --ref "$BRANCH"
+            echo "ci_needs_approval=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::CI for $PR_URL may need a one-click approval (PR → Checks → Approve and run)"
+          fi
+
+      - name: Discord notification (self-heal)
+        # Recipe already on main (e.g. merged between checkout and now) → nothing to report.
+        if: always() && steps.pr.outputs.unchanged != 'true'
+        run: |
+          PR="${{ steps.pr.outputs.pr_url }}"
+          if [ -n "$PR" ] && [ "${{ steps.pr.outputs.ci_needs_approval }}" = "true" ]; then
+            TITLE="🩹 E2E self-healed Stripe — PR needs a CI approval click"
+            DESC="LLM fallback healed a Stripe Checkout change. The auto-merge PR's CI run awaits approval (open the PR → Checks → Approve and run): $PR"
+            COLOR=16776960
+          elif [ -n "$PR" ]; then
+            TITLE="🩹 E2E self-healed a Stripe Checkout change"
+            DESC="Stripe changed its checkout page; the LLM fallback got through and the purchase was verified. Auto-merge PR: $PR"
+            COLOR=16776960
+          else
+            TITLE="⚠️ E2E self-heal PR could not be opened"
+            DESC="The LLM fallback healed a Stripe step but opening the PR failed — see the run."
+            COLOR=15105570
+          fi
+          curl -s -H "Content-Type: application/json" \
+            -d "{\"embeds\": [{\"title\": \"$TITLE\", \"description\": \"$DESC\n\n**Run:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\", \"color\": $COLOR}]}" \
+            "${{ secrets.DISCORD_ALERT_WEBHOOK_URL }}"
+
+  # =========================================================================
+  # Stage 2: Happy Path (uses credit from Stage 1)
+  # =========================================================================
+  e2e-happy-path:
+    name: "Stage 2: Happy Path"
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    needs: e2e-credit-purchase
+    if: |
+      always() && (
+        needs.e2e-credit-purchase.result == 'success' ||
+        github.event.inputs.skip_payment == 'true' ||
+        github.event.inputs.use_test_token == 'true'
+      )
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        working-directory: frontend
+        run: npm ci --legacy-peer-deps
+
+      - name: Install Playwright browsers
+        working-directory: frontend
+        run: npx playwright install --with-deps ${{ inputs.browser || 'chromium' }}
+
+      - name: Create test-results directory
+        working-directory: frontend
+        run: mkdir -p test-results
+
+      - name: Ensure testmail.app domain is allowlisted
+        run: |
+          curl -sf -X POST \
+            "https://api.nomadkaraoke.com/api/admin/rate-limits/blocklists/allowlisted-domains" \
+            -H "X-Admin-Token: ${{ secrets.E2E_ADMIN_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d '{"domain": "inbox.testmail.app"}' || echo "Warning: allowlist may already exist"
+
+      - name: Refresh E2E session token (when use_test_token enabled)
+        id: refresh_token
+        if: github.event.inputs.use_test_token == 'true'
+        run: |
+          RESPONSE=$(curl -sf -X POST \
+            "https://api.nomadkaraoke.com/api/admin/users/e2e-test-runner@nomadkaraoke.com/impersonate" \
+            -H "X-Admin-Token: ${{ secrets.E2E_ADMIN_TOKEN }}" \
+            -H "Content-Type: application/json")
+          TOKEN=$(echo "$RESPONSE" | python3 -c 'import json,sys; print(json.load(sys.stdin)["session_token"])')
+          echo "::add-mask::$TOKEN"
+          echo "token=$TOKEN" >> $GITHUB_OUTPUT
+
+      - name: Run Happy Path Test
+        id: run_test
+        working-directory: frontend
+        env:
+          TESTMAIL_API_KEY: ${{ secrets.TESTMAIL_API_KEY }}
+          TESTMAIL_NAMESPACE: ${{ secrets.TESTMAIL_NAMESPACE }}
+          E2E_TEST_TOKEN: ${{ steps.refresh_token.outputs.token || needs.e2e-credit-purchase.outputs.session_token || '' }}
+          E2E_ADMIN_TOKEN: ${{ secrets.E2E_ADMIN_TOKEN }}
+          E2E_BYPASS_KEY: ${{ secrets.E2E_BYPASS_KEY }}
+          DEBUG_MODE: ${{ inputs.debug_mode || 'false' }}
+        run: |
+          echo "=== Stage 2: Happy Path ==="
+          echo "Time: $(date)"
+          TOKEN_SOURCE="none"
+          if [ -n "${{ steps.refresh_token.outputs.token }}" ]; then
+            TOKEN_SOURCE="use_test_token (impersonation)"
+          elif [ -n "${{ needs.e2e-credit-purchase.outputs.session_token }}" ]; then
+            TOKEN_SOURCE="Stage 1 (credit purchase)"
+          fi
+          echo "Token source: $TOKEN_SOURCE"
+
+          npx playwright test happy-path-real-user.spec.ts \
+            --config=playwright.production.config.ts \
+            --project=${{ inputs.browser || 'chromium' }} \
+            --reporter=list \
+            --timeout=3600000 \
+            2>&1 | tee test-output-happy-path.log
+          # Capture Playwright's real exit code, not tee's (0). This is the
+          # authoritative pass/fail signal — grepping the log for "failed" is
+          # fragile because benign retry warnings (e.g. "goto attempt 1/3
+          # failed") contain that substring and produce false alarms.
+          echo "exit_code=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+        continue-on-error: true
+
+      - name: Check test result
+        id: test_result
+        run: |
+          if [ "${{ steps.run_test.outputs.exit_code }}" = "0" ]; then
+            echo "result=success" >> "$GITHUB_OUTPUT"
+          else
+            echo "result=failure" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Scrub secrets from artifacts (public repo)
+        id: scrub
+        if: always()
+        working-directory: frontend
+        env:
+          E2E_ADMIN_TOKEN: ${{ secrets.E2E_ADMIN_TOKEN }}
+          TESTMAIL_API_KEY: ${{ secrets.TESTMAIL_API_KEY }}
+          E2E_BYPASS_KEY: ${{ secrets.E2E_BYPASS_KEY }}
+          E2E_TEST_TOKEN: ${{ steps.refresh_token.outputs.token || needs.e2e-credit-purchase.outputs.session_token || '' }}
+        run: node e2e/scripts/scrub-artifacts.mjs test-results playwright-report test-output-happy-path.log
+
+      - name: Upload test artifacts
+        if: always() && steps.scrub.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-happy-path-results-${{ github.run_number }}
+          path: |
+            frontend/test-results/
+            frontend/playwright-report/
+            frontend/test-output-happy-path.log
+          retention-days: 30
+
+      - name: Upload video recordings
+        if: always() && steps.scrub.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-happy-path-videos-${{ github.run_number }}
+          path: frontend/test-results/**/*.webm
+          retention-days: 30
+          if-no-files-found: ignore
+
+      - name: Create summary
+        if: always()
+        run: |
+          STAGE1="${{ needs.e2e-credit-purchase.result || 'skipped' }}"
+          STAGE2="${{ steps.test_result.outputs.result || 'unknown' }}"
+          echo "## E2E Daily Test Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Stage | Result |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Stage 1: Credit Purchase | ${STAGE1} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Stage 2: Happy Path | ${STAGE2} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Run | #${{ github.run_number }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Trigger | ${{ github.event_name }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Browser | ${{ inputs.browser || 'chromium' }} |" >> $GITHUB_STEP_SUMMARY
+
+      - name: Discord notification (failure)
+        if: steps.test_result.outputs.result == 'failure'
+        run: |
+          curl -s -H "Content-Type: application/json" \
+            -d "{\"embeds\": [{\"title\": \"🚨 E2E Daily Test FAILED — Stage 2: Happy Path\", \"description\": \"Karaoke generation flow is broken.\n\n**Run:** #${{ github.run_number }}\n**Details:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\", \"color\": 15158332}]}" \
+            "${{ secrets.DISCORD_ALERT_WEBHOOK_URL }}"
+
+      - name: Fail if test failed
+        if: steps.test_result.outputs.result == 'failure'
+        run: exit 1
+
+  # =========================================================================
+  # Final: Send notifications
+  # =========================================================================
+  notify:
+    name: "Notify"
+    runs-on: ubuntu-latest
+    needs: [e2e-credit-purchase, e2e-happy-path, self-heal-pr]
+    if: always()
+
+    steps:
+      - name: Discord notification (success)
+        if: needs.e2e-happy-path.result == 'success'
+        run: |
+          STAGE1="${{ needs.e2e-credit-purchase.result || 'skipped' }}"
+          curl -s -H "Content-Type: application/json" \
+            -d "{\"embeds\": [{\"title\": \"✅ E2E Daily Test PASSED\", \"description\": \"Payment: ${STAGE1} | Happy Path: success\n\n**Run:** #${{ github.run_number }}\", \"color\": 3066993}]}" \
+            "${{ secrets.DISCORD_ALERT_WEBHOOK_URL }}"
+
+      - name: Send email notification
+        if: github.event_name == 'schedule'
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.postmarkapp.com
+          server_port: 587
+          username: ${{ secrets.POSTMARK_SERVER_TOKEN }}
+          password: ${{ secrets.POSTMARK_SERVER_TOKEN }}
+          subject: "E2E Daily Test ${{ needs.e2e-happy-path.result == 'success' && 'PASSED' || 'FAILED' }} - Run #${{ github.run_number }}"
+          to: andrew@nomadkaraoke.com
+          from: "Karaoke Gen CI <noreply@nomadkaraoke.com>"
+          body: |
+            E2E Daily Test Results
+            ======================
+
+            Stage 1 (Credit Purchase): ${{ needs.e2e-credit-purchase.result || 'skipped' }}${{ vars.E2E_REAL_PAYMENT != 'true' && ' [checkout-only: no real payment]' || '' }}${{ needs.e2e-credit-purchase.outputs.failure_reason && format(' — {0}', needs.e2e-credit-purchase.outputs.failure_reason) || '' }}
+            Stage 2 (Happy Path):      ${{ needs.e2e-happy-path.result || 'skipped' }}
+            Stripe self-heal:          ${{ needs.e2e-credit-purchase.outputs.healed == 'true' && format('Stripe changed its checkout; LLM fallback healed it. Auto-merge PR: {0}', needs.self-heal-pr.outputs.pr_url || (needs.self-heal-pr.outputs.unchanged == 'true' && '(already on main)' || '(failed to open — see run)')) || 'not needed' }}
+
+            Run: #${{ github.run_number }}
+            Trigger: ${{ github.event_name }}
+
+            View details: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}

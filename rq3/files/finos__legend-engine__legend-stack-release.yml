@@ -1,0 +1,104 @@
+# Copyright 2023 Goldman Sachs
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: Legend Stack Release
+
+on:
+  repository_dispatch:
+    types: [ legend-stack-release ]
+
+env:
+  CI_DEPLOY_USERNAME: ${{ secrets.CI_DEPLOY_USERNAME }}
+  CI_DEPLOY_PASSWORD: ${{ secrets.CI_DEPLOY_PASSWORD }}
+  CI_GPG_PASSPHRASE: ${{ secrets.CI_GPG_PASSPHRASE }}
+  DOCKER_USERNAME: finos
+  DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+  MAVEN_OPTS: -Xmx20g
+
+jobs:
+  release:
+    runs-on: ubuntu-latest-16-cores
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v6
+        with:
+          token: ${{ secrets.FINOS_GITHUB_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config --global user.email "37706051+finos-admin@users.noreply.github.com"
+          git config --global user.name "FINOS Administrator"
+
+      - name: Set up Maven Central
+        uses: actions/setup-java@v5
+        with:
+          distribution: "zulu"
+          java-version: 17
+          server-id: central
+          server-username: CI_DEPLOY_USERNAME
+          server-password: CI_DEPLOY_PASSWORD
+          gpg-private-key: ${{ secrets.CI_GPG_PRIVATE_KEY }}
+          gpg-passphrase: CI_GPG_PASSPHRASE
+
+      - name: Update And Commit Legend Stack Version Upgrade
+        run: |
+          pureVersion="${{ github.event.client_payload.legendPureVersion }}"
+          sharedVersion="${{ github.event.client_payload.legendSharedVersion }}"
+          echo "Legend Pure version: $pureVersion, Legend Shared version: $sharedVersion"
+          
+          if [ -n "$sharedVersion" ]; then
+            mvn versions:set-property -Dproperty=legend.shared.version -DnewVersion=${sharedVersion}
+          fi
+          if [ -n "$pureVersion" ]; then
+            mvn versions:set-property -Dproperty=legend.pure.version -DnewVersion=${pureVersion}
+          fi
+          
+          if [ -n "$sharedVersion" ] || [ -n "$pureVersion" ]; then
+            git add pom.xml
+            git commit -m "Legend Stack Versions upgrade"
+            git push origin master
+          fi
+
+      - name: Collect Workflow Telemetry
+        uses: runforesight/workflow-telemetry-action@v1
+        with:
+          theme: dark
+
+      - name: Build and deploy release
+        env:
+          RELEASE_VERSION: ${{ github.event.client_payload.releaseVersion }}
+        run: mvn -B -e -T 2 -DargLine="-Xmx20g" -Drevision="${RELEASE_VERSION}" deploy -P release,docker
+
+      - name: Create and push git tag
+        env:
+          TAG: ${{ github.event.repository.name }}-${{ github.event.client_payload.releaseVersion }}
+        run: |
+          set -euo pipefail
+          git tag "${TAG}"
+          git push origin "refs/tags/${TAG}"
+
+      - name: Compute and set next SNAPSHOT
+        env:
+          RELEASE_VERSION: ${{ github.event.client_payload.releaseVersion }}
+        run: |
+          set -euo pipefail
+          IFS=. read -r major minor patch <<< "${RELEASE_VERSION}"
+          nextSnapshot="${major}.${minor}.$((patch + 1))-SNAPSHOT"
+          git fetch origin "${GITHUB_REF_NAME}"
+          git checkout -B "${GITHUB_REF_NAME}" "origin/${GITHUB_REF_NAME}"
+          sed -i "s|<revision>.*</revision>|<revision>${nextSnapshot}</revision>|" pom.xml
+          git add pom.xml
+          git commit -m "Bump version to ${nextSnapshot}"
+          git push origin "${GITHUB_REF_NAME}"
+

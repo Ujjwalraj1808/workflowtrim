@@ -1,0 +1,115 @@
+name: Build, Release & Publish to NPM
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to build (e.g., v0.12.0)'
+        required: true
+        type: string
+      source_ref:
+        description: 'Source ref to build/publish (defaults to tag)'
+        required: false
+        type: string
+
+permissions: {}
+
+jobs:
+  release:
+    name: Build, Release and Publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+    env:
+      RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+      SOURCE_REF: ${{ github.event.inputs.source_ref || github.event.inputs.tag || github.ref_name }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.SOURCE_REF }}
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+          package-manager-cache: false
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ripgrep bubblewrap socat ffmpeg poppler-utils imagemagick libcairo2-dev libpango1.0-dev libjpeg-dev libgif-dev librsvg2-dev fd-find
+
+      - name: Install dependencies
+        run: bun install
+
+      - name: Compile i18n
+        run: bun run i18n:compile
+
+      - name: Lint
+        run: bun run lint
+
+      - name: Typecheck
+        run: bun run typecheck
+
+      - name: Test
+        run: bun run test
+
+      - name: Build NPM packages
+        run: bun run build-npm
+
+      - name: Generate release notes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          CHANGELOG_NOTES=$(bun run scripts/extract-changelog.ts "${{ env.RELEASE_TAG }}" 2>/dev/null || true)
+          PR_NOTES=$(gh api "repos/${{ github.repository }}/releases/generate-notes" -f tag_name="${{ env.RELEASE_TAG }}" --jq .body 2>/dev/null || true)
+
+          {
+            if [ -n "$CHANGELOG_NOTES" ]; then
+              echo "$CHANGELOG_NOTES"
+              echo ""
+              echo "---"
+              echo ""
+            fi
+            if [ -n "$PR_NOTES" ]; then
+              echo "$PR_NOTES"
+            fi
+          } > /tmp/release-notes.md
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ ! -s /tmp/release-notes.md ]; then
+            NOTES_FLAG="--generate-notes"
+          else
+            NOTES_FLAG="--notes-file /tmp/release-notes.md"
+          fi
+          if gh release view "${{ env.RELEASE_TAG }}" >/dev/null 2>&1; then
+            gh release edit "${{ env.RELEASE_TAG }}" \
+              --title "${{ env.RELEASE_TAG }}" \
+              $NOTES_FLAG
+          else
+            gh release create "${{ env.RELEASE_TAG }}" \
+              --title "${{ env.RELEASE_TAG }}" \
+              $NOTES_FLAG
+          fi
+
+      - name: Upgrade npm for trusted publishing
+        run: |
+          npm install -g npm@11.16.0 --ignore-scripts
+          npm --version
+
+      - name: Publish to NPM
+        run: bun run scripts/publish.ts

@@ -1,0 +1,36 @@
+name: Version Consistency
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  check-versions:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: package.json
+
+      - name: Verify bun.lock matches manifests
+        shell: bash
+        env:
+          ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
+        run: bun install --frozen-lockfile
+
+      - name: Verify Docker build pipeline stays aligned
+        shell: bash
+        run: bun test ./tests/integration/docker-build-regression.test.ts
+
+      - name: Verify package versions are aligned
+        shell: bash
+        run: bun scripts/version-sync.ts --check

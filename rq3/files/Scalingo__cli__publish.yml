@@ -1,0 +1,72 @@
+name: Test and Release Go CLI
+
+on:
+  pull_request:
+  push:
+    branches: [main, master, prod]
+    tags: ["*"]
+
+# The list of permissions is explained on the GitHub doc:
+# https://docs.github.com/en/actions/using-jobs/assigning-permissions-to-jobs
+permissions:
+  # Write permissions is needed to create a new release
+  contents: write
+  # allow read access to pull request. Use with `only-new-issues` option.
+  pull-requests: read
+
+jobs:
+  linter:
+    name: Linter on a PR
+    if: ${{ github.event_name == 'pull_request' }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: Scalingo/actions/go-linter@main
+
+  tests:
+    name: Unit Tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: Scalingo/actions/go-tests@main
+
+  releases:
+    needs: [tests]
+    name: GoReleaser Build on All OS but Windows
+    if: ${{ github.ref_type == 'tag' }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # required by GoReleaser (https://goreleaser.com/ci/actions/#fetch-all-history)
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: "go.mod"
+          check-latest: true
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
+        with:
+          version: "~> v2"
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CGO_ENABLED: 0
+
+  releases-windows:
+    needs: [tests]
+    name: GoReleaser Build on Windows
+    if: ${{ github.ref_type == 'tag' }}
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # required by GoReleaser (https://goreleaser.com/ci/actions/#fetch-all-history)
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: "go.mod"
+          check-latest: true
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
+        with:
+          version: "~> v2"
+          args: release --config .goreleaser-windows.yaml --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

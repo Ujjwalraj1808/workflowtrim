@@ -1,0 +1,92 @@
+# Builds the Docusaurus static site and publishes it to the `gh-pages` branch
+# as a single orphan commit (no history growth). Hosting serves that branch as
+# a plain static deploy — no build step runs on the hosting provider, which is
+# the point: the heavyweight rspack build (current + 3 versioned snapshots +
+# the local-search index) runs here on free public-repo Actions minutes.
+#
+# Path-filtered: most pushes to main don't touch docs/** and skip this entirely.
+# The codegen-generated reference pages land under docs/docs/, so a
+# `generate.py --docs` regeneration commit triggers a republish as intended.
+name: docs-deploy
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docs/**"
+      # The /changelog-unreleased page is rendered from these at build time (step below).
+      - "changelog.d/**"
+      - "tools/hooks/sync_docs_changelog.py"
+      - ".github/workflows/docs-deploy.yml"
+  workflow_dispatch:
+
+concurrency:
+  # Per ref: a build-only dispatch from a branch must never cancel a main deploy.
+  group: docs-deploy-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  build-deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: docs
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # Job holds contents:write but the build runs third-party yarn
+          # scripts; the publish step passes its token explicitly instead.
+          persist-credentials: false
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: yarn
+          cache-dependency-path: docs/yarn.lock
+
+      - name: Install dependencies
+        run: yarn install --frozen-lockfile
+
+      - name: Add swap
+        # Compiling every built version peaks past the runner's 16 GB of RAM (15.8 GB used when
+        # the #724 build-only run was killed). Swap absorbs that late spike; without it the kernel
+        # kills the runner, which reports only "received a shutdown signal".
+        run: |
+          sudo fallocate -l 16G /mnt/sdv-swap
+          sudo chmod 600 /mnt/sdv-swap
+          sudo mkswap /mnt/sdv-swap > /dev/null
+          sudo swapon /mnt/sdv-swap
+          free -m
+
+      - name: Render the unreleased changelog page
+        # docs/src/pages/changelog-unreleased.md is gitignored and built here from changelog.d/, so a PR that
+        # adds a changelog fragment edits no shared file. The script is stdlib-only: no uv sync needed.
+        run: python3 ../tools/hooks/sync_docs_changelog.py --no-git-add
+
+      - name: Build site
+        run: |
+          # Log each new RAM + swap peak, so the trail survives a runner that is killed.
+          ( peak=0; while sleep 10; do u=$(free -m | awk '/^Mem:/{m=$3} /^Swap:/{s=$3} END{print m+s}'); if [ "$u" -gt "$peak" ]; then peak=$u; echo "mem+swap peak ${peak} MB"; fi; done ) &
+          yarn build
+        env:
+          # The 4-version build peaked past default heap limits on Vercel's
+          # container; public-repo runners have 16GB, give node room to use it.
+          NODE_OPTIONS: --max-old-space-size=8192
+          # `faster` renders pages in one worker thread per CPU, each holding its own copy of
+          # the server bundle (every built version) plus up to 1 GB before it is recycled.
+          DOCUSAURUS_SSG_WORKER_THREAD_COUNT: 2
+
+      - name: Publish to gh-pages
+        # workflow_dispatch from a branch is a build-only check; only main publishes.
+        if: github.ref == 'refs/heads/main'
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./docs/build
+          # Single-commit branch: each deploy replaces the previous one, so the
+          # repo never accumulates built-site history.
+          force_orphan: true

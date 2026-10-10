@@ -1,0 +1,156 @@
+name: Emscripten nightly build + push to solc-bin
+
+on:
+  schedule:
+    # Run once a day, at midnight
+    - cron: '0 0 * * *'
+
+env:
+  TARGET_BRANCH: gh-pages
+  COMMITTER_NAME: emscripten nightly action
+  COMMITTER_EMAIL: builds@argot.org
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+jobs:
+  build-emscripten-nightly:
+    runs-on: ubuntu-latest
+    outputs:
+      solidity-version: ${{ env.SOLIDITY_VERSION }}
+      nightly-version: ${{ env.NIGHTLY_VERSION }}
+      nightly-already-exists: ${{ env.NIGHTLY_ALREADY_EXISTS }}
+
+    steps:
+      - name: Symlink solc-bin to /mnt/solc-bin
+        # It's now too big to fit on the main partition on Ubuntu, which is mostly filled with software.
+        # NOTE: We don't clone to /mnt/solc-bin directly because the checkout action does not support that.
+        # See https://github.com/actions/checkout/issues/197
+        run: |
+          sudo mkdir /mnt/solc-bin/
+          sudo chown "$USER" /mnt/solc-bin/
+          ln -s /mnt/solc-bin/ solc-bin
+
+      - uses: actions/checkout@v4
+        with:
+          repository: 'argotorg/solidity'
+          ref: 'develop'
+          path: 'solidity/'
+          submodules: 'recursive'
+
+      - name: Clone solc-bin repository without checking out a working copy
+        run: |
+          git clone --no-checkout --branch "$TARGET_BRANCH" "https://github.com/${GITHUB_REPOSITORY}.git" solc-bin/
+
+          # For some reason git stages all files for deletion when you use --no-checkout
+          cd solc-bin/
+          git reset HEAD --quiet
+
+      - name: Determine Solidity version
+        run: |
+          cd solidity/
+          last_commit_timestamp=$(git log -1 --date=iso --format=%ad HEAD)
+          last_commit_date=$(date --date="$last_commit_timestamp" --utc +%Y.%-m.%-d)
+          last_commit_hash=$(git rev-parse --short=8 HEAD)
+          solidity_version=$("scripts/get_version.sh")
+          nightly_version="v${solidity_version}-nightly.${last_commit_date}+commit.${last_commit_hash}"
+
+          echo "LAST_COMMIT_DATE=${last_commit_date}" >> $GITHUB_ENV
+          echo "LAST_COMMIT_HASH=${last_commit_hash}" >> $GITHUB_ENV
+          echo "SOLIDITY_VERSION=${solidity_version}" >> $GITHUB_ENV
+          echo "NIGHTLY_VERSION=${nightly_version}" >> $GITHUB_ENV
+
+      - name: Check if there's already a nightly with the same date or commit ID
+        run: |
+          cd solc-bin/
+          matching_nightlies_in_the_repo="$(
+            git ls-files "bin/soljson-v${SOLIDITY_VERSION}-nightly.${LAST_COMMIT_DATE}+commit.*.js";
+            git ls-files "bin/soljson-v${SOLIDITY_VERSION}-nightly.*+commit.${LAST_COMMIT_HASH}.js"
+          )"
+          nightly_already_exists="$(test -n "$matching_nightlies_in_the_repo" && echo true || echo false)"
+
+          # There's no way to just stop a job without failing and that would spam everyone with
+          # spurious e-mail notifications about the failure. Instead we have to make do with `if`s.
+          echo "NIGHTLY_ALREADY_EXISTS=${nightly_already_exists}" >> $GITHUB_ENV
+
+      - name: Build soljson.js
+        if: "env.NIGHTLY_ALREADY_EXISTS == 'false'"
+        run: |
+          cd solidity/
+          # Note that this script will spawn and build inside a docker image (which works just fine in github actions).
+          scripts/build_emscripten.sh --prerelease-source "nightly"
+
+      - name: Upload soljson.js as an artifact
+        if: "env.NIGHTLY_ALREADY_EXISTS == 'false'"
+        uses: actions/upload-artifact@v4
+        with:
+          name: soljson.js
+          path: solidity/upload/soljson.js
+
+
+  test-emscripten-nightly:
+    runs-on: ubuntu-latest
+    needs: build-emscripten-nightly
+
+    env:
+      SOLIDITY_VERSION: ${{ needs.build-emscripten-nightly.outputs.solidity-version }}
+
+    if: "needs.build-emscripten-nightly.outputs.nightly-already-exists == 'false'"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: 'argotorg/solidity'
+          submodules: 'recursive'
+
+      - name: Download soljson.js artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: soljson.js
+
+      - name: Run solc-js tests
+        run: |
+          test/externalTests/solc-js/solc-js.sh "${PWD}/soljson.js" "$SOLIDITY_VERSION"
+
+
+  add-nightly-and-push:
+    runs-on: ubuntu-latest
+    needs:
+      - build-emscripten-nightly
+      - test-emscripten-nightly
+
+    permissions:
+      contents: write
+
+    env:
+      NIGHTLY_VERSION: ${{ needs.build-emscripten-nightly.outputs.nightly-version }}
+
+    if: "needs.build-emscripten-nightly.outputs.nightly-already-exists == 'false'"
+    steps:
+      - uses: actions/setup-node@v4
+
+      - name: Symlink solc-bin to /mnt/solc-bin
+        # It's now too big to fit on the main partition on Ubuntu, which is mostly filled with software.
+        run: |
+          sudo mkdir /mnt/solc-bin/
+          sudo chown "$USER" /mnt/solc-bin/
+          ln -s /mnt/solc-bin/ solc-bin
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TARGET_BRANCH }}
+          path: 'solc-bin'
+
+      - name: Download soljson.js artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: soljson.js
+
+      - name: Set committer name and e-mail
+        run: |
+          cd solc-bin/
+          git config --local user.name "$COMMITTER_NAME"
+          git config --local user.email "$COMMITTER_EMAIL"
+
+      - name: Run add-nightly-and-push.sh
+        run: |
+          soljson_path="${PWD}/soljson.js"
+          cd solc-bin/
+          ./add-nightly-and-push.sh "$soljson_path" "$NIGHTLY_VERSION"

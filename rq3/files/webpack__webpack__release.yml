@@ -1,0 +1,89 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+
+concurrency: ${{ github.workflow }}-${{ github.ref }}
+
+permissions:
+  id-token: write # Required for OIDC
+  contents: write
+  pull-requests: write
+
+jobs:
+  release:
+    if: github.repository == 'webpack/webpack'
+    name: Release
+    runs-on: ubuntu-latest
+    outputs:
+      published: ${{ steps.changesets.outputs.published }}
+      publishedPackages: ${{ steps.changesets.outputs.published-packages }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Use Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: lts/*
+          cache: yarn
+
+      - run: node tooling/retry.js yarn --frozen-lockfile
+
+      - name: Create Release Pull Request or Publish to npm
+        id: changesets
+        uses: changesets/action@ae32849d5ba541f9ae29e40e22a623bc13562f51 # v2.1.2
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          # Formats what `changeset version` wrote before the action commits
+          # it, so the release pull request is not born failing fmt:check.
+          version-script: yarn version:release
+          # `changeset publish` refuses to run under Yarn Classic, so npm
+          # publishes instead. The action runs this on every push that leaves no
+          # changeset behind, hence the skip when npm already carries the
+          # version; it execs without a shell, hence `bash -c`; and it splits
+          # the command on double quotes, so there are none inside.
+          publish-script: bash -c "v=$(npm pkg get version | xargs); (npm view webpack@${v:?} version > /dev/null 2>&1 || npm publish) && node ./node_modules/.bin/changeset git-tag"
+          commit-message: "chore(release): new release"
+          pr-title: "chore(release): new release"
+        env:
+          NPM_TOKEN: "" # https://github.com/changesets/changesets/issues/1152#issuecomment-3190884868
+
+  announce-release:
+    needs: release
+    if: needs.release.outputs.published == 'true'
+    uses: ./.github/workflows/release-announcement.yml
+    secrets: inherit
+
+  trigger-documentation-update:
+    needs: release
+    if: needs.release.outputs.published == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate Token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        id: app-token
+        with:
+          app-id: ${{ secrets.BOT_APP_ID }}
+          private-key: ${{ secrets.BOT_PRIVATE_KEY }}
+      - name: Dispatch workflow
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          PUBLISHED_PACKAGES: ${{ needs.release.outputs.publishedPackages }}
+        with:
+          github-token: ${{ steps.app-token.outputs.token }}
+          script: |
+            const packages = JSON.parse(process.env.PUBLISHED_PACKAGES);
+            const pkg = packages.find(p => p.name === "webpack");
+            if (!pkg) throw new Error("webpack package not found in published packages");
+
+            await github.rest.actions.createWorkflowDispatch({
+              owner: "webpack",
+              repo: "webpack-doc-kit",
+              workflow_id: "release.yml",
+              ref: "main",
+              inputs: {
+                tag: "v" + pkg.version,
+              },
+            });

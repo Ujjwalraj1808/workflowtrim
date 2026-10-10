@@ -1,0 +1,83 @@
+name: Automate release
+
+on:
+  workflow_dispatch:
+    inputs:
+      short-description:
+        description: |
+          A brief summary of what the release contains.
+          This will be added directly to the release ticket.
+        required: true
+      rule-props-changed:
+        type: choice
+        description: |
+          Did any rule properties change in this release?
+        required: true
+        default: "No"
+        options:
+          - "Yes"
+          - "No"
+      branch:
+        description: |
+          Branch from which to do the release.
+        required: true
+        default: "master"
+      release-notes:
+        description: |
+          Release notes.
+          If blank, release notes will be generated from the Jira Release.
+      sq-ide-short-description:
+        description: |
+          A brief summary of SQ IDE related changes.
+          If blank, the generic brief summary defined above will be used.
+      new-version:
+        description: |
+          Specify the version for the next release (e.g., 4.2.0).
+          If left blank, the last version number will be automatically incremented (e.g., 1.51 -> 1.52, 1.51.1 -> 1.51.2).
+      require-rule-metadata-update:
+        type: boolean
+        description: |
+          Toggle wether the pre release checks should include a rule metadata update.
+        default: true
+      verbose:
+        type: boolean
+        description: |
+          Add verbose job summaries
+        default: false
+
+jobs:
+  release:
+    name: Release
+    uses: SonarSource/release-github-actions/.github/workflows/automated-release.yml@v1
+    permissions:
+      statuses: write
+      id-token: write
+      contents: write
+      actions: write
+      pull-requests: write
+    with:
+      jira-project-key: "SONARPHP"
+      project-name: "SonarPHP"
+      plugin-name: "php"
+      plugin-artifacts-sqs: "php"
+      plugin-artifacts-sqc: "php"
+      use-jira-sandbox: false
+      is-draft-release: false
+      pm-email: "alexandre.gigleux@sonarsource.com"
+      release-automation-secret-name: "sonar-php-release-automation"
+      short-description: ${{ inputs.short-description }}
+      rule-props-changed: ${{ inputs.rule-props-changed }}
+      branch: ${{ inputs.branch }}
+      release-notes: ${{ inputs.release-notes }}
+      sq-ide-short-description: ${{ inputs.sq-ide-short-description }}
+      new-version: ${{ inputs.new-version }}
+      require-rule-metadata-update: ${{ inputs.require-rule-metadata-update }}
+      create-slvscode-ticket: true
+      create-sli-ticket: true
+      create-sle-ticket: true
+      slack-channel: "squad-security-taint-notifs"
+      freeze-branch-slack-notification: false
+      runner-environment: sonar-xs
+      verbose: ${{ inputs.verbose }}
+      bump-version: true
+      ktlo-jira-project-key: "SONARSEC"

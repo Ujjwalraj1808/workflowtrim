@@ -1,0 +1,28 @@
+---
+name: Release
+on:
+  workflow_dispatch:
+  # Auto-release: every push to main runs semantic-release (create-release.yaml).
+  # Its commit-analyzer cuts a new vX.Y.Z tag only when the merged commits warrant
+  # one (fix: → patch, feat: → minor, BREAKING CHANGE/! → major) and no-ops otherwise
+  # (chore:/docs:/ci:). The tag push then triggers cd.yaml's GoReleaser publish.
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: "Release"
+  cancel-in-progress: false
+  # Keep every pending release instead of replacing it with a newer one, so a
+  # burst of merges publishes each release in order.
+  queue: max
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    name: 🎉 Create Release
+    uses: devantler-tech/actions/.github/workflows/create-release.yaml@1d726483facb9340655489913f609082677be8f5 # v13.10.6
+    secrets:
+      APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}

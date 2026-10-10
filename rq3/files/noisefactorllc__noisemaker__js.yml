@@ -1,0 +1,224 @@
+name: JavaScript
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'js/**'
+      - '!js/doc/**'
+      - '!js/README*.md'
+      - 'scripts/**'
+      # The test job also runs the shader engine's tests, which read these
+      - 'test/**'
+      - 'shaders/src/**'
+      - 'shaders/effects/**'
+      - 'shaders/tests/**'
+      - '!shaders/**/*.md'
+      - 'vendor/shade-mcp/**'
+      - 'llms-full.txt'
+      - '.mcp.json'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'eslint.config.js'
+      - 'playwright.config.js'
+      - '.github/workflows/js.yml'
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'js/**'
+      - '!js/doc/**'
+      - '!js/README*.md'
+      - 'scripts/**'
+      # The test job also runs the shader engine's tests, which read these
+      - 'test/**'
+      - 'shaders/src/**'
+      - 'shaders/effects/**'
+      - 'shaders/tests/**'
+      - '!shaders/**/*.md'
+      - 'vendor/shade-mcp/**'
+      - 'llms-full.txt'
+      - '.mcp.json'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'eslint.config.js'
+      - 'playwright.config.js'
+      - '.github/workflows/js.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: JS tests
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+    - name: Set up Node.js
+      uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+      with:
+        node-version: '22'
+        cache: 'npm'
+
+    - name: Install dependencies
+      run: npm install --include=dev
+
+    - name: Run JS tests (non-parity)
+      run: npm run test:non-parity -- --skip-docs
+
+  lint:
+    name: JS lint
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+    - name: Set up Node.js
+      uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+      with:
+        node-version: '22'
+        cache: 'npm'
+
+    - name: Install dependencies
+      run: npm install --include=dev
+
+    - name: Run ESLint
+      run: npm run lint
+
+  build-bundles:
+    name: Build JS bundles
+    runs-on: ubuntu-latest
+    needs: [test, lint]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    steps:
+    - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+    - name: Set up Node.js
+      uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+      with:
+        node-version: '22'
+        cache: 'npm'
+
+    - name: Install dependencies
+      run: npm install --include=dev
+
+    - name: Build browser bundles
+      run: npm run bundle
+
+    - name: Build CLI bundle
+      run: npm run build:cli
+
+    - name: Upload JS artifacts
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      with:
+        name: noisemaker-js-bundles
+        path: |
+          dist/noisemaker.bundle.js
+          dist/noisemaker.min.js
+          dist/noisemaker.esm.js
+          dist/noisemaker.cjs
+        retention-days: 7
+
+  build-standalone-linux:
+    name: Build standalone (Linux)
+    runs-on: ubuntu-latest
+    needs: [test, lint]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    steps:
+    - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+    - name: Set up Node.js
+      uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+      with:
+        node-version: '22'
+        cache: 'npm'
+
+    - name: Install dependencies
+      run: npm install --include=dev
+
+    - name: Build standalone executable
+      run: npm run build:standalone
+
+    - name: Package Linux executable
+      run: |
+        mkdir -p dist/release
+        tar -C dist/cli/linux-x64 -czf dist/release/noisemaker-cli-linux-x64.tar.gz noisemaker
+
+    - name: Upload Linux artifact
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      with:
+        name: noisemaker-cli-linux-x64
+        path: dist/release/noisemaker-cli-linux-x64.tar.gz
+        retention-days: 7
+
+  build-standalone-macos:
+    name: Build standalone (macOS)
+    runs-on: macos-latest
+    needs: [test, lint]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    steps:
+    - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+    - name: Set up Node.js
+      uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+      with:
+        node-version: '22'
+        cache: 'npm'
+
+    - name: Install dependencies
+      run: npm install --include=dev
+
+    - name: Build standalone executable
+      run: npm run build:standalone
+
+    - name: Package macOS executable
+      run: |
+        mkdir -p dist/release
+        tar -C dist/cli/darwin-arm64 -czf dist/release/noisemaker-cli-macos-arm64.tar.gz noisemaker
+
+    - name: Upload macOS artifact
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      with:
+        name: noisemaker-cli-macos-arm64
+        path: dist/release/noisemaker-cli-macos-arm64.tar.gz
+        retention-days: 7
+
+  build-standalone-windows:
+    name: Build standalone (Windows)
+    runs-on: windows-latest
+    needs: [test, lint]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    steps:
+    - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+    - name: Set up Node.js
+      uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+      with:
+        node-version: '22'
+        cache: 'npm'
+
+    - name: Install dependencies
+      run: npm install --include=dev
+
+    - name: Build standalone executable
+      run: npm run build:standalone
+
+    - name: Package Windows executable
+      shell: pwsh
+      run: |
+        New-Item -ItemType Directory -Force -Path dist/release
+        Set-Location dist/cli/win32-x64
+        7z a ../../release/noisemaker-cli-windows-x64.zip noisemaker.exe
+
+    - name: Upload Windows artifact
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      with:
+        name: noisemaker-cli-windows-x64
+        path: dist/release/noisemaker-cli-windows-x64.zip
+        retention-days: 7

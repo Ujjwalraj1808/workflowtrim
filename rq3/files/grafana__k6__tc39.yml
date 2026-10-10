@@ -1,0 +1,44 @@
+name: TC39
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - master
+      - v1.x
+  pull_request:
+      paths:
+          - 'js/**'
+          - 'internal/js/**'
+          - 'vendor/github.com/grafana/sobek/**'
+          - 'vendor/github.com/evanw/esbuild**'
+
+defaults:
+  run:
+    shell: bash
+
+permissions:
+  contents: read
+
+
+jobs:
+  tc39:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Resolve Go versions
+        id: go_versions
+        uses: grafana/k6-ci/.github/actions/go-versions@bc53c239916ae45b50a0bdea2a37698589219c84 # v0.5.3
+      - name: Install Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: ${{ steps.go_versions.outputs.current }}
+          check-latest: true
+      - name: Run tests
+        run: |
+          set -x
+          cd internal/js/tc39
+          sh checkout.sh
+          go test -timeout 1h

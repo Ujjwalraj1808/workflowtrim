@@ -1,0 +1,16 @@
+
+name: General PR Handling for 1Panel
+on: pull_request
+permissions:
+  pull-requests: write
+jobs:
+  generic_handler:
+    name: Add Labels to PR
+    if: github.repository == '1Panel-dev/1Panel' && github.event.pull_request.user.login != 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions-ecosystem/action-add-labels@v1
+        with:
+          github_token: ${{ secrets.GITHUBTOKEN }}
+          labels: ${{ github.base_ref }}

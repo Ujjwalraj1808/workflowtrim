@@ -1,0 +1,93 @@
+name: PR Risk
+
+on:
+  pull_request:
+    branches: [ main, 'release/**', 'hotfix/**' ]
+  # Merge queue (engdocs/CI_REQUIRED_CHECK_TOPOLOGY.md, "Merge Queue"):
+  # the ruleset's required gate must also report on each queue entry's
+  # merge-group commit, or a queued PR waits until the queue times it out.
+  # checks_requested is the queue asking for those checks; pinned
+  # explicitly (scripts/ci_merge_queue_test.go). The concurrency group
+  # below keys a merge group on its own gh-readonly-queue/* ref, so queue
+  # runs never cancel each other or a PR's own runs.
+  merge_group:
+    types: [ checks_requested ]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  BD_DISABLE_METRICS: "1"
+  BD_DISABLE_EVENT_FLUSH: "1"
+
+# The legacy Go test tiers this workflow used to run (embedded Dolt storage,
+# conformance and cmd shards; proxied-server cmd shards; server-Dolt storage
+# and full suite) are pr.yml's Bazel lanes on rbe-west now: `embedded Dolt
+# tier`, `proxied-server tier` and `server-Dolt storage tier` (bazel.yml),
+# which pr.yml's `CI Gate / Required` requires to have run remotely and
+# passed on every pull_request and merge group, fork and Dependabot PRs
+# included (ga-96smfk.22). What remains is the Nix packaging check, which no
+# Bazel target can stand in for: it builds the package Nix users install.
+
+jobs:
+  test-nix:
+    name: Test Nix Flake
+    # F7a: cache-free (no GitHub-saved cache restored/saved here) same-repo
+    # job moved onto Blacksmith at 4 vCPU; forks, Dependabot and any other
+    # event stay GitHub-hosted. Must match TestSameRepoBlacksmithRunners.
+    runs-on: ${{ (github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]')) && 'blacksmith-4vcpu-ubuntu-2404' || 'ubuntu-latest' }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: DeterminateSystems/determinate-nix-action@527f17dd63d2d60d3e5552934bc84b9a33a14d11 # v3
+      - name: Run bd help via Nix
+        id: nix_help
+        run: |
+          nix run .#default -- --help > help.txt
+      # A packaging check, not a test: evaluates every flake output (packages,
+      # apps, devShells, overlay) for every system the flake declares. The
+      # flake has no `checks`: its one check, hook-timeout-backends, runs
+      # under Bazel as //tests/hook_timeout_backends:hook_timeout_backends_test
+      # in bazel.yml's PR-core lane.
+      - name: Run the flake checks
+        run: |
+          nix flake check -L
+      - name: Verify help text
+        if: steps.nix_help.outcome == 'success'
+        run: |
+          FIRST_LINE=$(head -n 1 help.txt)
+          EXPECTED="Issues chained together like beads. A lightweight issue tracker with first-class dependency support."
+          if [ "$FIRST_LINE" != "$EXPECTED" ]; then
+            echo "First line of help.txt doesn't match expected output"
+            echo "Expected: $EXPECTED"
+            echo "Got: $FIRST_LINE"
+            exit 1
+          fi
+          echo "Help text first line is correct"
+
+  ci-gate:
+    name: PR Risk Gate / Required
+    # F3: same-repo PRs and merge_group get the org's Blacksmith pool; forks,
+    # Dependabot and any other event stay GitHub-hosted. This job restores no
+    # GitHub-saved cache. Must match the TestSameRepoBlacksmithRunners pin;
+    # the gate's NAME must never change (ruleset requires exactly "PR Risk
+    # Gate / Required").
+    runs-on: ${{ (github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]')) && 'blacksmith-2vcpu-ubuntu-2404' || 'ubuntu-latest' }}
+    # F3: now on Blacksmith for same-repo PRs; a hang used to burn only the
+    # default 360 minutes of a free GitHub-hosted runner, now Blacksmith
+    # minutes too.
+    timeout-minutes: 10
+    needs:
+      - test-nix
+    if: ${{ always() }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+
+      - name: Evaluate CI gate
+        env:
+          CI_GATE_NAME: PR risk gate
+          CI_GATE_REQUIRED: >-
+            TEST_NIX
+          TEST_NIX: ${{ needs.test-nix.result }}
+        run: bash .github/scripts/ci-gate.sh

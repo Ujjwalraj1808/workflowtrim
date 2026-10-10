@@ -1,0 +1,37 @@
+name: Untriaged issue label check (daily)
+
+# #3563: a dozen issues filed through the GitHub API on 2026-09-26 carried no
+# TYPE label and no priority:* label -- filing through the API bypasses the
+# issue templates that would otherwise force one. This job fails loud, once a
+# day, whenever any open issue is still missing either.
+
+on:
+  schedule:
+    - cron: "11 6 * * *" # daily 06:11 UTC (jittered off the hour)
+  workflow_dispatch: {}
+
+permissions: {}
+
+jobs:
+  detect:
+    name: Detect untriaged issues
+    runs-on: ubuntu-latest
+    # refs #3123: bounds a hang against GitHub's 360-min default. No run
+    # history yet (new workflow); floor of 10 min, matching the sibling
+    # stale-open-issues.yml detector this job is modeled on.
+    timeout-minutes: 10
+    permissions:
+      contents: read # checkout
+      issues: read # list open issues
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GITHUB_REPOSITORY: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: "22"
+      - name: Detect untriaged issues
+        run: node scripts/detect-untriaged-issues.mjs

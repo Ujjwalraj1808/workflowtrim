@@ -1,0 +1,44 @@
+name: Docs (Mintlify) checks
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    # The Mintlify site and the check itself. The docsync guard (docs nav,
+    # links and agent-instruction routing over docs/, engdocs/ and the root
+    # markdown) is //test/docsync:docsync_test, which bazel.yml's --config=ci
+    # lane runs on every PR; this workflow keeps only Mintlify's own
+    # broken-link check, which needs the network (npx mint) and the base
+    # branch's history.
+    paths:
+      - 'docs/**'
+      - 'mint.sh'
+      - '.github/scripts/docs-render-check.sh'
+      - '.github/workflows/docs-mintlify.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docs-mintlify-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  broken-links:
+    name: Mintlify broken-links (baseline-aware)
+    runs-on: ${{ (github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]')) && 'blacksmith-2vcpu-ubuntu-2404' || 'ubuntu-latest' }}
+    timeout-minutes: 10
+    if: github.event.pull_request.draft == false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+        with:
+          node-version: 22
+
+      - name: Run baseline-aware broken-link check
+        env:
+          BASE_REF: origin/${{ github.base_ref }}
+        run: .github/scripts/docs-render-check.sh "$BASE_REF"

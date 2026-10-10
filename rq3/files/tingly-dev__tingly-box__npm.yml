@@ -1,0 +1,791 @@
+name: NPX Package Publish from GitHub Release
+
+run-name: >-
+  📦 NPX publish ${{ github.event.inputs.tag || github.event.release.tag_name }}
+  → npm:${{ github.event.inputs.npm_tag || 'auto' }}
+  [cli=${{ github.event.inputs.publish_cli || 'true' }},
+  gui=${{ github.event.inputs.publish_gui || 'false' }},
+  docker=${{ github.event.inputs.build_docker || 'true' }}]
+  by @${{ github.actor }}
+
+# Triggers:
+#   - release: published — fires only for releases created by a person or an
+#     app token. Releases cut by release-cli.yml and release-gui.yml use GITHUB_TOKEN, and GitHub does
+#     not start workflow runs for events created with that token. Tag pushes
+#     and manual releases reach this workflow via the `trigger-npm-publish`
+#     jobs in those workflows, which dispatch it with the inputs below (npm_tag
+#     inferred from the version). Either way the run parks at the `production`
+#     environment approval before anything is published.
+#   - workflow_dispatch — manual (re-)publish against any existing release.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to publish from (e.g., v1.0.0). Type an EXISTING published release tag — it must already exist on GitHub Releases; the job verifies it before publishing.'
+        required: true
+        type: string
+      npm_tag:
+        description: 'npm dist-tag for publish (latest/rc). Auto-trigger infers from version: stable→latest, pre-release→rc'
+        required: false
+        type: choice
+        options:
+          - latest
+          - rc
+        default: 'rc'
+      publish_cli:
+        description: '[pkg: tingly-box + @tingly-dev/tingly-box-<os>-<cpu>] shim plus the per-platform binary packages it depends on'
+        required: false
+        type: boolean
+        default: true
+      publish_gui:
+        description: '[pkg: tingly-box-gui] desktop UI with bundled frontend'
+        required: false
+        type: boolean
+        default: false
+      build_docker:
+        description: '[docker] build and push the npm-installed Docker image after CLI publish'
+        required: false
+        type: boolean
+        default: true
+
+# npm auth: Trusted Publishing (OIDC). No npm token is stored anywhere; the
+# publish jobs mint a short-lived GitHub Actions id-token and npm (>= 11.5.1)
+# exchanges it for publish rights. Each package on npmjs.com is configured
+# with this repo, workflow file "npm.yml" and environment "production"; those
+# names must stay exactly in sync. Provenance is generated automatically.
+# Read-only by default; each job that writes (release notes, id-token for npm,
+# packages for GHCR) grants exactly that on itself.
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION: '24'
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      publish_cli: ${{ steps.set_vars.outputs.publish_cli }}
+      publish_gui: ${{ steps.set_vars.outputs.publish_gui }}
+      build_docker: ${{ steps.set_vars.outputs.build_docker }}
+      npm_tag: ${{ steps.set_vars.outputs.npm_tag }}
+      npx_version: ${{ steps.version.outputs.npx_version }}
+      release_tag: ${{ steps.version.outputs.release_tag }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Set variables
+        id: set_vars
+        run: |
+          if [ "${{ github.event_name }}" = "release" ]; then
+            echo "publish_cli=true" >> $GITHUB_OUTPUT
+            echo "publish_gui=false" >> $GITHUB_OUTPUT
+            echo "build_docker=true" >> $GITHUB_OUTPUT
+            # Auto-infer npm tag from version: stable → latest, pre-release → rc
+            RELEASE_TAG="${{ github.event.release.tag_name }}"
+            VERSION="${RELEASE_TAG#v}"
+            if [[ "$VERSION" == *-* ]]; then
+              echo "npm_tag=rc" >> $GITHUB_OUTPUT
+            else
+              echo "npm_tag=latest" >> $GITHUB_OUTPUT
+            fi
+          else
+            # workflow_dispatch: tag must be provided explicitly
+            echo "publish_cli=${{ github.event.inputs.publish_cli }}" >> $GITHUB_OUTPUT
+            echo "publish_gui=${{ github.event.inputs.publish_gui }}" >> $GITHUB_OUTPUT
+            echo "build_docker=${{ github.event.inputs.build_docker }}" >> $GITHUB_OUTPUT
+            echo "npm_tag=${{ github.event.inputs.npm_tag }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Validate and extract version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "release" ]; then
+            RELEASE_TAG="${{ github.event.release.tag_name }}"
+          else
+            RELEASE_TAG="${{ github.event.inputs.tag }}"
+          fi
+
+          # Validate tag format
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9]+)?$ ]]; then
+            echo "Error: Invalid tag format. Expected format: v1.0.0 or v1.0.0-beta"
+            exit 1
+          fi
+
+          NPX_VERSION="${RELEASE_TAG#v}"
+
+          echo "release_tag=$RELEASE_TAG" >> $GITHUB_OUTPUT
+          echo "npx_version=$NPX_VERSION" >> $GITHUB_OUTPUT
+          echo ""
+          echo "Summary:"
+          echo "  - Release tag (assets source): $RELEASE_TAG"
+          echo "  - NPX version to publish: $NPX_VERSION"
+
+      - name: Check if GitHub Release exists
+        run: |
+          RELEASE_TAG="${{ steps.version.outputs.release_tag }}"
+          echo "Checking if release $RELEASE_TAG exists..."
+
+          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "❌ Error: Release $RELEASE_TAG does not exist!"
+            echo ""
+            echo "The 'tag' input must match a published GitHub Release."
+            echo "👉 Open https://github.com/${{ github.repository }}/releases to"
+            echo "   find the exact tag, then re-run with that value."
+            exit 1
+          fi
+
+          echo "✅ Release $RELEASE_TAG found"
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      - name: Write publish summary (reference for approval reviewers)
+        run: |
+          {
+            echo "## 📦 NPX Publish Request — pending approval"
+            echo ""
+            echo "Review the details below before approving the \`production\` deployment."
+            echo ""
+            echo "| Item | Value |"
+            echo "| --- | --- |"
+            echo "| Trigger | \`${{ github.event_name }}\` |"
+            echo "| Initiated by | @${{ github.actor }} |"
+            echo "| Source release | [\`${{ steps.version.outputs.release_tag }}\`](https://github.com/${{ github.repository }}/releases/tag/${{ steps.version.outputs.release_tag }}) |"
+            echo "| npm version | \`${{ steps.version.outputs.npx_version }}\` |"
+            echo "| npm dist-tag | \`${{ steps.set_vars.outputs.npm_tag }}\` |"
+            echo "| Publish CLI (\`tingly-box\` + platform packages) | ${{ steps.set_vars.outputs.publish_cli }} |"
+            echo "| Publish GUI (\`tingly-box-gui\`) | ${{ steps.set_vars.outputs.publish_gui }} |"
+            echo "| Build Docker image | ${{ steps.set_vars.outputs.build_docker }} |"
+            echo "| Docker moving tag | \`${{ steps.set_vars.outputs.npm_tag }}\` (mirrors npm dist-tag) |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # Publish the per-platform binary packages (@tingly-dev/tingly-box-linux-x64, …) and
+  # then the cli shim that pins them as optionalDependencies at this exact
+  # version. One job so a release needs one production approval, and the
+  # platform packages exist on the registry before the shim is installed
+  # anywhere. See .design/npm.md ("F. Platform packages").
+  publish-cli:
+    needs: setup
+    name: Publish CLI + Platform Packages
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      contents: write
+      id-token: write
+    if: needs.setup.outputs.publish_cli == 'true'
+    env:
+      PKG_NAME: tingly-box
+      PKG_DIR: build/npx/tingly-box
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          registry-url: "https://registry.npmjs.org"
+          cache: "npm"
+          cache-dependency-path: build/npx/package-lock.json
+
+      - name: Check npm supports trusted publishing
+        run: |
+          npm --version
+          node -e 'const [a,b,c]=process.argv[1].split(".").map(Number); if (a<11||(a===11&&(b<5||(b===5&&c<1)))) { console.error("npm >= 11.5.1 required for OIDC trusted publishing"); process.exit(1) }' "$(npm --version)"
+
+      # npm silently falls back to token auth (and then fails with E404) when
+      # the OIDC exchange is rejected; do the same exchange here first so the
+      # registry's reason is visible in the log. Fails the job early.
+      - name: Verify npm OIDC trusted-publisher exchange
+        env:
+          PACKAGES: ${{ env.PKG_NAME }} @tingly-dev/tingly-box-linux-x64 @tingly-dev/tingly-box-linux-arm64 @tingly-dev/tingly-box-darwin-x64 @tingly-dev/tingly-box-darwin-arm64 @tingly-dev/tingly-box-win32-x64
+        run: |
+          # shellcheck disable=SC2086 # one package per word
+          .github/scripts/npm-oidc-check.sh $PACKAGES
+
+      - name: Configure Git
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+      # ---- platform packages -------------------------------------------
+      - name: Download release binaries
+        env:
+          RELEASE_TAG: ${{ needs.setup.outputs.release_tag }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          mkdir -p zips
+          echo "📥 Downloading platform zips from release $RELEASE_TAG..."
+          gh release download "$RELEASE_TAG" --repo "$REPO" \
+            --pattern "tingly-box-linux-amd64.zip" \
+            --pattern "tingly-box-linux-arm64.zip" \
+            --pattern "tingly-box-macos-amd64.zip" \
+            --pattern "tingly-box-macos-arm64.zip" \
+            --pattern "tingly-box-windows-amd64.zip" \
+            --dir zips
+          ls -lh zips
+
+      - name: Build platform packages
+        run: |
+          VERSION="${{ needs.setup.outputs.npx_version }}"
+          build/npx/scripts/build-platform-packages.sh "$VERSION" zips platform > built.txt
+          # Every platform the shim knows must have been built — a missing
+          # release asset would otherwise silently leave that platform on
+          # the GitHub download path.
+          EXPECTED=$(node -e 'import("./build/npx/shared/platform.js").then(m => console.log(Object.keys(m.PLATFORM_PACKAGES).length))')
+          BUILT=$(wc -l < built.txt)
+          if [ "$BUILT" -ne "$EXPECTED" ]; then
+            echo "❌ Built $BUILT platform packages, expected $EXPECTED"
+            exit 1
+          fi
+          echo "✅ Built $BUILT platform packages:"
+          cat built.txt
+          du -sh platform/@tingly-dev/*
+          # The package carries the release zip; run the binary out of it once.
+          unzip -q -o platform/@tingly-dev/tingly-box-linux-x64/bin/tingly-box-linux-amd64.zip tingly-box -d "$RUNNER_TEMP/sanity"
+          "$RUNNER_TEMP/sanity/tingly-box" version
+
+      # All five uploads run concurrently (one job, so still one production
+      # approval). A version that is already on the registry is a skip, not a
+      # failure: `npm view` can lag behind a publish by minutes on the read
+      # replicas, so the registry's own "previously published" rejection is
+      # treated as "already there" too. Per-package logs keep output readable.
+      - name: Publish platform packages to npm
+        run: |
+          mapfile -t NAMES < built.txt
+          .github/scripts/npm-publish.sh "${{ needs.setup.outputs.npx_version }}" "${{ needs.setup.outputs.npm_tag }}" \
+            "${NAMES[@]/#/platform/}"
+
+      # ---- cli shim ----------------------------------------------------
+      - name: Update NPX package.json with new version
+        working-directory: ${{ env.PKG_DIR }}
+        run: |
+          VERSION="${{ needs.setup.outputs.npx_version }}"
+          npm version "$VERSION" --no-git-tag-version
+          echo "Updated $PKG_NAME to version: $VERSION"
+
+      # Exact-version pins: the shim only uses a platform package whose
+      # version equals its own (see shared/platform.js), and npm installs
+      # just the one matching the host os/cpu.
+      - name: Wire platform packages as optionalDependencies
+        working-directory: ${{ env.PKG_DIR }}
+        run: |
+          VERSION="${{ needs.setup.outputs.npx_version }}"
+          while read -r name; do
+            npm pkg set "optionalDependencies.${name}=${VERSION}"
+          done < ../../../built.txt
+          echo "optionalDependencies:"
+          npm pkg get optionalDependencies
+
+      - name: Update bin.js to reference the correct release
+        working-directory: ${{ env.PKG_DIR }}
+        run: |
+          RELEASE_TAG="${{ needs.setup.outputs.release_tag }}"
+          echo "Updating bin.js to reference release tag: $RELEASE_TAG"
+          sed -i.bak "s|const BINARY_RELEASE_BRANCH = .*|const BINARY_RELEASE_BRANCH = '$RELEASE_TAG';|g" bin.js
+          echo "Updated bin.js content:"
+          head -20 bin.js
+          rm -f bin.js.bak
+
+      # Deps are hoisted to build/npx/ so bin.js and shared/ modules resolve
+      # them from one place (see .design/npm.md).
+      - name: Install dependencies
+        working-directory: build/npx
+        run: npm ci
+
+      # Mitigation A in .design/npm.md: the shim loses undici+unzipper, so
+      # the installed package materializes no nested node_modules beyond the
+      # single platform package, which keeps npm's retire-rename on global
+      # updates near-atomic.
+      - name: Bundle shim into a single dependency-free file
+        working-directory: ${{ env.PKG_DIR }}
+        run: |
+          # Zero runtime deps in the published package (see .design/npm.md).
+          # @aws-sdk/client-s3 is unzipper's optional lazy S3 support — unused.
+          npx --yes esbuild@0.25.9 bin.js --bundle --platform=node --target=node18 \
+            --format=esm --external:@aws-sdk/client-s3 \
+            --banner:js="import{createRequire as __cr}from'module';const require=__cr(import.meta.url);" \
+            --outfile=bin.bundled.js
+          mv bin.bundled.js bin.js
+          npm pkg delete dependencies
+          node --check bin.js
+          echo "✅ Bundled bin.js ($(du -h bin.js | cut -f1)), dependencies stripped"
+
+      # Built before the smoke tests run, so it's there for `publish-cli-review`
+      # to publish from if a smoke test below fails the job.
+      - name: Upload CLI package (in case smoke test fails and review is needed)
+        uses: actions/upload-artifact@v7
+        with:
+          name: tingly-box-npm-package
+          path: ${{ env.PKG_DIR }}
+          retention-days: 7
+
+      - name: Smoke-test bundled shim (download fallback + exec real release)
+        working-directory: ${{ env.PKG_DIR }}
+        run: |
+          # The fallback a user without the platform package hits: bundled
+          # bin.js, no node_modules (also not the hoisted one at build/npx),
+          # explicit tag -> GitHub release download.
+          rm -rf node_modules ../node_modules
+          node bin.js --transport-version="${{ needs.setup.outputs.release_tag }}" version
+
+      - name: Smoke-test a real install (platform package via the registry)
+        working-directory: ${{ env.PKG_DIR }}
+        run: |
+          VERSION="${{ needs.setup.outputs.npx_version }}"
+          # A successful `npm publish` doesn't mean a package is queryable
+          # yet — npm's read replicas can lag behind the write by minutes.
+          # Wait for every platform package the shim depends on (not just
+          # linux-x64) to actually be visible before trusting them: a user
+          # installing before that would resolve no binary for their
+          # platform and silently fall back to the slower GitHub download.
+          wait_ready() {
+            local name="$1" log
+            log="$RUNNER_TEMP/ready-$(echo "$1" | tr '/@' '__').status"
+            for _ in $(seq 1 30); do
+              if npm view "${name}@${VERSION}" version >/dev/null 2>&1; then
+                echo "ok" > "$log"; return 0
+              fi
+              sleep 10
+            done
+            echo "timeout" > "$log"
+          }
+          while read -r name; do
+            echo "⏳ waiting for ${name}@${VERSION} on the registry..."
+            wait_ready "$name" &
+          done < ../../../built.txt
+          wait
+          FAILED=0
+          while read -r name; do
+            log="$RUNNER_TEMP/ready-$(echo "$name" | tr '/@' '__').status"
+            case "$(cat "$log" 2>/dev/null)" in
+              ok) echo "✅ ${name}@${VERSION} ready" ;;
+              *)  echo "❌ ${name}@${VERSION} not visible on the registry after 5 minutes"; FAILED=1 ;;
+            esac
+          done < ../../../built.txt
+          [ "$FAILED" -eq 0 ]
+          # Exactly what `npm install -g tingly-box` does, from the tarball
+          # we are about to publish, into a scratch prefix.
+          npm pack --pack-destination "$RUNNER_TEMP" >/dev/null
+          PREFIX="$RUNNER_TEMP/prefix"
+          npm install -g --prefix "$PREFIX" "$RUNNER_TEMP/tingly-box-${VERSION}.tgz"
+          ls "$PREFIX/lib/node_modules/tingly-box/node_modules/@tingly-dev"
+          XDG_CACHE_HOME="$RUNNER_TEMP/cache" "$PREFIX/bin/tingly-box" version | tee install.log
+          grep -q "Installing binary from @tingly-dev/tingly-box-linux-x64@${VERSION}" install.log
+          # Not `! grep`: set -e ignores a negated command, so it never failed.
+          if grep -q "Downloading" install.log; then
+            echo "❌ The install fell back to the GitHub download"; exit 1
+          fi
+          echo "✅ Global install resolved the binary from the platform package"
+
+      - name: Publish to npm
+        working-directory: ${{ env.PKG_DIR }}
+        run: |
+          VERSION="${{ needs.setup.outputs.npx_version }}"
+          NPM_TAG="${{ needs.setup.outputs.npm_tag }}"
+
+          "$GITHUB_WORKSPACE/.github/scripts/npm-publish.sh" "$VERSION" "$NPM_TAG" .
+
+  # Only runs when publish-cli above failed (most commonly one of its two
+  # smoke-test steps — see .design/npm.md). Sits behind the
+  # `production-smoke-review` environment, which must be configured in repo
+  # Settings -> Environments with required reviewers — that's what actually
+  # pauses the run for a human. Approve to publish the shim anyway (e.g. the
+  # smoke test's registry-visibility timeout was just replica lag); reject
+  # (or leave it unanswered) and this job fails, so the pipeline ends in
+  # error without publishing.
+  publish-cli-review:
+    needs: [setup, publish-cli]
+    name: Manual Review — Publish CLI (after smoke-test failure)
+    runs-on: ubuntu-latest
+    environment: production-smoke-review
+    permissions:
+      contents: read
+      id-token: write
+    if: >-
+      needs.setup.outputs.publish_cli == 'true' &&
+      needs.publish-cli.result == 'failure'
+    env:
+      PKG_NAME: tingly-box
+      PKG_DIR: build/npx/tingly-box
+    steps:
+      # Only for .github/scripts/npm-publish.sh.
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          sparse-checkout: .github
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Download CLI package built before the smoke-test failure
+        uses: actions/download-artifact@v8
+        with:
+          name: tingly-box-npm-package
+          path: ${{ env.PKG_DIR }}
+
+      - name: Publish to npm
+        working-directory: ${{ env.PKG_DIR }}
+        run: |
+          VERSION="${{ needs.setup.outputs.npx_version }}"
+          NPM_TAG="${{ needs.setup.outputs.npm_tag }}"
+
+          echo "⚠️ Publishing despite failed smoke test — approved via manual review."
+          "$GITHUB_WORKSPACE/.github/scripts/npm-publish.sh" "$VERSION" "$NPM_TAG" .
+
+  # Append NPX install info to the existing version release (no extra tag/release)
+  create-release:
+    needs: [setup, publish-cli, publish-cli-review]
+    name: Annotate Release with NPX Info
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    if: >-
+      always() &&
+      needs.setup.result == 'success' &&
+      (needs.publish-cli.result == 'success' ||
+       needs.publish-cli-review.result == 'success' ||
+       needs.setup.outputs.publish_cli != 'true')
+    steps:
+      - name: Append NPX info to release notes
+        env:
+          VERSION: ${{ needs.setup.outputs.npx_version }}
+          RELEASE_TAG: ${{ needs.setup.outputs.release_tag }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          PUBLISHED_CLI="${{ needs.setup.outputs.publish_cli }}"
+
+          echo "Annotating release $RELEASE_TAG with NPX info"
+          echo "  - CLI: $PUBLISHED_CLI"
+
+          if [ "$PUBLISHED_CLI" != 'true' ]; then
+            echo "⏭️ CLI package not published, skipping annotation..."
+            exit 0
+          fi
+
+          START="<!-- NPX_PUBLISH_INFO:START -->"
+          END="<!-- NPX_PUBLISH_INFO:END -->"
+
+          # Reuse the existing version release. Strip only THIS block (bounded by
+          # START/END) so re-runs stay idempotent and never clobber a sibling
+          # block (e.g. the GUI section) appended elsewhere in the body.
+          CURRENT_BODY="$(gh release view "$RELEASE_TAG" --repo "$REPO" --json body -q .body 2>/dev/null || echo "")"
+          BASE_BODY="$(printf '%s' "$CURRENT_BODY" | sed "/$START/,/$END/d")"
+
+          {
+            printf '%s\n' "$BASE_BODY"
+            echo "$START"
+            cat << NOTES_EOF
+          ## 📦 NPX Packages - $VERSION
+
+          ### 🚀 Installation
+
+          \`\`\`bash
+          # Use with npx (recommended)
+          npx tingly-box@$VERSION
+
+          # Or install globally
+          npm install -g tingly-box@$VERSION
+          \`\`\`
+
+          The binary for your platform ships in a companion package
+          (\`@tingly-dev/tingly-box-linux-x64\`, \`@tingly-dev/tingly-box-darwin-arm64\`, …) that npm
+          installs automatically — no GitHub download, npm mirrors work.
+          NOTES_EOF
+
+            echo ""
+            echo "### 🔗 NPX Links"
+            echo ""
+            echo "- 📦 [CLI on npm](https://www.npmjs.com/package/tingly-box/v/$VERSION)"
+            echo "$END"
+          } > npx_release_notes.md
+
+          echo "Updating release $RELEASE_TAG notes..."
+          gh release edit "$RELEASE_TAG" --repo "$REPO" --notes-file npx_release_notes.md
+
+  # Build the npm-installed Docker image after the package is published
+  build-docker-npm:
+    needs: [setup, publish-cli, publish-cli-review, create-release]
+    name: Build Docker npm Image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    if: >-
+      always() &&
+      needs.setup.result == 'success' &&
+      (needs.publish-cli.result == 'success' || needs.publish-cli-review.result == 'success') &&
+      needs.create-release.result == 'success' &&
+      needs.setup.outputs.publish_cli == 'true' &&
+      needs.setup.outputs.build_docker == 'true'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      # The docker moving tag mirrors the npm dist-tag: a `latest` npm publish
+      # moves docker `latest`, an `rc` publish moves docker `rc` only.
+      - name: Build and push Docker image
+        uses: ./.github/actions/docker-build-push
+        with:
+          image_name: tingly-box
+          version: ${{ needs.setup.outputs.release_tag }}
+          channel_tag: ${{ needs.setup.outputs.npm_tag }}
+          github_token: ${{ github.token }}
+          build_args: |
+            TINGLY_VERSION=${{ needs.setup.outputs.npx_version }}
+          expected_version: ${{ needs.setup.outputs.npx_version }}
+
+  # Publish GUI NPX package
+  # Runs in parallel with publish-cli (each has its own production approval).
+  # Release-note edits are done afterwards by annotate-gui, never here, so the
+  # two publishes never race on the shared release body.
+  publish-gui:
+    needs: setup
+    name: Publish GUI Package
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      contents: write
+      id-token: write
+    if: needs.setup.outputs.publish_gui == 'true'
+    env:
+      PKG_NAME: tingly-box-gui
+      PKG_DIR: build/npx/tingly-box-gui
+      PKG_TYPE: gui
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          registry-url: "https://registry.npmjs.org"
+          cache: "npm"
+          cache-dependency-path: build/npx/package-lock.json
+
+      - name: Check npm supports trusted publishing
+        run: |
+          npm --version
+          node -e 'const [a,b,c]=process.argv[1].split(".").map(Number); if (a<11||(a===11&&(b<5||(b===5&&c<1)))) { console.error("npm >= 11.5.1 required for OIDC trusted publishing"); process.exit(1) }' "$(npm --version)"
+
+      # A platform package that has never been published cannot be checked or
+      # published through OIDC (its Trusted Publisher cannot exist yet). Skip
+      # it instead of failing: it is neither published nor pinned, and the
+      # shim falls back to the GitHub release download on that platform.
+      - name: Find GUI platform packages that exist on npm
+        run: |
+          : > gui-existing.txt
+          for name in $(node -e 'import("./build/npx/shared/platform.js").then(m => { for (const p of Object.values(m.GUI_PLATFORM_PACKAGES)) console.log(p.name) })'); do
+            if npm view "$name" name >/dev/null 2>&1; then
+              echo "$name" >> gui-existing.txt
+            else
+              echo "::warning::$name does not exist on npm yet; skipping it (publish its first version by hand, see .design/gui-packaging.md)"
+            fi
+          done
+          echo "GUI_PLATFORM_PKGS=$(tr '\n' ' ' < gui-existing.txt)" >> "$GITHUB_ENV"
+          echo "Existing: $(cat gui-existing.txt | tr '\n' ' ')"
+
+      # npm silently falls back to token auth (and then fails with E404) when
+      # the OIDC exchange is rejected; do the same exchange here first so the
+      # registry's reason is visible in the log. Fails the job early.
+      - name: Verify npm OIDC trusted-publisher exchange
+        env:
+          PACKAGES: ${{ env.PKG_NAME }} ${{ env.GUI_PLATFORM_PKGS }}
+        run: |
+          # shellcheck disable=SC2086 # one package per word
+          .github/scripts/npm-oidc-check.sh $PACKAGES
+
+      - name: Configure Git
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+      # ---- platform packages (same scheme as the cli) -------------------
+      # tingly-box-gui-<os>-<cpu> carry the desktop zip from the release, so
+      # `npx tingly-box-gui` needs only the npm registry. macOS: the zip holds
+      # the ad-hoc signed TinglyBox.app; the shim re-verifies/re-signs it after
+      # extraction. Linux: the GTK3 bare binary; the shim checks for the
+      # system GTK 3 / WebKitGTK 4.1 libraries before launching it.
+      - name: Download GUI release assets
+        env:
+          RELEASE_TAG: ${{ needs.setup.outputs.release_tag }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          mkdir -p zips
+          gh release download "$RELEASE_TAG" --repo "$REPO" \
+            --pattern "tingly-box-gui-macos-arm64.zip" \
+            --pattern "tingly-box-gui-windows-amd64.zip" \
+            --pattern "tingly-box-gui-linux-amd64.zip" \
+            --pattern "tingly-box-gui-linux-arm64.zip" \
+            --dir zips || {
+              echo "❌ GUI assets missing on $RELEASE_TAG; run the 'Release GUI' workflow for it first"
+              exit 1
+            }
+          ls -lh zips
+
+      - name: Build GUI platform packages
+        run: |
+          VERSION="${{ needs.setup.outputs.npx_version }}"
+          build/npx/scripts/build-platform-packages.sh "$VERSION" zips platform gui > built.txt
+          EXPECTED=$(node -e 'import("./build/npx/shared/platform.js").then(m => console.log(Object.keys(m.GUI_PLATFORM_PACKAGES).length))')
+          BUILT=$(wc -l < built.txt)
+          if [ "$BUILT" -ne "$EXPECTED" ]; then
+            echo "❌ Built $BUILT GUI platform packages, expected $EXPECTED"
+            exit 1
+          fi
+          # Only the packages that already exist on npm are published and pinned.
+          grep -Fxf gui-existing.txt built.txt > built-publish.txt || true
+          mv built-publish.txt built.txt
+          echo "Publishing $(wc -l < built.txt) of $BUILT GUI platform packages:"
+          cat built.txt
+
+      - name: Publish GUI platform packages to npm
+        run: |
+          mapfile -t NAMES < built.txt
+          .github/scripts/npm-publish.sh "${{ needs.setup.outputs.npx_version }}" "${{ needs.setup.outputs.npm_tag }}" \
+            "${NAMES[@]/#/platform/}"
+
+      # ---- gui shim ------------------------------------------------------
+      - name: Update NPX package.json with new version
+        run: |
+          VERSION="${{ needs.setup.outputs.npx_version }}"
+          cd $PKG_DIR
+          npm version "$VERSION" --no-git-tag-version
+          echo "Updated $PKG_NAME to version: $VERSION"
+          cd ..
+
+      # Exact-version pins, as for the cli: the shim uses a platform package
+      # only when its version equals its own.
+      - name: Wire platform packages as optionalDependencies
+        run: |
+          VERSION="${{ needs.setup.outputs.npx_version }}"
+          cd $PKG_DIR
+          while read -r name; do
+            npm pkg set "optionalDependencies.${name}=${VERSION}"
+          done < ../../../built.txt
+          npm pkg get optionalDependencies
+
+      - name: Update bin.js to reference the correct release
+        run: |
+          RELEASE_TAG="${{ needs.setup.outputs.release_tag }}"
+          echo "Updating bin.js to reference release tag: $RELEASE_TAG"
+          cd $PKG_DIR
+          sed -i.bak "s|const BINARY_RELEASE_BRANCH = .*|const BINARY_RELEASE_BRANCH = '$RELEASE_TAG';|g" bin.js
+          echo "Updated bin.js content:"
+          head -20 bin.js
+          rm -f bin.js.bak
+          cd ..
+
+      # Deps hoisted to build/npx/, same as the cli job.
+      - name: Install dependencies
+        working-directory: build/npx
+        run: npm ci
+
+      - name: Run tests
+        working-directory: ${{ env.PKG_DIR }}
+        run: |
+          if [ -f "package.json" ] && npm run | grep -q "test"; then
+            echo "🧪 Running tests..."
+            npm test
+          else
+            echo "⏭️ No tests found, skipping..."
+          fi
+
+      - name: Bundle shim into a single dependency-free file
+        working-directory: ${{ env.PKG_DIR }}
+        run: |
+          # Same as the cli package: zero runtime deps (see .design/npm.md).
+          npx --yes esbuild@0.25.9 bin.js --bundle --platform=node --target=node18 \
+            --format=esm --external:@aws-sdk/client-s3 \
+            --banner:js="import{createRequire as __cr}from'module';const require=__cr(import.meta.url);" \
+            --outfile=bin.bundled.js
+          mv bin.bundled.js bin.js
+          npm pkg delete dependencies
+          node --check bin.js
+          # On this headless Linux runner the GUI shim exits non-zero at its
+          # no-desktop-session check; running it only proves the bundle starts
+          # without deps.
+          rm -rf node_modules ../node_modules
+          node bin.js || true
+          echo "✅ Bundled bin.js ($(du -h bin.js | cut -f1)), dependencies stripped"
+
+      - name: Publish to npm
+        working-directory: ${{ env.PKG_DIR }}
+        run: |
+          VERSION="${{ needs.setup.outputs.npx_version }}"
+          NPM_TAG="${{ needs.setup.outputs.npm_tag }}"
+
+          "$GITHUB_WORKSPACE/.github/scripts/npm-publish.sh" "$VERSION" "$NPM_TAG" .
+
+  annotate-gui:
+    needs: [setup, create-release, publish-gui]
+    name: Annotate Release with GUI NPX Info
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    # create-release has to finish first: both edit the same release body.
+    if: >-
+      always() &&
+      needs.publish-gui.result == 'success' &&
+      needs.create-release.result != 'failure' &&
+      needs.create-release.result != 'cancelled'
+    env:
+      PKG_NAME: tingly-box-gui
+      PKG_TYPE: gui
+    steps:
+      - name: Append GUI NPX info to release notes
+        env:
+          VERSION: ${{ needs.setup.outputs.npx_version }}
+          RELEASE_TAG: ${{ needs.setup.outputs.release_tag }}
+          PKG_TYPE: ${{ env.PKG_TYPE }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          START="<!-- NPX_PUBLISH_INFO_GUI:START -->"
+          END="<!-- NPX_PUBLISH_INFO_GUI:END -->"
+
+          # Reuse the existing version release. Strip only THIS block (bounded by
+          # START/END) so re-runs stay idempotent and never clobber the CLI block.
+          CURRENT_BODY="$(gh release view "$RELEASE_TAG" --repo "$REPO" --json body -q .body 2>/dev/null || echo "")"
+          BASE_BODY="$(printf '%s' "$CURRENT_BODY" | sed "/$START/,/$END/d")"
+
+          {
+            printf '%s\n' "$BASE_BODY"
+            echo "$START"
+            cat << EOF
+          ## 📦 NPX Package - $VERSION ($PKG_TYPE)
+
+          ### 🚀 Installation
+
+          \`\`\`bash
+          # Use with npx (recommended)
+          npx $PKG_NAME@$VERSION start
+
+          # Or install globally
+          npm install -g $PKG_NAME@$VERSION
+          \`\`\`
+
+          ### 🔗 Links
+          - 📦 [View on npm](https://www.npmjs.com/package/$PKG_NAME/v/$VERSION)
+          EOF
+            echo "$END"
+          } > npx_release_notes.md
+
+          echo "Updating release $RELEASE_TAG notes with $PKG_TYPE info..."
+          gh release edit "$RELEASE_TAG" --repo "$REPO" --notes-file npx_release_notes.md

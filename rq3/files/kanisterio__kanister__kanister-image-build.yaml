@@ -1,0 +1,75 @@
+name: Update build image
+
+run-name: Update build image to ${{ inputs.tag }} as ${{ inputs.latest_tag }}
+
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Image tag in the format short-commit-<sha>'
+        required: true
+        type: string
+      latest_tag:
+        description: 'Tag image as latest or dev_latest'
+        required: true
+        default: dev_latest
+        type: choice
+        options:
+        - latest
+        - dev_latest
+  push:
+    branches:
+      - master
+    paths:
+      - 'docker/build/Dockerfile'
+      
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: kanisterio/build
+
+jobs:
+  build:
+    permissions:
+      contents: read
+      packages: write
+
+    runs-on: ubuntu-latest
+    # TODO: Uncomment following when we enable check-file job
+    # needs: check-files
+    # if: needs.check-files.outputs.changed == 'true'
+    steps:
+    - name: Set up QEMU
+      uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+    - name: Image metadata
+      id: meta
+      uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+      with:
+        images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+        tags: |
+          type=ref,event=branch
+          {{date 'YYYY.MM.DD-HHmm'}}
+          type=sha,prefix=commit-
+          type=sha,prefix=short-commit-,format=short,length=12,enable=${{ github.event_name != 'workflow_dispatch' }}
+          type=raw,value=latest,enable=${{ github.event_name != 'workflow_dispatch' }}
+          type=raw,value=v9.99.9-dev,enable=${{ github.event_name != 'workflow_dispatch' }}
+          type=raw,value=${{ inputs.tag }},enable=${{ github.event_name == 'workflow_dispatch' }}
+          type=raw,value=${{ inputs.latest_tag }},enable=${{ github.event_name == 'workflow_dispatch' }}
+    - name: Login to GHCR
+      uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    - name: Build and push
+      uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+      with:
+        context: "{{defaultContext}}:docker/build"
+        platforms: linux/amd64,linux/arm64
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}

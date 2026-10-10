@@ -1,0 +1,129 @@
+name: Migration Nightly
+on:
+  schedule:
+    - cron: '30 19 * * *'
+  workflow_dispatch: {}
+  push:
+    branches: [main]
+    paths:
+      - 'src-tauri/migrations/**'
+      - 'src-tauri/src/data_governance/migration*'
+      - 'src-tauri/src/data_governance/migration/**'
+      - 'src-tauri/tests/migration*'
+      - 'src-tauri/tests/migration-fixtures/**'
+      - 'scripts/migration-ci/**'
+      - 'scripts/ci/**'
+      - '.github/actions/setup-linux-rust/**'
+      - '.github/workflows/migration-nightly.yml'
+permissions:
+  contents: read
+concurrency:
+  group: migration-nightly-${{ github.ref }}
+  cancel-in-progress: false
+env:
+  CARGO_INCREMENTAL: '0'
+  CARGO_BUILD_JOBS: '2'
+  CARGO_PROFILE_DEV_DEBUG: '0'
+  CARGO_PROFILE_TEST_DEBUG: '0'
+  RUSTFLAGS: -C link-arg=-fuse-ld=lld
+  SCCACHE_GHA_ENABLED: 'true'
+  SCCACHE_IDLE_TIMEOUT: '0'
+  SCCACHE_IGNORE_SERVER_IO_ERROR: '1'
+  DEEP_STUDENT_BUILD_NUMBER: '14639'
+jobs:
+  fixtures:
+    name: Migration fixtures (compile once, upgrade + fault + scale)
+    runs-on: ${{ vars.LINUX_BUILD_RUNNER || 'ubuntu-22.04' }}
+    timeout-minutes: 100
+    outputs:
+      full: ${{ steps.full.outputs.fixtures_available }}
+      scale: ${{ steps.scale.outputs.fixtures_available }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version: '22'
+      - run: node scripts/check-migrations.mjs
+      - name: Fetch full fixture tier
+        id: full
+        env:
+          MIGRATION_FIXTURE_URL: ${{ secrets.MIGRATION_FIXTURE_URL }}
+          MIGRATION_FIXTURE_SHA256: ${{ secrets.MIGRATION_FIXTURE_SHA256 }}
+          MIGRATION_FIXTURE_TOKEN: ${{ secrets.MIGRATION_FIXTURE_TOKEN }}
+        run: bash scripts/migration-ci/fetch-fixtures.sh --tier full --dest "$RUNNER_TEMP/full" --mode skip
+      - name: Fetch scale fixture tier
+        id: scale
+        env:
+          MIGRATION_FIXTURE_URL: ${{ secrets.MIGRATION_FIXTURE_URL }}
+          MIGRATION_FIXTURE_SHA256: ${{ secrets.MIGRATION_FIXTURE_SHA256 }}
+          MIGRATION_FIXTURE_TOKEN: ${{ secrets.MIGRATION_FIXTURE_TOKEN }}
+        run: bash scripts/migration-ci/fetch-fixtures.sh --tier scale --dest "$RUNNER_TEMP/scale" --mode skip
+      - uses: ./.github/actions/setup-linux-rust
+      - name: Production migration tests
+        run: bash scripts/ci/with-resource-monitor.sh bash scripts/migration-ci/run-migration-tests.sh --min-tests 50 --count-out "$RUNNER_TEMP/migration-test-count.json"
+      - name: Compile fixture executable once
+        if: steps.full.outputs.fixtures_available == 'true' || steps.scale.outputs.fixtures_available == 'true'
+        run: bash scripts/ci/with-resource-monitor.sh node scripts/ci/test-binary.mjs migration_fixture_upgrade_gate MIGRATION_GATE_BINARY
+      - name: Upgrade and fault modes (same executable)
+        if: steps.full.outputs.fixtures_available == 'true'
+        run: |
+          for mode in upgrade fault; do
+            bash scripts/migration-ci/run-fixture-upgrades.sh --fixture-root "${{ steps.full.outputs.fixture_root }}" \
+              --mode "$mode" --report "$RUNNER_TEMP/migration-reports/full-$mode.jsonl"
+          done
+          node scripts/migration-ci/generate-report.mjs \
+            --out "$RUNNER_TEMP/migration-reports/migration-compatibility-report.json" \
+            --candidate-commit "$GITHUB_SHA" --platform linux-x86_64 --fixture-tier full \
+            --fixture-hash "${{ steps.full.outputs.fixture_hash }}" \
+            --test-count-file "$RUNNER_TEMP/migration-test-count.json" \
+            --harness-report "$RUNNER_TEMP/migration-reports/full-upgrade.jsonl" \
+            --harness-report "$RUNNER_TEMP/migration-reports/full-fault.jsonl" --fail-on-empty
+      - name: Scale mode (same executable)
+        if: steps.scale.outputs.fixtures_available == 'true'
+        run: |
+          bash scripts/migration-ci/run-fixture-upgrades.sh --fixture-root "${{ steps.scale.outputs.fixture_root }}" \
+            --mode scale --max-seconds 600 --report "$RUNNER_TEMP/migration-reports/scale.jsonl"
+      - name: Report fixture coverage
+        if: always()
+        run: |
+          echo 'Full fixtures: ${{ steps.full.outputs.fixtures_available }}; scale fixtures: ${{ steps.scale.outputs.fixtures_available }}' >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: migration-nightly-reports
+          path: |
+            ${{ runner.temp }}/migration-reports/
+            ${{ runner.temp }}/release-resource-metrics.log
+          retention-days: 30
+
+  notify:
+    name: Report nightly outcome
+    needs: fixtures
+    if: always() && !cancelled()
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RESULT: ${{ needs.fixtures.result }}
+          FULL: ${{ needs.fixtures.outputs.full }}
+          SCALE: ${{ needs.fixtures.outputs.scale }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          LABEL=migration-nightly-failure
+          NUMBER=$(gh issue list --state open --label "$LABEL" --json number --jq '.[0].number // empty')
+          if [ "$RESULT" = failure ]; then
+            BODY="Migration nightly failed: $RUN_URL (full=$FULL, scale=$SCALE)"
+            if [ -n "$NUMBER" ]; then
+              gh issue comment "$NUMBER" --body "$BODY"
+            else
+              gh label create "$LABEL" --color D93F0B --force
+              gh issue create --title 'Migration nightly failed' --label "$LABEL" --body "$BODY"
+            fi
+          elif [ "$RESULT" = success ] && [ "$FULL" = true ] && [ "$SCALE" = true ] && [ -n "$NUMBER" ]; then
+            gh issue close "$NUMBER" --reason completed --comment "All fixture tiers recovered: $RUN_URL"
+          fi

@@ -1,0 +1,350 @@
+name: Release
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 17 * * *"
+
+defaults:
+  run:
+    shell: bash -euo pipefail {0}
+
+permissions: {}
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    name: preflight
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      actions: read # required for stable version dates and Runner Image status
+      contents: read
+    outputs:
+      release_due: ${{ steps.due.outputs.release_due }}
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      runner_image: ${{ steps.runner.outputs.image }}
+    steps:
+      - name: Require main branch
+        env:
+          REF: ${{ github.ref }}
+        run: |
+          if [[ "${REF}" != "refs/heads/main" ]]; then
+            echo "::error::Releases must run from main, not ${REF}"
+            exit 1
+          fi
+
+      - name: Set up Git repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Determine whether a release is due
+        id: due
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          CREATED_AT=$(gh api "repos/${REPOSITORY}/actions/runs/${RUN_ID}" --jq '.created_at')
+          PUBLISHED_AT=""
+          RELEASE_ERROR="${RUNNER_TEMP}/release-error"
+          if [[ "${EVENT_NAME}" == "schedule" ]]; then
+            if ! PUBLISHED_AT=$(gh api "repos/${REPOSITORY}/releases/latest" \
+              --jq '.published_at' 2>"${RELEASE_ERROR}"); then
+              if grep -q 'HTTP 404' "${RELEASE_ERROR}"; then
+                echo "No published release exists; creating the first one"
+                PUBLISHED_AT=""
+              else
+                cat "${RELEASE_ERROR}" >&2
+                echo "::error::Unable to determine the latest published release"
+                exit 1
+              fi
+            fi
+          fi
+
+          scripts/release-resolver.sh cadence \
+            "${EVENT_NAME}" "${CREATED_AT}" "${PUBLISHED_AT}" >> "${GITHUB_OUTPUT}"
+
+      - name: Set up Go
+        if: steps.due.outputs.release_due == 'true'
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Determine version
+        id: version
+        if: steps.due.outputs.release_due == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+          COMMIT_SHA: ${{ github.sha }}
+          VERSION_DATE: ${{ steps.due.outputs.version_date }}
+        run: |
+          TAG_INPUT="${RUNNER_TEMP}/release-tags.tsv"
+          gh api --paginate \
+            "repos/${REPOSITORY}/git/matching-refs/tags/v" \
+            --jq '.[] | [.ref, .object.sha, .object.type] | @tsv' > "${TAG_INPUT}.raw"
+          : > "${TAG_INPUT}"
+          while IFS=$'\t' read -r REF OBJECT_SHA OBJECT_TYPE; do
+            TAG="${REF#refs/tags/}"
+            # Lightweight tags point straight at a commit; annotated tags point at
+            # a tag object, so peel those to the underlying commit before comparing.
+            if [[ "${OBJECT_TYPE}" == "tag" ]]; then
+              TAG_SHA=$(gh api "repos/${REPOSITORY}/git/tags/${OBJECT_SHA}" --jq '.object.sha')
+            else
+              TAG_SHA="${OBJECT_SHA}"
+            fi
+            RELEASE_STATE=unknown
+            if [[ "${TAG_SHA}" == "${COMMIT_SHA}" ]] \
+              && [[ "${TAG}" =~ ^v[0-9]{4}\.(0[1-9]|1[0-2])\.(0[1-9]|[12][0-9]|3[01])\.[1-9][0-9]*$ ]] \
+              && [[ "${TAG}" != "v${VERSION_DATE}."* ]]; then
+              RELEASE_ERROR="${RUNNER_TEMP}/release-error-${TAG}"
+              if gh api "repos/${REPOSITORY}/releases/tags/${TAG}" --silent 2>"${RELEASE_ERROR}"; then
+                RELEASE_STATE=published
+              elif grep -q 'HTTP 404' "${RELEASE_ERROR}"; then
+                RELEASE_STATE=unpublished
+              else
+                cat "${RELEASE_ERROR}" >&2
+                echo "::error::Unable to determine whether ${TAG} is published"
+                exit 1
+              fi
+            fi
+            printf '%s\t%s\t%s\t%s\t%s\n' \
+              "${REF}" "${OBJECT_SHA}" "${OBJECT_TYPE}" "${TAG_SHA}" "${RELEASE_STATE}" >> "${TAG_INPUT}"
+          done < "${TAG_INPUT}.raw"
+
+          scripts/release-resolver.sh version \
+            "${VERSION_DATE}" "${COMMIT_SHA}" < "${TAG_INPUT}" >> "${GITHUB_OUTPUT}"
+
+      - name: Validate existing tag target
+        if: steps.due.outputs.release_due == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+          COMMIT_SHA: ${{ github.sha }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          TAG_ERROR="${RUNNER_TEMP}/tag-error"
+          if EXISTING=$(gh api "repos/${REPOSITORY}/git/ref/tags/${TAG}" --jq '[.object.sha, .object.type] | @tsv' 2>"${TAG_ERROR}"); then
+            IFS=$'\t' read -r EXISTING_SHA EXISTING_TYPE <<< "${EXISTING}"
+            # Peel an annotated tag to the commit it references before comparing.
+            if [[ "${EXISTING_TYPE}" == "tag" ]]; then
+              EXISTING_SHA=$(gh api "repos/${REPOSITORY}/git/tags/${EXISTING_SHA}" --jq '.object.sha')
+            fi
+            scripts/release-resolver.sh validate-tag "${TAG}" "${COMMIT_SHA}" "${EXISTING_SHA}"
+            echo "Tag ${TAG} already points to this commit; continuing recovery run"
+          elif ! grep -q 'HTTP 404' "${TAG_ERROR}"; then
+            cat "${TAG_ERROR}" >&2
+            echo "::error::Unable to check whether tag ${TAG} already exists"
+            exit 1
+          fi
+
+      - name: Test
+        if: steps.due.outputs.release_due == 'true'
+        run: go test ./...
+
+      - name: Set up Docker Buildx
+        if: steps.due.outputs.release_due == 'true'
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Resolve commit-matched runner image
+        id: runner
+        if: steps.due.outputs.release_due == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          RUNNER_IMAGE=$(scripts/wait-for-runner-image.sh \
+            "${REPOSITORY}" "${COMMIT_SHA}" 900 15)
+          echo "image=${RUNNER_IMAGE}" >> "${GITHUB_OUTPUT}"
+
+  build:
+    name: build (${{ matrix.goos }}-${{ matrix.goarch }})
+    needs: preflight
+    if: needs.preflight.outputs.release_due == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            runner: ubuntu-24.04
+            run_binary: true
+          - goos: linux
+            goarch: arm64
+            runner: ubuntu-24.04-arm
+            run_binary: true
+          - goos: darwin
+            goarch: arm64
+            runner: macos-26
+            run_binary: true
+          - goos: darwin
+            goarch: amd64
+            runner: macos-26
+            run_binary: false
+          # Cross-compiled: CGO is off, and the Windows CI leg already runs a
+          # natively built scrutineer.exe.
+          - goos: windows
+            goarch: amd64
+            runner: ubuntu-24.04
+            run_binary: false
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      attestations: write # required to generate build provenance for the release archive
+      id-token: write # required to sign the provenance with GitHub OIDC
+    env:
+      ARTIFACT: scrutineer-${{ needs.preflight.outputs.version }}-${{ matrix.goos }}-${{ matrix.goarch }}
+    steps:
+      - name: Set up Git repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          VERSION: ${{ needs.preflight.outputs.version }}
+          RUNNER_IMAGE: ${{ needs.preflight.outputs.runner_image }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          BINARY=scrutineer
+          if [[ "${GOOS}" == "windows" ]]; then
+            BINARY=scrutineer.exe
+          fi
+          echo "BINARY=${BINARY}" >> "${GITHUB_ENV}"
+          BUILD_DATE=$(git show -s --format=%cI "${COMMIT_SHA}")
+          mkdir -p dist
+          CGO_ENABLED=0 go build -trimpath \
+            -ldflags "-s -w -X main.version=${VERSION} -X main.commit=${COMMIT_SHA} -X main.buildDate=${BUILD_DATE} -X main.defaultRunnerImage=${RUNNER_IMAGE}" \
+            -o "dist/${BINARY}" ./cmd/scrutineer
+
+      - name: Validate executable
+        if: matrix.run_binary
+        env:
+          VERSION: ${{ needs.preflight.outputs.version }}
+          RUNNER_IMAGE: ${{ needs.preflight.outputs.runner_image }}
+        run: |
+          OUTPUT=$("dist/${BINARY}" --version)
+          grep -F "scrutineer ${VERSION}" <<< "${OUTPUT}"
+          grep -F "runner: ${RUNNER_IMAGE}" <<< "${OUTPUT}"
+
+      - name: Validate binary format
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          file "dist/${BINARY}"
+          if [[ "${GOOS}" == "linux" ]]; then
+            if readelf -l "dist/${BINARY}" | grep -q 'Requesting program interpreter'; then
+              echo "::error::${GOOS}-${GOARCH} binary is dynamically linked"
+              exit 1
+            fi
+          elif [[ "${GOOS}" == "windows" ]]; then
+            if ! file "dist/${BINARY}" | grep -q 'PE32+'; then
+              echo "::error::${GOOS}-${GOARCH} artifact is not a PE32+ executable"
+              exit 1
+            fi
+          elif [[ "${GOARCH}" == "amd64" ]] && ! file "dist/${BINARY}" | grep -q 'x86_64'; then
+            echo "::error::darwin-amd64 artifact is not an x86_64 Mach-O binary"
+            exit 1
+          fi
+
+      - name: Package
+        run: |
+          mkdir -p package
+          cp "dist/${BINARY}" LICENSE README.md package/
+          TAR_FLAGS=(--no-xattrs)
+          if [[ "${RUNNER_OS}" == "macOS" ]]; then
+            TAR_FLAGS+=(--no-mac-metadata)
+          fi
+          /usr/bin/tar "${TAR_FLAGS[@]}" -czf "${ARTIFACT}.tar.gz" -C package .
+
+      - name: Generate build provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: ${{ env.ARTIFACT }}.tar.gz
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ env.ARTIFACT }}
+          path: ${{ env.ARTIFACT }}.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: release
+    needs: [preflight, build]
+    if: needs.preflight.outputs.release_due == 'true'
+    runs-on: ubuntu-slim
+    timeout-minutes: 20
+    permissions:
+      contents: write # required to create the version tag and GitHub release
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: artifacts
+          pattern: scrutineer-*
+          merge-multiple: true
+
+      - name: Generate checksums
+        working-directory: artifacts
+        run: sha256sum -- *.tar.gz > SHA256SUMS
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+          COMMIT_SHA: ${{ github.sha }}
+          TAG: ${{ needs.preflight.outputs.tag }}
+        run: |
+          RELEASE_ERROR="${RUNNER_TEMP}/release-error"
+          if gh api "repos/${REPOSITORY}/releases/tags/${TAG}" --silent 2>"${RELEASE_ERROR}"; then
+            echo "Release ${TAG} is already published; nothing to recover"
+            exit 0
+          elif grep -q 'HTTP 404' "${RELEASE_ERROR}"; then
+            DRAFTS=$(gh api --paginate "repos/${REPOSITORY}/releases?per_page=100" \
+              --jq '.[] | select(.draft) | [.id, .tag_name] | @tsv')
+            while IFS=$'\t' read -r DRAFT_ID DRAFT_TAG; do
+              if [[ -n "${DRAFT_ID}" && "${DRAFT_TAG}" == "${TAG}" ]]; then
+                echo "Deleting incomplete draft ${DRAFT_ID} for ${TAG}"
+                gh api --method DELETE "repos/${REPOSITORY}/releases/${DRAFT_ID}"
+              fi
+            done <<< "${DRAFTS}"
+
+            gh release create "${TAG}" \
+              --repo "${REPOSITORY}" \
+              --target "${COMMIT_SHA}" \
+              --title "${TAG}" \
+              --generate-notes \
+              --draft
+          else
+            cat "${RELEASE_ERROR}" >&2
+            echo "::error::Unable to check whether release ${TAG} already exists"
+            exit 1
+          fi
+
+          gh release upload "${TAG}" \
+            --repo "${REPOSITORY}" \
+            --clobber \
+            artifacts/*.tar.gz artifacts/SHA256SUMS
+          gh release edit "${TAG}" \
+            --repo "${REPOSITORY}" \
+            --draft=false

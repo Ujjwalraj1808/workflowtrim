@@ -1,0 +1,95 @@
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: "Build documentation"
+on:
+  schedule:
+    - cron: '0 0 * * *' # Deploy every day
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: true
+
+jobs:
+  build-documentation:
+    if: github.repository == 'apache/flink'
+    runs-on: ubuntu-latest
+    strategy:
+      max-parallel: 1
+      matrix:
+        branch:
+          - master
+          - release-2.3
+          - release-2.2
+          - release-1.20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ matrix.branch }}
+
+      - name: Set branch environment variable
+        run: |
+          currentBranch=$(git branch --show-current)
+
+          echo "flink_branch=${currentBranch}" >> ${GITHUB_ENV}
+
+          if [ "${currentBranch}" = "master" ]; then
+            echo "flink_alias=release-2.4" >> ${GITHUB_ENV}
+          elif [ "${currentBranch}" = "release-2.3" ]; then
+            echo "flink_alias=stable" >> ${GITHUB_ENV}
+          elif [ "${currentBranch}" = "release-1.20" ]; then
+            echo "flink_alias=lts" >> ${GITHUB_ENV}
+          fi
+
+      - name: Cache Maven dependencies
+        uses: actions/cache@v5
+        with:
+          path: ~/.m2/repository
+          key: ${{ runner.os }}-maven-docs-${{ hashFiles('**/pom.xml') }}
+          restore-keys: |
+            ${{ runner.os }}-maven-docs-
+
+      - name: Build documentation
+        # The build runs as root, the upload below as the runner user, hence the chmod
+        run: |
+          docker run --rm \
+            --volume "$PWD:/root/flink" \
+            --volume "$HOME/.m2/repository:/root/.m2/repository" \
+            apache/flink-ci-docker:java_8_11_17_21_25_maven_386_3916_noble \
+            bash -c "cd /root/flink && ./.github/workflows/docs.sh && chmod -R a+rX docs/target"
+
+      - name: Upload documentation
+        env:
+          NIGHTLIES_RSYNC_HOST: ${{ secrets.NIGHTLIES_RSYNC_HOST }}
+          NIGHTLIES_RSYNC_KEY: ${{ secrets.NIGHTLIES_RSYNC_KEY }}
+          NIGHTLIES_RSYNC_PATH: ${{ secrets.NIGHTLIES_RSYNC_PATH }}
+          NIGHTLIES_RSYNC_PORT: ${{ secrets.NIGHTLIES_RSYNC_PORT }}
+          NIGHTLIES_RSYNC_USER: ${{ secrets.NIGHTLIES_RSYNC_USER }}
+        run: |
+          eval "$(ssh-agent -s)"
+          trap 'ssh-agent -k > /dev/null || true' EXIT
+          printf '%s\n' "${NIGHTLIES_RSYNC_KEY}" | ssh-add -
+          unset NIGHTLIES_RSYNC_KEY
+          upload() {
+            echo "Uploading to flink-docs-$1"
+            rsync --archive --compress --delete \
+              -e "ssh -o StrictHostKeyChecking=no -p ${NIGHTLIES_RSYNC_PORT}" \
+              docs/target/ "${NIGHTLIES_RSYNC_USER}@${NIGHTLIES_RSYNC_HOST}:${NIGHTLIES_RSYNC_PATH}/flink/flink-docs-$1/"
+          }
+          upload "${flink_branch}"
+          if [ -n "${flink_alias}" ]; then
+            upload "${flink_alias}"
+          fi

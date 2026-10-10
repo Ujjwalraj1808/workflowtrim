@@ -1,0 +1,12 @@
+name: Dependency Check Changes
+on:
+  pull_request:
+    paths:
+      - 'code-style/dependency-check-suppressions.xml'
+      - 'java/**/pom.xml'
+
+jobs:
+  check:
+    uses: ./.github/workflows/dependency-check.yaml
+    with:
+      failOnCacheMiss: true

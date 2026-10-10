@@ -1,0 +1,366 @@
+name: Original SSOT Sync
+
+# ──────────────────────────────────────────────────────────────
+# 원본과 검색 catalog를 함께 갱신한다.
+#  ① dart-zip   : 정기보고서 원본 zip archive(증분) → 변경 종목 tar seed → panel within-company
+#                 증분 빌드(신규 zip만 merge=True period upsert) → dartOriginal(tar) + panel HF push.
+#                 dart_full_rebuild=true 시에만 전이력 재빌드(self-heal).  (dartlab.pipeline dartZip)
+#  ①' dart-reconcile : panel rcept 단위(파일내) 자가치유 — DART 정기 rcept(85일 윈도) vs HF panel
+#                 rceptNo 차집합 = 누락 분기만 fetch+merge+push. forward 7일 윈도가 run 실패/
+#                 타임아웃으로 놓친 분기보고서를 회복한다.
+#                 (dartlab.pipeline panelRceptReconcile)
+#  ①'' dart-catalog : HF panel SHA256 대조로 미반영 원문을 찾아 검색 catalog에 병합한다.
+#  ② allfilings : 비정기 공시 일별 parquet forward 7일 증분.  (dartlab.pipeline allFilings)
+#  ②' allfilings-backfill : 과거 커버리지 심화는 별도 AllFilings Backfill workflow 가 자동 담당.
+#                 이 workflow 에서는 명시 dispatch 때만 실행해 current 전진/검색 갱신을 막지 않는다.
+#  ③ edgar      : panel per-filing 증분 — daily-index 로 신규 재무공시 발견 → 영향 ticker
+#                 기존 panel HF seed → 신규 accession 만 append → 변경분 deploy → raw 폐기.
+#                 EDGAR_FULL_REBUILD=1 일 때만 전 universe 부트스트랩(dispatch, 디스크 floor).
+#
+# cron 0 2 UTC = KST 11:00 — kindlist(00:00) 후, edgarSync(04:30) 전 빈 창(race 회피).
+# HF-repo-family 직렬화(412 commit-conflict 회피) 2 축:
+#   ① 외부 cron 과의 직렬 = concurrency group hf-dart-push (dataSync/dartNewStocks/dataPrebuild/
+#     valuationSnapshot/newsArchiveSync 와 공유, cancel-in-progress:false). 메인 public repo
+#     (eddmpython/dartlab-data, panel·allFilings 동거)에 push 하는 모든 cron 을 한 줄로.
+#   ② 본 run 내부 dart 4-job 직렬 = needs 체인 (dart-zip → dart-reconcile → dart-catalog →
+#     allfilings). ⚠ 같은 group 을 *병렬* 로 4 job 이 선언하면 GitHub 동시성은
+#     "실행 1 + 대기 1" 만 허용 → 새 대기가 이전 대기를 취소 → 매 run 2~3 job 이 1 초 만에
+#     queue 축출(2026-06 allfilings 산출물 43h 동결 사고). needs 로 한 번에 한 job 만
+#     group 을 요청하게 해 자가 축출을 차단. 상위 실패가 하위(특히 daily allfilings)를 막지
+#     않도록 하위 if 에 !cancelled() 부여(skip 된 needs 도 통과). 백필은 별도 workflow 로 분리해
+#     긴 과거 수집/일시 장애가 daily current + Search Delta 후속 갱신을 붙잡지 않게 한다.
+#   dartOriginal(private repo)은 별 repo 라 무관하나 dart-zip 한 job 이 panel+original 둘 다 다뤄 자연 직렬.
+#   edgar → hf-edgar-push(edgarSync 와 직렬, 본 run 내 dart 체인과 무관해 병렬 유지).
+# ──────────────────────────────────────────────────────────────
+
+on:
+  schedule:
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+    inputs:
+      jobs:
+        description: 'all | dart-zip | dart-reconcile | dart-catalog | allfilings | allfilings-backfill | edgar'
+        default: 'all'
+        type: choice
+        options: [all, dart-zip, dart-reconcile, dart-catalog, allfilings, allfilings-backfill, edgar]
+      lookback_days:
+        description: 'archive/allFilings forward 윈도 (일)'
+        default: '7'
+        type: string
+      edgar_full_rebuild:
+        description: 'EDGAR 전 universe 부트스트랩 재빌드 (true=무겁다·디스크 floor 가드, false=일간 per-filing 증분)'
+        default: 'false'
+        type: string
+      dart_full_rebuild:
+        description: 'DART panel 전이력 재빌드 (true=self-heal·전 zip 재파싱, false=신규 zip만 within-company 증분)'
+        default: 'false'
+        type: string
+      search_catalog_bootstrap:
+        description: '초기 search source catalog 생성 허용 (true=이전 manifest 없이 높은 하한으로 1회 bootstrap)'
+        default: 'false'
+        type: string
+
+permissions:
+  contents: read  # HF push 만(HF_TOKEN) — git commit/release 없음. 최소권한.
+
+jobs:
+  dart-zip:
+    if: ${{ github.event_name == 'schedule' || github.event.inputs.jobs == 'all' || github.event.inputs.jobs == 'dart-zip' }}
+    runs-on: ubuntu-latest
+    # 150 -> 240. 정기보고서 마감 주에는 변경 종목이 평시의 30 배 가까이 뛴다
+    # (2026-08-12 85 종목 -> 2026-08-19 2448 종목 실측). 그 주에 dart-zip 과
+    # dart-reconcile 이 둘 다 정확히 150 분에 잘렸다. 업로드를 배치 커밋으로 바꿔
+    # HF 호출 수를 낮췄지만 seed 와 merge 는 여전히 종목 수에 비례하고 429 백오프가
+    # 최대 900 초씩 남아 있다. 계절 피크를 정상 작업량으로 인정하고 상한을 맞춘다.
+    # panel 업로드는 200 종목마다 checkpoint 로 올리고(dartZip._PANEL_UPLOAD_EVERY) 원본 tar 를 panel
+    # 보다 먼저 올리므로, 상한에 잘려도 그때까지의 merge 는 HF 에 남고 다음 run 은 HF 차집합만 본다.
+    timeout-minutes: 240
+    concurrency:
+      group: hf-dart-push
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+      - name: Set up Python
+        run: uv python install 3.12
+      - name: Install dependencies
+        run: uv sync
+      - name: Smoke import
+        run: uv run python -c "import dartlab; print('dartlab', getattr(dartlab, '__version__', 'dev'))"
+      - name: DART 정기 zip archive + seed + panel 빌드 + HF
+        env:
+          DART_API_KEYS: ${{ secrets.DART_API_KEYS }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          SYNC_LOOKBACK_DAYS: ${{ github.event.inputs.lookback_days || '7' }}
+          PANEL_WORKERS: '2'
+          # 기본 within-company 증분(신규 zip만 merge). full-rebuild(self-heal)는 dispatch 시에만.
+          DART_PANEL_FULL_REBUILD: ${{ github.event.inputs.dart_full_rebuild == 'true' && '1' || '0' }}
+        run: uv run python -X utf8 -m dartlab.pipeline dartZip
+
+  dart-reconcile:
+    needs: dart-zip  # 자가 축출 차단 — 한 번에 한 dart job 만 hf-dart-push 요청
+    if: ${{ !cancelled() && (github.event_name == 'schedule' || github.event.inputs.jobs == 'all' || github.event.inputs.jobs == 'dart-reconcile') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    concurrency:
+      group: hf-dart-push  # 메인 public repo(panel) + private(dartOriginal) push → dart-zip 와 직렬(412 회피)
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+      - name: Set up Python
+        run: uv python install 3.12
+      - name: Install dependencies
+        run: uv sync
+      - name: Smoke import
+        run: uv run python -c "import dartlab"
+      - name: panel rcept 단위 자가치유 (DART 정기 rcept vs panel 누락분 fetch+merge+HF)
+        # forward dartZip 7일 윈도가 놓친 분기보고서를 85일 윈도 reconcile 로 회복.
+        # 탐지=HF panel rceptNo 컬럼 range-read(싸다), heal=누락 rcept zip 만 fetch.
+        # heal 은 200 종목 chunk 로 "원본 tar, 그다음 panel(checkpoint 업로드)" 순으로 닫는다
+        # (panelRceptReconcile._HEAL_CHUNK). 분기 마감 뒤 수천 종목 backlog 가 timeout 에 통째로 증발하지 않는다.
+        env:
+          DART_API_KEYS: ${{ secrets.DART_API_KEYS }}
+          DARTLAB_DART_CONNECT_RETRY_ATTEMPTS: '6'  # OpenDART TCP 연결 불통(수 분) 대비, 약 4분 긴 백오프 재시도
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          DART_PANEL_RECONCILE_DAYS: '85'  # corp 생략 list.json 3개월(~92일) cap 안쪽 + 현 백로그 커버
+          PANEL_WORKERS: '2'
+        run: uv run python -X utf8 -m dartlab.pipeline panelRceptReconcile
+
+  dart-catalog:
+    needs: [dart-zip, dart-reconcile]
+    if: ${{ !cancelled() && (github.event_name == 'schedule' || contains(fromJSON('["all", "dart-zip", "dart-reconcile", "dart-catalog"]'), github.event.inputs.jobs)) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    concurrency:
+      group: hf-dart-push
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v7
+      - run: uv python install 3.12
+      - run: uv sync
+      - name: DART panel search source manifest + catalog
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          SEARCH_CATALOG_BOOTSTRAP: ${{ github.event.inputs.search_catalog_bootstrap == 'true' && '1' || '0' }}
+        run: |
+          extra=()
+          if [ "${SEARCH_CATALOG_BOOTSTRAP:-0}" != "1" ]; then
+            extra+=(--require-previous-manifest)
+          fi
+          uv run python -X utf8 .github/scripts/search/buildSearchCatalog.py \
+            --source dartPanel \
+            --input 'data/dart/panel/*.parquet' \
+            --out-dir data/dart/searchCatalog/dartPanel \
+            --producer originalSync.dart-catalog \
+            --compare-remote-manifest \
+            --merge-previous-catalog \
+            --reconcile-remote-source \
+            --min-files 2400 \
+            --min-rows 90000 \
+            --min-catalog-rows 90000 \
+            "${extra[@]}" \
+            --upload
+      - name: Upload DART panel search catalog evidence
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: search-catalog-dartPanel-${{ github.job }}-${{ github.run_id }}
+          path: data/dart/searchCatalog/dartPanel/**
+          if-no-files-found: ignore
+  allfilings:
+    needs: dart-catalog  # 원문과 catalog 반영 뒤 실행. 상위 실패는 !cancelled()로 격리한다.
+    if: ${{ !cancelled() && (github.event_name == 'schedule' || github.event.inputs.jobs == 'all' || github.event.inputs.jobs == 'allfilings') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    concurrency:
+      group: hf-dart-push  # 메인 public repo 동거 → dart-zip/dataSync 와 직렬(412 회피)
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+      - name: Set up Python
+        run: uv python install 3.12
+      - name: Install dependencies
+        run: uv sync
+      - name: Smoke import
+        run: uv run python -c "import dartlab"
+      - name: allFilings forward 증분 + HF push
+        env:
+          DART_API_KEYS: ${{ secrets.DART_API_KEYS }}
+          DARTLAB_DART_CONNECT_RETRY_ATTEMPTS: '6'  # OpenDART TCP 연결 불통(수 분) 대비, 약 4분 긴 백오프 재시도
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          SYNC_LOOKBACK_DAYS: ${{ github.event.inputs.lookback_days || '7' }}
+          DARTLAB_HF_RETRY_ATTEMPTS: '3'
+          DARTLAB_HF_RETRY_MAX_SINGLE_WAIT_SECONDS: '120'
+        run: uv run python -X utf8 -m dartlab.pipeline allFilings
+      - name: 비정기공시 코드 버킷 증분 갱신 + HF 원자 push
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          DARTLAB_HF_RETRY_ATTEMPTS: '3'
+          DARTLAB_HF_RETRY_MAX_SINGLE_WAIT_SECONDS: '120'
+        run: uv run python -X utf8 .github/scripts/sync/buildAllFilingsRecent.py
+      - name: allFilings search source manifest + catalog
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          SEARCH_CATALOG_BOOTSTRAP: ${{ github.event.inputs.search_catalog_bootstrap == 'true' && '1' || '0' }}
+          DARTLAB_HF_RETRY_ATTEMPTS: '3'
+          DARTLAB_HF_RETRY_MAX_SINGLE_WAIT_SECONDS: '120'
+        run: |
+          extra=()
+          if [ "${SEARCH_CATALOG_BOOTSTRAP:-0}" != "1" ]; then
+            extra+=(--require-previous-manifest)
+          fi
+          uv run python -X utf8 .github/scripts/search/buildSearchCatalog.py \
+            --source allFilings \
+            --input 'data/dart/allFilings/**/*.parquet' \
+            --out-dir data/dart/searchCatalog/allFilings \
+            --producer originalSync.allfilings \
+            --compare-remote-manifest \
+            --merge-previous-catalog \
+            --min-files 300 \
+            --min-rows 150000 \
+            --min-catalog-rows 150000 \
+            "${extra[@]}" \
+            --upload
+      - name: Upload allFilings search catalog evidence
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: search-catalog-allFilings-${{ github.job }}-${{ github.run_id }}
+          path: data/dart/searchCatalog/allFilings/**
+          if-no-files-found: ignore
+
+  allfilings-backfill:
+    needs: allfilings  # 명시 dispatch 전용. 자동 백필은 allFilingsBackfill.yml 이 담당.
+    if: ${{ !cancelled() && github.event_name == 'workflow_dispatch' && github.event.inputs.jobs == 'allfilings-backfill' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    concurrency:
+      group: hf-dart-push  # 메인 public repo 동거 → forward/dart-zip 와 직렬(412 회피)
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+      - name: Set up Python
+        run: uv python install 3.12
+      - name: Install dependencies
+        run: uv sync
+      - name: Smoke import
+        run: uv run python -c "import dartlab"
+      - name: allFilings 과거 백필 (2개월/run, floor 2015-01)
+        # HF 최오래 일자 직전 달부터 과거로 2개월 collect+push. floor 201501 도달 시 no-op(skipped=true).
+        # ephemeral 안전: _remoteDates 스코프 목록만 읽고 신규 일자만 수집(전이력 pull 없음).
+        id: backfill
+        env:
+          DART_API_KEYS: ${{ secrets.DART_API_KEYS }}
+          DARTLAB_DART_CONNECT_RETRY_ATTEMPTS: '6'  # OpenDART TCP 연결 불통(수 분) 대비, 약 4분 긴 백오프 재시도
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          DART_ALLFILINGS_BACKFILL_MONTHS: '2'
+          DART_ALLFILINGS_BACKFILL_FLOOR: '201501'
+          DARTLAB_HF_RETRY_ATTEMPTS: '3'
+          DARTLAB_HF_RETRY_MAX_SINGLE_WAIT_SECONDS: '120'
+        run: uv run python -X utf8 -m dartlab.pipeline allFilingsBackfill
+      - name: 비정기공시 코드 버킷 증분 갱신 + HF 원자 push (백필 slab 반영)
+        # 방금 수집한 과거 slab의 종목코드 버킷만 원격 파티션과 merge한다. 백필이 할 일 없음이면 건너뛴다.
+        if: steps.backfill.outputs.skipped != 'true'
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          DARTLAB_HF_RETRY_ATTEMPTS: '3'
+          DARTLAB_HF_RETRY_MAX_SINGLE_WAIT_SECONDS: '120'
+        run: uv run python -X utf8 .github/scripts/sync/buildAllFilingsRecent.py
+      - name: allFilings search source manifest + catalog
+        if: steps.backfill.outputs.skipped != 'true'
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          SEARCH_CATALOG_BOOTSTRAP: ${{ github.event.inputs.search_catalog_bootstrap == 'true' && '1' || '0' }}
+          DARTLAB_HF_RETRY_ATTEMPTS: '3'
+          DARTLAB_HF_RETRY_MAX_SINGLE_WAIT_SECONDS: '120'
+        run: |
+          extra=()
+          if [ "${SEARCH_CATALOG_BOOTSTRAP:-0}" != "1" ]; then
+            extra+=(--require-previous-manifest)
+          fi
+          uv run python -X utf8 .github/scripts/search/buildSearchCatalog.py \
+            --source allFilings \
+            --input 'data/dart/allFilings/**/*.parquet' \
+            --out-dir data/dart/searchCatalog/allFilings \
+            --producer originalSync.allfilings-backfill \
+            --compare-remote-manifest \
+            --merge-previous-catalog \
+            --min-files 300 \
+            --min-rows 150000 \
+            --min-catalog-rows 150000 \
+            "${extra[@]}" \
+            --upload
+      - name: Upload allFilings search catalog evidence
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: search-catalog-allFilings-${{ github.job }}-${{ github.run_id }}
+          path: data/dart/searchCatalog/allFilings/**
+          if-no-files-found: ignore
+
+  edgar:
+    if: ${{ github.event_name == 'schedule' || github.event.inputs.jobs == 'all' || github.event.inputs.jobs == 'edgar' }}
+    runs-on: ubuntu-latest
+    # full-rebuild(EDGAR_FULL_REBUILD=1)는 resumable(ledger)+배치 upload 라 timeout 취소돼도 진행분 보존.
+    # 350 = GitHub job 한도(360) 근처로 run 당 처리량↑. 증분(기본)은 수분이라 영향 없음.
+    # 코드 시간가드 EDGAR_REBUILD_DEADLINE_MIN(기본 320)이 이보다 작아 upload/ledger 여유 확보.
+    timeout-minutes: 350
+    concurrency:
+      group: hf-edgar-push
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+      - name: Set up Python
+        run: uv python install 3.12
+      - name: Install dependencies
+        run: uv sync
+      - name: Smoke import
+        run: uv run python -c "import dartlab"
+      - name: EDGAR panel per-filing 증분(daily-index 발견 → append) + deploy
+        # 일간 = per-filing 증분(raw 폐기 정합): daily-index 로 신규 재무공시 발견 → 영향 ticker
+        # 기존 panel HF seed → 신규 accession 만 fetch·append → 변경분 deploy → raw 폐기.
+        # EDGAR_FULL_REBUILD=1(dispatch)일 때만 전 universe 부트스트랩(무겁다, 디스크 floor 가드).
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          SYNC_LOOKBACK_DAYS: ${{ github.event.inputs.lookback_days || '7' }}
+          EDGAR_FULL_REBUILD: ${{ github.event.inputs.edgar_full_rebuild == 'true' && '1' || '0' }}
+          EDGAR_SINCE_YEAR: '2015'
+        run: uv run python -X utf8 -m dartlab.pipeline edgarPanel
+      - name: EDGAR panel search source manifest + catalog
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          SEARCH_CATALOG_BOOTSTRAP: ${{ github.event.inputs.search_catalog_bootstrap == 'true' && '1' || '0' }}
+        run: |
+          extra=()
+          if [ "${SEARCH_CATALOG_BOOTSTRAP:-0}" != "1" ]; then
+            extra+=(--require-previous-manifest)
+          fi
+          uv run python -X utf8 .github/scripts/search/buildSearchCatalog.py \
+            --source edgarPanel \
+            --input 'data/edgar/panel/*.parquet' \
+            --out-dir data/dart/searchCatalog/edgarPanel \
+            --producer originalSync.edgar \
+            --compare-remote-manifest \
+            --merge-previous-catalog \
+            --min-files 2000 \
+            --min-rows 50000 \
+            --min-catalog-rows 50000 \
+            "${extra[@]}" \
+            --upload
+      - name: Upload EDGAR panel search catalog evidence
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: search-catalog-edgarPanel-${{ github.job }}-${{ github.run_id }}
+          path: data/dart/searchCatalog/edgarPanel/**
+          if-no-files-found: ignore

@@ -1,0 +1,141 @@
+name: Backend Pull Requests
+
+on:
+  pull_request:
+    branches: [ master ]
+    paths:
+      # Backend modules
+      - 'common/**'
+      - 'master/**'
+      - '!master/front-end/**'
+      - 'master-oss/**'
+      - 'plugins/**'
+      - 'sbs/**'
+
+      # Playground projects
+      - 'playgrounds/**'
+
+      # Core Gradle build configuration
+      - 'buildSrc/**'
+      - 'gradle/**'
+      - 'build.gradle.kts'
+      - 'settings.gradle.kts'
+      - 'gradle.properties'
+      - 'gradlew'
+      - 'gradlew.bat'
+      - 'Makefile'
+
+      # Code quality, formatting, and license configurations
+      - 'pmd.ruleset.xml'
+      - '.editorconfig'
+      - 'LICENSE'
+      - 'LICENSE_HEADER'
+
+concurrency:
+  # Unique ID of the concurrency group, which cancels an already running workflow for this PR (if any)
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  check-pr-size:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Check PR size
+        uses: ./.github/actions/check-pr-size
+        with:
+          max-lines: '500'
+
+  backend-build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      # Java 25 will be installed at this step.
+      - name: Build Backend
+        id: build-backend
+        uses: ./.github/actions/build-master
+        with:
+          gradle-cache-encryption-key: ''
+
+      # Set up Extra JDKs for Playgrounds
+      - name: Set up JDK 17 for Playgrounds
+        uses: actions/setup-java@v5.6.0
+        id: setup-java-17
+        with:
+          java-version: '17'
+          distribution: 'liberica'
+
+      - name: Set up JDK 21 for Playgrounds
+        uses: actions/setup-java@v5.6.0
+        id: setup-java-21
+        with:
+          java-version: '21'
+          distribution: 'liberica'
+
+      # Starting build playground projects
+      - name: Detect Changed Modules
+        uses: dorny/paths-filter@v4
+        id: filter
+        with:
+          filters: |
+            sb2_specific_trigger:
+              - 'sbs/axelix-spring-boot-2-starter/**'
+              - 'playgrounds/spring-petclinic-maven-sb-2/**'
+              - 'playgrounds/notification-service-gradle-sb-2/**'
+            
+            sb3_specific_trigger:
+              - 'sbs/axelix-spring-boot-3-starter/**'
+              - 'playgrounds/spring-petclinic-gradle-sb-3/**'
+              - 'playgrounds/feature-service-maven-sb-3/**'
+
+            sb4_specific_trigger:
+              - 'sbs/axelix-spring-boot-4-starter/**'
+              - 'playgrounds/spring-petclinic-maven-sb-4/**'
+              - 'playgrounds/api-gateway-gradle-sb-4/**'
+
+            sbs_global_trigger:
+              - 'common/**'
+              - 'sbs/starter-domain/**'
+              - 'buildSrc/**'
+              - 'gradle/**'
+              - 'build.gradle.kts'
+              - 'settings.gradle.kts'
+              - 'gradle.properties'
+              - '.github/workflows/**'
+              - 'Makefile'
+          
+      - name: Run Conditional Playground Build via Make
+        env:
+          SB2_CHANGE_TRIGGER: ${{ steps.filter.outputs.sb2_specific_trigger }}
+          SB3_CHANGE_TRIGGER: ${{ steps.filter.outputs.sb3_specific_trigger }}
+          SB4_CHANGE_TRIGGER: ${{ steps.filter.outputs.sb4_specific_trigger }}
+          GLOBAL_CHANGE_TRIGGER: ${{ steps.filter.outputs.sbs_global_trigger }}
+
+          JAVA_17_HOME: ${{ steps.setup-java-17.outputs.path }}
+          JAVA_21_HOME: ${{ steps.setup-java-21.outputs.path }}
+          JAVA_25_HOME: ${{ steps.build-backend.outputs.java-25-home }}
+        run: |
+          SHOULD_BUILD_SB2="false"
+          if [ "$SB2_CHANGE_TRIGGER" = "true" ] || [ "$GLOBAL_CHANGE_TRIGGER" = "true" ]; then
+            SHOULD_BUILD_SB2="true"
+          fi
+          
+          SHOULD_BUILD_SB3="false"
+          if [ "$SB3_CHANGE_TRIGGER" = "true" ] || [ "$GLOBAL_CHANGE_TRIGGER" = "true" ]; then
+            SHOULD_BUILD_SB3="true"
+          fi
+
+          SHOULD_BUILD_SB4="false"
+          if [ "$SB4_CHANGE_TRIGGER" = "true" ] || [ "$GLOBAL_CHANGE_TRIGGER" = "true" ]; then
+            SHOULD_BUILD_SB4="true"
+          fi
+
+          make build-playground BUILD_SB2="$SHOULD_BUILD_SB2" BUILD_SB3="$SHOULD_BUILD_SB3" BUILD_SB4="$SHOULD_BUILD_SB4"

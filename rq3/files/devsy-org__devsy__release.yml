@@ -1,0 +1,484 @@
+name: Release
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: tag name for the release (e.g., v1.0.0)
+        required: true
+        type: string
+
+jobs:
+  build-cli:
+    name: Build CLI Binary on ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-latest
+          - runner: macos-latest
+          - runner: windows-latest
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: go.mod
+
+      - name: get operating system lowercase
+        id: os
+        shell: bash
+        run: |
+          OS=$(echo "${{ runner.os }}" | tr '[:upper:]' '[:lower:]')
+          if [ "$OS" == "macos" ]; then
+            OS="darwin"
+          fi
+          echo "runner_os=$OS" >> "$GITHUB_OUTPUT"
+
+      - uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: build --id devsy-${{ steps.os.outputs.runner_os }} --snapshot
+        env:
+          DEVSY_CLI_VERSION: ${{ inputs.tag || github.ref_name }}
+          DEVSY_POSTHOG_API_KEY: ${{ secrets.DEVSY_POSTHOG_API_KEY }}
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: devsy-${{ steps.os.outputs.runner_os }}
+          path: dist/devsy-${{ steps.os.outputs.runner_os }}_*/devsy-${{ steps.os.outputs.runner_os }}-*
+
+  build-desktop:
+    name: Build Desktop App (${{ matrix.name }})
+    needs: build-cli
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x64
+            os: ubuntu-latest
+            go-os: linux
+            go-arch: amd64
+            builder-args: --linux
+          - name: macos-arm64
+            os: macos-latest
+            go-os: darwin
+            go-arch: arm64
+            builder-args: --mac --arm64
+          - name: macos-x64
+            os: macos-latest
+            go-os: darwin
+            go-arch: amd64
+            builder-args: --mac --x64
+          - name: windows-x64
+            os: windows-2022
+            go-os: windows
+            go-arch: amd64
+            builder-args: --win
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: go.mod
+
+      - name: get operating system lowercase
+        id: os
+        shell: bash
+        run: |
+          OS=$(echo "${{ runner.os }}" | tr '[:upper:]' '[:lower:]')
+          if [ "$OS" == "macos" ]; then
+            OS="darwin"
+          fi
+          echo "runner_os=$OS" >> "$GITHUB_OUTPUT"
+
+      - name: download CLI artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: devsy-*
+          path: ${{ runner.temp }}/devsy-bin/
+          merge-multiple: true
+
+      - name: inventory and flatten CLI artifacts
+        shell: bash
+        run: |
+          go run ./hack/release_artifacts inventory --dir "${{ runner.temp }}/devsy-bin" --flatten
+
+      - name: stage embedded CLI binary
+        shell: bash
+        run: |
+          go run ./hack/release_artifacts stage \
+            --src-dir "${{ runner.temp }}/devsy-bin" \
+            --dst-dir desktop/resources/bin \
+            --goos "${{ matrix.go-os }}" --goarch "${{ matrix.go-arch }}"
+
+      - name: populate dist for pro provider generation
+        if: matrix.name == 'linux-x64'
+        shell: bash
+        run: |
+          go run ./hack/release_artifacts populate-dist \
+            --src-dir "${{ runner.temp }}/devsy-bin" --dst-dir dist
+
+      - name: generate pro provider
+        if: matrix.name == 'linux-x64'
+        working-directory: ./hack/pro
+        env:
+          PARTIAL: "true"
+        run: go run ./main.go ${{ inputs.tag || github.ref_name }} ../../dist > ../../dist/provider.yaml
+
+      - name: configure Windows build tools
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          echo "GYP_MSVS_VERSION=2022" >> $env:GITHUB_ENV
+          $vsPath = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
+          echo "GYP_MSVS_OVERRIDE_PATH=$vsPath" >> $env:GITHUB_ENV
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.14"
+
+      - name: install setuptools
+        run: pip install setuptools
+
+      - name: install dependencies
+        working-directory: desktop
+        run: npm ci
+
+      - name: set version
+        shell: bash
+        working-directory: desktop
+        run: |
+          VERSION=${{ inputs.tag || github.ref_name }}
+          VERSION="${VERSION#v}"
+          npm version "$VERSION" --no-git-tag-version
+
+      - name: install xvfb
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y xvfb
+
+      - name: build desktop app
+        working-directory: desktop
+        run: npx electron-vite build
+        env:
+          DEVSY_POSTHOG_API_KEY: ${{ secrets.DEVSY_POSTHOG_API_KEY }}
+
+      - name: package and publish with electron-builder (macOS, signed)
+        if: runner.os == 'macOS'
+        working-directory: desktop
+        run: npx electron-builder ${{ matrix.builder-args }} --publish always --config electron-builder.yml
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CSC_LINK: ${{ secrets.DEVSY_APPLE_CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.DEVSY_APPLE_CSC_PASSWORD }}
+          APPLE_ID: ${{ secrets.DEVSY_APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.DEVSY_APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.DEVSY_APPLE_TEAM_ID }}
+
+      - name: package and publish with electron-builder (non-macOS)
+        if: runner.os != 'macOS'
+        working-directory: desktop
+        run: npx electron-builder ${{ matrix.builder-args }} --publish always --config electron-builder.yml
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      # macOS-only because .app is a directory bundle the CLI can read
+      # directly. AppImage / deb / rpm / NSIS would need archive extractors.
+      # electron-builder emits arm64 under release/mac-arm64/ and x64 under
+      # release/mac/; pick the directory that matches the matrix arch.
+      - name: verify packaged macOS app embedded CLI arch
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          MATRIX_GO_OS: ${{ matrix.go-os }}
+          MATRIX_GO_ARCH: ${{ matrix.go-arch }}
+        run: |
+          set -euo pipefail
+          case "$MATRIX_GO_ARCH" in
+            arm64) app=desktop/release/mac-arm64/Devsy.app ;;
+            amd64) app=desktop/release/mac/Devsy.app ;;
+            *) echo "::error::unsupported matrix arch: $MATRIX_GO_ARCH"; exit 1 ;;
+          esac
+          if [ ! -d "$app" ]; then
+            echo "::error::Devsy.app bundle missing for $MATRIX_GO_ARCH at $app"
+            ls -la desktop/release || true
+            exit 1
+          fi
+          go run ./hack/release_artifacts verify \
+            --file "$app/Contents/Resources/bin/devsy" \
+            --goos "$MATRIX_GO_OS" --goarch "$MATRIX_GO_ARCH"
+
+      - name: upload desktop artifacts to release
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          draft: true
+          files: |
+            desktop/release/*.dmg
+            desktop/release/*.zip
+            desktop/release/*.exe
+            desktop/release/*.AppImage
+            desktop/release/*.deb
+            desktop/release/*.rpm
+
+      - name: upload macOS dmg for homebrew cask
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: desktop-dmg-${{ matrix.name }}
+          path: desktop/release/*.dmg
+
+      - name: rewrite manifest URLs to GitHub Release assets
+        if: hashFiles('desktop/release/latest*.yml', 'desktop/release/beta*.yml') != ''
+        # Windows defaults to pwsh; `$REPO`/`$TAG` would be empty PowerShell vars.
+        shell: bash
+        env:
+          REPO: ${{ github.repository }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          go run hack/rewrite_manifest_urls/main.go desktop/release/ "$REPO" "$TAG"
+
+      - name: upload update metadata artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: update-metadata-${{ matrix.name }}
+          path: |
+            desktop/release/latest*.yml
+            desktop/release/beta*.yml
+          if-no-files-found: ignore
+
+      - name: upload cli assets
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
+        if: matrix.name == 'linux-x64'
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          draft: true
+          files: |
+            ./dist/*
+
+      - name: upload desktop linux artifact for flatpak
+        if: matrix.name == 'linux-x64'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: devsy-flatpak
+          path: desktop/release/*.deb
+
+  deploy-update-metadata:
+    name: Deploy Electron Update Metadata
+    needs: [build-desktop]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: go.mod
+
+      - name: download update metadata artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: update-metadata-*
+          path: metadata/
+
+      - name: assemble this channel's manifests
+        env:
+          IS_PRERELEASE: ${{ github.event.release.prerelease }}
+        run: |
+          set -euo pipefail
+          mkdir -p upload
+          go run hack/merge_mac_metadata/main.go metadata/ upload/
+          if [ "$IS_PRERELEASE" = "true" ]; then
+            rm -f upload/latest*.yml
+            find metadata/ \( -name 'beta.yml' -o -name 'beta-linux.yml' \) \
+              -exec cp {} upload/ \;
+          else
+            rm -f upload/beta*.yml
+            find metadata/ \( -name 'latest.yml' -o -name 'latest-linux.yml' \) \
+              -exec cp {} upload/ \;
+          fi
+          ls -la upload/
+
+      - name: upload manifests to R2 (dl.devsy.sh)
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.DEVSY_R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.DEVSY_R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          R2_S3_API: ${{ secrets.DEVSY_R2_S3_API }}
+        run: |
+          set -euo pipefail
+          bucket="devsy"
+          rest="${R2_S3_API#*://}"
+          endpoint="${R2_S3_API%%://*}://${rest%%/*}"
+          for f in upload/*.yml; do
+            name=$(basename "$f")
+            aws s3 cp "$f" "s3://${bucket}/desktop/${name}" \
+              --endpoint-url "$endpoint" \
+              --content-type "text/yaml" \
+              --cache-control "public, max-age=0, must-revalidate"
+            echo "uploaded desktop/${name}"
+          done
+
+  build-flatpak:
+    name: Build Flatpak
+    runs-on: ubuntu-latest
+    needs: [build-desktop]
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    container:
+      image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-48@sha256:50fea670968fd3ec4aeeb3a91d9d807d0af6eab3c3b44c33d4c40c311832c8fa
+      options: --privileged
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: download desktop linux artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: devsy-flatpak
+          path: desktop/flatpak/
+
+      - name: find and rename .deb file
+        working-directory: desktop/flatpak
+        run: |
+          DEB=$(find . -maxdepth 1 -name '*.deb' -print -quit)
+          if [ -n "$DEB" ]; then
+            mv "$DEB" devsy-desktop.deb
+          else
+            echo "No .deb file found"
+            exit 1
+          fi
+
+      - name: build flatpak
+        uses: flatpak/flatpak-github-actions/flatpak-builder@79327416609af08178ad73b352877e51450790b3 # v6
+        with:
+          bundle: Devsy.flatpak
+          manifest-path: desktop/flatpak/sh.devsy.app.yml
+          cache-key: flatpak-builder-${{ github.sha }}
+          upload-artifact: true
+
+      - name: upload flatpak bundle
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          draft: true
+          files: |
+            ./Devsy.flatpak
+
+  publish-homebrew:
+    name: Publish Homebrew Formula & Cask
+    needs: [build-desktop]
+    if: ${{ !github.event.release.prerelease }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: go.mod
+
+      - name: download darwin CLI artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: devsy-darwin
+          path: ${{ runner.temp }}/devsy-bin/
+
+      - name: download linux CLI artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: devsy-linux
+          path: ${{ runner.temp }}/devsy-bin/
+
+      - name: download macOS dmg artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: desktop-dmg-*
+          path: ${{ runner.temp }}/devsy-dmg/
+          merge-multiple: true
+
+      - name: flatten CLI artifacts
+        run: go run ./hack/release_artifacts inventory --dir "${{ runner.temp }}/devsy-bin" --flatten
+
+      - name: generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
+        with:
+          client-id: ${{ secrets.DEVSY_GITHUB_APP_ID }}
+          private-key: ${{ secrets.DEVSY_GITHUB_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: homebrew-tap
+
+      - name: generate and push formula and cask
+        env:
+          TAP_TOKEN: ${{ steps.app-token.outputs.token }}
+          TAP_REPO: ${{ github.repository_owner }}/homebrew-tap
+          REPO: ${{ github.repository }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+          BIN_DIR: ${{ runner.temp }}/devsy-bin
+          DMG_DIR: ${{ runner.temp }}/devsy-dmg
+        run: |
+          set -euo pipefail
+
+          if [ -z "${TAP_TOKEN:-}" ]; then
+            echo "::error::GitHub App token was not generated"
+            exit 1
+          fi
+
+          git clone --depth 1 "https://x-access-token:${TAP_TOKEN}@github.com/${TAP_REPO}.git" tap
+          mkdir -p tap/Formula tap/Casks
+          go run ./hack/homebrew_formula \
+            --bin-dir "$BIN_DIR" \
+            --repo "$REPO" \
+            --tag "$TAG" \
+            --out tap/Formula/devsy.rb
+          go run ./hack/homebrew_cask \
+            --dmg-dir "$DMG_DIR" \
+            --repo "$REPO" \
+            --tag "$TAG" \
+            --out tap/Casks/devsy.rb
+
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/devsy.rb Casks/devsy.rb
+          if git diff --cached --quiet; then
+            echo "Formula and cask unchanged; nothing to publish"
+            exit 0
+          fi
+          git commit -m "devsy ${TAG}"
+          git push -u origin HEAD
+
+  prerelease:
+    name: Publish Prerelease
+    needs: [build-desktop, build-flatpak, deploy-update-metadata]
+    permissions:
+      contents: write
+    if: github.event.release.prerelease
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          prerelease: true
+          draft: false

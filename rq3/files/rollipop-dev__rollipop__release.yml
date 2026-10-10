@@ -1,0 +1,81 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  publish-to-npm:
+    name: Publish to NPM
+    if: "${{ startsWith(github.event.head_commit.message, 'release: v') }}"
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Prepare metadata
+        id: metadata
+        env:
+          COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          version=$(jq -r '.version' packages/rollipop/package.json)
+          tag="v${version}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Tools
+        uses: jdx/mise-action@v3
+
+      - name: Setup Node
+        run: corepack enable
+
+      - name: Setup NPM
+        # https://github.com/npm/cli/issues/9722
+        run: |
+          npm install -g npm@11
+          npm -v
+
+      - name: Install dependencies
+        run: yarn install --immutable
+
+      - name: Publish packages
+        run: yarn scripts:publish
+
+      - name: Get changelog from commit body
+        id: changelog
+        run: |
+          {
+            echo 'CHANGELOG<<EOF'
+            git show -s --format=%b
+            echo EOF
+          } >> $GITHUB_OUTPUT
+
+      - name: Create GitHub Release
+        id: github_release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG_NAME: ${{ steps.metadata.outputs.tag }}
+          TARGET: ${{ github.sha }}
+          NOTES: ${{ steps.changelog.outputs.CHANGELOG }}
+          PRERELEASE: ${{ contains(steps.metadata.outputs.version, '-') }}
+        run: |
+          url=$(gh release create "$TAG_NAME" \
+            --target "$TARGET" \
+            --title "$TAG_NAME" \
+            --notes "$NOTES" \
+            --prerelease="$PRERELEASE")
+          echo "url=$url" >> "$GITHUB_OUTPUT"

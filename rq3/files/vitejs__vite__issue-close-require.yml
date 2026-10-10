@@ -1,0 +1,22 @@
+name: Issue Close Require
+
+on:
+  schedule:
+    - cron: "0 0 * * *"
+
+jobs:
+  close-issues:
+    if: github.repository == 'vitejs/vite'
+    runs-on: ubuntu-slim
+    permissions:
+      contents: read # to check out the repo for local actions
+      issues: write # for actions/issues-helper to update issues
+      pull-requests: write # for actions/issues-helper to update PRs
+    steps:
+      - name: needs reproduction
+        uses: $/.github/actions/issues-helper
+        with:
+          actions: "close-issues"
+          token: ${{ secrets.GITHUB_TOKEN }}
+          labels: "needs reproduction"
+          inactive-day: 3

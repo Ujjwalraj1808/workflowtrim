@@ -1,0 +1,124 @@
+name: Code Checks
+
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        required: true
+        type: string
+
+env:
+  TOOL_NODE_FLAGS: ${{ vars.TOOL_NODE_FLAGS }}
+
+permissions: {}
+
+jobs:
+  code-check:
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+
+    name: ${{ matrix.check == 'ts' && 'TypeScript' || 'Code Lint' }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        check: ['ts', 'lint']
+
+    steps:
+      - name: Set Swap Space
+        uses: pierotofy/set-swap-space@49819abfb41bd9b44fb781159c033dba90353a7c # v1.0.0
+        with:
+          swap-size-gb: 4
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup NodeJS
+        uses: ./.github/actions/setup-node
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache-modules: true
+          install: true
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - uses: rharkor/caching-for-turbo@2238fae6eb9a9936f92356f54cb3660200d105e7 # v2.5.1
+
+      - uses: ./.github/actions/restore-packages
+
+      - name: Restore TypeScript incremental cache
+        id: restore-typecheck
+        if: matrix.check == 'ts'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ./apps/meteor/tsconfig.typecheck.tsbuildinfo
+          key: typecheck-cache-${{ runner.os }}-${{ hashFiles('yarn.lock') }}
+          restore-keys: |
+            typecheck-cache-${{ runner.os }}-
+
+      - name: Cache observability (typecheck)
+        if: matrix.check == 'ts'
+        run: |
+          {
+            echo "### TypeScript incremental cache"
+            echo "- **exact hit**: \`${{ steps.restore-typecheck.outputs.cache-hit }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Install Meteor
+        shell: bash
+        run: |
+          # Restore bin from cache
+          set +e
+          METEOR_SYMLINK_TARGET=$(readlink ~/.meteor/meteor)
+          METEOR_TOOL_DIRECTORY=$(dirname "$METEOR_SYMLINK_TARGET")
+          set -e
+          LAUNCHER=$HOME/.meteor/$METEOR_TOOL_DIRECTORY/scripts/admin/launch-meteor
+          if [ -e "$LAUNCHER" ]
+          then
+            echo "Cached Meteor bin found, restoring it"
+            sudo cp "$LAUNCHER" "/usr/local/bin/meteor"
+          else
+            echo "No cached Meteor bin found."
+          fi
+
+          # only install meteor if bin isn't found
+          command -v meteor >/dev/null 2>&1 || curl https://install.meteor.com | sed s/--progress-bar/-sL/g | /bin/sh
+
+      - name: TS TypeCheck
+        if: matrix.check == 'ts'
+        run: yarn turbo run typecheck --concurrency=5
+
+      - name: Save TypeScript incremental cache
+        if: matrix.check == 'ts' && github.ref == 'refs/heads/develop' && github.event_name == 'push'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ./apps/meteor/tsconfig.typecheck.tsbuildinfo
+          key: typecheck-cache-${{ runner.os }}-${{ hashFiles('yarn.lock') }}
+
+      - name: Restore ESLint cache
+        id: restore-eslint
+        if: matrix.check == 'lint'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ./apps/meteor/.eslintcache
+          key: eslintcache-${{ runner.os }}-${{ hashFiles('yarn.lock') }}
+          restore-keys: |
+            eslintcache-${{ runner.os }}-
+
+      - name: Cache observability (eslint)
+        if: matrix.check == 'lint'
+        run: |
+          {
+            echo "### ESLint cache"
+            echo "- **exact hit**: \`${{ steps.restore-eslint.outputs.cache-hit }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Lint
+        if: matrix.check == 'lint'
+        run: yarn lint
+
+      - name: Save ESLint cache
+        if: matrix.check == 'lint' && github.ref == 'refs/heads/develop' && github.event_name == 'push'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ./apps/meteor/.eslintcache
+          key: eslintcache-${{ runner.os }}-${{ hashFiles('yarn.lock') }}

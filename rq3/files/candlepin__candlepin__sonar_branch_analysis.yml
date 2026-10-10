@@ -1,0 +1,63 @@
+---
+name: Sonar analysis for long-lived branches
+
+on:
+  push:
+    branches:
+      - main
+      - candlepin-*-HOTFIX
+      - feature/*
+
+  workflow_dispatch:
+    inputs:
+      branch-name:
+        description: 'The name of the branch to analyze'
+        required: true
+        default: 'main'
+        type: string
+
+# Cancel in-progress sonar branch analysis workflows. We only care about analyzing the latest commit.
+concurrency:
+  group: ${{ github.workflow }}-${{ inputs.branch-name || github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  branch_sonar_analysis:
+    name: long-lived branch sonar analysis
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mask secrets
+        shell: bash
+        run: |
+          echo "::add-mask::${{ secrets.GITHUB_TOKEN }}"
+          echo "::add-mask::${{ secrets.SONAR_TOKEN }}"
+
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Install dependencies
+        shell: bash
+        run: sudo apt-get install -y gettext
+
+      - name: Set Environment Variables
+        uses: ./.github/actions/set_vars
+        with:
+          varFilePath: ./.github/variables/pr_verification.env
+
+      - name: Set up Java
+        uses: actions/setup-java@v6
+        with:
+          distribution: ${{ env.JAVA_DISTRIBUTION }}
+          java-version: ${{ env.JAVA_VERSION }}
+          check-latest: ${{ env.JAVA_CHECK_LATEST }}
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Run unit tests & Analyze
+        run: ./gradlew test coverage sonar
+          -Dsonar.branch.name=${{ inputs.branch-name || github.ref_name }}
+          -Dorg.gradle.jvmargs=-Xmx1g
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}

@@ -1,0 +1,224 @@
+name: Skylos Advisory Scan
+
+on:
+  pull_request:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.11"
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: "1.22"
+          cache: false
+
+      - uses: astral-sh/setup-uv@e4db8464a088ece1b920f60402e813ea4de65b8f # v4
+
+      - name: Build repo Go engine
+        if: github.event_name != 'pull_request'
+        run: |
+          mkdir -p "$RUNNER_TEMP/skylos-go-engine" "$RUNNER_TEMP/skylos-go-build" "$RUNNER_TEMP/skylos-go-gopath"
+          cd skylos/engines/go
+          GOCACHE="$RUNNER_TEMP/skylos-go-build" GOPATH="$RUNNER_TEMP/skylos-go-gopath" \
+            go build -trimpath -o "$RUNNER_TEMP/skylos-go-engine/skylos-go" ./cmd/skylos-go
+
+      - name: Build trusted base Go engine for pull requests
+        if: github.event_name == 'pull_request'
+        env:
+          TRUSTED_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        shell: bash
+        run: |
+          if [[ ! "$TRUSTED_BASE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Invalid pull request base SHA" >&2
+            exit 1
+          fi
+          git cat-file -e "$TRUSTED_BASE_SHA^{commit}"
+          TRUSTED_SOURCE_ROOT="$RUNNER_TEMP/skylos-trusted-base"
+          ENGINE_DIR="$RUNNER_TEMP/skylos-go-engine"
+          mkdir -p "$TRUSTED_SOURCE_ROOT" "$ENGINE_DIR" "$RUNNER_TEMP/skylos-go-build" "$RUNNER_TEMP/skylos-go-gopath"
+          git archive "$TRUSTED_BASE_SHA" -- skylos/engines/go | tar -x -C "$TRUSTED_SOURCE_ROOT"
+          cd "$TRUSTED_SOURCE_ROOT/skylos/engines/go"
+          GOCACHE="$RUNNER_TEMP/skylos-go-build" GOPATH="$RUNNER_TEMP/skylos-go-gopath" \
+            go build -trimpath -o "$ENGINE_DIR/skylos-go" ./cmd/skylos-go
+          "$ENGINE_DIR/skylos-go" --version
+
+      - name: Install trusted Skylos for pull requests
+        if: github.event_name == 'pull_request'
+        run: |
+          uv venv --python 3.11
+          uv pip install --python .venv/bin/python "skylos>=4.7.0"
+          .venv/bin/skylos --version
+
+      - name: Use repo Skylos on trusted refs
+        if: github.event_name != 'pull_request'
+        run: |
+          uv venv --python 3.11
+          uv pip install --python .venv/bin/python -e .
+          .venv/bin/python -c "import skylos; print('skylos from:', skylos.__file__)"
+          .venv/bin/python -c "import skylos.visitors.languages; print('languages OK')"
+
+      - name: Resolve diff base
+        id: diff
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BEFORE_SHA: ${{ github.event.before }}
+          REF_NAME: ${{ github.ref_name || 'main' }}
+        shell: bash
+        run: |
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            if [[ ! "$PR_BASE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "Invalid pull request base SHA" >&2
+              exit 1
+            fi
+            git cat-file -e "$PR_BASE_SHA^{commit}"
+            echo "base=$PR_BASE_SHA" >> "$GITHUB_OUTPUT"
+          elif [[ "$BEFORE_SHA" =~ ^[0-9a-f]{40}$ ]] && [ "$BEFORE_SHA" != "0000000000000000000000000000000000000000" ]; then
+            git cat-file -e "$BEFORE_SHA^{commit}"
+            echo "base=$BEFORE_SHA" >> "$GITHUB_OUTPUT"
+          else
+            git check-ref-format --branch "$REF_NAME" >/dev/null
+            echo "base=origin/$REF_NAME" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run Skylos
+        id: scan
+        env:
+          REPORT: skylos_${{ github.run_number }}_${{ github.sha }}.json
+          DIFF_BASE: ${{ steps.diff.outputs.base }}
+          # Give the large self-scan additional verification time while
+          # retaining a two-minute grep-verification limit.
+          SKYLOS_GREP_BUDGET: "120"
+          SKYLOS_GO_BIN: ${{ format('{0}/skylos-go-engine/skylos-go', runner.temp) }}
+        shell: bash
+        run: |
+          echo "REPORT=$REPORT" >> "$GITHUB_OUTPUT"
+          AI_DEFECTS_FLAG=""
+          if .venv/bin/skylos --help | grep -q -- "--ai-defects"; then
+            AI_DEFECTS_FLAG="--ai-defects"
+          fi
+          set +e
+          if [ -n "$DIFF_BASE" ]; then
+            .venv/bin/skylos . --quality --danger --secrets $AI_DEFECTS_FLAG --diff-base "$DIFF_BASE" --diff "$DIFF_BASE" --json -o "$REPORT"
+            SCAN_STATUS=$?
+          else
+            .venv/bin/skylos . --quality --danger --secrets $AI_DEFECTS_FLAG --baseline --json -o "$REPORT"
+            SCAN_STATUS=$?
+          fi
+          set -e
+          echo "status=$SCAN_STATUS" >> "$GITHUB_OUTPUT"
+          if [ "$SCAN_STATUS" -ne 0 ] && [ ! -s "$REPORT" ]; then
+            echo "Skylos exited $SCAN_STATUS without producing $REPORT" >&2
+            exit "$SCAN_STATUS"
+          fi
+
+      - name: Report findings (advisory)
+        if: always() && steps.scan.outcome == 'success'
+        env:
+          REPORT: ${{ steps.scan.outputs.REPORT }}
+        run: |
+          .venv/bin/skylos cicd gate --input "$REPORT" --summary --advisory
+
+      - name: Block new high-risk security findings
+        if: always() && steps.scan.outcome == 'success'
+        env:
+          REPORT: ${{ steps.scan.outputs.REPORT }}
+        run: |
+          python - "$REPORT" <<'PY'
+          import json
+          import os
+          import sys
+
+          severity_rank = {"LOW": 1, "MEDIUM": 2, "HIGH": 3, "CRITICAL": 4}
+          report_path = sys.argv[1]
+          with open(report_path, encoding="utf-8") as fh:
+              report = json.load(fh)
+
+          blocking = []
+          for category in ("danger", "secrets"):
+              for finding in report.get(category, []) or []:
+                  severity = str(
+                      finding.get("severity") or ("HIGH" if category == "secrets" else "")
+                  ).upper()
+                  if severity_rank.get(severity, 0) >= severity_rank["HIGH"]:
+                      blocking.append((category, severity, finding))
+
+          if not blocking:
+              print("No new high-risk security findings.")
+              sys.exit(0)
+
+          summary = os.environ.get("GITHUB_STEP_SUMMARY")
+          lines = [
+              "## Blocking Skylos findings",
+              "",
+              "New HIGH/CRITICAL security or secret findings were detected in this diff.",
+              "",
+          ]
+
+          for category, severity, finding in blocking[:20]:
+              file_path = finding.get("file") or finding.get("file_path") or "unknown"
+              line = finding.get("line") or finding.get("line_number") or 1
+              rule = finding.get("rule_id") or finding.get("rule") or category
+              message = finding.get("message") or "High-risk finding"
+              detail = f"{severity} {rule} {file_path}:{line} - {message}"
+              print(detail)
+              print(f"::error file={file_path},line={line},title=Skylos {rule}::{detail}")
+              lines.append(f"- `{severity}` `{rule}` {file_path}:{line} - {message}")
+
+          if len(blocking) > 20:
+              lines.append(f"- ...and {len(blocking) - 20} more finding(s)")
+
+          if summary:
+              with open(summary, "a", encoding="utf-8") as fh:
+                  fh.write("\n".join(lines) + "\n")
+
+          raise SystemExit(1)
+          PY
+
+      - name: GitHub annotations
+        if: always() && steps.scan.outcome == 'success'
+        env:
+          REPORT: ${{ steps.scan.outputs.REPORT }}
+        run: |
+          .venv/bin/skylos cicd annotate --input "$REPORT"
+
+      - name: Upload report artifact
+        if: always() && steps.scan.outcome == 'success'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ steps.scan.outputs.REPORT }}
+          path: ${{ steps.scan.outputs.REPORT }}
+          if-no-files-found: error
+
+      - name: Preserve Skylos scan exit code
+        if: always() && steps.scan.outputs.status != '0'
+        env:
+          SCAN_STATUS: ${{ steps.scan.outputs.status }}
+        shell: bash
+        run: |
+          if [[ ! "$SCAN_STATUS" =~ ^[1-9][0-9]*$ ]]; then
+            echo "Invalid Skylos exit status: $SCAN_STATUS" >&2
+            exit 1
+          fi
+          exit "$SCAN_STATUS"
+
+      - name: Summarize in job log
+        if: always()
+        run: |
+          echo "Skylos report: ${{ steps.scan.outputs.REPORT }}" >> $GITHUB_STEP_SUMMARY

@@ -1,0 +1,82 @@
+# Unified GitHub Pages deploy: showcase site at /, Storybook at /storybook/.
+#
+# GitHub Pages serves one site per repo, so both projects are built and merged
+# into a single artifact:
+#   site/dist/            → served at  https://ooxml.silurus.dev/
+#   site/dist/storybook/  → served at  https://ooxml.silurus.dev/storybook/
+#
+# Replaces the former deploy-storybook.yml + deploy-site.yml.
+name: Deploy site + Storybook to GitHub Pages
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: pnpm/action-setup@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+          cache: 'pnpm'
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build WASM
+        run: pnpm build:wasm
+
+      # 1) Showcase site → site/dist  (base '/')
+      - name: Build showcase site
+        run: pnpm --filter @silurus/ooxml-site build
+
+      # 2) Storybook → storybook-static  (base '/storybook/')
+      - name: Build Storybook
+        env:
+          STORYBOOK_BASE: /storybook/
+        run: pnpm build-storybook
+
+      # 3) Merge Storybook under the site, add the custom-domain CNAME
+      - name: Merge into one artifact
+        run: |
+          mkdir -p site/dist/storybook
+          cp -r storybook-static/* site/dist/storybook/
+          echo "ooxml.silurus.dev" > site/dist/CNAME
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: site/dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v5

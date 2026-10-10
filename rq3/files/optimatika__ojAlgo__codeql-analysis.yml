@@ -1,0 +1,43 @@
+name: "CodeQL"
+
+on:
+  push:
+    branches: [ "develop" ]
+  pull_request:
+    branches: [ "develop" ]
+  schedule:
+    - cron: '24 22 * * 0'
+
+jobs:
+  analyze:
+    name: Analyze
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v7
+
+    - name: Initialize CodeQL
+      uses: github/codeql-action/init@v4
+      with:
+        languages: java
+        queries: security-and-quality,./.github/queries/submodules.ql
+        config-file: ./.github/codeql/codeql-config.yml
+
+    - name: Set up JDK
+      uses: actions/setup-java@v6
+      with:
+        distribution: 'temurin'
+        java-version: '25'
+
+    - name: Build
+      run: mvn process-sources compiler:compile -B -ntp
+
+    - name: Perform CodeQL Analysis
+      uses: github/codeql-action/analyze@v4
+      with:
+        category: "/language:java"

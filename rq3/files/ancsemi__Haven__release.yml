@@ -1,0 +1,26 @@
+name: Attach release tarball
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  tarball:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Create tarball with fixed directory name
+        run: |
+          # Re-pack the repo into haven/ so the path never changes between versions
+          mkdir -p /tmp/haven
+          rsync -a --exclude='.git' . /tmp/haven/
+          tar -czf haven.tar.gz -C /tmp haven
+
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${{ github.event.release.tag_name }}" haven.tar.gz --clobber

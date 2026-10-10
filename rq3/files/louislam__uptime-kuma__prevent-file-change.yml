@@ -1,0 +1,19 @@
+name: prevent-file-change
+
+on:
+  pull_request_target:
+permissions: {}
+
+jobs:
+  check-file-changes:
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
+    steps:
+      - name: Prevent file change
+        uses: xalvarez/prevent-file-change-action@dbc67c205c9ed02aa39c497b422c24f364c3e8dd # v3.0.1
+        with:
+          githubToken: ${{ secrets.GITHUB_TOKEN }}
+          # Regex, /src/lang/*.json is not allowed to be changed, except for /src/lang/en.json
+          pattern: '^(?!src/lang/en\.json$)src/lang/.*\.json$'
+          trustedAuthors: UptimeKumaBot

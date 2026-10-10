@@ -1,0 +1,415 @@
+# Reusable mecatequi workflow. See user-docs/building/deployment/mecatequi.md for setup and
+# the split-privilege design.
+#
+# Sibling actions use the `$/` self-repository syntax: it resolves to THIS repository at
+# the exact ref this workflow is running from, with no checkout. That is why there is no
+# version pin here to bump. `./` would be wrong — a workspace-relative path resolves in the
+# CALLER's checkout, which does not contain these actions.
+
+name: mecatequi (reusable)
+
+on:
+  workflow_call:
+    # Inputs are the per-session passthrough surface of the mecatequi action. The
+    # escape-hatch-only knobs are deliberately NOT exposed here — `default-model` (catalog-
+    # validated, rejects an uncatalogued id — use `model` instead), `openai` (provider is
+    # auto-detected from the present key), and `subagent-ask-reviewer` (an autonomous-approval
+    # capability that is a deployment decision better made by editing the action) — so a
+    # consumer needing them vendors the escape-hatch template rather than the reusable workflow.
+    inputs:
+      label:
+        description: >-
+          Issue label that triggers a run (the caller's `issues: labeled` event must carry
+          it). A reusable workflow cannot reliably read the caller repo's `vars.*`, so the
+          trigger label/mention are INPUTS, not repo variables.
+        type: string
+        required: false
+        default: mecatequi
+      mention:
+        description: Comment mention that triggers a run on an issue_comment.
+        type: string
+        required: false
+        default: "@mecatequi"
+      model:
+        description: >-
+          Model identifier (per-session passthrough — accepts ids newer than the embedded
+          catalog). Prefer this over a catalog-validated default-model. Empty -> provider
+          default.
+        type: string
+        required: false
+        default: ""
+      default-provider:
+        description: >-
+          Deployment default provider id (openai | openrouter | anthropic). Auto-detected
+          from the present provider key; set only to FORCE the provider.
+        type: string
+        required: false
+        default: ""
+      posture:
+        description: >-
+          Operator posture ladder (strict < trusted < auto < yolo). Default "auto" — the
+          documented CI posture (allow-all, child injection-defence ON).
+        type: string
+        required: false
+        default: auto
+      max-run-tokens:
+        description: >-
+          Max cumulative input+output tokens per run; the run ends cleanly with stop=budget
+          on crossing it. Empty (default) is unlimited.
+        type: string
+        required: false
+        default: ""
+      max-turns:
+        description: >-
+          Max model calls (turns) for the run; the run ends cleanly with stop=max_turns on
+          crossing it. Empty (default) uses the binary's deployment default. Orthogonal to
+          max-run-tokens (turns vs tokens; both compose).
+        type: string
+        required: false
+        default: ""
+      timeout:
+        description: >-
+          Wall-clock bound on the whole run (e.g. 40m); the primary cost ceiling for a
+          headless run — lower it to cap CI minutes / model spend. 0 disables it.
+        type: string
+        required: false
+        default: 40m
+      openai-base-url:
+        description: >-
+          Override the OpenAI API base URL (for an OpenAI-compatible endpoint). Empty
+          (default) uses the provider default.
+        type: string
+        required: false
+        default: ""
+      guardrails-model:
+        description: >-
+          Guardrails (issue #27) checker model id / alias that inspects outbound tool args +
+          inbound results. Empty (default) disables guardrails.
+        type: string
+        required: false
+        default: ""
+      setup-script:
+        description: >-
+          OPTIONAL multi-line shell run in the implement job BEFORE the binary, to install a
+          PROJECT-SPECIFIC self-verification toolchain (buf, protoc plugins, node, system
+          packages). `task` (go-task) and golangci-lint are ALWAYS provisioned by the mecatequi
+          action, so a plain Go repo needs nothing here. This is TRUSTED operator code (a
+          maintainer sets it), distinct from the untrusted prompt; it runs at contents:read with
+          NO write token. Empty (default) runs no hook.
+        type: string
+        required: false
+        default: ""
+      base-branch:
+        description: >-
+          Base branch for the PR. Empty (default) lets publish.sh resolve the repo default
+          branch.
+        type: string
+        required: false
+        default: ""
+      pr-body-template:
+        description: >-
+          OPTIONAL path (relative to the caller's checkout) to a PR-body template with
+          {{placeholder}} tokens. Empty uses .github/mecatequi/pr-body.md if present, else
+          the built-in body. The trust caveat is always force-prepended.
+        type: string
+        required: false
+        default: ""
+      pr-title-template:
+        description: >-
+          OPTIONAL path (relative to the caller's checkout) to a one-line PR-title template
+          (same placeholders). Empty uses the built-in title.
+        type: string
+        required: false
+        default: ""
+    secrets:
+      # THREE NAMED PROVIDER SECRETS, all optional. The implement job sets all three at
+      # job-level env: (OPENROUTER_API_KEY / OPENAI_API_KEY / ANTHROPIC_API_KEY). An
+      # undefined secret yields the EMPTY STRING, which the binary treats as ABSENT (the
+      # registry registers a provider iff its key resolves non-empty — see
+      # internal/app/registry.go providerKey/buildProviderRegistry; an empty key is a no-op),
+      # so a caller wires only the provider(s) it uses. The binary auto-detects the provider
+      # from a present key; `default-provider` forces it.
+      openrouter-key:
+        description: OpenRouter API key (OPENROUTER_API_KEY). Optional — set the one provider you use.
+        required: false
+      openai-key:
+        description: OpenAI API key (OPENAI_API_KEY). Optional.
+        required: false
+      anthropic-key:
+        description: Anthropic API key (ANTHROPIC_API_KEY). Optional.
+        required: false
+      # Publish credentials are resolved in the publish job: prefer a short-lived GitHub
+      # App installation token, then a pre-minted token, then GITHUB_TOKEN as fallback.
+      publish-token:
+        description: Pre-minted GitHub token for the publish job (contents+PR+issues write). Optional.
+        required: false
+      publish-app-id:
+        description: GitHub App id for JIT installation-token minting in the publish job. Optional.
+        required: false
+      publish-app-private-key:
+        description: GitHub App private key paired with publish-app-id. Optional.
+        required: false
+
+# Least-privilege workflow default. A called workflow's GITHUB_TOKEN can only be DOWNGRADED
+# from the caller's grant, never escalated; each job below sets its own scope explicitly.
+permissions:
+  contents: read
+
+# Never run two mecatequi runs for the same issue at once. Fall back to run_id for any
+# non-issue event so distinct events never collapse into one group.
+concurrency:
+  group: mecatequi-${{ github.event.issue.number || github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  # ── acknowledge: post an EARLY issue-side trace, FIRST, before any agent runs ──────────
+  # Runs first, gated on the SAME trigger as `implement`, holds ONLY issues:write (no LLM
+  # key, no agent code), and posts a durable "working on it" comment with the run URL. Even
+  # if everything downstream fails, the author has a link to the run from the moment it
+  # starts. No checkout — it touches no repository contents.
+  acknowledge:
+    name: Acknowledge (early issue comment, no agent code)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    # Same gate as `implement` (kept in lockstep — both must match for a run to start). The
+    # trigger label/mention come from INPUTS (a reusable workflow can't reliably read the
+    # caller's vars.*). The label path requires the configured label; the comment path
+    # requires the configured mention on an ISSUE (not a PR — issue_comment fires for PR
+    # comments too, where the "issue" is the PR). GitHub can't filter `on: issues: labeled`
+    # by name, so the filtering is here in the `if:`; an unmatched label just skips.
+    if: >-
+      ( github.event_name == 'issues' && github.event.label.name == inputs.label ) ||
+      (
+        github.event_name == 'issue_comment' &&
+        github.event.issue.pull_request == null &&
+        contains(github.event.comment.body, inputs.mention)
+      )
+    # Only issues:write. No contents write, no id-token, no LLM key — runs no agent code.
+    permissions:
+      issues: write
+    steps:
+      - name: Post acknowledgement comment
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        # The body is a fixed string + the run URL (a github-context value, not event text),
+        # passed via env and --body — never an inline interpolation of untrusted issue text.
+        run: |
+          gh issue comment "${ISSUE_NUMBER}" --repo "${REPO}" \
+            --body "🤖 mecatequi is working on this — see the run: ${RUN_URL}"
+
+  implement:
+    name: Run mecatequi (agent, no write token)
+    runs-on: ubuntu-24.04
+    # 50m job ceiling vs the 40m agent --timeout default: the 10m envelope absorbs
+    # pre-agent setup (toolchain install, setup-script) AND the post-agent artifact
+    # upload before the hard SIGKILL. The agent timeout is graceful (clean summary);
+    # the job timeout is destructive (kills the upload post-mortems depend on), so the
+    # margin is biased to the job side. Keep job > agent on every path.
+    timeout-minutes: 50
+    # Run after `acknowledge` so the issue always carries an early trace before the agent
+    # starts. `needs: acknowledge` makes implement skip whenever acknowledge was skipped
+    # (the gate did not match), and `needs.acknowledge.result == 'success'` keeps implement
+    # from running if the acknowledge step itself failed. The TRIGGER conditions are restated
+    # here as defense-in-depth (editing the acknowledge gate alone can never silently run the
+    # agent on the wrong event).
+    #
+    # We deliberately do NOT gate on author_association: GitHub's webhook author_association
+    # is unreliable for membership (it reports an org MEMBER as CONTRIBUTOR), so basing a gate
+    # on it wrongly SKIPS legitimate runs. For a PRIVATE repo the trigger IS the gate (label
+    # application needs triage/write; comment access is team-only). For a PUBLIC repo, the
+    # caller should use the escape-hatch template and add a dedicated permission-check gate
+    # job (see user-docs/building/deployment/mecatequi.md).
+    needs: acknowledge
+    if: >-
+      needs.acknowledge.result == 'success' && (
+        ( github.event_name == 'issues' && github.event.label.name == inputs.label ) ||
+        (
+          github.event_name == 'issue_comment' &&
+          github.event.issue.pull_request == null &&
+          contains(github.event.comment.body, inputs.mention)
+        )
+      )
+    # NO write, NO id-token. The only secrets are the LLM keys.
+    permissions:
+      contents: read
+    # The LLM keys MUST be delivered at JOB level, not on the `uses:` step that invokes the
+    # composite action. STEP-LEVEL env on a `uses:` step does NOT propagate into a composite
+    # action's internal steps, but JOB-level env does — and the composite reads the key from
+    # the process environment, never an input. All three are set unconditionally: an undefined
+    # secret yields the empty string, which the binary treats as absent (registry registers a
+    # provider iff its key resolves non-empty). Scoped to THIS (implement) job ONLY — the
+    # publish job must never see an LLM key.
+    env:
+      OPENROUTER_API_KEY: ${{ secrets.openrouter-key }}
+      OPENAI_API_KEY: ${{ secrets.openai-key }}
+      ANTHROPIC_API_KEY: ${{ secrets.anthropic-key }}
+    steps:
+      # Pin to the IMMUTABLE event SHA so the tree the agent diffs against is exactly the
+      # tree `publish` later applies the patch onto — the default branch tip can move between
+      # the two jobs (especially on issue_comment), which would apply the patch to the wrong
+      # tree. This checks out the CALLER's repo (the workflow runs in the caller's context).
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
+      # The action provides Go, task, and golangci-lint. Use setup-script only for
+      # additional project-specific tools needed by repository verification.
+
+      # Extract the untrusted prompt from the event file rather than interpolating event text.
+      # A full repository path is required because local action paths resolve in the caller's checkout.
+      - name: Extract prompt
+        id: prompt
+        uses: $/.github/actions/mecatequi-extract-prompt
+        with:
+          out-file: ${{ runner.temp }}/prompt.txt
+
+      # The LLM keys reach the composite action through the job-level environment above;
+      # step-level env on a `uses:` step does not propagate to its internal steps.
+      - name: mecatequi
+        id: mecatequi
+        uses: $/.github/actions/mecatequi
+        with:
+          prompt-file: ${{ steps.prompt.outputs.prompt-file }}
+          untrusted: "true"
+          posture: ${{ inputs.posture }}
+          model: ${{ inputs.model }}
+          default-provider: ${{ inputs.default-provider }}
+          max-run-tokens: ${{ inputs.max-run-tokens }}
+          max-turns: ${{ inputs.max-turns }}
+          timeout: ${{ inputs.timeout }}
+          openai-base-url: ${{ inputs.openai-base-url }}
+          guardrails-model: ${{ inputs.guardrails-model }}
+          setup-script: ${{ inputs.setup-script }}
+
+      - name: Upload run artifacts
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: mecatequi-run
+          # Read every path from the action's outputs (including events-path) so an
+          # out-events override is never silently missed.
+          path: |
+            ${{ steps.mecatequi.outputs.patch-path }}
+            ${{ steps.mecatequi.outputs.summary-path }}
+            ${{ steps.mecatequi.outputs.events-path }}
+          if-no-files-found: warn
+          retention-days: 7
+
+    outputs:
+      stop-reason: ${{ steps.mecatequi.outputs.stop-reason }}
+      non-empty-diff: ${{ steps.mecatequi.outputs.non-empty-diff }}
+      exit-class: ${{ steps.mecatequi.outputs.exit-class }}
+
+  publish:
+    name: Publish result (write token, no agent code)
+    needs: [acknowledge, implement]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    # Run whenever the gate matched (acknowledge succeeded) and the run was not cancelled —
+    # on implement SUCCESS *and* on implement FAILURE — so the operator always gets a
+    # terminal result (an honest failure comment, never silence). `needs.acknowledge.result
+    # == 'success'` means a non-matching trigger (acknowledge skipped) skips publish too,
+    # while an implement failure (result == 'failure') still lands here: publish.sh reads an
+    # empty/failed EXIT_CLASS as setup-failure and posts the honest failure comment.
+    if: ${{ !cancelled() && needs.acknowledge.result == 'success' }}
+    # The privileged job. It applies the patch as DATA and posts text — it never runs agent
+    # output as code. The publish-token secrets are interpolated ONLY in this job, so GitHub
+    # never materialises them in the implement job — the secret-scoping proof of the token
+    # boundary.
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+    # The `secrets` context is NOT allowed in a step `if:` (only in `env:`/`with:`), so map
+    # the app-private-key PRESENCE to a job-level env flag and gate the mint step on that. The
+    # flag is a boolean-ish string ("true"/"") — it leaks no secret value, only its presence.
+    env:
+      HAVE_APP_KEY: ${{ secrets.publish-app-private-key != '' }}
+    steps:
+      # Pin to the SAME immutable SHA `implement` diffed against (see that job's checkout)
+      # so the patch applies onto the matching tree. persist-credentials:false keeps the
+      # checkout token off disk — publish.sh pushes via the explicit GH_TOKEN env, not the
+      # on-disk credential.
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
+      # NON-FATAL on purpose: when `implement` failed before its upload-artifact step, the
+      # 'mecatequi-run' artifact does not exist and download-artifact would otherwise HARD-
+      # ABORT this job — exactly the silent-failure case the acknowledge job + this fallback
+      # close. continue-on-error lets publish.sh run regardless: a missing artifact leaves
+      # PATCH_PATH/SUMMARY_PATH absent and an empty EXIT_CLASS, which the script reads as
+      # setup-failure and comments.
+      - name: Download run artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        continue-on-error: true
+        with:
+          name: mecatequi-run
+          path: ${{ runner.temp }}/mecatequi-run
+
+      # PUBLISH-TOKEN form (1): mint a SHORT-LIVED GitHub App installation token when app
+      # creds are present. The `if:` is gated on the private key being non-empty — when the
+      # consumer wired only a pre-minted publish-token (or neither), this step skips and
+      # steps.app-token.outputs.token is empty, so the GH_TOKEN fallback chain below resolves
+      # to the next form. SHA-pinned third-party action (house set).
+      - name: Mint GitHub App token
+        id: app-token
+        if: ${{ env.HAVE_APP_KEY == 'true' }}
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.publish-app-id }}
+          private-key: ${{ secrets.publish-app-private-key }}
+
+      # Resolve the publish token ONCE into the job environment ($GITHUB_ENV), per the
+      # publish-token decision: minted app token (form 1) -> pre-minted publish-token
+      # (form 2) -> standing GITHUB_TOKEN (form 3). It MUST be written to $GITHUB_ENV (not
+      # set as step-level env: on the `uses:` step below): step-level env on a `uses:` step
+      # does NOT propagate into a composite action's internal steps, whereas a $GITHUB_ENV
+      # write IS visible to every subsequent step in the job, including the composite's
+      # internal step that runs publish.sh — the SAME mechanism job-level env relies on. The
+      # GH_TOKEN value is written via env: (never inline-interpolated into the run: body), and
+      # `>> "$GITHUB_ENV"` masks it from the log. Emit the standing-token ::warning:: here too
+      # (form 3): the run still works zero-config, but a broad standing write grant is weaker
+      # than a JIT app token — the warning nudges the operator toward form (1) or (2).
+      - name: Resolve publish token
+        shell: bash
+        env:
+          APP_TOKEN: ${{ steps.app-token.outputs.token }}
+          PUBLISH_TOKEN: ${{ secrets.publish-token }}
+          STANDING_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -n "${APP_TOKEN}" ]; then
+            gh_token="${APP_TOKEN}"
+            echo "mecatequi-publish: using a minted GitHub App installation token (form 1)."
+          elif [ -n "${PUBLISH_TOKEN}" ]; then
+            gh_token="${PUBLISH_TOKEN}"
+            echo "mecatequi-publish: using the pre-minted publish-token (form 2)."
+          else
+            gh_token="${STANDING_TOKEN}"
+            echo "::warning::mecatequi-publish: no publish-app-private-key and no publish-token were provided; falling back to the standing GITHUB_TOKEN grant (form 3). The stronger posture is a JIT GitHub App installation token (publish-app-id + publish-app-private-key) or a pre-minted publish-token."
+          fi
+          # Write to $GITHUB_ENV so publish.sh reads GH_TOKEN from the process environment.
+          # The value never appears in the log: it is piped to the file, not echoed.
+          echo "GH_TOKEN=${gh_token}" >> "${GITHUB_ENV}"
+
+      # publish.sh applies the patch as data and reads the resolved GH_TOKEN from the
+      # job environment; it never executes agent output.
+      - name: Publish
+        uses: $/.github/actions/mecatequi-publish
+        with:
+          issue-number: ${{ github.event.issue.number }}
+          patch-path: ${{ runner.temp }}/mecatequi-run/mecatequi.patch
+          summary-path: ${{ runner.temp }}/mecatequi-run/mecatequi.summary.json
+          exit-class: ${{ needs.implement.outputs.exit-class }}
+          repo: ${{ github.repository }}
+          base-branch: ${{ inputs.base-branch }}
+          pr-body-template: ${{ inputs.pr-body-template }}
+          pr-title-template: ${{ inputs.pr-title-template }}

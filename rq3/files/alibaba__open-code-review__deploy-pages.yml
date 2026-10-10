@@ -1,0 +1,77 @@
+name: Deploy Pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'pages/**'
+      - 'install.sh'
+      - 'install.ps1'
+      - '.github/workflows/deploy-pages.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: github.repository == 'alibaba/open-code-review'
+    runs-on: self-hosted
+    timeout-minutes: 10
+    container:
+      image: node:24
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Trust workspace
+        run: git config --global --replace-all safe.directory '*'
+
+      - name: Install dependencies
+        working-directory: pages
+        run: npm install
+
+      - name: Build
+        working-directory: pages
+        run: npm run build
+
+      - name: Prepare deployment artifact
+        run: |
+          mkdir -p _site
+          cp -r pages/dist/* _site/
+          cp pages/logo.svg _site/logo.svg
+          cp install.sh _site/install.sh
+          cp install.ps1 _site/install.ps1
+
+      - name: Verify deployment artifact
+        run: |
+          test -f _site/install.sh
+          test -f _site/install.ps1
+          sh -n _site/install.sh
+          cmp install.sh _site/install.sh
+          cmp install.ps1 _site/install.ps1
+          test -e _site/robots.txt
+
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: _site
+
+  deploy:
+    if: github.repository == 'alibaba/open-code-review'
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: self-hosted
+    timeout-minutes: 15
+    container:
+      image: node:24
+    needs: build
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128 # v5.0.0

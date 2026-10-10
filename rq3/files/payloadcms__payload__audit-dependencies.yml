@@ -1,0 +1,45 @@
+name: audit-dependencies
+
+on:
+  # Monday at 2am EST
+  schedule:
+    - cron: '0 7 * * 1'
+  workflow_dispatch:
+    inputs:
+      scope:
+        description: Which surface to audit (consumer-facing or monorepo)
+        required: false
+        default: consumer-facing
+      audit-level:
+        description: The level of audit to run (low, moderate, high, critical)
+        required: false
+        default: high
+      debug:
+        description: Enable debug logging
+        required: false
+        default: false
+
+env:
+  DO_NOT_TRACK: 1 # Disable Turbopack telemetry
+  NEXT_TELEMETRY_DISABLED: 1 # Disable Next telemetry
+
+jobs:
+  audit:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+      - name: Setup
+        uses: ./.github/actions/setup
+        with:
+          # The audit resolves each package's dependencies fresh; a full
+          # workspace install is not needed.
+          pnpm-run-install: false
+
+      - name: Run audit dependencies action
+        id: audit_dependencies
+        uses: ./.github/actions/audit-dependencies
+        with:
+          # inputs.* are empty on `schedule`; fall back to the action defaults.
+          scope: ${{ inputs.scope || 'consumer-facing' }}
+          severity: ${{ inputs.audit-level || 'high' }}

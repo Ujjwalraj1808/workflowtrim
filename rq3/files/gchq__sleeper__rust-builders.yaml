@@ -1,0 +1,80 @@
+name: Rust Builders
+on:
+  workflow_call:
+    inputs:
+      pushImages:
+        default: false
+        required: false
+        type: boolean
+
+env:
+  DOCKER_PLATFORMS: linux/amd64,linux/arm64/v8
+  BUILD_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+  BASE_IMAGE_LOCAL: localhost:5000/sleeper-rust-builder-base:latest
+  BASE_IMAGE: ghcr.io/gchq/sleeper-rust-builder-al2023:latest
+  SCCACHE_IMAGE: ghcr.io/gchq/sleeper-rust-builder-sccache:latest
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    services:
+      registry:
+        image: registry:2
+        ports:
+          - 5000:5000
+
+    steps:
+      - uses: actions/checkout@v7
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+        with:
+          driver-opts: network=host
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build base Docker image
+        uses: docker/build-push-action@v7
+        with:
+          context: ./rust/builders/base
+          tags: ${{ env.BASE_IMAGE_LOCAL }}
+          sbom: false
+          provenance: false
+          platforms: ${{ env.DOCKER_PLATFORMS }}
+          push: true
+          labels: |
+            git-commit=${{ github.sha }}
+            build-url=${{ env.BUILD_URL }}
+      - name: Push base Docker image
+        if: ${{ inputs.pushImages }}
+        run: docker buildx imagetools create --tag ${{ env.BASE_IMAGE }} ${{ env.BASE_IMAGE_LOCAL }}
+      - name: Build sccache Docker image
+        uses: docker/build-push-action@v7
+        with:
+          context: ./rust/builders/sccache
+          tags: ${{ env.SCCACHE_IMAGE }}
+          build-args: BASE_IMAGE=${{ env.BASE_IMAGE_LOCAL }}
+          sbom: false
+          provenance: false
+          platforms: ${{ env.DOCKER_PLATFORMS }}
+          push: ${{ inputs.pushImages }}
+          labels: |
+            git-commit=${{ github.sha }}
+            build-url=${{ env.BUILD_URL }}
+      - name: Delete old images
+        if: ${{ inputs.pushImages }}
+        working-directory: ./java/build
+        run: |
+          echo "token=${{ secrets.GITHUB_TOKEN }}" >> delete.properties
+          echo "organization=${{ github.repository_owner }}" >> delete.properties
+          echo "packageNames=sleeper-rust-builder-al2023,sleeper-rust-builder-sccache" >> delete.properties
+          echo "ignoreTagsPattern=^latest$" >> delete.properties
+          echo "keepMostRecent=4" >> delete.properties
+          mvn compile exec:java -q -e -Dexec.mainClass=sleeper.build.github.api.containers.DeleteGHCRVersions \
+            -Dmaven.repo.local=../.m2/repository \
+            -Dexec.args=delete.properties

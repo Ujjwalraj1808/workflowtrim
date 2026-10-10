@@ -1,0 +1,91 @@
+name: Build and Push Container Images
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      ref-name:
+        type: string
+        description: 'The ref to build a container image from. For example a tag v23.0.0.'
+        required: true
+
+concurrency:
+  group: ${{ github.workflow }}-${{ inputs.ref-name || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    if: ${{ github.repository == 'greenbone/gsa' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - build:
+              name: default
+              base-image: greenbone/gsad
+          - build:
+              name: slim
+              suffix: slim
+              build-args: |
+                BASE_IMAGE=busybox:stable
+              base-image: busybox:stable
+    name: Build and Push Container Images (${{ matrix.build.name }})
+    uses: greenbone/workflows/.github/workflows/container-build-push-gea.yml@main
+    with:
+      ref: ${{ inputs.ref-name }}
+      ref-name: ${{ inputs.ref-name }}
+      name: ${{ matrix.build.name }}
+      labels: |
+        org.opencontainers.image.vendor=Greenbone
+        org.opencontainers.image.base.name=${{ matrix.build.base-image }}
+      build-args: ${{ matrix.build.build-args }}
+      prefix: ${{ matrix.build.prefix }}
+      suffix: ${{ matrix.build.suffix }}
+      images: |
+        ghcr.io/${{ github.repository }},enable=true
+        ${{ vars.GREENBONE_REGISTRY }}/community/${{ github.event.repository.name }},enable=${{ github.event_name != 'pull_request' && github.ref_type == 'tag' }}
+        ${{ vars.GREENBONE_REGISTRY }}/openvas-scan-dev/${{ github.event.repository.name }},enable=${{ github.event_name != 'pull_request' && github.ref_type == 'tag' && matrix.build.name == 'slim' }}
+    secrets: inherit
+
+  notify:
+    needs:
+      - build
+    if: ${{ !cancelled() && github.event_name != 'pull_request' && github.repository == 'greenbone/gsa' }}
+    uses: greenbone/workflows/.github/workflows/notify-mattermost-2nd-gen.yml@main
+    with:
+      status: ${{ contains(needs.*.result, 'failure') && 'failure' || 'success' }}
+    secrets: inherit
+
+  trigger-replication:
+    needs:
+      - build
+    if: ${{ !cancelled() && github.event_name != 'pull_request' && github.repository == 'greenbone/gsa' }}
+    runs-on: self-hosted-generic
+    steps:
+      - name: Ensure all tags are replicated on the public registry
+        uses: greenbone/actions/trigger-harbor-replication@v3
+        if: ${{ github.event_name != 'pull_request' }}
+        with:
+          registry: ${{ vars.GREENBONE_REGISTRY }}
+          token: ${{ secrets.GREENBONE_REGISTRY_REPLICATION_TOKEN }}
+          user: ${{ secrets.GREENBONE_REGISTRY_REPLICATION_USER }}
+
+  automatix:
+    name: Update Automatix
+    if: ${{ !cancelled() && startsWith(github.ref, 'refs/tags/v') }}
+    needs: build
+    uses: greenbone/workflows/.github/workflows/automatix-service.yml@main
+    with:
+      service: openvas-gsa
+      url: ${{ vars.GREENBONE_REGISTRY }}/openvas-scan-dev/${{ github.event.repository.name }}
+      tag: ${{ github.ref_name }}
+      # We only need the slim version for enterprise-contianer
+      artifact-pattern: slim
+    secrets: inherit

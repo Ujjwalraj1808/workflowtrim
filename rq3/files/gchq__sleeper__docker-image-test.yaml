@@ -1,0 +1,126 @@
+on:
+  workflow_call:
+    inputs:
+      imageName:
+        required: true
+        type: string
+      isLambda:
+        default: false
+        required: false
+        type: boolean
+      testClassNames:
+        required: false
+        type: string
+      dockerOptions:
+        required: false
+        type: string
+      mavenOptions:
+        required: false
+        type: string
+      trivyIgnore:
+        default: code-style/.trivyignore.yaml
+        required: false
+        type: string
+      enableTrivy:
+        default: true
+        type: boolean
+
+env:
+  BASE_IMAGE: localhost:5000/base:test
+  RUST_BUILD_IMAGE: "ghcr.io/gchq/sleeper-rust-builder-sccache:latest"
+  SCCACHE_GHA_ENABLED: "true"
+  SCCACHE_CACHE_SIZE: "2G"
+
+jobs:
+  build:
+    name: Test Docker image ${{ inputs.imageName }}
+    runs-on: ubuntu-latest
+
+    services:
+      registry:
+        image: registry:3
+        ports:
+          - 5000:5000
+
+    steps:
+      - name: Delete huge unnecessary tools folder
+        run: |
+          rm -rf /opt/hostedtoolcache
+          rm -rf /usr/share/dotnet
+          rm -rf /opt/ghc
+          rm -rf "/usr/local/share/boost"
+          rm -rf "$AGENT_TOOLSDIRECTORY"
+      - uses: actions/checkout@v7
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+        with:
+          driver-opts: network=host
+          name: sleeper
+      - uses: actions/setup-java@v6
+        with:
+          java-version: '17'
+          distribution: 'corretto'
+      - uses: mozilla-actions/sccache-action@v0.0.11
+      - name: Cache dependencies
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ runner.temp }}/.m2/repository
+          key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
+          restore-keys: |
+            ${{ runner.os }}-maven-
+      - name: Resolve dependencies
+        run: mvn de.qaware.maven:go-offline-maven-plugin:resolve-dependencies -Dmaven.repo.local=${{ runner.temp }}/.m2/repository
+        working-directory: ./java
+      - name: Build with Maven
+        run: mvn --batch-mode install -Pquick -T 1C -Dmaven.repo.local=${{ runner.temp }}/.m2/repository ${{ inputs.mavenOptions }}
+        working-directory: ./java
+      - name: Copy build output
+        working-directory: ./scripts/build
+        run: ./copyBuildOutput.sh
+      - name: Build base image
+        run: ./scripts/dev/buildDockerImage.sh base ${{ env.BASE_IMAGE }} ${{ inputs.dockerOptions }} --builder sleeper --push
+      - name: Build Docker image ${{ inputs.imageName }}
+        run: ./scripts/dev/buildDockerImage.sh ${{ inputs.imageName }} ${{ inputs.imageName }}:test-no-rie --default-base-image ${{ env.BASE_IMAGE }} ${{ inputs.dockerOptions }} --builder sleeper --load
+      - name: Check Docker image does not run as root
+        run: |
+          IMAGE_USER=$(docker image inspect --format '{{.Config.User}}' ${{ inputs.imageName }}:test-no-rie)
+          echo "Image ${{ inputs.imageName }} runs as user: '$IMAGE_USER'"
+          if [ -z "$IMAGE_USER" ] || [ "$IMAGE_USER" = "root" ] || [ "$IMAGE_USER" = "0" ]; then
+            echo "::error::Image ${{ inputs.imageName }} runs as root. Images deployed in an instance of Sleeper must run as a non-root user, so that code injected into a running container cannot modify the container. See docs/deployment/docker-images.md."
+            exit 1
+          fi
+      - name: Add RIE to Docker image
+        if: ${{ inputs.testClassNames != '' && inputs.isLambda }}
+        run: |
+          docker tag ${{ inputs.imageName }}:test-no-rie localhost:5000/${{ inputs.imageName }}:test-no-rie
+          docker push localhost:5000/${{ inputs.imageName }}:test-no-rie
+          docker buildx build --builder sleeper --load \
+            --build-arg BASE_IMAGE=localhost:5000/${{ inputs.imageName }}:test-no-rie \
+            -t ${{ inputs.imageName }}:test ${{ inputs.dockerOptions }} \
+            ./java/common/docker-lambda/add-rie/
+      - name: Re-tag non-lambda Docker image
+        if: ${{ inputs.testClassNames != '' && !inputs.isLambda }}
+        run: docker tag ${{ inputs.imageName }}:test-no-rie ${{ inputs.imageName }}:test
+      - name: Delete build output to free disk space
+        run: |
+          rm -rf ./scripts/docker
+          rm -rf ./scripts/jars
+      - name: Docker image tests
+        working-directory: ./java
+        if: ${{ inputs.testClassNames != '' }}
+        run: mvn verify -PsystemTest -Drust.skip=true -pl clients "-DrunIT=${{ inputs.testClassNames }}" -Dmaven.repo.local=${{ runner.temp }}/.m2/repository
+      - name: Run Trivy vulnerability scanner
+        if: ${{ inputs.enableTrivy }}
+        env:
+          TRIVY_IGNOREFILE: ${{ inputs.trivyIgnore }}
+          TRIVY_SHOW_SUPPRESSED: true
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          version: v0.74.0
+          image-ref: '${{ inputs.imageName }}:test-no-rie'
+          format: 'table'
+          exit-code: '1'
+          ignore-unfixed: true
+          scanners: 'vuln,secret,misconfig'

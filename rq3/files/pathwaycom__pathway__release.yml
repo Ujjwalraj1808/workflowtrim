@@ -1,0 +1,540 @@
+name: Package release
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*.*.*"
+  schedule:
+    - cron: "0 2 * * *"
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+env:
+  # Print the Python-level traceback when a native extension crashes the
+  # interpreter, so CI failures like segfaults on import are diagnosable.
+  PYTHONFAULTHANDLER: "1"
+
+jobs:
+  start-runner:
+    name: Start self-hosted EC2 runner
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    outputs:
+      label: ${{ steps.start-ec2-runner.outputs.label }}
+      ec2-instance-id: ${{ steps.start-ec2-runner.outputs.ec2-instance-id }}
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v3
+        with:
+          aws-access-key-id: ${{ secrets.EC2_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.EC2_ACCESS_KEY_SECRET }}
+          aws-region: ${{ secrets.EC2_AWS_REGION }}
+      - name: Start EC2 runner
+        id: start-ec2-runner
+        uses: machulav/ec2-github-runner@v2.6.1
+        with:
+          mode: start
+          github-token: ${{ secrets.EC2_GH_PERSONAL_TOKEN }}
+          ec2-image-id: ${{ vars.EC2_INSTANCE_AMI_AARCH }}
+          ec2-instance-type: ${{ secrets.EC2_INSTANCE }}
+          subnet-id: ${{ secrets.EC2_SUBNET_ID }}
+          security-group-id: ${{ secrets.EC2_SECURITY_GROUP_ID }}
+          aws-resource-tags: >
+            [
+              {"Key": "Name", "Value": "ec2-github-runner"},
+              {"Key": "GitHubRepository", "Value": "${{ github.repository }}"}
+            ]
+
+  Build_packages:
+    name: Build packages
+    needs: start-runner
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10"]
+        os:
+          - ubuntu-22.04
+          - selfhosted-macOS
+          - ${{ needs.start-runner.outputs.label }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 270
+    steps:
+      # This will ensure we have clean workspace
+      - name: Cleanup build folder
+        run: |
+          ls -la ./
+          rm -rf ./* || true
+          rm -rf ./.??* || true
+          ls -la ./
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+
+      - name: Git checkout
+        uses: actions/checkout@v6
+
+      - name: License files
+        run: |
+          rm -f LICENSE_*-LICENSE-*
+          for filename in library_licenses/*; do cp "$filename" "LICENSE_$(basename "${filename}")"; done;
+
+      - name: Set package version nightly
+        if: (github.event_name == 'workflow_dispatch' || github.event_name == 'schedule')
+        run: |
+          BUILD_NUMBER="${{ github.run_number }}"
+          PACKAGE_VERSION=$(perl -nle 'print $& while m{^version[[:space:]]*=[[:space:]]"\K[[:digit:]]+\.[[:digit:]]+\.[[:digit:]]+(?=")}g' Cargo.toml)
+          [[ -z "$PACKAGE_VERSION" ]] && { echo "Malformed package version in Cargo.toml" ; exit 1; }
+          NEXT_PATCH_VERSION=$(echo "${PACKAGE_VERSION}" | awk -F. -v OFS=. '{$NF += 1 ; print}')
+          DEV_VERSION="\"${NEXT_PATCH_VERSION}-dev${BUILD_NUMBER}\""
+          SED_RESULT=$(sed -i -r -E 's/^(version)[[:space:]]*=[[:space:]]"([[:digit:]]+\.[[:digit:]]+).[[:digit:]]+"/\1 = '"$DEV_VERSION"'/ w /dev/stdout' Cargo.toml)
+          echo $DEV_VERSION
+          echo "__version__ = ${DEV_VERSION}" > python/pathway/internals/version.py
+
+      - name: Set package version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          PACKAGE_VERSION=$(perl -nle 'print $& while m{^version[[:space:]]*=[[:space:]]"\K[[:digit:]]+\.[[:digit:]]+\.[[:digit:]]+(?=")}g' Cargo.toml)
+          [[ -z "$PACKAGE_VERSION" ]] && { echo "Malformed package version in Cargo.toml" ; exit 1; }
+
+          echo $PACKAGE_VERSION
+          echo "__version__ = \"${PACKAGE_VERSION}\"" > python/pathway/internals/version.py
+
+      - name: Build package Ubuntu x86-x64
+        if: ${{ matrix.os == 'ubuntu-22.04'}}
+        uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          args: --release --strip -i python3.10
+          manylinux: auto
+          container: "quay.io/pypa/manylinux_2_28_x86_64:2026.02.01-1"
+          before-script-linux: |
+            dnf install -y \
+              perl-core \
+              llvm \
+              llvm-devel \
+              clang \
+              clang-devel \
+              postgresql-devel
+
+      - name: Install libpq (macOS)
+        if: ${{ matrix.os == 'selfhosted-macOS'}}
+        run: |
+          brew install libpq
+
+          LIBPQ_PREFIX=$(brew --prefix libpq)
+
+          echo "PG_CONFIG_AARCH64_APPLE_DARWIN=$LIBPQ_PREFIX/bin/pg_config" >> $GITHUB_ENV
+          echo "PG_CONFIG_X86_64_APPLE_DARWIN=$LIBPQ_PREFIX/bin/pg_config" >> $GITHUB_ENV
+          echo "LIBPQ_LIB_DIR=$LIBPQ_PREFIX/lib" >> $GITHUB_ENV
+          echo "LIBPQ_INCLUDE_DIR=$LIBPQ_PREFIX/include" >> $GITHUB_ENV
+
+      - name: Build package macOS Apple silicon
+        if: ${{ matrix.os == 'selfhosted-macOS'}}
+        uses: PyO3/maturin-action@v1
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "10.15"
+          DEVELOPER_DIR: /Library/Developer/CommandLineTools
+          SDKROOT: /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk
+          # numkong's SME feature probes pass on Apple clang 16, but compiling
+          # the actual SME kernels crashes its frontend; NEON kernels stay on.
+          # Drop once the runner's CommandLineTools are upgraded past clang 16.
+          NK_TARGET_SME: "0"
+          NK_TARGET_SME2: "0"
+          NK_TARGET_SMEF64: "0"
+          NK_TARGET_SMEHALF: "0"
+          NK_TARGET_SMEBI32: "0"
+          NK_TARGET_SMELUT2: "0"
+        with:
+          command: build
+          args: --release --strip -i python3.10
+          target: aarch64-apple-darwin
+
+      - name: Build package macos x86_64
+        if: ${{ matrix.os == 'selfhosted-macOS'}}
+        uses: PyO3/maturin-action@v1
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "10.15"
+          DEVELOPER_DIR: /Library/Developer/CommandLineTools
+          SDKROOT: /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk
+        with:
+          command: build
+          args: --release --strip -i python3.10
+          target: x86_64-apple-darwin
+
+      - name: Delocate macos wheels
+        if: ${{ matrix.os == 'selfhosted-macOS'}}
+        run: |
+          pip install delocate
+          delocate-wheel ./target/wheels/*.whl
+
+      - name: Build package Ubuntu AArch64
+        if: ${{ matrix.os == needs.start-runner.outputs.label }}
+        uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          args: --release --strip -i python3.10
+          manylinux: 2_28
+          container: "quay.io/pypa/manylinux_2_28_aarch64:2026.02.01-1"
+          before-script-linux: |
+            dnf install -y \
+              perl-core \
+              llvm \
+              llvm-devel \
+              clang \
+              clang-devel \
+              postgresql-devel
+            python3 -m ensurepip
+
+      - name: Upload artifact
+        if: ${{ matrix.os == needs.start-runner.outputs.label }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: pathway-arch64
+          path: ./target/wheels/
+
+      - name: Upload artifact
+        if: ${{ matrix.os == 'ubuntu-22.04' }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: pathway-x86-x64
+          path: ./target/wheels/
+
+      - name: Upload artifact
+        if: ${{ matrix.os == 'selfhosted-macOS' }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: pathway-macOS
+          path: ./target/wheels/
+
+      - name: Upload artifact
+        if: ${{ matrix.os == needs.start-runner.outputs.label }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: CHANGELOG.md
+          path: CHANGELOG.md
+
+  Verify_Linux:
+    needs: Build_packages
+    name: Verify packages
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.14"]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    steps:
+      # This will ensure we have clean workspace
+      - name: Cleanup build folder
+        run: |
+          ls -la ./
+          rm -rf ./* || true
+          rm -rf ./.??* || true
+          ls -la ./
+      - name: Create dir for wheels
+        run: |
+          mkdir -p wheels
+
+      - uses: actions/download-artifact@v7
+        with:
+          name: pathway-x86-x64
+          path: ./wheels/
+
+      - name: Provision uv
+        # Same uv provisioning as the monorepo verify jobs: uv's standalone
+        # CPython builds work uniformly on hosted and self-hosted runners.
+        run: |
+          if ! command -v uv >/dev/null 2>&1; then
+            curl -LsSf https://astral.sh/uv/install.sh | sh
+          fi
+          # The installer picks its directory from its own idea of the home
+          # directory, which does not always match $HOME inside the step (on
+          # containerized runners they diverge) — locate the binary instead.
+          UV_BIN=$(command -v uv || true)
+          if [ -z "$UV_BIN" ]; then
+            for d in "$HOME/.local/bin" /root/.local/bin "$HOME/.cargo/bin"; do
+              if [ -x "$d/uv" ]; then UV_BIN="$d/uv"; break; fi
+            done
+          fi
+          if [ -z "$UV_BIN" ]; then echo "uv not found after install" >&2; exit 1; fi
+          UV_DIR=$(dirname "$UV_BIN")
+          export PATH="$UV_DIR:$PATH"
+          echo "$UV_DIR" >> "$GITHUB_PATH"
+          # Make sure a *stable* interpreter of the requested minor version is
+          # present: a stale uv cache on a runner may only hold a pre-release
+          # (e.g. 3.14.0a4), whose ABI differs from the final release and
+          # crashes extensions built for the stable cp314 ABI.
+          uv python install "${{ matrix.python-version }}"
+
+      - name: Install and verify Linux package
+        run: |
+          set -ex
+          ENV_NAME="testenv_${{ matrix.python-version }}"
+          rm -rf "${ENV_NAME}"
+          uv venv --seed --python "${{ matrix.python-version }}" "${ENV_NAME}"
+          source "${ENV_NAME}/bin/activate"
+          WHEEL=(./wheels/pathway-*.whl)
+          # install with uv: pip backtracks for hours on the boto/google/openapi
+          # dependency lattices that uv solves in seconds
+          uv pip install --no-cache "${WHEEL}[tests]"
+          # --confcutdir anything below to avoid picking REPO_TOP_DIR/conftest.py
+          export PYTEST_ADDOPTS="--dist worksteal -n auto --timeout=900"
+          python -m pytest -v --confcutdir "${ENV_NAME}" --doctest-modules --pyargs pathway
+        env:
+          PATHWAY_LICENSE_KEY: ${{ secrets.PATHWAY_LICENSE_KEY }}
+
+  Verify_ARM_ARCH:
+    needs:
+      - start-runner
+      - Build_packages
+    name: Verify macOS and Linux
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.14"]
+        os:
+          - selfhosted-macOS
+          - ${{ needs.start-runner.outputs.label }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    steps:
+      # This will ensure we have clean workspace
+      - name: Cleanup build folder
+        run: |
+          ls -la ./
+          rm -rf ./* || true
+          rm -rf ./.??* || true
+          ls -la ./
+      - name: Create dir for wheels
+        run: |
+          mkdir -p wheels
+
+      - uses: actions/download-artifact@v7
+        if: ${{ matrix.os == 'selfhosted-macOS' }}
+        with:
+          name: pathway-macOS
+          path: ./wheels/
+
+      - uses: actions/download-artifact@v7
+        if: ${{ matrix.os == needs.start-runner.outputs.label }}
+        with:
+          name: pathway-arch64
+          path: ./wheels/
+
+      - name: Provision uv
+        # These self-hosted runners have no actions/setup-python, and the
+        # system pythons only cover the versions preinstalled on the runner.
+        # uv's standalone CPython builds work uniformly on all of them.
+        run: |
+          if ! command -v uv >/dev/null 2>&1; then
+            curl -LsSf https://astral.sh/uv/install.sh | sh
+          fi
+          # The installer picks its directory from its own idea of the home
+          # directory, which does not always match $HOME inside the step (on
+          # containerized runners they diverge) — locate the binary instead.
+          UV_BIN=$(command -v uv || true)
+          if [ -z "$UV_BIN" ]; then
+            for d in "$HOME/.local/bin" /root/.local/bin "$HOME/.cargo/bin"; do
+              if [ -x "$d/uv" ]; then UV_BIN="$d/uv"; break; fi
+            done
+          fi
+          if [ -z "$UV_BIN" ]; then echo "uv not found after install" >&2; exit 1; fi
+          UV_DIR=$(dirname "$UV_BIN")
+          export PATH="$UV_DIR:$PATH"
+          echo "$UV_DIR" >> "$GITHUB_PATH"
+          # Make sure a *stable* interpreter of the requested minor version is
+          # present: a stale uv cache on a runner may only hold a pre-release
+          # (e.g. 3.14.0a4), whose ABI differs from the final release and
+          # crashes extensions built for the stable cp314 ABI.
+          uv python install "${{ matrix.python-version }}"
+
+      - name: Install and verify ${{ matrix.os }} package
+        run: |
+          set -ex
+          ENV_NAME="testenv_${{ matrix.python-version }}"
+          rm -rf "${ENV_NAME}"
+          uv venv --seed --python "${{ matrix.python-version }}" "${ENV_NAME}"
+          source "${ENV_NAME}/bin/activate"
+          if [[ "${{ matrix.os }}" == 'selfhosted-macOS' ]]; then
+            WHEEL=(./wheels/pathway-*arm64.whl)
+          else
+            WHEEL=(./wheels/pathway-*aarch64.whl)
+          fi
+          export PATHWAY_MONITORING_HTTP_PORT=20099
+          export LLAMA_READER_PORT=8799
+          # install with uv: pip backtracks for hours on the boto/google/openapi
+          # dependency lattices that uv solves in seconds
+          uv pip install --no-cache "${WHEEL}[tests]"
+          uv pip install llama_index
+          # --confcutdir anything below to avoid picking REPO_TOP_DIR/conftest.py
+          if [[ "$RUNNER_NAME" == *mac* ]]; then
+            export PYTEST_XDIST_AUTO_NUM_WORKERS=2
+          fi
+          export PYTEST_ADDOPTS="--dist worksteal -n auto --timeout=900"
+          python -m pytest -v --confcutdir "${ENV_NAME}" --doctest-modules --pyargs pathway
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "10.15"
+          DEVELOPER_DIR: /Library/Developer/CommandLineTools
+          SDKROOT: /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk
+          PATHWAY_LICENSE_KEY: ${{ secrets.PATHWAY_LICENSE_KEY }}
+
+      - name: post cleanup
+        run: rm -rf ./wheels
+
+  Publish:
+    needs:
+      - Verify_Linux
+      - Verify_ARM_ARCH
+      - start-runner
+    name: Publish package
+    strategy:
+      fail-fast: false
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v3
+        with:
+          aws-access-key-id: ${{ secrets.ARTIFACT_AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.ARTIFACT_AWS_SECRET_ACCESS_KEY }}
+          role-to-assume: ${{ secrets.ARTIFACT_AWS_ROLE }}
+          aws-region: ${{ secrets.ARTIFACT_AWS_REGION }}
+          role-duration-seconds: 1200
+
+      - name: Create dir for wheels
+        run: |
+          mkdir -p wheels
+
+      - uses: actions/download-artifact@v7
+        with:
+          name: pathway-x86-x64
+          path: ./wheels/
+
+      - uses: actions/download-artifact@v7
+        with:
+          name: pathway-arch64
+          path: ./wheels/
+
+      - uses: actions/download-artifact@v7
+        with:
+          name: pathway-macOS
+          path: ./wheels/
+
+      - uses: actions/download-artifact@v7
+        with:
+          name: CHANGELOG.md
+          path: .
+
+      - name: Create Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: ncipollo/release-action@v1.12.0
+        with:
+          draft: true
+          artifacts: "./wheels/*.whl"
+          artifactContentType: "raw"
+          allowUpdates: true
+
+      - name: Publish package distributions to PyPI
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          password: ${{ secrets.PYPI_TOKEN }}
+          packages-dir: "./wheels/"
+
+      - name: Publish package to s3
+        uses: prewk/s3-cp-action@v2
+        with:
+          aws_access_key_id: ${{ secrets.ARTIFACT_AWS_ACCESS_KEY_ID }}
+          aws_secret_access_key: ${{ secrets.ARTIFACT_AWS_SECRET_ACCESS_KEY }}
+          dest: ${{ secrets.ARTIFACT_AWS_BUCKET }}
+          source: ./wheels/
+          flags: --recursive
+
+      - name: post cleanup
+        run: rm -rf ./wheels
+
+  Update_pip_index:
+    needs:
+      - Publish
+    name: Update pip index
+    strategy:
+      fail-fast: false
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v3
+        with:
+          aws-access-key-id: ${{ secrets.ARTIFACT_AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.ARTIFACT_AWS_SECRET_ACCESS_KEY }}
+          role-to-assume: ${{ secrets.ARTIFACT_AWS_ROLE }}
+          aws-region: ${{ secrets.ARTIFACT_AWS_REGION }}
+          role-duration-seconds: 1200
+
+      - name: Generate and upload pip index.html
+        run: |
+          set -ex
+          aws s3 cp ${{ secrets.ARTIFACT_AWS_BUCKET }}/templates/pip-index.html pip-index.html
+          export PACKAGE_LIST_HTML=$(aws s3 ls ${{ secrets.ARTIFACT_AWS_BUCKET }}/ | awk '/\.whl$/ {href=$4; sub("+","%252B",href); print "<li><a href=\""href"\">"$4"</a></li>"}')
+          perl -i -pe 's/<PACKAGE_LIST>/$ENV{"PACKAGE_LIST_HTML"}/g' pip-index.html
+          aws s3 cp pip-index.html ${{ secrets.ARTIFACT_AWS_BUCKET }}/index.html
+
+      - name: Publish pip index.html
+        uses: prewk/s3-cp-action@v2
+        with:
+          aws_access_key_id: ${{ secrets.ARTIFACT_AWS_ACCESS_KEY_ID }}
+          aws_secret_access_key: ${{ secrets.ARTIFACT_AWS_SECRET_ACCESS_KEY }}
+          source: pip-index.html
+          dest: ${{ secrets.ARTIFACT_AWS_BUCKET }}/index.html
+
+  stop-runner:
+    name: Stop self-hosted EC2 runner
+    needs:
+      - start-runner
+      - Build_packages
+      - Verify_ARM_ARCH
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    if: ${{ always() }}
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v3
+        with:
+          aws-access-key-id: ${{ secrets.EC2_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.EC2_ACCESS_KEY_SECRET }}
+          aws-region: ${{ secrets.EC2_AWS_REGION }}
+      - name: Stop EC2 runner
+        uses: machulav/ec2-github-runner@v2.6.1
+        with:
+          mode: stop
+          github-token: ${{ secrets.EC2_GH_PERSONAL_TOKEN }}
+          label: ${{ needs.start-runner.outputs.label }}
+          ec2-instance-id: ${{ needs.start-runner.outputs.ec2-instance-id }}
+
+  Notify_on_failure:
+    needs:
+      - Build_packages
+      - Verify_Linux
+      - Verify_ARM_ARCH
+      - Publish
+      - Update_pip_index
+    if: failure()
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Post to a Slack channel
+        id: slack
+        uses: slackapi/slack-github-action@v2.1.1
+        with:
+          webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
+          webhook-type: webhook-trigger
+          payload: |
+            {
+              "text": ":warning: :warning: GitHub Action build result: failure :manul:\nAction run URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }} :warning: :warning:",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": ":warning: :warning: GitHub Action build result: failure :manul:\nAction run URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }} :warning: :warning:"
+                  }
+                }
+              ]
+            }

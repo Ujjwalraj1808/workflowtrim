@@ -1,0 +1,51 @@
+name: Knowledge graph discovery cron
+
+# Pings the cloud backend to refresh the knowledge graph (static +
+# observational layers) for a staleness-ordered batch of organizations,
+# prune expired kg_value_seen hashes, and apply tool_invocations
+# retention. The endpoint (`/api/cron/kg-discovery`) is idempotent —
+# per-connector watermarks mean a re-run won't re-ingest already-seen
+# invocations, and the per-run org cap (KG_CRON_MAX_ORGS) bounds cost.
+#
+# Schedule: every 2 hours, so the observational layer stays reasonably
+# fresh without heavy load (work is incremental + capped).
+
+on:
+  schedule:
+    - cron: "0 */2 * * *"
+  workflow_dispatch:
+    inputs:
+      target_url:
+        description: "Override the kg-discovery URL (used for staging / dry-run)"
+        required: false
+        default: "https://cloud.anythingmcp.com/api/cron/kg-discovery"
+
+jobs:
+  trigger:
+    name: Trigger knowledge-graph discovery
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Call cron endpoint
+        env:
+          CRON_SECRET: ${{ secrets.ONBOARDING_CRON_SECRET }}
+          TARGET_URL: ${{ inputs.target_url || 'https://cloud.anythingmcp.com/api/cron/kg-discovery' }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CRON_SECRET:-}" ]; then
+            echo "::error::ONBOARDING_CRON_SECRET secret is not set on this repository."
+            exit 1
+          fi
+          response_file="$(mktemp)"
+          http_code=$(curl -sS -o "${response_file}" -w "%{http_code}" \
+            -X POST \
+            -H "Authorization: Bearer ${CRON_SECRET}" \
+            -H "Content-Type: application/json" \
+            "${TARGET_URL}")
+          echo "HTTP ${http_code}"
+          cat "${response_file}"
+          echo
+          if [ "${http_code}" -lt 200 ] || [ "${http_code}" -ge 300 ]; then
+            echo "::error::Knowledge-graph discovery cron endpoint returned ${http_code}"
+            exit 1
+          fi

@@ -1,0 +1,74 @@
+name: Publish docs
+permissions:
+  contents: read
+
+on:
+  workflow_call:
+    inputs:
+      release_tag:
+        description: 'Existing git tag in the format x.x.x'
+        required: true
+        type: string
+  workflow_dispatch:
+     inputs:
+      release_tag:
+        description: 'Existing git tag in the format x.x.x'
+        required: true
+        type: string
+
+jobs:
+  build_docs:
+    runs-on: ubuntu-latest
+    env:
+      RELEASE_TAG: ${{ inputs.release_tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+      - name: Setup pnpm
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v4
+        with:
+          run_install: false
+          package_json_file: docs/package.json
+          version: 8
+      - name: Setup Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v4
+        with:
+          node-version: 20
+      - name: Setup Pages
+        uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
+      - name: Install dependencies
+        run: pnpm install
+        working-directory: ./docs
+      - name: Build with VitePress
+        run: |
+          echo "{\"version\":\"${RELEASE_TAG}\"}" > ./.vitepress/version.json
+          pnpm docs:build
+        working-directory: ./docs
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v3
+        with:
+          path: docs/.vitepress/dist
+          name: docs
+
+  publish_docs:
+    needs: build_docs
+
+    # Grant GITHUB_TOKEN the permissions required to make a Pages deployment
+    permissions:
+      pages: write      # to deploy to Pages
+      id-token: write   # to verify the deployment originates from an appropriate source
+
+    # Deploy to the github-pages environment
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    # Specify runner + deployment step
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 #v5.0.1
+        with:
+          artifact_name: docs

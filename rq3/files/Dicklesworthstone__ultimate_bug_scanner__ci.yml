@@ -1,0 +1,444 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref_name }}
+  cancel-in-progress: true
+
+env:
+  UBS_NO_AUTO_UPDATE: "1"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          # The version-tag drift check below resolves
+          # `git show v$UBS_VERSION:modules/...`. The default fetch-depth
+          # of 1 doesn't include tag refs, so use 0 (full history +
+          # tags) — the repo is small enough that the cost is
+          # negligible and silently missing tags would let drift slip
+          # past the check.
+          fetch-depth: 0
+
+      - name: Syntax-check shell scripts
+        run: |
+          bash -n install.sh
+          bash -n ubs
+
+      - name: Verify entrypoint loads
+        run: ./ubs --help >/dev/null
+
+      - name: Verify v$UBS_VERSION tag matches MODULE_CHECKSUMS (issue #45)
+        # Catches the recurring distribution-drift bug: install.sh
+        # ships the latest `main` runner, but `ubs` fetches modules
+        # from v${UBS_VERSION}. If main's MODULE_CHECKSUMS table
+        # advances past the tag without bumping UBS_VERSION, every
+        # fresh install hits checksum mismatch on `ubs doctor --fix`.
+        # See https://github.com/Dicklesworthstone/ultimate_bug_scanner/issues/45
+        run: ./scripts/check-version-tag-drift.sh
+
+      - name: Release script dry run
+        # scripts/cut-release.sh is the only supported release path; make sure
+        # its plan stage keeps working (no files are changed in --dry-run).
+        run: ./scripts/cut-release.sh 999.0.0 --dry-run --allow-dirty
+
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up uv with caching
+        uses: astral-sh/setup-uv@v10
+        with:
+          python-version: "3.14"
+          enable-cache: true
+          cache-dependency-glob: |
+            uv.lock
+
+      - name: Install system tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends jq ripgrep
+
+      - name: Install ast-grep
+        run: npm install -g @ast-grep/cli@0.45.3 >/dev/null
+
+      - name: Sync Python dependencies
+        run: uv sync --locked --python 3.14
+
+      - name: Installer smoke tests
+        # Runs install.sh end to end from a clean $HOME (no network needed: the
+        # local ./ubs is installed), including the Claude hook registration,
+        # flag-order independence and the fresh-HOME regression scenarios.
+        env:
+          NO_COLOR: "1"
+        run: bash test-suite/install/run_tests.sh
+
+      - name: Self-scan (UBS must pass on its own sources)
+        # The repository is its own fixture: every warning or critical that UBS
+        # reports on ubs, install.sh, scripts/ and modules/helpers/ is either a
+        # real bug or a false positive we owe a fix for. .ubsignore only skips
+        # the intentionally buggy test fixtures.
+        env:
+          NO_COLOR: "1"
+        run: |
+          ./ubs . --ci --fail-on-warning --format=json > self-scan.json
+          jq -e '.totals.critical == 0 and .totals.warning == 0' self-scan.json
+          jq -c '.totals' self-scan.json
+
+      - name: Run helper test suites
+        env:
+          NO_COLOR: "1"
+          UBS_LOG_JSON: "1"
+        run: |
+          uv run python test-suite/shareable/test_shareable_reports.py
+          uv run python test-suite/shareable/test_cli_contract.py
+          uv run python test-suite/shareable/test_supply_chain.py
+          uv run python test-suite/python/tests/test_resource_helper.py
+          uv run python test-suite/python/tests/test_git_safety_guard.py
+          uv run python test-suite/java/tests/test_resource_lifecycle_helper.py
+          uv run python test-suite/csharp/tests/test_helper_scanners.py
+
+  manifest:
+    # The full manifest (447 cases) takes ~30 min serially; four deterministic
+    # slices (run_manifest.py --shard I/N) bring the PR gate under ten minutes.
+    # The nightly/main full run (test-suite.yml) still executes everything in
+    # one process through run_all.sh.
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    env:
+      NO_COLOR: "1"
+      UBS_LOG_JSON: "1"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up uv with caching
+        uses: astral-sh/setup-uv@v10
+        with:
+          python-version: "3.14"
+          enable-cache: true
+          cache-dependency-glob: |
+            uv.lock
+
+      - name: Install system tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends jq ripgrep
+
+      - name: Install ast-grep
+        run: npm install -g @ast-grep/cli@0.45.3 >/dev/null
+
+      - name: Install toon_rust encoder (tru)
+        # toon-format-* cases need the real encoder; pinned release + sha256 sidecar.
+        run: |
+          TOON_RUST_TAG="v0.2.4"
+          curl -fsSLO "https://github.com/Dicklesworthstone/toon_rust/releases/download/${TOON_RUST_TAG}/toon-linux-amd64.tar.xz"
+          curl -fsSLO "https://github.com/Dicklesworthstone/toon_rust/releases/download/${TOON_RUST_TAG}/toon-linux-amd64.tar.xz.sha256"
+          sha256sum -c <(awk '{print $1"  toon-linux-amd64.tar.xz"}' toon-linux-amd64.tar.xz.sha256)
+          tar -xf toon-linux-amd64.tar.xz
+          sudo install -m 0755 toon /usr/local/bin/tru
+          rm -f toon toon-linux-amd64.tar.xz toon-linux-amd64.tar.xz.sha256
+          tru --version
+
+      - name: Sync Python dependencies
+        run: uv sync --locked --python 3.14
+
+      - name: Run manifest shard ${{ matrix.shard }}/4
+        run: cd test-suite && uv run python run_manifest.py --shard ${{ matrix.shard }}/4
+
+  docker-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Build image for the host platform
+        run: docker build -t ubs-smoke:ci .
+
+      - name: Scan the fixture tree inside the image (JS + Python must produce findings)
+        # The image bundles modules, helpers, python3, unzip and a pre-provisioned
+        # ast-grep, so this runs with --network=none: no downloads at scan time.
+        run: |
+          docker run --rm --network=none -v "$PWD/test-suite:/scan:ro" \
+            -e UBS_NO_AUTO_UPDATE=1 -e UBS_SKIP_SIZE_CHECK=1 \
+            ubs-smoke:ci /scan/js/buggy /scan/python/security --ci --format=json > docker-smoke.json || true
+          jq -e '.scanners | map(select(.language=="js" and .critical > 0)) | length > 0' docker-smoke.json
+          jq -e '.scanners | map(select(.language=="python" and .critical > 0)) | length > 0' docker-smoke.json
+
+  macos-smoke:
+    # macOS ships bash 3.2 as /bin/bash and BSD userland (du, sed, stat), the
+    # two things most likely to break a Bash meta-runner developed on Linux.
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install a modern bash and the scan tools
+        run: |
+          brew update >/dev/null
+          brew install bash jq ripgrep >/dev/null
+          npm install -g @ast-grep/cli@0.45.3 >/dev/null
+          "$(brew --prefix)/bin/bash" --version | head -n 1
+
+      - name: Stock /bin/bash 3.2 must fail with the documented message (exit 2)
+        run: |
+          set +e
+          /bin/bash ./ubs --version > guard.out 2>&1
+          rc=$?
+          set -e
+          cat guard.out
+          [ "$rc" -eq 2 ] || { echo "expected exit 2 from the bash-version guard, got $rc" >&2; exit 1; }
+          grep -q 'brew install bash' guard.out
+          set +e
+          /bin/bash ./install.sh --help > guard-install.out 2>&1
+          rc=$?
+          set -e
+          [ "$rc" -eq 2 ] || { echo "expected exit 2 from the installer bash-version guard, got $rc" >&2; cat guard-install.out; exit 1; }
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v10
+        with:
+          python-version: "3.14"
+
+      - name: Sync Python dependencies
+        run: uv sync --locked --python 3.14
+
+      - name: Version, doctor and smoke scans under Homebrew bash
+        env:
+          NO_COLOR: "1"
+        run: |
+          export PATH="$(brew --prefix)/bin:$PATH"
+          bash --version | head -n 1
+          ./ubs --version
+          ./ubs doctor
+          ./ubs test-suite/js/buggy test-suite/python/security --ci --format=json > macos-smoke.json || true
+          jq -e '.scanners | map(select(.language=="js" and .critical > 0)) | length > 0' macos-smoke.json
+          jq -e '.scanners | map(select(.language=="python" and .critical > 0)) | length > 0' macos-smoke.json
+          cd test-suite && uv run python run_manifest.py --fail-fast \
+            --case js-core-buggy --case js-core-clean \
+            --case golang-buggy --case golang-clean \
+            --case rust-buggy --case rust-clean
+
+      - name: Installer smoke tests under Homebrew bash
+        env:
+          NO_COLOR: "1"
+        run: |
+          export PATH="$(brew --prefix)/bin:$PATH"
+          bash test-suite/install/run_tests.sh
+
+      - name: toon_rust encoder installs from its release and drives --format=toon
+        # The digest-pinned darwin asset (bead 3a6.6, macOS half): a throwaway
+        # HOME, the installer's easy mode accepting the toon prompt, then ubs
+        # finds the installed `toon` on PATH without configuration.
+        env:
+          NO_COLOR: "1"
+        run: |
+          export PATH="$(brew --prefix)/bin:$PATH"
+          home="$(mktemp -d)"
+          mkdir -p "$home/.local/bin"
+          HOME="$home" bash ./install.sh --local --easy-mode --skip-ast-grep --skip-ripgrep --skip-jq --skip-typos \
+            --skip-doctor --skip-hooks --skip-version-check --no-path-modify --install-dir "$home/.local/bin" | tee toon-install.log
+          grep -q 'Checksum verified for toon-darwin-' toon-install.log
+          "$home/.local/bin/toon" --version
+          PATH="$home/.local/bin:$PATH" ./ubs --ci --only=python --format=toon test-suite/python/clean > toon-scan.out
+          head -n 3 toon-scan.out
+          grep -q '^status: ok' toon-scan.out
+
+      - name: Homebrew tap install (released channel, informational)
+        # Exercises `brew install dicklesworthstone/tap/ubs` from the README.
+        # It installs the last RELEASE, not this commit, so it cannot block a
+        # change here; a failure means the tap formula is broken for users.
+        continue-on-error: true
+        run: |
+          brew install dicklesworthstone/tap/ubs
+          "$(brew --prefix)/bin/ubs" --version
+
+  windows-smoke:
+    # README advertises Windows through Git Bash (or WSL). Git for Windows ships
+    # bash 5 and coreutils but no rsync, and `python3` is whatever the runner
+    # provides, so this job covers what a Windows user actually gets: version,
+    # doctor, a JS and a Python smoke scan, a directory with spaces, a CRLF
+    # fixture and a single-file scan (bead G4). The installer harness is not run
+    # here: it assumes /tmp semantics. Written without a Windows box to observe
+    # it on; the first run on main is the observation.
+    runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Keep fixture line endings as committed
+        run: git config --global core.autocrlf false
+
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v10
+        with:
+          python-version: "3.14"
+
+      - name: Install scan tools
+        run: |
+          choco install -y --no-progress ripgrep >/dev/null
+          command -v jq >/dev/null || choco install -y --no-progress jq >/dev/null
+          npm install -g @ast-grep/cli@0.45.3 >/dev/null
+          bash --version | head -n 1
+          rg --version | head -n 1
+          jq --version
+          ast-grep --version
+          echo "python3: $(command -v python3 || echo missing); python: $(command -v python || echo missing)"
+
+      - name: Version and doctor
+        env:
+          NO_COLOR: "1"
+          UBS_NO_AUTO_UPDATE: "1"
+        run: |
+          ./ubs --version
+          ./ubs doctor
+
+      - name: JS and Python smoke scans
+        env:
+          NO_COLOR: "1"
+          UBS_NO_AUTO_UPDATE: "1"
+        run: |
+          ./ubs test-suite/js/buggy --only=js --ci --format=json > js.json || true
+          jq -e '.scanners | map(select(.language=="js" and .critical > 0)) | length > 0' js.json
+          ./ubs test-suite/python/buggy --only=python --ci --format=json > py.json || true
+          jq -e '.scanners | map(select(.language=="python" and .critical > 0)) | length > 0' py.json
+
+      - name: Directory with spaces, CRLF fixture, single-file scan
+        env:
+          NO_COLOR: "1"
+          UBS_NO_AUTO_UPDATE: "1"
+        run: |
+          base="$(cygpath -u "$RUNNER_TEMP")/dir with spaces"
+          mkdir -p "$base/src"
+          cp test-suite/python/security/parser_token_compare_buggy.py "$base/src/app.py"
+          sed -i 's/$/\r/' "$base/src/app.py"
+          file "$base/src/app.py" || true
+          ./ubs "$base" --only=python --ci --format=json > spaces.json || true
+          jq -e '.scanners | map(select(.language=="python" and .files >= 1 and .critical > 0)) | length > 0' spaces.json
+          ./ubs "$base/src/app.py" --ci --format=json > single.json || true
+          jq -e '.scanners[0].language == "python" and .scanners[0].files == 1 and .scanners[0].critical > 0' single.json
+
+  goldens-bot:
+    # The rule-coverage and SARIF-evidence goldens are derived from the fixture
+    # corpus; when a rule or fixture changes on main they go stale and the test
+    # job stays red until someone regenerates them by hand. This job regenerates
+    # both on every push to main and opens (or updates) one PR with the diff, so
+    # the reviewer decides whether the drift is intentional. A PR from the
+    # default GITHUB_TOKEN does not trigger CI on itself: push an empty commit
+    # or close/reopen it to get a run before merging.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up uv with caching
+        uses: astral-sh/setup-uv@v10
+        with:
+          python-version: "3.14"
+          enable-cache: true
+          cache-dependency-glob: |
+            uv.lock
+
+      - name: Install system tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends jq ripgrep
+
+      - name: Install ast-grep
+        run: npm install -g @ast-grep/cli@0.45.3 >/dev/null
+
+      - name: Sync Python dependencies
+        run: uv sync --locked --python 3.14
+
+      - name: Regenerate goldens
+        env:
+          NO_COLOR: "1"
+        run: |
+          cd test-suite && uv run python quality/rule_quality_harness.py --update-goldens
+          git status --short goldens/
+
+      - name: Open or update the goldens PR
+        uses: peter-evans/create-pull-request@v8
+        with:
+          add-paths: test-suite/goldens/*.json
+          branch: bot/goldens-refresh
+          delete-branch: true
+          commit-message: "chore(goldens): refresh rule coverage and SARIF evidence goldens"
+          title: "chore(goldens): refresh rule coverage and SARIF evidence goldens"
+          body: |
+            `test-suite/quality/rule_quality_harness.py --update-goldens` produced a
+            different `rule_coverage.json` / `ast_grep_rule_pack_sarif.json` on `main`.
+
+            Review the diff before merging: added rules or higher counts mean the golden
+            was merely stale; removed rules or lower counts mean coverage regressed and
+            the fix belongs in the module or fixture, not in this PR.
+
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install shellcheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends shellcheck
+
+      - name: Run shellcheck
+        # The meta-runner, installer, scripts, test harnesses and hooks are
+        # held at -S warning (clean as of bead H5); the language modules still
+        # carry ~130 unused-variable warnings and stay at -S error until the
+        # shared-library work (A1) retires that boilerplate.
+        run: |
+          shellcheck -S warning install.sh ubs modules/lib/*.sh scripts/*.sh test-suite/*.sh test-suite/install/run_tests.sh .githooks/* .claude/hooks/*.sh
+          shellcheck -S error modules/*.sh
+
+      - name: Compile-check Python files
+        run: python3 -m compileall scripts modules/helpers
+
+      - name: Documentation claims match the code
+        # Flags shown in the docs must be accepted by the binaries; language and
+        # helper counts, version strings, the Python pin and the exit-code table
+        # must agree with ubs, install.sh and the workflows (scripts/check_docs_claims.py).
+        run: python3 scripts/check_docs_claims.py
+
+      - name: CHANGELOG keeps an Unreleased section
+        # scripts/cut-release.sh rolls "## [Unreleased]" under the new version
+        # header and re-creates an empty one; every change lands there first.
+        run: |
+          grep -q '^## \[Unreleased\]' CHANGELOG.md || {
+            echo "CHANGELOG.md has no '## [Unreleased]' section (see docs/release.md)" >&2
+            exit 1
+          }

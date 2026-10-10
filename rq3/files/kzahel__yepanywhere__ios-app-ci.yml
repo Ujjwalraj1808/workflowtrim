@@ -1,0 +1,111 @@
+name: iOS App CI
+
+on:
+  # Shared web/server and lockfile changes are covered by nightly runs.
+  push:
+    branches: [main]
+    paths:
+      - 'packages/ios/**'
+      - 'packages/mobile-core/**'
+      - 'packages/mobile-core-proof/test-vectors/**'
+      - 'packages/client/src/lib/nativeHost.ts'
+      - 'packages/client/src/lib/__tests__/nativeHost.test.ts'
+      - 'packages/server/src/crypto/**'
+      - 'packages/shared/src/binary-framing.ts'
+      - 'packages/server/scripts/android-native-secure-probe-server.ts'
+      - 'scripts/android-secure-interop-fixture.ts'
+      - 'pnpm-workspace.yaml'
+      - 'packages/android/app/src/sharedTest/resources/**'
+      - 'scripts/perf-suite/host-profile.mjs'
+      - '.github/workflows/ios-app-ci.yml'
+      - '!packages/ios/**/*.md'
+      - '!packages/mobile-core/**/*.md'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'packages/ios/**'
+      - 'packages/mobile-core/**'
+      - 'packages/mobile-core-proof/test-vectors/**'
+      - 'packages/client/src/lib/nativeHost.ts'
+      - 'packages/client/src/lib/__tests__/nativeHost.test.ts'
+      - 'packages/server/src/crypto/**'
+      - 'packages/shared/src/binary-framing.ts'
+      - 'packages/server/scripts/android-native-secure-probe-server.ts'
+      - 'scripts/android-secure-interop-fixture.ts'
+      - 'pnpm-workspace.yaml'
+      - 'packages/android/app/src/sharedTest/resources/**'
+      - 'scripts/perf-suite/host-profile.mjs'
+      - '.github/workflows/ios-app-ci.yml'
+      - '!packages/ios/**/*.md'
+      - '!packages/mobile-core/**/*.md'
+  schedule:
+    - cron: '47 4 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+concurrency:
+  group: ios-app-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify-ios-app:
+    name: Rust, simulator, and device archive
+    # The older runtime settled on arm64; its prior memory rejection measured
+    # free pages rather than availability. Intel remained CPU-bound without video.
+    # Retain all tests/gates, the simulator profile and corrected memory sampler.
+    runs-on: macos-15
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
+      YA_IOS_SIMULATOR_VERSION: '18.6'
+      YA_IOS_SIMULATOR_PROFILE: input-acceptance
+    # Cold Intel run 36898374886 took 42 minutes before UI/device acceptance.
+    # Allow ~2x that measured elapsed time for all gates; input stays at 100ms.
+    timeout-minutes: 90
+    steps:
+      - name: Disable indexing on the disposable measurement host
+        # The failed headroom samples also show mds/mdworker contention.
+        # This is an ephemeral hosted VM, never a developer's workstation.
+        run: sudo mdutil -a -i off
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24.19.0'
+          cache: pnpm
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Install pinned native tools
+        run: |
+          rustup toolchain install 1.97.0 --profile minimal --component rustfmt --component clippy
+          rustup target add --toolchain 1.97.0 aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
+          curl -fLsS https://github.com/yonaskolb/XcodeGen/releases/download/2.45.3/xcodegen.zip -o "$RUNNER_TEMP/xcodegen.zip"
+          echo "0c90f4d28ca57335f9fa78cf5bf6dabfe20a232036dabe36de2eef79cb7c0878  $RUNNER_TEMP/xcodegen.zip" | shasum -a 256 --check
+          unzip -q "$RUNNER_TEMP/xcodegen.zip" -d "$RUNNER_TEMP/ya-xcodegen"
+          echo "$RUNNER_TEMP/ya-xcodegen/xcodegen/bin" >> "$GITHUB_PATH"
+      - name: Verify Rust profile and resource ownership
+        run: node packages/mobile-core/scripts/run.mjs rust
+      - name: Verify unchanged server and relay routes
+        run: |
+          node packages/mobile-core/scripts/live.mjs
+          pnpm exec tsx --conditions source packages/mobile-core/scripts/live-relay.ts
+      - name: Verify native web host descriptor
+        run: pnpm --filter @yep-anywhere/client exec vitest run src/lib/__tests__/nativeHost.test.ts
+      - name: Build and test on an owned simulator
+        run: node packages/ios/scripts/run.mjs test
+      - name: Link an unsigned physical-device build
+        run: node packages/ios/scripts/run.mjs build
+      - name: Upload simulator evidence and unsigned app
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: ios-app-build-${{ github.run_attempt }}
+          if-no-files-found: ignore
+          path: |
+            packages/ios/build/*.xcresult
+            packages/ios/build/host-*.json
+            packages/ios/build/DerivedData/Build/Products/Release-iphoneos/YepAnywhere.app

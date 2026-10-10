@@ -1,0 +1,23 @@
+name: gittuf Verification
+on:
+  push:
+    branches: ['main']
+permissions: read-all
+jobs:
+  gittuf-verify:
+    if: github.repository == 'gittuf/gittuf'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install gittuf
+        uses: gittuf/gittuf-installer@872fe5227186d97f958e6983717942ca0e50384d
+      - name: Checkout and verify repository
+        run: |
+          sleep 10s
+          gittuf clone https://github.com/${{ github.repository }}
+          cd gittuf
+          echo "RSL:            $(git show --oneline refs/gittuf/reference-state-log)"
+          echo "Policy:         $(git show --oneline refs/gittuf/policy)"
+          echo "Policy staging: $(git show --oneline refs/gittuf/policy-staging)"
+          echo "Attestations:   $(git show --oneline refs/gittuf/attestations)"
+          echo "Main:           $(git show --oneline refs/heads/main)"
+          gittuf verify-ref main --verbose

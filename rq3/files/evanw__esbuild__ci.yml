@@ -1,0 +1,234 @@
+name: CI
+
+on:
+  push:
+    branches: ['*']
+  pull_request:
+    branches: ['*']
+  workflow_dispatch:
+
+permissions:
+  contents: read # to fetch code (actions/checkout)
+
+jobs:
+  esbuild-platforms:
+    # Split this out into its own runner because it's slow
+    name: esbuild CI (All Platforms)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@a37ce9120846195fa4ece8f58b268e6043cb2f26 # actions/checkout@v3
+
+      - name: Read go.version
+        run: |
+          echo "GO_VERSION=$(cat go.version)" >> $GITHUB_ENV
+
+      - name: Set up Go ${{ env.GO_VERSION }}
+        uses: actions/setup-go@be3c94b385c4f180051c996d336f57a34c397495 # actions/setup-go@v3
+        with:
+          go-version: ${{ env.GO_VERSION }}
+        id: go
+
+      - name: Set up Node 18
+        uses: actions/setup-node@3235b876344d2a9aa001b8d1453c930bba69e610 # actions/setup-node@v3
+        with:
+          node-version: 18
+
+      - name: Ensure all supported platforms can be built
+        run: |
+          make platform-all
+
+  esbuild-slow:
+    # Split these out into their own runner because they're very slow
+    name: esbuild CI (Slow Tests)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@a37ce9120846195fa4ece8f58b268e6043cb2f26 # actions/checkout@v3
+
+      - name: Read go.version
+        run: |
+          echo "GO_VERSION=$(cat go.version)" >> $GITHUB_ENV
+
+      - name: Set up Go ${{ env.GO_VERSION }}
+        uses: actions/setup-go@be3c94b385c4f180051c996d336f57a34c397495 # actions/setup-go@v3
+        with:
+          go-version: ${{ env.GO_VERSION }}
+        id: go
+
+      - name: Set up Node 16
+        uses: actions/setup-node@3235b876344d2a9aa001b8d1453c930bba69e610 # actions/setup-node@v3
+        with:
+          node-version: 16
+
+      # Note: These tests break with node version 18. Something about WebAssembly.
+      - name: Rollup Tests
+        run: make test-rollup
+
+      - name: Uglify Tests
+        run: CI=1 make uglify
+
+      - name: Type check tsc using tsc
+        run: make test-tsc
+
+      - name: Test an old TypeScript version
+        run: make test-old-ts
+
+      # Plan 9 is not a supported platform, but someone wanted esbuild to be able to build for it anyway...
+      - name: Ensure esbuild can be built for Plan 9
+        run: |
+          GOOS=plan9 GOARCH=386 go build ./cmd/esbuild
+          GOOS=plan9 GOARCH=amd64 go build ./cmd/esbuild
+          GOOS=plan9 GOARCH=arm go build ./cmd/esbuild
+
+  esbuild:
+    name: esbuild CI
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@a37ce9120846195fa4ece8f58b268e6043cb2f26 # actions/checkout@v3
+
+      - name: Read go.version (non-Windows)
+        if: matrix.os != 'windows-latest'
+        run: |
+          echo "GO_VERSION=$(cat go.version)" >> $GITHUB_ENV
+
+      - name: Read go.version (Windows)
+        if: matrix.os == 'windows-latest'
+        run: |
+          echo "GO_VERSION=$(cat go.version)" >> $Env:GITHUB_ENV
+
+      - name: Set up Go ${{ env.GO_VERSION }}
+        uses: actions/setup-go@be3c94b385c4f180051c996d336f57a34c397495 # actions/setup-go@v3
+        with:
+          go-version: ${{ env.GO_VERSION }}
+        id: go
+
+      - name: Set up Node 18
+        uses: actions/setup-node@3235b876344d2a9aa001b8d1453c930bba69e610 # actions/setup-node@v3
+        with:
+          node-version: 18
+
+      - name: go test
+        env:
+          WT_SESSION: 1 # Ensure that FormatMessages output on Windows matches macOS
+        run: go test -race ./cmd/... ./internal/... ./pkg/...
+
+      - name: go vet
+        run: go vet ./cmd/... ./internal/... ./pkg/...
+
+      - name: Test for path/filepath
+        if: matrix.os == 'ubuntu-latest'
+        run: make no-filepath
+
+      - name: Make sure "check-go-version" works (non-Windows)
+        if: matrix.os != 'windows-latest'
+        run: make check-go-version
+
+      - name: go fmt
+        if: matrix.os == 'macos-latest'
+        run: make fmt-go
+
+      - name: npm ci
+        run: cd scripts && npm ci
+
+      - name: Register Test (ESBUILD_WORKER_THREADS=0, non-Windows)
+        if: matrix.os != 'windows-latest'
+        run: ESBUILD_WORKER_THREADS=0 node scripts/register-test.js
+
+      - name: Register Test
+        run: node scripts/register-test.js
+
+      - name: Verify Source Map
+        run: node scripts/verify-source-map.js
+
+      - name: E2E Tests
+        run: node scripts/end-to-end-tests.js
+
+      - name: JS API Tests (ESBUILD_WORKER_THREADS=0, non-Windows)
+        if: matrix.os != 'windows-latest'
+        run: ESBUILD_WORKER_THREADS=0 node scripts/js-api-tests.js
+
+      - name: JS API Tests
+        run: node scripts/js-api-tests.js
+
+      - name: NodeJS Unref Tests
+        run: node scripts/node-unref-tests.js
+
+      - name: Plugin Tests
+        run: node scripts/plugin-tests.js
+
+      - name: TypeScript Type Definition Tests
+        if: matrix.os == 'ubuntu-latest'
+        run: node scripts/ts-type-tests.js
+
+      - name: JS API Type Check
+        if: matrix.os == 'ubuntu-latest'
+        run: make lib-typecheck
+
+      - name: Decorator Tests
+        if: matrix.os == 'ubuntu-latest'
+        run: make decorator-tests
+
+      - name: WebAssembly API Tests (browser)
+        if: matrix.os == 'ubuntu-latest'
+        run: make test-wasm-browser
+
+      - name: WebAssembly API Tests (node, Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: make test-wasm-node
+
+      - name: WebAssembly API Tests (node, non-Linux)
+        if: matrix.os != 'ubuntu-latest'
+        run: node scripts/wasm-tests.js
+
+      - name: Sucrase Tests
+        if: matrix.os == 'ubuntu-latest'
+        run: make test-sucrase
+
+      - name: Esprima Tests
+        if: matrix.os == 'ubuntu-latest'
+        run: make test-esprima
+
+      - name: Preact Splitting Tests
+        if: matrix.os == 'ubuntu-latest'
+        run: make test-preact-splitting
+
+      - name: Check the unicode table generator
+        if: matrix.os == 'ubuntu-latest'
+        run: cd scripts && node gen-unicode-table.js
+
+      - name: Yarn PnP tests
+        run: |
+          # Note that Yarn recently deliberately broke "npm install -g yarn".
+          # They say you now have to run "corepack enable" to fix it. They have
+          # written about this here: https://yarnpkg.com/corepack
+          corepack enable
+
+          make test-yarnpnp
+
+  esbuild-old-go-version:
+    name: esbuild CI (old Go version)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@a37ce9120846195fa4ece8f58b268e6043cb2f26 # actions/checkout@v3
+
+      - name: Set up Go 1.13 (the minimum required Go version for esbuild)
+        uses: actions/setup-go@be3c94b385c4f180051c996d336f57a34c397495 # actions/setup-go@v3
+        with:
+          go-version: 1.13
+        id: go
+
+      - name: go build
+        run: go build ./cmd/esbuild
+
+      - name: go test
+        run: go test ./internal/...

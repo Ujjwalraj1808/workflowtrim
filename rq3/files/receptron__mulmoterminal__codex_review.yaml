@@ -1,0 +1,281 @@
+# Review a PR on request using OpenAI Codex CLI pointed at Azure OpenAI.
+# Runs alongside CodeRabbit + Sourcery; the verdict marker
+# (`CODEX VERDICT: LGTM` / `CHANGES REQUESTED`) matches the
+# `/codex-cross-review` skill so both human-driven and automated
+# reviews speak the same protocol.
+#
+# MANUAL ONLY. It used to fire on every PR; the `pull_request` trigger was
+# removed deliberately, so nothing here starts on its own. Ask for a review
+# with the PR number:
+#
+#     gh workflow run "Codex auto-review" -f pr_number=<N>
+#
+# Cost control (intentionally minimal — user wants every PR
+# reviewed regardless of draft / path):
+#   - `concurrency` cancels superseded runs so a quick push burst
+#     produces one review against the latest commit, not N reviews
+#   - `~/.npm` is cached, so `npm install -g @openai/codex` reuses
+#     the prior tarball + skips the network on warm runs
+#   - Azure deployment SKU caps TPM (10000 currently); throttling
+#     happens at the model layer, not the workflow layer
+#
+# Auth: Azure OpenAI via the OpenAI-compatible `/openai/v1` endpoint.
+# Codex CLI does NOT honour `OPENAI_BASE_URL` directly — the iter-1
+# attempt 401'd against `api.openai.com` because the env var was
+# silently ignored. Workflow now writes an explicit
+# `~/.codex/config.toml` with `[model_providers.azure]` before the
+# `codex exec` invocation. Required secrets:
+#   - AZURE_OPENAI_API_KEY        (the Azure key)
+#   - AZURE_OPENAI_BASE_URL       (e.g. https://<resource>.openai.azure.com — no path)
+# Optional overrides:
+#   - AZURE_OPENAI_DEPLOYMENT     (defaults to codex-review-terra; whatever it names
+#                                  must stay a deployment the CLI does not recognise
+#                                  as a model — see the AZURE_MODEL comment below)
+#   - AZURE_OPENAI_API_VERSION    (defaults to `preview`)
+#
+# `workflow_dispatch` takes the PR number, so it also serves a re-review
+# after argument changes, or a run against a closed PR for forensics.
+
+name: Codex auto-review
+
+on:
+  # The only trigger: run on demand against any PR — open, draft or closed.
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "PR number to review"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+# Pin the Codex CLI version so the cache key is deterministic and
+# upgrades are explicit. Bump together with cache-version when
+# moving to a new Codex release.
+env:
+  CODEX_VERSION: "0.147.0"
+
+concurrency:
+  group: codex-review-pr-${{ inputs.pr_number }}
+  cancel-in-progress: true
+
+jobs:
+  codex-review:
+    # Skip on Dependabot PRs. GitHub strips repo secrets from PRs
+    # opened by Dependabot for security; `secrets.AZURE_OPENAI_API_KEY`
+    # resolves to "" and `codex exec` exits "Missing environment
+    # variable: OPENAI_API_KEY" within seconds, failing the check.
+    # Dependabot version bumps don't benefit from an LLM review
+    # anyway — let the rest of the matrix (CodeRabbit / Socket /
+    # lint_test / smoke) gate them.
+    if: github.actor != 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    # 10 wasn't enough: the review step hit it and was cancelled on #945, #951 and #952 within
+    # two days, each time passing in ~1-2 minutes on a plain rerun of the same commit. The job
+    # is not hanging — it is occasionally slow — so the cap only has to sit above the slow tail,
+    # and cancelling costs a full re-review round trip on a PR that was ready to merge.
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # Codex needs full history to inspect the PR diff via `gh`.
+          fetch-depth: 0
+          # `gh` uses GH_TOKEN env, not git-persisted creds, so
+          # dropping them is safe (zizmor artipacked).
+          persist-credentials: false
+
+      - name: Use Node.js 24.x
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24.x
+
+      - name: Cache global npm tarballs
+        uses: actions/cache@v5
+        with:
+          path: ~/.npm
+          key: codex-cli-${{ env.CODEX_VERSION }}-node24
+          restore-keys: |
+            codex-cli-${{ env.CODEX_VERSION }}-
+
+      - name: Install codex CLI (pinned)
+        run: npm install -g "@openai/codex@${CODEX_VERSION}"
+
+      - name: Configure Codex for Azure OpenAI
+        env:
+          AZURE_BASE_URL: ${{ secrets.AZURE_OPENAI_BASE_URL }}
+          # Default to a known Azure API version; override with
+          # `AZURE_OPENAI_API_VERSION` secret if a newer deployment
+          # demands a different one.
+          # Azure exposes Codex's required Responses API on the
+          # `/openai/v1/responses` compat endpoint with the magic
+          # `api-version=preview` — dated previews
+          # (`2024-10-01-preview` … `2025-04-01-preview`) all return
+          # `400 API version not supported` on the `mulmo-sweden`
+          # resource. Override via `AZURE_OPENAI_API_VERSION` if a
+          # newer Azure resource pins a dated preview.
+          AZURE_API_VERSION: ${{ secrets.AZURE_OPENAI_API_VERSION || 'preview' }}
+          # Deployment name on the Azure resource (the LLM model
+          # alias the workspace administrator created). Codex passes
+          # this through as `model = ...` in the request body.
+          # `codex-review-terra` runs gpt-5.6-terra (deployed on
+          # `mulmo-sweden` 2026-08-07) under a name the CLI does NOT
+          # recognise, and that mismatch is deliberate: for a model it
+          # has metadata for, Codex nests the whole tool list under a
+          # `functions` namespace carrying an empty description, and
+          # Azure's Responses validator rejects that outright —
+          # `400 empty_string` on `input[0].tools[0].description`.
+          # An unknown name falls back to the flat tool list Azure
+          # accepts. Deploying gpt-5.6-terra under its own name breaks
+          # every review until upstream stops sending that payload.
+          AZURE_MODEL: ${{ secrets.AZURE_OPENAI_DEPLOYMENT || 'codex-review-terra' }}
+        run: |
+          mkdir -p "$HOME/.codex"
+          # Strip trailing slash so concatenation never doubles up.
+          BASE_URL="${AZURE_BASE_URL%/}"
+          # Quoted heredoc (<<'TOML') = pure literal: the TOML body
+          # (with its `=`, `{ }`, comments) is never parsed as shell,
+          # so no accidental command substitution. envsubst then fills
+          # ONLY the three whitelisted vars — anything else, including
+          # a literal `$x` in TOML, is left untouched.
+          # Codex CLI only supports the "responses" wire (Chat
+          # Completions was removed), so the deployment has to expose
+          # the Responses surface (recent gpt-4o / gpt-4.1 / gpt-5).
+          # It is reached with whatever AZURE_API_VERSION resolved to
+          # above — `preview` unless a resource pins a dated one.
+          export AZURE_MODEL BASE_URL AZURE_API_VERSION
+          # envsubst's SHELL-FORMAT arg MUST stay single-quoted: it is
+          # the literal allowlist of names to replace, not a shell
+          # expansion. SC2016 is exactly backwards here.
+          # shellcheck disable=SC2016
+          envsubst '${AZURE_MODEL} ${BASE_URL} ${AZURE_API_VERSION}' \
+            > "$HOME/.codex/config.toml" <<'TOML'
+          model_provider = "azure"
+          model = "${AZURE_MODEL}"
+
+          [model_providers.azure]
+          name = "Azure OpenAI"
+          base_url = "${BASE_URL}/openai/v1"
+          env_key = "OPENAI_API_KEY"
+          wire_api = "responses"
+          query_params = { "api-version" = "${AZURE_API_VERSION}" }
+          TOML
+          # Sanity log: print the config without the URL host so we
+          # can see the structure landed correctly without leaking
+          # the resource name in logs.
+          sed 's|https://[^/]*|<azure-host>|g' "$HOME/.codex/config.toml"
+
+      - name: Run codex review
+        env:
+          OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          REPO: ${{ github.repository }}
+          # Per-attempt deadline. Well above a healthy review (30s-2min) and far below the job's
+          # own cap, so a hang is cut short and retried instead of eating the whole budget.
+          CODEX_TIMEOUT_SECONDS: "300"
+        run: |
+          # `--sandbox danger-full-access` skips bubblewrap entirely.
+          # The default `workspace-write` sandbox tries to create a
+          # network namespace via bwrap, which fails on GitHub
+          # Actions runners with `RTM_NEWADDR: Operation not
+          # permitted` — the runner kernel restricts unprivileged
+          # `unshare` for namespaces. Without bwrap, codex can't
+          # spawn ANY shell command, including `gh`. The runner VM
+          # is itself ephemeral + isolated per job, so dropping the
+          # nested sandbox is safe in this context.
+          PROMPT_TEXT="$(cat <<PROMPT
+          Review PR #${PR_NUMBER} in ${REPO}.
+
+          Use the gh CLI to inspect the diff:
+            gh pr view ${PR_NUMBER} --json title,body,headRefName
+            gh pr diff ${PR_NUMBER}
+
+          Before posting your own findings, look at what's already
+          on the PR — this PR may have had earlier review iterations
+          (yours or another bot's) that are already addressed by
+          later commits. An earlier ATTEMPT OF THIS SAME RUN may also
+          have posted before it was cut short, so if you find comments
+          that already say what you were going to say about the
+          current commit, leave them alone rather than repeating them.
+          Read the existing thread:
+            gh api repos/${REPO}/issues/${PR_NUMBER}/comments --paginate
+            gh api repos/${REPO}/pulls/${PR_NUMBER}/comments --paginate
+          For every prior 'CODEX VERDICT: CHANGES REQUESTED' bullet,
+          check the current diff to decide whether the concern is
+          now resolved (don't re-flag) or still present (re-flag and
+          point at the new line). Don't echo back findings other
+          bots have already covered identically — focus on the
+          marginal value you can add over the existing thread.
+
+          Then post inline review comments on specific lines via:
+            gh api repos/${REPO}/pulls/${PR_NUMBER}/comments
+          or top-level comments via:
+            gh pr comment ${PR_NUMBER}
+
+          This checkout has NO project dependencies installed — only
+          the codex CLI itself. Do not try to run the test suite, the
+          linter or the build: vitest, eslint and vue-tsc are all
+          absent, and the attempt only costs you time. Running them
+          is the CI job's role — ci.yml installs dependencies and
+          runs lint, the typecheck, the build and the full test
+          suite on ubuntu AND macOS for every PR — so a second
+          execution here would buy nothing the PR does not already
+          report. Review by READING the diff and the surrounding
+          code through gh. If a claim you want to make could only be
+          settled by running something, say so plainly instead; do
+          NOT report the missing tooling itself as a finding, since
+          a reader takes that for a broken pipeline.
+
+          Focus on: correctness, edge cases, security (XSS / SSRF /
+          path traversal / prompt injection), accessibility, test
+          coverage for the happy path + boundary cases, and
+          consistency with the rest of the codebase. This repo has
+          no locale files — user-facing strings are written inline,
+          so there is no i18n lockstep to check. Skip stylistic
+          nits unless they hide a real bug.
+
+          At the END of your work, ALWAYS post ONE final top-level
+          comment that starts with a verdict marker on its own line:
+            - 'CODEX VERDICT: LGTM' if you have no outstanding concerns
+            - 'CODEX VERDICT: CHANGES REQUESTED' followed by a
+              bulleted summary of remaining issues
+
+          Do not apply any fixes yourself — only review and post findings.
+          PROMPT
+          )"
+
+          # `codex exec` HANGS rather than running slow (#1020): on a bad run it reads the PR
+          # thread, goes quiet waiting on the model, and never returns — the job then burns the
+          # whole `timeout-minutes` and leaves an orphan `codex` process behind. Raising the cap
+          # only lengthens the wait, so the call gets its OWN, much shorter deadline and one
+          # retry. A healthy review takes 30s-2min, and every hung run so far has succeeded in
+          # about a minute on a plain rerun of the same commit.
+          for attempt in 1 2; do
+            # `|| status=$?` rather than `if …; then`: after an `if`, $? is the IF statement's
+            # status (0), not the command's — the codes below would never be seen.
+            started=$SECONDS
+            status=0
+            timeout --signal=TERM --kill-after=30s "${CODEX_TIMEOUT_SECONDS}" \
+              codex exec --sandbox danger-full-access "$PROMPT_TEXT" || status=$?
+            elapsed=$(( SECONDS - started ))
+            if [ "$status" -eq 0 ]; then
+              exit 0
+            fi
+            # A deadline hit is 124 (child died on TERM) or 137 (it ignored TERM, so --kill-after
+            # SIGKILLed it). 137 is the one that matters — a process wedged on a model call is
+            # exactly the kind that does not take TERM (measured: a child trapping TERM exits 137).
+            #
+            # But timeout(1) cannot tell ITS deadline from the child exiting 124/137 on its own,
+            # so the elapsed time decides: a run that gave up early was codex failing, not a hang,
+            # and retrying it would spend the deadline again to reach the same answer.
+            if { [ "$status" -ne 124 ] && [ "$status" -ne 137 ]; } || [ "$elapsed" -lt "${CODEX_TIMEOUT_SECONDS}" ]; then
+              echo "::error::codex exec failed with status $status after ${elapsed}s (not a timeout) — not retrying"
+              exit "$status"
+            fi
+            echo "::warning::codex exec hit the ${CODEX_TIMEOUT_SECONDS}s deadline on attempt $attempt (see #1020)"
+          done
+          echo "::error::codex exec hung twice; giving up"
+          exit 1

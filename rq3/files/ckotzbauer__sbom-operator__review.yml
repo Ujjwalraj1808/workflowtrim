@@ -1,0 +1,16 @@
+name: review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  actions: read
+  contents: read
+  pull-requests: write
+
+jobs:
+  review:
+    uses: ckotzbauer/actions-toolkit/.github/workflows/toolkit-review.yml@187b42cc2ca9bc9257d6e72bb1c1be730f1d0565 # 0.56.0
+    secrets:
+      openrouter-token: ${{ secrets.OPENROUTER_TOKEN }}

@@ -1,0 +1,140 @@
+# Copyright 2019, 2025, Oracle Corporation and/or its affiliates.  All rights reserved.
+# Licensed under the Universal Permissive License v 1.0 as shown at
+# http://oss.oracle.com/licenses/upl.
+
+# ---------------------------------------------------------------------------
+# Coherence Operator GitHub Actions Backwards Compatibility Tests.
+# ---------------------------------------------------------------------------
+name: Istio Tests
+
+on:
+  workflow_dispatch:
+  push:
+    branches-ignore:
+    - gh-pages
+    - 1.0.0
+    - 2.x
+    - 3.x
+  pull_request:
+    types:
+      - opened
+      - synchronize
+      - committed
+    branches-ignore:
+    - gh-pages
+    - 1.0.0
+    - 2.x
+    - 3.x
+
+env:
+  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  SKIP_SPRING_CNBP: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        istioVersion:
+        - latest
+        - 1.23.4
+        - 1.22.8
+
+    steps:
+    - uses: actions/checkout@v5
+      with:
+        fetch-depth: 0
+
+    #   This step will free up disc space on the runner by removing
+    #   lots of things that we do not need.
+    - name: disc
+      shell: bash
+      run: |
+        echo "Listing 100 largest packages"
+        dpkg-query -Wf '${Installed-Size}\t${Package}\n' | sort -n | tail -n 100
+        df -h
+        echo "Removing large packages"
+        sudo docker image prune --all --force
+        sudo docker builder prune -a
+        sudo apt-get remove -y '^dotnet-.*' || true
+        sudo apt-get remove -y '^llvm-.*' || true
+        sudo apt-get remove -y 'monodoc-http' || true
+        sudo apt-get remove -y 'php.*' || true
+        sudo apt-get remove -y azure-cli google-cloud-sdk hhvm google-chrome-stable firefox powershell mono-devel || true
+        sudo apt-get autoremove -y || true
+        sudo apt-get clean
+        df -h
+        echo "Removing large directories"
+        rm -rf /usr/share/dotnet/
+        sudo rm -rf /usr/local/lib/android
+        sudo rm -rf /opt/ghc
+        sudo rm -rf /opt/hostedtoolcache/CodeQL
+        df -h
+
+    - name: Set up JDK
+      uses: oracle-actions/setup-java@v1
+      with:
+        website: oracle.com
+        release: 21
+
+    - name: Cache Go Modules
+      uses: actions/cache@v5
+      with:
+        path: ~/go/pkg/mod
+        key: ${{ runner.os }}-go-mods-${{ hashFiles('**/go.sum') }}
+        restore-keys: |
+          ${{ runner.os }}-go-mods-
+
+    - name: Cache Maven packages
+      uses: actions/cache@v5
+      with:
+        path: ~/.m2
+        key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
+        restore-keys: ${{ runner.os }}-m2
+
+    - name: Edit DNS Resolve
+      shell: bash
+      run: |
+        sudo chown -R runner:runner /run/systemd/resolve/stub-resolv.conf
+        sudo echo nameserver 8.8.8.8 > /run/systemd/resolve/stub-resolv.conf
+
+    - name: Start KinD Cluster
+      shell: bash
+      run: |
+        echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u $ --password-stdin
+        make kind
+        kubectl version
+        kubectl get nodes
+
+    - name: Build
+      shell: bash
+      run: | 
+        make all
+
+    - name: Load Images to KinD
+      shell: bash
+      run: |
+        make kind-load
+        sudo docker image prune --all --force
+        sudo docker builder prune -a
+        df -h
+
+    - name: Istio Tests
+      shell: bash
+      run: |
+        make reset-namespace
+        ISTIO_VERSION=${{ matrix.istioVersion }} make install-istio
+        make deploy
+        make e2e-client-test
+        make e2e-test
+        make undeploy
+        ISTIO_VERSION=${{ matrix.istioVersion }} make uninstall-istio
+
+    - uses: actions/upload-artifact@v6
+      if: ${{ failure() || cancelled() }}
+      with:
+        name: test-output-${{ matrix.istioVersion }}
+        path: build/_output/test-logs
+        if-no-files-found: ignore

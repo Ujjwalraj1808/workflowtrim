@@ -1,0 +1,64 @@
+name: Baseline Streaming
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - modules/helpers/ubs_core/findings_merge.py
+      - test-suite/quality/test_findings*.py
+      - .github/workflows/baseline-streaming.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 25
+    env:
+      UBS_NO_AUTO_UPDATE: '1'
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install scanner dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq ripgrep rsync shellcheck python3-yaml python3-jsonschema
+          npm install --global @ast-grep/cli
+      - name: Verify committed runtime integrity
+        run: |
+          echo "BASELINE_STREAMING_REVISION $(git rev-parse HEAD)"
+          ./scripts/verify_checksums.sh
+          ./scripts/verify_sha256sums.sh
+      - name: Validate streaming memory and real scanner integration
+        run: |
+          set -o pipefail
+          python3 -m unittest discover -s test-suite/quality -p 'test_findings*.py' -v 2>&1 | tee "$RUNNER_TEMP/stream-findings-tests.log"
+          python3 -m unittest discover -s test-suite/quality -p 'test_ubs_core.py' -v 2>&1 | tee "$RUNNER_TEMP/stream-core-tests.log"
+          python3 test-suite/run_manifest.py --case python-taint-buggy --case python-taint-clean --case js-taint-buggy --case js-taint-clean --case golang-taint-buggy --case golang-taint-clean 2>&1 | tee "$RUNNER_TEMP/stream-manifest.log"
+      - name: Verify lint and deterministic integrity closure
+        run: |
+          git diff --check
+          ./scripts/verify_checksums.sh
+          ./scripts/verify_sha256sums.sh
+          git diff > "$RUNNER_TEMP/stream-tested.diff"
+          python3 scripts/update_checksums.py
+          ./scripts/update_sha256sums.sh
+          git diff > "$RUNNER_TEMP/stream-regenerated.diff"
+          cmp "$RUNNER_TEMP/stream-tested.diff" "$RUNNER_TEMP/stream-regenerated.diff"
+          for script in ubs modules/lib/ubs-common.sh scripts/new-module.sh modules/ubs-*.sh; do bash -n "$script"; done
+          shellcheck -S warning ubs modules/lib/ubs-common.sh scripts/new-module.sh modules/ubs-*.sh
+      - name: Preserve diagnostics
+        if: always()
+        run: |
+          git diff > "$RUNNER_TEMP/stream-final.diff"
+          git ls-files -z | tar --null -T - -czf "$RUNNER_TEMP/stream-source.tar.gz"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: baseline-streaming-${{ github.sha }}
+          path: ${{ runner.temp }}/stream-*
+          retention-days: 3

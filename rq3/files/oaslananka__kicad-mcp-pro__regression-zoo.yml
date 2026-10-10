@@ -1,0 +1,35 @@
+name: Regression Zoo
+
+on:
+  schedule:
+    - cron: "21 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: regression-zoo-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  benchmark:
+    if: github.repository_owner == 'oaslananka' || github.repository_owner == 'oaslananka-ops'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version-file: .node-version
+          package-manager-cache: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7
+        with:
+          enable-cache: true
+          prune-cache: true
+          version-file: uv.toml
+      - run: corepack enable
+      - run: corepack pnpm install --frozen-lockfile
+      - run: uv sync --all-extras --frozen
+      - run: corepack pnpm run test:benchmark

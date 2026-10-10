@@ -1,0 +1,380 @@
+name: CI
+# Other branches run through their pull request; pushing them too would run
+# every PR (Renovate's included) twice.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      e2e_workers:
+        description: Browser workers per shard for a fixed-source comparison
+        type: choice
+        default: "2"
+        options: ["1", "2", "4"]
+      e2e_scope:
+        description: Mutable server ownership (run is the legacy control)
+        type: choice
+        default: worker
+        options: [worker, run]
+
+# Server checks run at the supported Node floor. SQLite boundary and Bun
+# distribution checks live in sqlite.yml; managed runners retain their own floor.
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  computer-control:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 22.16.0
+          cache: "pnpm"
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter @yep-anywhere/shared build
+      - run: >-
+          pnpm --filter @yep-anywhere/server exec vitest run
+          test/computer-control.test.ts test/computer-control-releases.test.ts
+          test/computer-control-provider.test.ts test/computer-control-job.test.ts
+          test/computer-control-guardian.test.ts
+          test/computer-control-native.test.ts
+          test/scripts/e2e-process-lifecycle.test.ts
+          test/scripts/e2e-process-lifecycle-windows.test.mjs
+          test/scripts/wait-for-port-file.test.mjs
+      - run: pnpm --filter @yep-anywhere/client exec playwright install chromium
+      - run: pnpm --filter @yep-anywhere/client exec playwright test --config playwright.computer-control.config.ts
+      - name: Preserve computer-control browser evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: computer-control-${{ matrix.os }}-${{ github.run_attempt }}
+          if-no-files-found: ignore
+          include-hidden-files: true
+          path: .artifacts/computer-control-results/**
+  persistence-native:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 22.16.0
+          cache: "pnpm"
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter @yep-anywhere/shared build
+      - run: node --test scripts/run-with-safe-home.test.mjs
+      - name: Native credentials, settings, review persistence and storage transitions
+        run: >-
+          pnpm --filter @yep-anywhere/server test
+          test/auth/AuthService.test.ts
+          test/auth/credential-state-fail-closed.test.ts
+          test/utils/writeFileAtomically.test.ts
+          test/utils/syncDirectory.test.ts
+          test/services/ServerSettingsService.test.ts
+          test/routes/settings.test.ts
+          test/routes/settings-persistence.test.ts
+          test/projects/projectStoragePolicy.test.ts
+          test/review/ReviewCaptureService.test.ts
+          test/review/ReviewCommentService.test.ts
+          test/review/ReviewStorageTransition.test.ts
+          test/review/ReviewStoreRetention.test.ts
+
+  provider-host-native:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, macos-15-intel, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 22.16.0
+          cache: "pnpm"
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter @yep-anywhere/shared build
+      - name: Native ownership, replacement, real-worker callbacks and Windows fallback
+        run: >-
+          pnpm --filter @yep-anywhere/server exec vitest run
+          test/scripts/provider-process-identity.test.mjs
+          test/scripts/dev-reload.test.mjs
+          test/scripts/dev-reload-portable.test.mjs
+          test/scripts/provider-host-ownership.test.mjs
+          test/scripts/provider-host-system.test.mjs
+          test/scripts/e2e-host-launch.test.ts
+          test/scripts/e2e-offline-runtime.test.ts
+          test/sdk/providers/provider-runtime-host.test.ts
+          test/sdk/providers/provider-host-status.test.ts
+          --maxWorkers=1 --testTimeout=20000
+
+  agent-self-source:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 22.16.0
+          cache: "pnpm"
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter @yep-anywhere/shared build
+      - run: pnpm --filter @yep-anywhere/server exec vitest run test/agent-tools
+      - run: node --import tsx scripts/agent-self-smoke.mjs packages/server --source
+
+  agent-self-npm:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 22.16.0
+          cache: "pnpm"
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build:bundle
+      - run: node scripts/agent-self-package-smoke.mjs
+
+  site-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 22
+          cache: "npm"
+          cache-dependency-path: site/package-lock.json
+      - run: npm ci
+        working-directory: site
+      - run: npm run build
+        working-directory: site
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 22.16.0
+          cache: "pnpm"
+      - run: pnpm install
+      - run: pnpm lint
+      - run: pnpm format:check
+      - run: pnpm capabilities:audit
+      - run: pnpm console:scan
+
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 22.16.0
+      # Advisories triaged as unreachable are listed in auditConfig.ignoreGhsas
+      # (pnpm-workspace.yaml) with rationale in docs/development/dependencies.md
+      # "Known-unreachable advisories".
+      # A failure here means a new, untriaged advisory: fix it or triage it in both
+      # places — never ignore without a table entry.
+      - run: pnpm audit --prod
+
+  typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 22.16.0
+          cache: "pnpm"
+      - run: pnpm install
+      - run: pnpm typecheck
+
+  unit-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: Enable Linux app sandbox tests
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap slirp4netns iproute2 util-linux
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 22.16.0
+          cache: "pnpm"
+      - run: pnpm install
+      - run: pnpm --filter @yep-anywhere/shared build
+      - run: pnpm -F @yep-anywhere/client exec playwright install chromium
+      - run: pnpm test
+
+  cached-sidebar-performance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: graehl/agents
+          ref: 496159563aafd1f5abd15e4315bf502187d2e9d1
+          path: .perf-tools/agents
+          persist-credentials: false
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 22.16.0
+          cache: "pnpm"
+      - run: pnpm install
+      - run: pnpm -F @yep-anywhere/client exec playwright install chromium
+      - name: Run retained sidebar switch ratchet
+        env:
+          YA_PERF_SWEEP: ${{ github.workspace }}/.perf-tools/agents/scripts/perf-sweep
+        run: >-
+          node scripts/perf-suite/run.mjs
+          --checkout "$GITHUB_WORKSPACE"
+          --driver browser
+          --scenario cached-sidebar-switch-routine
+          --label "github-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          --output cached-sidebar-performance.json
+      - name: Upload retained sidebar switch evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: cached-sidebar-performance-${{ github.run_attempt }}
+          if-no-files-found: ignore
+          path: cached-sidebar-performance.json
+      - name: Verify no performance process debris remains
+        if: always()
+        env:
+          YA_PERF_SWEEP: ${{ github.workspace }}/.perf-tools/agents/scripts/perf-sweep
+        run: |
+          "$YA_PERF_SWEEP" 'ya-perf-suite-' --kill --kill-group
+
+  markdown-performance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 22.16.0
+          cache: "pnpm"
+      - run: pnpm install
+      - run: pnpm --filter @yep-anywhere/server benchmark:markdown
+
+  windows-host-awake-smoke:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 22.16.0
+          cache: "pnpm"
+      - run: pnpm install
+      - run: pnpm --filter @yep-anywhere/shared build
+      # A hosted runner can rarely spend the full production startup bound in
+      # cold PowerShell/Add-Type setup. One isolated-test retry distinguishes
+      # that host jitter without extending YA's bounded 20-second probe.
+      - run: >-
+          pnpm --filter @yep-anywhere/server exec vitest run
+          test/services/WindowsHostAwakeBackend.test.ts --retry=1
+
+  e2e-tests:
+    name: e2e-tests (${{ matrix.shard }}/2)
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 22.16.0
+          cache: "pnpm"
+      - run: pnpm install
+      - run: pnpm -F @yep-anywhere/client exec playwright install chromium
+      - name: Install sandbox runtime for the real live-preview test
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap slirp4netns util-linux iproute2
+          # This disposable runner must permit the network helper's user
+          # namespace. The test still uses the real bwrap/network sandbox.
+          if [ -f /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+      - name: Run isolated browser workers
+        env:
+          YEP_E2E_SERVER_SCOPE: ${{ inputs.e2e_scope || 'worker' }}
+          E2E_WORKERS: ${{ inputs.e2e_workers || '2' }}
+        run: pnpm test:e2e --reporter=list,github --max-failures=5 --workers="$E2E_WORKERS" --shard=${{ matrix.shard }}/2
+      - name: Preserve browser failure and retry evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: e2e-failures-shard-${{ matrix.shard }}-${{ github.run_attempt }}
+          path: |
+            packages/client/test-results/**/trace.zip
+            packages/client/test-results/**/test-failed-*.png
+            packages/client/test-results/**/error-context.md
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # Safari's engine on an emulated iPad: a limited user's relay login resumes
+  # from the Home Screen start URL (site/src/content/docs/home-screen.md).
+  ipad-webkit:
+    runs-on: ubuntu-latest
+    # Run 36908114440 exhausted 15m downloading 125 MB of Ubuntu WebKit
+    # dependencies before tests began. Allow 3x that observed setup limit;
+    # Playwright's per-test and input-latency assertions remain unchanged.
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 22.16.0
+          cache: "pnpm"
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter @yep-anywhere/shared build
+      - run: pnpm -F @yep-anywhere/client exec playwright install --with-deps webkit
+      - run: pnpm -F @yep-anywhere/client exec playwright test --config playwright.ipad.config.ts --reporter=list,github
+      - name: Preserve browser failure evidence
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: ipad-webkit-failures-${{ github.run_attempt }}
+          path: packages/client/test-results/
+          if-no-files-found: ignore
+          retention-days: 7

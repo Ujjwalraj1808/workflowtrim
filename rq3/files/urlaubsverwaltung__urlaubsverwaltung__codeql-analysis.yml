@@ -1,0 +1,38 @@
+name: "Code scanning - action"
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 23 * * *'
+env:
+  MAVEN_ARGS: "--no-transfer-progress --errors --fail-at-end --show-version"
+
+jobs:
+  CodeQL-Build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 2
+
+      - run: git checkout HEAD^2
+        if: ${{ github.event_name == 'pull_request' }}
+
+      # Initializes the CodeQL tools for scanning.
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2
+        with:
+          languages: javascript, java
+
+      # Autobuild does not work so we build it by our own
+      - name: Set up JDK from .tool-versions
+        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6
+        with:
+          distribution: 'liberica'
+          java-version-file: ".tool-versions"
+          cache: 'maven'
+      - name: Build with Maven
+        run: ./mvnw package -DskipTests
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2

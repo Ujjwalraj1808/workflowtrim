@@ -1,0 +1,99 @@
+name: Integration for Compatibility
+
+on: [push, pull_request]
+
+env:
+  CONTAINER_PROVIDER: docker
+  CONTAINER_RUNTIME: docker
+
+jobs:
+  integ-test-compat:
+    runs-on: ubuntu-latest
+    continue-on-error: ${{ matrix.opensearch_version == 'latest' }}
+    strategy:
+      fail-fast: false
+      # The supported set tracks the OpenSearch releases still receiving patches
+      # within the last 12 months at each opensearch-go release: every release of
+      # the current major plus the latest release of the previous major. Today
+      # that is 2.19.x and all of 3.x. See opensearch-project/opensearch-go#856.
+      # Re-evaluate this list at each release. All supported lines run as 3-node
+      # clusters.
+      matrix:
+        secured: ["true", "false"]
+        opensearch_version:
+          - 2.19.6
+          - 3.0.0
+          - 3.1.0
+          - 3.2.0
+          - 3.3.2
+          - 3.4.0
+          - 3.5.0
+          - 3.6.0
+          - 3.7.0
+          - 3.8.0
+          - latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with: { go-version-file: 'go.mod' }
+
+      - run: go version
+
+      - name: Increase system limits
+        run: |
+          sudo swapoff -a
+          sudo sysctl -w vm.swappiness=1
+          sudo sysctl -w fs.file-max=262144
+          sudo sysctl -w vm.max_map_count=262144
+
+      - name: Launch OpenSearch cluster
+        run: |
+          export OPENSEARCH_VERSION=${{ matrix.opensearch_version }}
+          export SECURE_INTEGRATION=${{ matrix.secured }}
+          export OPENSEARCH_NODE_COUNT=3
+          make cluster.clean cluster.build cluster.start
+          if [ "${SECURE_INTEGRATION}" = "true" ]; then
+            CURL_URL="https://localhost:9200"
+            CURL_OPTS="-sfku admin:myStrongPassword123!"
+          else
+            CURL_URL="http://localhost:9200"
+            CURL_OPTS="-sf"
+          fi
+          echo "=====> Waiting for OpenSearch ${OPENSEARCH_VERSION} (secure=${SECURE_INTEGRATION}) to be ready (max 125s)..."
+          for attempt in $(seq 25); do
+            sleep 5
+            if curl ${CURL_OPTS} ${CURL_URL} > /dev/null 2>&1; then
+              echo "=====> Cluster ready after $((attempt * 5))s"
+              curl -s ${CURL_OPTS} ${CURL_URL} | jq -r '.version.number // "unknown"' | xargs echo "OpenSearch version:"
+              break
+            fi
+            if [ $attempt -eq 25 ]; then
+              echo "=====> ERROR: Cluster failed to start after 125s"
+              echo ""
+              echo "=====> Container status:"
+              docker compose --project-directory .ci/opensearch ps
+              echo ""
+              echo "=====> Node 1 logs (last 50 lines):"
+              docker compose --project-directory .ci/opensearch logs --tail=50 opensearch-node1
+              echo ""
+              echo "=====> Node 2 logs (last 50 lines):"
+              docker compose --project-directory .ci/opensearch logs --tail=50 opensearch-node2
+              echo ""
+              echo "=====> Node 3 logs (last 50 lines):"
+              docker compose --project-directory .ci/opensearch logs --tail=50 opensearch-node3
+              exit 1
+            fi
+            echo "=====> Attempt $attempt/25 - waiting..."
+          done
+
+      - name: Integration test
+        run: |
+          export OPENSEARCH_VERSION=${{ matrix.opensearch_version }}
+          export SECURE_INTEGRATION=${{ matrix.secured }}
+          export OPENSEARCH_NODE_COUNT=3
+          make cluster.get-cert test-integ-core test-integ-plugins race=true
+
+      - name: Stop the OpenSearch cluster
+        run: |
+          make cluster.stop

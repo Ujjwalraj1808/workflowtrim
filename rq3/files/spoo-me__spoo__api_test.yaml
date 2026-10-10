@@ -1,0 +1,53 @@
+name: API Test
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - '**.py'
+  pull_request:
+    branches: [ main ]
+    paths:
+      - '**.py'
+  workflow_dispatch:
+
+jobs:
+  test-api:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v7
+
+    - name: Setup environment
+      run: |
+        cp .env.example .env
+        echo "FLASK_SECRET_KEY=$(python3 -c 'import secrets; print(secrets.token_hex(32))')" >> .env
+
+    - name: Start services
+      run: docker compose up -d --build --wait
+
+    - name: Wait for app to be ready
+      run: |
+        for i in {1..30}; do
+          if docker compose exec app uv run python3 -c "import requests; requests.get('http://localhost:8000/metric', timeout=2)" 2>/dev/null; then
+            echo "✅ App is ready"
+            exit 0
+          fi
+          echo "Waiting for app... ($i/30)"
+          sleep 2
+        done
+        echo "❌ App failed to start"
+        docker compose logs app
+        exit 1
+
+    - name: Run API test
+      run: docker compose exec app uv run python tests/shorten.py
+
+    - name: Run Stats test
+      run: docker compose exec app uv run python tests/stats.py
+
+    - name: Show logs on failure
+      if: failure()
+      run: docker compose logs

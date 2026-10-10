@@ -1,0 +1,44 @@
+name: Go Test & Coverage
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod   # 用 go.mod 里声明的 Go 版本(1.19)，与题解代码年代匹配
+
+      - name: Run tests with coverage   # 复用仓库原有的 gotest.sh，生成 coverage.txt
+        run: bash ./gotest.sh
+
+      - name: Show coverage gaps   # 在日志里打印总覆盖率 + 所有未达 100% 的函数，方便定位
+        if: always()
+        run: |
+          echo "===== TOTAL ====="
+          go tool cover -func=coverage.txt | tail -n 1
+          echo "===== functions below 100% ====="
+          go tool cover -func=coverage.txt | grep -v '100.0%' || true
+
+      - name: Upload coverage profile   # 把 coverage.txt 作为构建产物，可在 run 页面 Artifacts 下载后发我
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-profile
+          path: coverage.txt
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}   # 需在仓库 Settings → Secrets and variables → Actions 里添加（从 codecov.io 获取）
+          files: ./coverage.txt
+          verbose: true   # 输出详细日志，方便核对 codecov 实际解析到的覆盖率
+          fail_ci_if_error: false   # codecov 上传出问题时不让整个 CI 变红，构建徽章只反映测试本身

@@ -1,0 +1,221 @@
+name: 📦 Upload Release Asset
+
+on:
+  workflow_dispatch:
+
+permissions: read-all
+
+jobs:
+  prepare-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      tag_name: ${{ steps.prepare.outputs.tag_name }}
+      version: ${{ steps.prepare.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 'latest'
+
+      - name: Prepare version and changes
+        id: prepare
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BASE_VERSION="$(node ./Scripts/SetVersionByDate.mjs)"
+          git fetch --tags
+
+          COUNTER=0
+          VERSION="${BASE_VERSION}.${COUNTER}"
+          TAG_NAME="v${VERSION}"
+          while git rev-parse "${TAG_NAME}" >/dev/null 2>&1; do
+            COUNTER=$((COUNTER + 1))
+            VERSION="${BASE_VERSION}.${COUNTER}"
+            TAG_NAME="v${VERSION}"
+          done
+
+          echo "version=${VERSION}"   >> "$GITHUB_OUTPUT"
+          echo "tag_name=${TAG_NAME}" >> "$GITHUB_OUTPUT"
+
+          PREV_TAG="$(git describe --tags --abbrev=0 2>/dev/null || true)"
+          if [ -n "${PREV_TAG}" ]; then
+            CHANGES="$(git log "${PREV_TAG}..HEAD" --no-merges --max-count=30 --pretty=format:'* %s' | sed '/\[skip ci\]/d')"
+          else
+            CHANGES="$(git log HEAD --no-merges --max-count=30 --pretty=format:'* %s' | sed '/\[skip ci\]/d')"
+          fi
+
+          {
+            printf 'changes<<CHANGES_EOF\n'
+            printf '%s\n' "${CHANGES}"
+            printf 'CHANGES_EOF\n'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Update package.json
+        run: |
+          node -e "
+            const fs = require('fs');
+            const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+            pkg.version = '${{ steps.prepare.outputs.version }}';
+            fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');
+          "
+
+      - name: Update CHANGELOG.md
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          VERSION: ${{ steps.prepare.outputs.version }}
+          TAG_NAME: ${{ steps.prepare.outputs.tag_name }}
+          CHANGES: ${{ steps.prepare.outputs.changes }}
+        with:
+          script: |
+            const fs = await import('fs');
+            const { VERSION: version, TAG_NAME: tagName, CHANGES: changes } = process.env;
+
+            if (!changes || !changes.trim()) {
+              console.log('No changes — skipping CHANGELOG update.');
+              return;
+            }
+
+            // Derive the release date from the version number (YYYY.MMDD.patch).
+            let dateStr = new Date().toISOString().split('T')[0];
+            const vMatch = version.match(/^(\d{4})\.(\d{3,4})\.(\d+)$/);
+            if (vMatch) {
+              const monthday = vMatch[2].padStart(4, '0');
+              dateStr = `${vMatch[1]}-${monthday.slice(0, 2)}-${monthday.slice(2, 4)}`;
+            }
+
+            const repoUrl = context.payload.repository.html_url;
+            const newEntry = `## [${version}] - ${dateStr}\n\n${changes.trim()}\n\n---\n\n`;
+            const linkLine = `[${version}]: ${repoUrl}/releases/tag/${tagName}`;
+
+            let changelog = fs.readFileSync('CHANGELOG.md', 'utf8');
+
+            const escapedVersion = version.replace(/\./g, '\\.');
+            const existingRe = new RegExp(
+              `## \\[${escapedVersion}\\][^\\n]*\\n[\\s\\S]*?(?=\\n## \\[|\\n\\[Unreleased\\]:|$)`
+            );
+
+            if (existingRe.test(changelog)) {
+              changelog = changelog.replace(existingRe, newEntry.trimEnd());
+            } else {
+              const sep = '---\n\n';
+              const insertAt = changelog.indexOf(sep);
+              if (insertAt === -1) {
+                changelog += '\n' + newEntry;
+              } else {
+                const pos = insertAt + sep.length;
+                changelog = changelog.slice(0, pos) + newEntry + changelog.slice(pos);
+              }
+            }
+
+            const linkRe = new RegExp(`^\\[${escapedVersion}\\]:.*$`, 'm');
+            if (linkRe.test(changelog)) {
+              changelog = changelog.replace(linkRe, linkLine);
+            } else {
+              changelog = changelog.replace(
+                /^(\[Unreleased\]:.*)/m,
+                `$1\n${linkLine}`
+              );
+              changelog = changelog.replace(
+                /\[Unreleased\]: .+\/compare\/.+\.\.\.HEAD/,
+                `[Unreleased]: ${repoUrl}/compare/${tagName}...HEAD`
+              );
+            }
+
+            fs.writeFileSync('CHANGELOG.md', changelog);
+            console.log(`CHANGELOG.md updated for ${version} (${dateStr})`);
+
+      - name: Commit, Tag, and Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.prepare.outputs.version }}
+          TAG_NAME: ${{ steps.prepare.outputs.tag_name }}
+          CHANGES: ${{ steps.prepare.outputs.changes }}
+        shell: bash
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add package.json CHANGELOG.md
+          if ! git diff --cached --quiet; then
+            git commit -m "chore(release): bump version to ${VERSION}"
+            git push origin HEAD
+          fi
+
+          git tag "${TAG_NAME}"
+          git push origin "${TAG_NAME}"
+
+          RELEASE_NOTES="**Change Log**
+          ${CHANGES}"
+
+          gh release create "${TAG_NAME}" \
+            --title "${VERSION}" \
+            --draft \
+            --notes "${RELEASE_NOTES}"
+
+  build-and-upload:
+    needs: prepare-release
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: '--win'
+          - os: ubuntu-latest
+            target: '--linux'
+          - os: macos-latest
+            target: '--mac'
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare-release.outputs.tag_name }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24.18.0'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Build and publish
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          for attempt in 1 2 3; do
+            if npx electron-builder ${{ matrix.target }} --publish always; then
+              exit 0
+            fi
+
+            if [ "${attempt}" -eq 3 ]; then
+              exit 1
+            fi
+
+            sleep $((attempt * 30))
+          done
+
+  publish-release:
+    needs: [prepare-release, build-and-upload]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Publish completed release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ needs.prepare-release.outputs.tag_name }}
+        run: gh release edit "${TAG_NAME}" --repo "${GITHUB_REPOSITORY}" --draft=false

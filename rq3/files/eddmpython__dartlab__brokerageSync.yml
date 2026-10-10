@@ -1,0 +1,55 @@
+name: Brokerage Research Sync
+
+# ──────────────────────────────────────────────────────────────
+# 증권사 리서치 메타 인덱스 — 공개 게시판 자체 스크랩(본문 0·원본 링크아웃) → 월별 parquet → HF.
+#   - gather.sources.brokerage 가 스크랩·파싱·ticker 해소 SSOT (별도빌드 금지).
+#   - syncBrokerageReports.py 는 g.brokerageReports() 호출 + 월별 write + manifest + HF push + 헬스 게이트.
+#   - report_id(증권사·제목·발간일) dedup 으로 재수집 idempotent — GHA 캐시 불필요(HF=store).
+#   - 서버렌더 5개사(미래에셋·NH·유안타·한양·부국) 작동. SPA 4개사(안티봇)는 deferred.
+#   - 헬스 게이트(PRD 03 §4): 수율 0행/카테고리 0행/완전성<90% 깨짐 감지 → Step Summary 표 +
+#     깨짐이면 exit 1 → 이 워크플로 RED → GitHub 가 운영자에게 자동 알림(데이터는 알림 전 push 보존).
+# 증권사 리서치 메타데이터 동기화 workflow.
+# ──────────────────────────────────────────────────────────────
+
+on:
+  schedule:
+    - cron: '0 23 * * *'  # UTC 23:00 = KST 08:00 (조간 리포트)
+    - cron: '0 10 * * *'  # UTC 10:00 = KST 19:00 (장 마감 후 당일 리포트)
+  workflow_dispatch:
+
+permissions:
+  contents: read  # HF push 는 HF_TOKEN 사용 — git commit/push 없음(checkout+cache 만). 최소권한.
+
+# 리서치 경로(research/*) push 전용 그룹 — DART(dart/*)·EDGAR(edgar/*) 와 분리(취소 연쇄 방지).
+concurrency:
+  group: hf-research-push
+  cancel-in-progress: false
+
+jobs:
+  sync-brokerage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Smoke import (fail fast on src regression)
+        run: uv run python -c "import dartlab; print('dartlab', getattr(dartlab, '__version__', 'dev'))"
+
+      # 수집 + 월별 parquet write + changed manifest + HF push (한 stage 가 전부).
+      # 명시 6자리코드 해소는 무키 동작 — DART 키는 회사명 fallback 용(있으면 커버리지↑).
+      - name: Sync brokerage research (fetch + write + HF push)
+        run: uv run python -X utf8 -m dartlab.pipeline brokerageReports
+        env:
+          DART_API_KEYS: ${{ secrets.DART_API_KEYS }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          PYTHONUNBUFFERED: "1"

@@ -1,0 +1,77 @@
+name: Quarkus Platform Deploy Snapshots
+
+on:
+  schedule:
+    - cron: '0 4 * * *'
+  workflow_dispatch:
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  LANG: en_US.UTF-8
+  MVNW_REPOURL: https://maven-central.storage-download.googleapis.com/maven2
+jobs:
+  build-and-deploy:
+    permissions:
+      contents: read
+      issues: write
+      packages: read
+    name: "Build and deploy"
+    runs-on: ubuntu-latest
+    if: github.repository == 'quarkusio/quarkus-platform'
+    env:
+      MAVEN_OPTS: -Xmx2048m -XX:MaxMetaspaceSize=1000m
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+      - name: Reclaim Disk Space
+        run: .github/ci-prerequisites.sh
+      - name: Set up JDK 21
+        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: temurin
+          java-version: 21
+      - name: Get SHA
+        id: quarkus-platform-sha
+        run: |
+          echo "sha=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
+      - name: Get Date
+        id: get-date
+        run: |
+          echo "date=$(/bin/date -u "+%Y-%m")" >> $GITHUB_OUTPUT
+      - name: Cache Maven Repository
+        id: cache-maven
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.m2/repository
+          # refresh cache every month to avoid unlimited growth
+          key: deploy-snapshots-${{ steps.get-date.outputs.date }}
+      - name: Build and Deploy
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_API_TOKEN }}
+          SONATYPE_USERNAME: ${{ secrets.SONATYPE_USERNAME }}
+          SONATYPE_PASSWORD: ${{ secrets.SONATYPE_PASSWORD }}
+        run: |
+          ./mvnw -B -N --settings .github/release-settings.xml versions:set-property -Dproperty=quarkus.version -DnewVersion=999-SNAPSHOT -DenableSnapshotsRepository
+          ./mvnw -B --settings .github/release-settings.xml -Dsync -DenableSnapshotsRepository
+          ./mvnw -e -B --settings .github/release-settings.xml \
+            -Dnjord.autoPublish \
+            -DskipTests -DskipITs \
+            -DenableSnapshotsRepository \
+            clean deploy
+      - name: Delete Local Artifacts From Cache
+        shell: bash
+        run: rm -r ~/.m2/repository/io/quarkus/platform ~/.m2/repository/io/quarkus/quarkus-universe-bom
+
+      - name: Report
+        uses: quarkusio/report-status-in-issue@main
+        if: always()
+        with:
+          github-token: ${{ secrets.ECOSYSTEM_CI_TOKEN }}
+          status: ${{ job.status }}
+          issue-repository: quarkusio/quarkus
+          issue-number: 35716
+          project-sha: ${{ steps.quarkus-platform-sha.outputs.sha }}

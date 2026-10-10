@@ -1,0 +1,96 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: publish-docker
+
+on:
+  push:
+    branches:
+      - master
+  release:
+    types:
+      - released
+
+env:
+  SKIP_TEST: true
+
+jobs:
+  build:
+    if: github.repository == 'apache/skywalking'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+          persist-credentials: false
+      - name: Cache local Maven repository
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository
+          key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
+          restore-keys: |
+            ${{ runner.os }}-maven-
+      - name: Set environment variables
+        run: |
+          if [[ ${{ github.event_name }} == "release" ]]; then
+            echo "HUB=apache" >> $GITHUB_ENV
+            echo "DOCKER_REGISTRY=docker.io" >> $GITHUB_ENV
+            echo "DOCKER_USERNAME=${{ secrets.DOCKERHUB_USER }}" >> $GITHUB_ENV
+            echo "DOCKER_PASSWORD=${{ secrets.DOCKERHUB_TOKEN }}" >> $GITHUB_ENV
+            echo "OAP_NAME=skywalking-oap-server" >> $GITHUB_ENV
+            TAG=${{ github.event.release.tag_name }}
+            echo "TAG=${TAG#v}" >> $GITHUB_ENV
+          else
+            echo "HUB=ghcr.io/apache/skywalking" >> $GITHUB_ENV
+            echo "DOCKER_REGISTRY=ghcr.io/apache/skywalking" >> $GITHUB_ENV
+            echo "DOCKER_USERNAME=${{ github.actor }}" >> $GITHUB_ENV
+            echo "DOCKER_PASSWORD=${{ secrets.GITHUB_TOKEN }}" >> $GITHUB_ENV
+            echo "TAG=${{ github.sha }}" >> $GITHUB_ENV
+          fi
+      - name: Log in to the Container registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ${{ env.DOCKER_REGISTRY }}
+          username: ${{ env.DOCKER_USERNAME }}
+          password: ${{ env.DOCKER_PASSWORD }}
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Build and push docker images based on Java 11
+        env:
+          SW_OAP_BASE_IMAGE: eclipse-temurin:11-jre
+          TAG: ${{ env.TAG }}-java11
+        run: make build.all docker.push
+      - name: Build and push docker images based on Java 17
+        env:
+          SW_OAP_BASE_IMAGE: eclipse-temurin:17-jre
+          TAG: ${{ env.TAG }}-java17
+        run: make build.all docker.push
+      - name: Build and push docker images based on Java 21
+        env:
+          SW_OAP_BASE_IMAGE: eclipse-temurin:21-jre
+          TAG: ${{ env.TAG }}-java21
+        run: make build.all docker.push
+      - name: Build and push docker images
+        run: make build.all docker.push
+      - name: Build and push data-generator image
+        if: github.event_name != 'release'
+        run: make push.docker.data-generator

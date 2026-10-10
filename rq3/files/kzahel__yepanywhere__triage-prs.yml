@@ -1,0 +1,95 @@
+# Auto-triage unsolicited code PRs.
+#
+# Why this exists: drive-by pull requests (often agent-generated) aren't useful
+# to a small core team — reconciling an outside patch against in-flight work
+# costs more than it saves, and these PRs aren't more likely to land. Issues
+# are what we want: bug reports with repro/logs, and feature ideas with
+# reasoning. This workflow closes non-maintainer PRs and redirects the author
+# to open an issue instead.
+#
+# Scope: this fires ONLY on pull_request events. It never touches issues — the
+# Issues tab stays fully open and welcoming.
+#
+# Security: pull_request_target runs with the base repo's write token, so it
+# MUST NOT check out or execute the PR's code. This job only reads PR metadata
+# and posts a comment, which is safe.
+
+name: Triage PRs
+
+on:
+  pull_request_target:
+    types: [opened, reopened]
+
+permissions:
+  pull-requests: write
+  issues: write
+
+jobs:
+  triage:
+    runs-on: ubuntu-latest
+    # Skip maintainers (by repo association) and bots (e.g. a future Dependabot).
+    # The login allowlist below is a belt-and-suspenders second check.
+    if: >-
+      github.event.pull_request.author_association != 'OWNER' &&
+      github.event.pull_request.author_association != 'MEMBER' &&
+      github.event.pull_request.author_association != 'COLLABORATOR' &&
+      github.event.pull_request.user.type != 'Bot'
+    steps:
+      - uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        with:
+          script: |
+            const MAINTAINERS = ['kzahel', 'graehl'];
+            const pr = context.payload.pull_request;
+            const author = pr.user.login;
+
+            if (MAINTAINERS.includes(author.toLowerCase())) {
+              core.info(`Author @${author} is a maintainer — leaving PR open.`);
+              return;
+            }
+
+            // Escape hatch: if a maintainer manually reopens a closed PR, honor
+            // it. We still trigger on `reopened` so the original author can't
+            // quietly reopen to bypass triage — only a maintainer reopen sticks.
+            if (context.payload.action === 'reopened') {
+              const sender = (context.payload.sender?.login || '').toLowerCase();
+              if (MAINTAINERS.includes(sender)) {
+                core.info(`PR reopened by maintainer @${sender} — leaving open.`);
+                return;
+              }
+            }
+
+            const repoUrl = context.payload.repository.html_url;
+            const body = [
+              `Thanks for your interest in Yep Anywhere! 👋`,
+              ``,
+              `This project is maintained by a small core team (@kzahel, @graehl), and we **don't accept unsolicited code PRs**. They aren't more likely to land — reviewing an outside patch against in-flight work usually costs more than it saves.`,
+              ``,
+              `What genuinely helps us is **issues**: a clear bug report (steps to reproduce, logs, expected vs. actual) or a feature idea with the reasoning behind it is far more valuable than a code change. Please open one here:`,
+              ``,
+              `➡️ ${repoUrl}/issues/new`,
+              ``,
+              `I'm closing this PR automatically — nothing personal. If a maintainer specifically asked you to send it, just say so in a comment and we'll reopen. Thanks for understanding!`,
+            ].join('\n');
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: pr.number,
+              body,
+            });
+
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: pr.number,
+              labels: ['unsolicited-pr'],
+            });
+
+            await github.rest.pulls.update({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: pr.number,
+              state: 'closed',
+            });
+
+            core.info(`Closed PR #${pr.number} from @${author} and redirected to issues.`);

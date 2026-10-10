@@ -1,0 +1,219 @@
+name: Runner Image
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "30 6 * * *"
+
+defaults:
+  run:
+    shell: bash -euo pipefail {0}
+
+permissions: {}
+
+concurrency:
+  # Superseded pull-request validations can be cancelled, but each main-branch
+  # commit must finish publishing the SHA-tagged image consumed by releases.
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE: ghcr.io/${{ github.repository }}-runner
+
+jobs:
+  build:
+    name: build (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            arch: amd64
+            runner: ubuntu-24.04
+          - platform: linux/arm64
+            arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write # push runner image by digest to ghcr.io
+    steps:
+      - name: Set up Git repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Verify runner CLI version pins
+        run: scripts/check-runner-cli-version-pins.sh
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Generate image metadata
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ env.IMAGE }}
+
+      # Build the native platform locally and smoke-test it before any push, so
+      # arm64 binaries are exercised on real arm64 hardware rather than emulated.
+      - name: Build smoke-test image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: Dockerfile.runner
+          platforms: ${{ matrix.platform }}
+          load: true
+          push: false
+          tags: scrutineer-runner:ci
+          labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Smoke test image
+        run: |
+          docker run --rm scrutineer-runner:ci claude --version
+          docker run --rm \
+            --read-only \
+            --cap-drop ALL \
+            --user 12345:12345 \
+            -e HOME=/tmp \
+            --tmpfs /tmp:rw,noexec,nosuid,size=256m \
+            scrutineer-runner:ci copilot --version
+          docker run --rm scrutineer-runner:ci curl --version
+          docker run --rm -i \
+            --read-only --cap-drop ALL --user 12345:12345 \
+            --tmpfs /tmp:rw,noexec,nosuid,size=16m \
+            scrutineer-runner:ci bash -eu <<'SMOKE'
+          printf '%s\n' '{"type":"integer"}' > /tmp/schema.json
+          printf '%s\n' '{"value":42}' | jq -e '.value' > /tmp/valid.json
+          jsonschema -i /tmp/valid.json /tmp/schema.json
+          printf '%s\n' '"not an integer"' > /tmp/invalid.json
+          if jsonschema -i /tmp/invalid.json /tmp/schema.json > /tmp/validation-error.log 2>&1; then
+            echo 'jsonschema accepted invalid input' >&2
+            exit 1
+          else
+            schema_status=$?
+          fi
+          cat /tmp/validation-error.log
+          test "$schema_status" -eq 1
+          grep -Fq "'not an integer' is not of type 'integer'" /tmp/validation-error.log
+          SMOKE
+          docker run --rm scrutineer-runner:ci semgrep --version
+          docker run --rm scrutineer-runner:ci zizmor --version
+          docker run --rm scrutineer-runner:ci betterleaks --version
+          docker run --rm scrutineer-runner:ci darnit --version
+          docker run --rm scrutineer-runner:ci git-pkgs --version
+          docker run --rm scrutineer-runner:ci brief --version
+          docker run --rm scrutineer-runner:ci git --version
+          # egress-proxy sidecar mode ships in this image
+          docker run --rm scrutineer-runner:ci scrutineer proxy -h
+          docker run --rm scrutineer-runner:ci harness-proxy -h
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Test Ruby profile detection
+        env:
+          SCRUTINEER_TEST_RUNNER_IMAGE: scrutineer-runner:ci
+        run: go test ./internal/worker -run '^TestIntegration_DetectRubyProfile$' -count=1 -v
+
+      - name: Log in to GHCR
+        if: github.event_name == 'push'
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Push by digest only; the merge job assembles the tagged multi-arch
+      # manifest. Reuses the buildx cache from the smoke build above.
+      - name: Push image by digest
+        id: push
+        if: github.event_name == 'push'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: Dockerfile.runner
+          platforms: ${{ matrix.platform }}
+          tags: ${{ env.IMAGE }}
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=image,push-by-digest=true,name-canonical=true,push=true
+
+      - name: Export digest
+        if: github.event_name == 'push'
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/digests"
+          touch "$RUNNER_TEMP/digests/${DIGEST#sha256:}"
+
+      - name: Upload digest
+        if: github.event_name == 'push'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: digests-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: merge manifest
+    needs: build
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write # push the multi-arch manifest list to ghcr.io
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Generate manifest metadata
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=sha-${{ github.sha }},enable={{is_default_branch}}
+            type=sha,prefix=sha-
+
+      - name: Create and push manifest list
+        working-directory: ${{ runner.temp }}/digests
+        run: |
+          mapfile -t TAGS < <(jq -r '.tags[]' <<< "$DOCKER_METADATA_OUTPUT_JSON")
+          mapfile -t DIGESTS < <(find . -maxdepth 1 -type f -printf '%f\n' | sort)
+          CREATE_ARGS=()
+          for tag in "${TAGS[@]}"; do
+            CREATE_ARGS+=("-t" "${tag}")
+          done
+          for digest in "${DIGESTS[@]}"; do
+            CREATE_ARGS+=("${IMAGE}@sha256:${digest}")
+          done
+          docker buildx imagetools create "${CREATE_ARGS[@]}"
+
+      - name: Inspect manifest
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: docker buildx imagetools inspect "$IMAGE:$VERSION"

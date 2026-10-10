@@ -1,0 +1,206 @@
+name: Examples
+permissions: {}
+on:
+  pull_request: {}
+  push:
+    branches: [master]
+  workflow_dispatch: {}
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+env:
+  DEVELOCITY_ACCESS_KEY: ${{ secrets.DEVELOCITY_ACCESS_KEY }}
+  ALLOWED_ENDPOINTS: >-
+    api.adoptium.net:443
+    api.foojay.io:443
+    api.github.com:443
+    caffeine.develocity.cloud:443
+    download.oracle.com:443
+    downloads.gradle.org:443
+    downloads.gradle-dn.com:443
+    gds.oracle.com:443
+    github.com:443
+    maven-central.storage-download.googleapis.com:443
+    objects.githubusercontent.com:443
+    plugins.gradle.org:443
+    plugins-artifacts.gradle.org:443
+    release-assets.githubusercontent.com:443
+    repo.maven.apache.org:443
+    repo1.maven.org:443
+    services.gradle.org:443
+    www.graalvm.org:443
+  JAVA_VERSION: 26
+
+jobs:
+  examples:
+    name: Examples
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          disable-sudo-and-containers: true
+          egress-policy: block
+          allowed-endpoints: ${{ env.ALLOWED_ENDPOINTS }}
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Write-behind (rxjava)
+        uses: $/.github/actions/run-gradle
+        with:
+          java: ${{ env.JAVA_VERSION }}
+          cache-encryption-key: ${{ secrets.GRADLE_ENCRYPTION_KEY }}
+          arguments:  build --project-dir examples/write-behind-rxjava
+      - name: Coalescing Bulkloader (reactor)
+        uses: $/.github/actions/run-gradle
+        with:
+          java: ${{ env.JAVA_VERSION }}
+          cache-encryption-key: ${{ secrets.GRADLE_ENCRYPTION_KEY }}
+          arguments:  build --project-dir examples/coalescing-bulkloader-reactor
+      - name: Hibernate (jcache)
+        uses: $/.github/actions/run-gradle
+        with:
+          java: ${{ env.JAVA_VERSION }}
+          cache-encryption-key: ${{ secrets.GRADLE_ENCRYPTION_KEY }}
+          arguments:  build --project-dir examples/hibernate
+      - name: Indexable
+        uses: $/.github/actions/run-gradle
+        with:
+          java: ${{ env.JAVA_VERSION }}
+          cache-encryption-key: ${{ secrets.GRADLE_ENCRYPTION_KEY }}
+          arguments:  build --project-dir examples/indexable
+      - name: Resilience (failsafe)
+        uses: $/.github/actions/run-gradle
+        with:
+          java: ${{ env.JAVA_VERSION }}
+          cache-encryption-key: ${{ secrets.GRADLE_ENCRYPTION_KEY }}
+          arguments:  build --project-dir examples/resilience-failsafe
+
+  graalvm:
+    name: GraalVM Native Image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      JAVA_VERSION: 25
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          disable-sudo-and-containers: true
+          egress-policy: block
+          allowed-endpoints: ${{ env.ALLOWED_ENDPOINTS }}
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build snapshot
+        uses: $/.github/actions/run-gradle
+        with:
+          java: ${{ env.JAVA_VERSION }}
+          cache-encryption-key: ${{ secrets.GRADLE_ENCRYPTION_KEY }}
+          arguments: caffeine:jar
+      - name: Graal Native Image (Profile)
+        uses: $/.github/actions/run-gradle
+        with:
+          distribution: graalvm
+          java: ${{ env.JAVA_VERSION }}
+          cache-encryption-key: ${{ secrets.GRADLE_ENCRYPTION_KEY }}
+          arguments: >
+            --project-dir examples/graal-native -Pagent -PSNAPSHOT run
+            metadataCopy --task run --dir src/main/resources/META-INF/native-image
+      - name: Graal Native Image (Metadata)
+        run: git diff --exit-code -- examples/graal-native/src/main/resources/META-INF/native-image
+      - name: Graal Native Image (Run)
+        uses: $/.github/actions/run-gradle
+        with:
+          distribution: graalvm
+          java: ${{ env.JAVA_VERSION }}
+          cache-encryption-key: ${{ secrets.GRADLE_ENCRYPTION_KEY }}
+          arguments: --project-dir examples/graal-native -PSNAPSHOT nativeRun nativeTest
+
+  simulator:
+    name: Simulator
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          disable-sudo-and-containers: true
+          egress-policy: block
+          allowed-endpoints: ${{ env.ALLOWED_ENDPOINTS }}
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Simulate
+        uses: $/.github/actions/run-gradle
+        with:
+          java: ${{ env.JAVA_VERSION }}
+          cache-encryption-key: ${{ secrets.GRADLE_ENCRYPTION_KEY }}
+          arguments: >
+            simulator:run
+            -Dcaffeine.simulator.report.output=${{ github.workspace }}/simulation.md
+            -Dcaffeine.simulator.files.paths.0=corda:trace_vaultservice.gz
+            -Dcaffeine.simulator.files.paths.1=lirs:loop.trace.gz
+            -Dcaffeine.simulator.files.paths.2=corda:trace_vaultservice.gz
+      - name: Chart Simulation
+        uses: $/.github/actions/run-gradle
+        with:
+          java: ${{ env.JAVA_VERSION }}
+          cache-encryption-key: ${{ secrets.GRADLE_ENCRYPTION_KEY }}
+          arguments: simulator:simulate --maximumSize=100,200,300
+      - name: Publish Results
+        run: |
+          {
+            echo '### Adaptivity'
+            echo '```'
+            cat $GITHUB_WORKSPACE/simulation.md
+            printf '\n```\n'
+          } >> $GITHUB_STEP_SUMMARY
+
+  stress:
+    name: Stress Tests
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          disable-sudo-and-containers: true
+          egress-policy: block
+          allowed-endpoints: ${{ env.ALLOWED_ENDPOINTS }}
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Memory Overhead
+        uses: $/.github/actions/run-gradle
+        with:
+          java: ${{ env.JAVA_VERSION }}
+          cache-encryption-key: ${{ secrets.GRADLE_ENCRYPTION_KEY }}
+          arguments: caffeine:memoryOverhead
+      - name: Stresser (read)
+        uses: $/.github/actions/run-gradle
+        with:
+          java: ${{ env.JAVA_VERSION }}
+          cache-encryption-key: ${{ secrets.GRADLE_ENCRYPTION_KEY }}
+          arguments: caffeine:stress --workload=read --duration PT1M
+      - name: Stresser (write)
+        uses: $/.github/actions/run-gradle
+        with:
+          java: ${{ env.JAVA_VERSION }}
+          cache-encryption-key: ${{ secrets.GRADLE_ENCRYPTION_KEY }}
+          arguments: caffeine:stress --workload=write --duration PT1M
+      - name: Stresser (refresh)
+        uses: $/.github/actions/run-gradle
+        with:
+          java: ${{ env.JAVA_VERSION }}
+          cache-encryption-key: ${{ secrets.GRADLE_ENCRYPTION_KEY }}
+          arguments: caffeine:stress --workload=refresh --duration PT1M

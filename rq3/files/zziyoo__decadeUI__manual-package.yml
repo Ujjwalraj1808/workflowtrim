@@ -1,0 +1,94 @@
+name: Manual Package
+
+on:
+  workflow_dispatch:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: manual-package
+  cancel-in-progress: true
+
+jobs:
+  package:
+    name: Build package
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (
+        github.event_name == 'issue_comment' &&
+        github.event.action == 'created' &&
+        !github.event.issue.pull_request &&
+        github.event.comment.body == '/package'
+      )
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout latest main
+        uses: actions/checkout@v5
+        with:
+          ref: main
+          fetch-depth: 1
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 9
+          run_install: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build
+        run: pnpm build
+
+      - name: Read version
+        id: version
+        run: |
+          VERSION=$(node -e "process.stdout.write(JSON.parse(require('fs').readFileSync('dist/info.json', 'utf8')).version)")
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Verify build output
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          test -f dist/extension.js
+          test -f dist/info.json
+          test -d dist/src
+          test -d dist/ui
+          node -e "const info = JSON.parse(require('fs').readFileSync('dist/info.json', 'utf8')); if (info.version !== process.env.VERSION) process.exit(1)"
+
+      - name: Create zip package
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          cd dist
+          zip -r -q "../十周年UI-${VERSION}.zip" .
+
+      - name: Upload package
+        uses: actions/upload-artifact@v7
+        id: upload
+        with:
+          name: 十周年UI-${{ steps.version.outputs.version }}
+          path: 十周年UI-${{ steps.version.outputs.version }}.zip
+          if-no-files-found: error
+          archive: false
+
+      - name: Show download link
+        if: success()
+        env:
+          ARTIFACT_URL: ${{ steps.upload.outputs.artifact-url }}
+        run: |
+          {
+            echo "## 十周年UI打包完成"
+            echo
+            echo "[点击下载压缩包](${ARTIFACT_URL})"
+          } >> "$GITHUB_STEP_SUMMARY"

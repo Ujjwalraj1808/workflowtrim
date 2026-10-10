@@ -1,0 +1,222 @@
+name: Paxeer / RocksDB
+on:
+  pull_request:
+    paths:
+      - 'go.mod'
+      - 'go.sum'
+      - 'chain.mk'
+      - 'docker/layerx/Dockerfile'
+      - 'docker/layerx/Dockerfile.dockerignore'
+      - 'foundry.paxeer.toml'
+      - 'buf.gen.yaml'
+      - 'buf.lock'
+      - 'buf.yaml'
+      - 'codecov.yml'
+      - 'config.yml'
+      - '.golangci.yml'
+      - 'gen.go'
+      - 'link_directives_test.go'
+      - 'mod_test.go'
+      - 'run_blocktests.sh'
+      - 'version.json'
+      - 'admin/**'
+      - 'api/**'
+      - 'assets/**'
+      - 'benchmark/**'
+      - 'consensus/**'
+      - 'custodyproof/**'
+      - 'daemon/**'
+      - 'docker/**'
+      - 'engine/**'
+      - 'example/**'
+      - 'hpx/**'
+      - 'integration_test/**'
+      - 'interchain/**'
+      - 'loadtest/**'
+      - 'modules/**'
+      - 'node/**'
+      - 'occ_tests/**'
+      - 'parallelization/**'
+      - 'precompiles/**'
+      - 'ratelimiter/**'
+      - 'rpc/**'
+      - 'sdk/**'
+      - 'storage/**'
+      - 'store/**'
+      - 'sync/**'
+      - 'testutil/**'
+      - 'types/**'
+      - 'utils/**'
+      - 'wasm/**'
+      - 'wasm-runtime/**'
+      - 'wasmbinding/**'
+      - 'contracts/src/**'
+      - 'contracts/test/**'
+      - 'contracts/scripts/**'
+      - 'contracts/wasm/**'
+      - 'docs/swagger/**'
+      - 'docs/swagger-ui/**'
+      - 'tests/chain/**'
+      - 'tools/chain/**'
+      - 'tools/tx-scanner/**'
+      - 'tools/utils/**'
+      - 'contracts/config/client.toml'
+      - 'contracts/hardhat.config.js'
+      - 'contracts/package.json'
+      - 'contracts/package-lock.json'
+      - 'contracts/tsconfig.json'
+      - 'docs/evm_jsonrpc_unsupported.md'
+      - 'docs/paxeer-network.md'
+      - 'docs/paxeer-chain-docs.md'
+      - 'scripts/**'
+      - '!scripts/PaxeerBetaDeploy.s.sol'
+      - '!scripts/qualify-mirror-live.sh'
+      - '!scripts/qualify-mirror-verification-live.sh'
+      - '.github/workflows/paxeer-rocksdb-unit-tests.yml'
+  merge_group:
+  push:
+    branches:
+      - main
+      - release/**
+    paths:
+      - 'go.mod'
+      - 'go.sum'
+      - 'chain.mk'
+      - 'docker/layerx/Dockerfile'
+      - 'docker/layerx/Dockerfile.dockerignore'
+      - 'foundry.paxeer.toml'
+      - 'buf.gen.yaml'
+      - 'buf.lock'
+      - 'buf.yaml'
+      - 'codecov.yml'
+      - 'config.yml'
+      - '.golangci.yml'
+      - 'gen.go'
+      - 'link_directives_test.go'
+      - 'mod_test.go'
+      - 'run_blocktests.sh'
+      - 'version.json'
+      - 'admin/**'
+      - 'api/**'
+      - 'assets/**'
+      - 'benchmark/**'
+      - 'consensus/**'
+      - 'custodyproof/**'
+      - 'daemon/**'
+      - 'docker/**'
+      - 'engine/**'
+      - 'example/**'
+      - 'hpx/**'
+      - 'integration_test/**'
+      - 'interchain/**'
+      - 'loadtest/**'
+      - 'modules/**'
+      - 'node/**'
+      - 'occ_tests/**'
+      - 'parallelization/**'
+      - 'precompiles/**'
+      - 'ratelimiter/**'
+      - 'rpc/**'
+      - 'sdk/**'
+      - 'storage/**'
+      - 'store/**'
+      - 'sync/**'
+      - 'testutil/**'
+      - 'types/**'
+      - 'utils/**'
+      - 'wasm/**'
+      - 'wasm-runtime/**'
+      - 'wasmbinding/**'
+      - 'contracts/src/**'
+      - 'contracts/test/**'
+      - 'contracts/scripts/**'
+      - 'contracts/wasm/**'
+      - 'docs/swagger/**'
+      - 'docs/swagger-ui/**'
+      - 'tests/chain/**'
+      - 'tools/chain/**'
+      - 'tools/tx-scanner/**'
+      - 'tools/utils/**'
+      - 'contracts/config/client.toml'
+      - 'contracts/hardhat.config.js'
+      - 'contracts/package.json'
+      - 'contracts/package-lock.json'
+      - 'contracts/tsconfig.json'
+      - 'docs/evm_jsonrpc_unsupported.md'
+      - 'docs/paxeer-network.md'
+      - 'docs/paxeer-chain-docs.md'
+      - 'scripts/**'
+      - '!scripts/PaxeerBetaDeploy.s.sol'
+      - '!scripts/qualify-mirror-live.sh'
+      - '!scripts/qualify-mirror-verification-live.sh'
+      - '.github/workflows/paxeer-rocksdb-unit-tests.yml'
+
+defaults:
+  run:
+    working-directory: .
+
+concurrency:
+  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event_name == 'push' && github.sha || github.ref }}
+
+# TODO: we should combine these tests into go-test at some point. For now this is complicated enough to approach separately.
+
+jobs:
+  tests-rocksdb:
+    name: RocksDB Tests
+    runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && 'ubuntu-latest' || vars.CI_LINUX_RUNNER || 'lx-runner' }}
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: '1.25.6'
+          cache-dependency-path: go.sum
+
+      - name: Install RocksDB dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config cmake git zlib1g-dev libbz2-dev libsnappy-dev liblz4-dev libzstd-dev libjemalloc-dev libgflags-dev liburing-dev
+
+      - name: Cache RocksDB
+        id: cache-rocksdb
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            /usr/local/lib/librocksdb.*
+            /usr/local/include/rocksdb
+          key: rocksdb-v8.9.1-${{ runner.os }}
+
+      - name: Build and Install RocksDB from source
+        if: steps.cache-rocksdb.outputs.cache-hit != 'true'
+        run: |
+          git clone https://github.com/facebook/rocksdb.git
+          cd rocksdb
+          git checkout v8.9.1
+          make clean
+          CXXFLAGS='-march=native -DNDEBUG' make -j"$(nproc)" shared_lib
+          sudo make install-shared
+          cd ..
+
+      - name: Configure RocksDB library path
+        run: |
+          echo '/usr/local/lib' | sudo tee /etc/ld.so.conf.d/rocksdb.conf
+          sudo ldconfig
+
+      - name: Run RocksDB Tests
+        run: |
+          export CGO_CFLAGS="-I/usr/local/include"
+          export CGO_LDFLAGS="-L/usr/local/lib -lrocksdb -lz -lbz2 -lsnappy -llz4 -lzstd -ljemalloc"
+          go test -v -mod=readonly -tags=rocksdbBackend ./storage/db_engine/rocksdb/... -covermode=atomic -coverprofile=./rdb-profile.out
+      - name: Upload coverage to Codecov
+        if: vars.CODECOV_ENABLED == 'true'
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
+        with:
+          files: rdb-profile.out
+          use_oidc: true
+          fail_ci_if_error: true
+          flags: pax-db
+          disable_search: true
+          name: pax-db-coverage

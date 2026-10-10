@@ -1,0 +1,319 @@
+name: Orchestrator Edge Sync
+
+# This workflow keeps the 'edge' branch in sync with 'master'
+# and prepares it for local development builds (removes image tags)
+
+on:
+  push:
+    branches:
+      - master
+    paths-ignore:
+      - ".unsupported/**"
+      - ".github/**"
+      - "docs/**"
+      - "tests/**"
+      - "*.md"
+      - "**/*.md"
+      - "LICENSE*"
+      - "project_manifest.json"
+      - "project_connections.json"
+  workflow_dispatch:
+    inputs:
+      app:
+        description: "Specific App to bump (leave empty to bump detected or all)"
+        required: false
+        default: ""
+        type: string
+      force_sync:
+        description: "Force sync edge branch"
+        required: false
+        default: false
+        type: boolean
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+permissions:
+  contents: write
+
+jobs:
+  sync-edge:
+    name: 🔄 Sync Edge Branch
+    runs-on: ubuntu-latest
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' && !contains(join(github.event.commits.*.message, ' '), '[skip-edge]'))
+    steps:
+      - name: ⤵️ Checkout for file check
+        if: github.event_name == 'push'
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: 🔍 Check if only workflow files changed
+        id: check_changes
+        if: github.event_name == 'push'
+        run: |
+          # Get changed files in the push
+          CHANGED_FILES=""
+          if [ -n "${{ github.event.before }}" ] && [ "${{ github.event.before }}" != "0000000000000000000000000000000000000000" ]; then
+            CHANGED_FILES=$(git diff --name-only "${{ github.event.before }}" "${{ github.event.after }}" 2>/dev/null || echo "")
+          fi
+
+          # Fallback: check commits in the push
+          if [ -z "$CHANGED_FILES" ] && [ -n "${{ github.event.commits }}" ]; then
+            # Get all changed files from all commits in this push
+            for commit in ${{ join(github.event.commits.*.id, ' ') }}; do
+              if git rev-parse --verify "$commit" >/dev/null 2>&1; then
+                COMMIT_FILES=$(git diff-tree --no-commit-id --name-only -r "$commit" 2>/dev/null || echo "")
+                if [ -n "$COMMIT_FILES" ]; then
+                  CHANGED_FILES="${CHANGED_FILES}${CHANGED_FILES:+$'\n'}${COMMIT_FILES}"
+                fi
+              fi
+            done
+          fi
+
+          # Final fallback: check last commit
+          if [ -z "$CHANGED_FILES" ]; then
+            CHANGED_FILES=$(git diff --name-only HEAD~1 HEAD 2>/dev/null || echo "")
+          fi
+
+          if [ -z "$CHANGED_FILES" ]; then
+            # If we can't determine changes, assume we should run
+            {
+              echo "only_workflows=false"
+              echo "changed_Apps=ALL"
+            } >> "$GITHUB_OUTPUT"
+            echo "⚠️ Could not determine changed files, proceeding with sync"
+            exit 0
+          fi
+
+          # Remove duplicates and empty lines
+          CHANGED_FILES=$(echo "$CHANGED_FILES" | sort -u | grep -v '^$')
+
+          echo "Changed files:"
+          echo "$CHANGED_FILES"
+
+          # Extract App directories from changed files (handles root apps and .dev/ apps)
+          ROOT_APPS=$(echo "$CHANGED_FILES" | grep -E "^[^./][^/]+/" | cut -d'/' -f1 || true)
+          DEV_APPS=$(echo "$CHANGED_FILES" | grep -E "^\.dev/[^/]+/" | cut -d'/' -f2 || true)
+          CHANGED_AppS=$(printf "%s\n%s\n" "$ROOT_APPS" "$DEV_APPS" | sort -u | grep -v -E "^$|^(\\.|custom_components$)" || echo "")
+
+          echo "Changed Apps: $CHANGED_AppS"
+          # Save to output (newline-separated -> space-separated for easier parsing)
+          {
+            echo "changed_Apps<<EOF"
+            echo "$CHANGED_AppS"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+          # Check if only workflow files, docs, or non-functional metadata were changed
+          ONLY_WORKFLOWS=true
+          for file in $CHANGED_FILES; do
+            # Skip if it's workflow, documentation, test or repository metadata
+            if [[ "$file" == .github/* ]] || \
+               [[ "$file" == .unsupported/* ]] || \
+               [[ "$file" == .scripts/* ]] || \
+               [[ "$file" == docs/* ]] || \
+               [[ "$file" == tests/* ]] || \
+               [[ "$file" == *.md ]] || \
+               [[ "$file" == */*.md ]] || \
+               [[ "$file" == */*/*.md ]] || \
+               [[ "$file" == LICENSE* ]] || \
+               [[ "$file" == .* && "$file" != .dev/* ]] || \
+               [[ "$file" == project_*.json ]]; then
+              continue
+            else
+              # Found a functional add-on file modification (root add-on or .dev add-on)
+              ONLY_WORKFLOWS=false
+              break
+            fi
+          done
+
+          # Check for force sync flag in commit messages (e.g. [force-edge], [sync-edge], [force-edge:AegisBot,Alivro])
+          COMMIT_MESSAGES="${{ join(github.event.commits.*.message, ' ') }}"
+          if echo "$COMMIT_MESSAGES" | grep -qiE "\[(force-edge|sync-edge)"; then
+            echo "🚀 Force edge sync tag detected in commit message!"
+            ONLY_WORKFLOWS=false
+
+            # Extract specific apps if specified: [force-edge:AegisBot,Alivro] or [sync-edge:AegisBot,Alivro]
+            SPECIFIC_APPS=$(echo "$COMMIT_MESSAGES" | grep -oE "\[(force-edge|sync-edge):[^]]+\]" | head -1 | sed -E 's/\[[^:]+:([^]]+)\]/\1/' | tr ',' '\n' | tr -d ' ' | grep -v '^$' || true)
+            if [ -n "$SPECIFIC_APPS" ]; then
+              CHANGED_AppS="$SPECIFIC_APPS"
+              echo "🎯 Targeted Apps specified via commit tag:"
+              echo "$CHANGED_AppS"
+            fi
+          fi
+
+          if [ "$ONLY_WORKFLOWS" = "true" ]; then
+            echo "ℹ️ Only workflow/documentation/metadata files changed, skipping edge sync"
+            echo "only_workflows=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "✅ Relevant add-on files changed, proceeding with edge sync"
+            echo "only_workflows=false" >> "$GITHUB_OUTPUT"
+            if [ -z "$CHANGED_AppS" ]; then
+              CHANGED_AppS="ALL"
+            fi
+            {
+              echo "changed_Apps<<EOF"
+              echo "$CHANGED_AppS"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: ⤵️ Checkout master
+        if: |
+          github.event_name == 'workflow_dispatch' ||
+          steps.check_changes.outputs.only_workflows != 'true'
+        uses: actions/checkout@v7
+        with:
+          ref: master
+          fetch-depth: 0
+          token: ${{ secrets.PAT || secrets.GITHUB_TOKEN }}
+
+      - name: 🔧 Setup Git
+        if: |
+          github.event_name == 'workflow_dispatch' ||
+          steps.check_changes.outputs.only_workflows != 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: 💾 Save dev versions from edge branch
+        id: save_versions
+        if: |
+          github.event_name == 'workflow_dispatch' ||
+          steps.check_changes.outputs.only_workflows != 'true'
+        run: |
+          pip install pyyaml --quiet
+
+          # Check if edge branch exists and save versions
+          if git rev-parse --verify origin/edge >/dev/null 2>&1; then
+            echo "📋 Saving current dev versions from edge branch..."
+
+            # Create temp file to store versions
+            VERSIONS_FILE="/tmp/edge_versions.txt"
+            true > "$VERSIONS_FILE"
+
+            # Get config.yaml files from edge branch
+            for config in $(git ls-tree -r --name-only origin/edge | grep -E "^[^./][^/]+/config.yaml$"); do
+              App=$(dirname "$config")
+              VERSION=$(git show "origin/edge:$config" 2>/dev/null | grep -E "^version:" | head -1 | sed 's/version:[[:space:]]*["'"'"']\?\([^"'"'"']*\)["'"'"']\?/\1/')
+              if [ -n "$VERSION" ]; then
+                echo "$App=$VERSION" >> "$VERSIONS_FILE"
+                echo "  $App: $VERSION"
+              fi
+            done
+
+            # Output file path for later step
+            echo "versions_file=$VERSIONS_FILE" >> "$GITHUB_OUTPUT"
+          else
+            echo "⚠️ Edge branch doesn't exist yet - no versions to preserve"
+            echo "versions_file=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 🌿 Reset edge branch to master
+        if: |
+          github.event_name == 'workflow_dispatch' ||
+          steps.check_changes.outputs.only_workflows != 'true'
+        run: |
+          echo "Resetting edge branch to match master..."
+          git checkout -B edge master
+
+      - name: 🗑️ Remove Unsupported Apps
+        if: |
+          github.event_name == 'workflow_dispatch' ||
+          steps.check_changes.outputs.only_workflows != 'true'
+        run: |
+          echo "Removing .unsupported directory from edge branch..."
+          rm -rf .unsupported
+          git add .unsupported
+          git commit -m "chore: remove unsupported Apps from edge [skip ci]" || echo "No unsupported Apps to remove"
+
+      - name: 📝 Prepare edge for local builds
+        if: |
+          github.event_name == 'workflow_dispatch' ||
+          steps.check_changes.outputs.only_workflows != 'true'
+        run: |
+          pip install pyyaml --quiet
+          python3 .scripts/prepare_edge_branch.py
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 🔄 Update version for changed Apps only
+        if: |
+          github.event_name == 'workflow_dispatch' ||
+          steps.check_changes.outputs.only_workflows != 'true'
+        run: |
+          echo "🔍 Determining which Apps to bump..."
+
+          # Get all App directories
+          ALL_AppS=$(find . -maxdepth 2 -name "config.yaml" -not -path "./.unsupported/*" | sed 's|^\./||' | sed 's|/config.yaml||' | grep -v "^\." | sort -u)
+
+          # For workflow_dispatch, bump specific App if specified, otherwise all
+          if [ -n "${{ github.event.inputs.app }}" ]; then
+            echo "📦 workflow_dispatch: Bumping SPECIFIC App: ${{ github.event.inputs.app }}"
+            CHANGED_AppS="${{ github.event.inputs.app }}"
+          elif [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "📦 workflow_dispatch: Bumping ALL Apps"
+            CHANGED_AppS="$ALL_AppS"
+          else
+            # Use the Apps detected in the check_changes step
+            CHANGED_AppS="${{ steps.check_changes.outputs.changed_Apps }}"
+
+            # Handle special case where we couldn't detect changes
+            if [ "$CHANGED_AppS" = "ALL" ]; then
+              echo "⚠️ Could not detect specific changes - bumping all Apps"
+              CHANGED_AppS="$ALL_AppS"
+            fi
+          fi
+
+          # Load saved versions file
+          VERSIONS_FILE="${{ steps.save_versions.outputs.versions_file }}"
+
+          # Bump changed Apps
+          if [ -n "$CHANGED_AppS" ]; then
+            echo "📦 Apps to bump (changed in this push):"
+            echo "$CHANGED_AppS" | while read -r App; do
+              [ -n "$App" ] && echo "  - $App"
+            done
+
+            for App in $CHANGED_AppS; do
+              if [ -f "$App/config.yaml" ]; then
+                echo ""
+                echo "📝 Bumping $App with auto-generated dev changelog..."
+                python3 .scripts/bump_version.py "$App" patch --dev --changelog || echo "⚠️ Skipping $App"
+              fi
+            done
+          fi
+
+          # Restore previous edge files for UNCHANGED Apps
+          if [ -n "$VERSIONS_FILE" ] && [ -f "$VERSIONS_FILE" ] && [ "${{ github.event_name }}" != "workflow_dispatch" ]; then
+            echo ""
+            echo "🔄 Restoring edge config and changelog files for unchanged Apps..."
+
+            for App in $ALL_AppS; do
+              # Skip if this App was changed (already bumped above)
+              if echo "$CHANGED_AppS" | grep -q "^${App}$"; then
+                continue
+              fi
+
+              # Checkout config.yaml and CHANGELOG.md from origin/edge for unchanged apps
+              if git rev-parse --verify "origin/edge:$App/config.yaml" >/dev/null 2>&1; then
+                echo "  📌 Checkout edge config for $App"
+                git checkout origin/edge -- "$App/config.yaml" 2>/dev/null || true
+              fi
+              if git rev-parse --verify "origin/edge:$App/CHANGELOG.md" >/dev/null 2>&1; then
+                git checkout origin/edge -- "$App/CHANGELOG.md" 2>/dev/null || true
+              fi
+            done
+          fi
+
+      - name: 🚀 Push edge branch
+        if: |
+          github.event_name == 'workflow_dispatch' ||
+          steps.check_changes.outputs.only_workflows != 'true'
+        run: |
+          git add -A
+          git diff --staged --quiet || git commit -m "chore: prepare edge branch for local builds [skip ci]"
+          git push origin edge --force

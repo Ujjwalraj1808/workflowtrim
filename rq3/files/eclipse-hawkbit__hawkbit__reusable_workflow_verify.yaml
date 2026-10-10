@@ -1,0 +1,81 @@
+name: Verify (Reusable Workflow)
+
+on:
+  workflow_call:
+    inputs:
+      repository:
+        description: 'The repository to checkout, e.g. eclipse-hawkbit/hawkbit'
+        type: string
+        default: 'eclipse-hawkbit/hawkbit'
+      ref:
+        description: 'The branch, tag or SHA to checkout, e.g. master'
+        type: string
+        default: 'master'
+      maven_properties:
+        type: string
+        default: ''
+        description: 'Properties to pass to Maven command line, e.g. -Djpa.vendor=hibernate'
+
+permissions:
+  contents: read
+
+jobs:
+  reusable_workflow_verify:
+    runs-on: ubuntu-latest
+
+    services:
+      rabbitmq:
+        image: rabbitmq:3-management-alpine
+        env:
+          RABBITMQ_DEFAULT_VHOST: /
+          RABBITMQ_DEFAULT_USER: guest
+          RABBITMQ_DEFAULT_PASS: guest
+        ports:
+          - 15672:15672
+          - 5672:5672
+      postgresql:
+        image: postgres:16.5
+        env:
+          POSTGRES_DB: hawkbit
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: admin
+        options: >-
+          --health-cmd "pg_isready -d hawkbit -U postgres"
+          --health-interval 20s
+          --health-timeout 5s
+          --health-retries 10
+        ports:
+          - 5432:5432
+
+    steps:
+      - name: Parameters
+        run: |
+          echo "Repository: ${{ inputs.repository }},"
+          echo "Ref: ${{ inputs.ref }},"
+          echo "Maven Properties: ${{ inputs.maven_properties }}"
+
+      - uses: actions/checkout@v7.0.1
+        with:
+          repository: ${{ inputs.repository }}
+          ref: ${{ inputs.ref }}
+
+      - name: Set up JDK
+        uses: actions/setup-java@v6.0.1
+        with:
+          distribution: 'temurin'
+          java-version: 21
+          cache: 'maven'
+
+      - name: Cache local Maven repository
+        uses: actions/cache@v6.1.0
+        with:
+          path: ~/.m2/repository
+          key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
+          restore-keys: |
+            ${{ runner.os }}-maven-
+
+      - name: Check file license headers
+        run: mvn license:check -PcheckLicense --batch-mode
+
+      - name: Run tests & javadoc
+        run: mvn clean verify javadoc:javadoc -DdetectOfflineLinks=false -PgenerateTestReport ${{ inputs.maven_properties }} --batch-mode

@@ -1,0 +1,151 @@
+# Reusable workflow called by interactive scenario tests in GHA
+name: Test run Vault Enos scenario
+
+on:
+  workflow_call:
+    inputs:
+      artifact-source:
+        type: string
+        description: "The artifact source to test artifactory or local (use local for current branch)"
+        required: true
+      artifact-type:
+        type: string
+        description: "The Vault artifact type to test"
+        required: true
+      distro:
+        type: string
+        description: "Linux distribution that Vault replication will be tested on"
+        required: true
+      product-version:
+        type: string
+        description: "Vault version to test (vault_product_version)"
+        required: false
+      scenario:
+        type: string
+        description: "Enos test scenario to run"
+        required: true
+      ssh-key-name:
+        type: string
+        default: ${{ github.event.repository.name }}-ci-ssh-key
+      vault-revision:
+        type: string
+        description: "The git SHA of the Vault release (vault_revision)"
+        required: false
+
+jobs:
+  enos-run-vault-interactive-test:
+    name:  Enos run Vault interactive test
+    runs-on: ${{ github.repository == 'hashicorp/vault' && 'ubuntu-latest' || fromJSON('["self-hosted","ubuntu-22.04-x64", "large"]') }}
+    permissions:
+      contents: read
+      id-token: write
+    timeout-minutes: 120
+    env:
+      GITHUB_TOKEN: ${{ secrets.ELEVATED_GITHUB_TOKEN }}
+      # Pass in enos variables
+      ENOS_VAR_aws_ssh_keypair_name: ${{ inputs.ssh-key-name }}
+      ENOS_VAR_vault_log_level: trace
+      ENOS_VAR_aws_ssh_private_key_path: ./support/private_key.pem
+      ENOS_VAR_tfc_api_token: ${{ secrets.TF_API_TOKEN }}
+      ENOS_VAR_artifactory_username: ${{ secrets.ARTIFACTORY_USER }}
+      ENOS_VAR_artifactory_token: ${{ secrets.ARTIFACTORY_TOKEN }}
+      ENOS_VAR_terraform_plugin_cache_dir: ./support/terraform-plugin-cache
+      ENOS_VAR_vault_license_path: ./support/vault.hclic
+      ENOS_DEBUG_DATA_ROOT_DIR: /tmp/enos-debug-data
+      VAULT_METADATA: ent
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set product version and revision
+        # If the Vault version and revision are not provided as workflow inputs, incase of
+        # testing local artifact, the environment variables ENOS_VAR_vault_product_version
+        # and ENOS_VAR_vault_revision are set using the current branch
+        id: set-version-sha
+        run: |
+          [[ -n "${{ inputs.product-version }}" ]] && echo "ENOS_VAR_vault_product_version=${{ inputs.product-version }}" >> "$GITHUB_ENV" || echo "ENOS_VAR_vault_product_version=$(make ci-get-version)" >> "$GITHUB_ENV"
+          [[ -n "${{ inputs.vault-revision }}" ]] && echo "ENOS_VAR_vault_revision=${{ inputs.vault-revision }}" >> "$GITHUB_ENV" || echo "ENOS_VAR_vault_revision=$(make ci-get-revision)" >> "$GITHUB_ENV"
+      - uses: ./.github/actions/set-up-go
+        with:
+          github-token: ${{ secrets.ELEVATED_GITHUB_TOKEN }}
+          cache: "false"
+      # Install additional tools like gotestsum that are required for Enos scenarios
+      - uses: ./.github/actions/install-tools
+        with:
+          cache: fetch-only
+      - name: Set up node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: './ui/package.json'
+          cache: pnpm
+          cache-dependency-path: ui/pnpm-lock.yaml
+
+      - name: Install PNPM
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+        with:
+          package_json_file: './ui/package.json'
+      - if: github.repository != 'hashicorp/vault'
+        id: vault-auth
+        name: Vault Authenticate
+        run: vault-auth
+      - if: github.repository != 'hashicorp/vault'
+        id: vault-secrets
+        name: Fetch Vault Secrets
+        uses: hashicorp/vault-action@892a26828f195e65540a40b4768ae4571f51ebfc # v4.0.0
+        with:
+          url: ${{ steps.vault-auth.outputs.addr }}
+          caCertificate: ${{ steps.vault-auth.outputs.ca_certificate }}
+          token: ${{ steps.vault-auth.outputs.token }}
+          secrets: |
+            kv/data/github/${{ github.repository }}/aws access-key-id_070182026 | AWS_ACCESS_KEY_ID_CI_070182026;
+            kv/data/github/${{ github.repository }}/aws secret-access-key_070182026 | AWS_SECRET_ACCESS_KEY_CI_070182026;
+            kv/data/github/${{ github.repository }}/aws role-arn | AWS_ROLE_ARN_CI;
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@cbe3b392738ccf3f987d68400dafcf4b0624a56c # v6.2.4
+        with:
+          aws-access-key-id: ${{ github.repository == 'hashicorp/vault' && secrets.AWS_ACCESS_KEY_ID_CI_070182026 || steps.vault-secrets.outputs.AWS_ACCESS_KEY_ID_CI_070182026 }}
+          aws-secret-access-key: ${{ github.repository == 'hashicorp/vault' && secrets.AWS_SECRET_ACCESS_KEY_CI_070182026 || steps.vault-secrets.outputs.AWS_SECRET_ACCESS_KEY_CI_070182026 }}
+          aws-region: 'us-west-1'
+          role-to-assume: ${{ github.repository == 'hashicorp/vault' && secrets.AWS_ROLE_ARN_CI || steps.vault-secrets.outputs.AWS_ROLE_ARN_CI }}
+          role-skip-session-tagging: true
+          role-duration-seconds: 3600
+      - name: Prepare scenario dependencies
+        id: scenario-deps
+        run: |
+          mkdir -p ./enos/support/terraform-plugin-cache
+          mkdir -p /tmp/enos-scenario-logs
+          echo logsdir="/tmp/enos-scenario-logs" >> "$GITHUB_OUTPUT"
+          echo "${{ secrets.SSH_KEY_PRIVATE_CI }}" > ./enos/support/private_key.pem
+          chmod 600 ./enos/support/private_key.pem
+      - name: Setup Vault Enterprise License
+        id: license
+        run: echo "${{ secrets.VAULT_LICENSE }}" > ./enos/support/vault.hclic
+      - name: Run Enos scenario
+        id: run-scenario
+        uses: ./.github/actions/run-enos-scenario
+        with:
+          scenario-filter: ${{ inputs.scenario }}
+          working-directory: ./enos
+          timeout: 60m0s
+          retry-timeout: 60m0s
+          destroy-timeout: 60m0s
+          show-state-on-retry: ${{ github.repository == 'hashicorp/vault-enterprise' && 'true' || 'false' }}
+          destroy-extra-args: --grpc-listen http://localhost
+          debug-data-path: ${{ env.ENOS_DEBUG_DATA_ROOT_DIR }}
+          debug-data-retention-days: '1'
+      - name: Collect logs when scenario fails
+        id: collect_logs
+        if: ${{ always() }}
+        run: |
+          bash -x ./scripts/gha_enos_logs.sh "${{ steps.scenario-deps.outputs.logsdir }}" "${{ inputs.scenario }}" "${{ inputs.distro }}" "${{ inputs.artifact-type }}" 2>/dev/null
+          find "${{ steps.scenario-deps.outputs.logsdir }}" -maxdepth 0 -empty -exec rmdir {} \;
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ always() }}
+        with:
+          name: enos-scenario-logs
+          path: ${{ steps.scenario-deps.outputs.logsdir }}
+          retention-days: 1
+      - name: Clean up Enos runtime directories
+        if: ${{ always() }}
+        run: |
+          rm -rf /tmp/enos*
+          rm -rf ./enos/support
+          rm -rf ./enos/.enos

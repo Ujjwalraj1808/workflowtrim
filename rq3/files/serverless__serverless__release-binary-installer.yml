@@ -1,0 +1,71 @@
+name: 'Release: Binary Installer'
+
+permissions:
+  id-token: write
+  contents: read
+
+on:
+  workflow_dispatch:
+
+defaults:
+  run:
+    working-directory: ./binary-installer
+
+jobs:
+  release-installer-binary:
+    name: 'Release: Binary Installer'
+    runs-on: ubuntu-latest
+    steps:
+      - name: 'Checkout Code'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: 'Setup: Go'
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '>=1.27.0'
+          cache-dependency-path: binary-installer/go.sum
+      - name: 'Setup: AWS Credentials'
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: arn:aws:iam::802587217904:role/GithubActionsPublicServerlessRepoAccessRole
+          aws-region: us-east-1
+      - name: 'Setup: Azure Credentials'
+        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - name: 'Test: Unit'
+        run: make test
+      - name: 'Build: Production'
+        run: make build-prod
+      # Authenticode-signs the Windows binary via Azure Artifact Signing (jsign
+      # detects the PE format by content, so the missing .exe suffix is fine).
+      # Timestamping is applied automatically for this storetype, keeping
+      # signatures valid after the short-lived certificate expires.
+      - name: 'Sign: Windows Binary'
+        env:
+          SIGNING_ENDPOINT: ${{ vars.AZURE_TRUSTED_SIGNING_ENDPOINT }}
+          SIGNING_ACCOUNT: ${{ vars.AZURE_TRUSTED_SIGNING_ACCOUNT }}
+          SIGNING_CERT_PROFILE: ${{ vars.AZURE_TRUSTED_SIGNING_CERT_PROFILE }}
+          JSIGN_VERSION: '7.5'
+          JSIGN_SHA256: 602a51c3545a6dc4fb99bd2ea7152b26d1345916d0c93ddfbd5936cb735af91c
+        run: |
+          curl -sSfL -o /tmp/jsign.jar "https://github.com/ebourg/jsign/releases/download/${JSIGN_VERSION}/jsign-${JSIGN_VERSION}.jar"
+          echo "$JSIGN_SHA256  /tmp/jsign.jar" | sha256sum -c -
+          ACCESS_TOKEN=$(az account get-access-token --resource https://codesigning.azure.net --query accessToken -o tsv)
+          echo "::add-mask::$ACCESS_TOKEN"
+          java -jar /tmp/jsign.jar \
+            --storetype TRUSTEDSIGNING \
+            --keystore "$SIGNING_ENDPOINT" \
+            --storepass "$ACCESS_TOKEN" \
+            --alias "$SIGNING_ACCOUNT/$SIGNING_CERT_PROFILE" \
+            dist/prod/serverless-windows-amd64
+      - name: 'Release: Install Script'
+        run: |
+          aws s3 cp ./install.sh s3://install.serverless.com/install.sh
+      - name: 'Release: Binaries'
+        run: |
+          aws s3 cp --recursive ./dist/prod s3://install.serverless.com/installer-builds/
+      - name: 'Release: Invalidate Cache'
+        run: |
+          aws cloudfront create-invalidation --distribution-id E3OEL4OJF1G5FG --paths "/install.sh" "/installer-builds/*"

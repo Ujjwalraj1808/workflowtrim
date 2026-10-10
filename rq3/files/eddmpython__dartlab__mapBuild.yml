@@ -1,0 +1,115 @@
+name: Industry Map Build
+
+# ──────────────────────────────────────────────────────────────
+# scan 프리빌드 완료 후 산업지도 JSON 전체 재생성.
+# ecosystem.json + companies/*.json + industryStats.json 등
+# 결과물은 HF dataset (eddmpython/dartlab-data/landing/map/) 에 업로드.
+# git master 에는 커밋하지 않음 — landing 빌드가 HF 에서 pull.
+# ──────────────────────────────────────────────────────────────
+
+on:
+  workflow_run:
+    workflows: ["Data Prebuild (DART)"]
+    types: [completed]
+  workflow_dispatch:
+
+concurrency:
+  group: map-build
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  build-map:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # 체인 decouple (하나 깨지면 다 깨진다 가드): upstream(Data Prebuild) 실패에도 실행 — 자체 HF seed +
+    # Smoke import 가 데이터·src 를 독립 보장. cancelled 만 skip. dispatch 항상 실행.
+    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' || github.event.workflow_run.conclusion == 'failure' }}
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Smoke import (fail fast on src regression)
+        run: uv run python -c "import dartlab; print('dartlab', getattr(dartlab, '__version__', 'dev'))"
+
+      - name: Build industry map (all companies) + HF upload
+        run: uv run python -X utf8 .github/scripts/prebuild/buildIndustryMap.py --companies 0
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+
+      - name: Build dashboard finance.json (Polars batch)
+        run: uv run python -X utf8 .github/scripts/prebuild/buildFinanceJson.py
+
+      - name: Build dashboard quarters.json (Polars batch)
+        run: uv run python -X utf8 .github/scripts/prebuild/buildQuartersJson.py
+
+      - name: Build dashboard meta.json
+        run: uv run python -X utf8 .github/scripts/prebuild/buildMetaJson.py
+
+      - name: Build dashboard macro.json
+        run: uv run python -X utf8 .github/scripts/prebuild/buildMacroJson.py
+
+      - name: Build story manifest
+        run: uv run python -X utf8 .github/scripts/prebuild/buildStoryManifest.py
+
+      # dashboards JSON 은 git 사본만 서빙돼 4/22 에 동결됐던 축 — 빌드 산출물을 HF 로
+      # publish 해야 docs 배포 seed + 클라이언트 HF 폴백이 신선해진다 (map/ 과 동일 구조).
+      - name: Upload dashboards JSON to HF
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          uv run python -X utf8 - <<'EOF'
+          import os, sys
+          sys.path.insert(0, ".github/scripts")
+          from _hfRetry import retryHfCall
+          from huggingface_hub import HfApi
+
+          retryHfCall(
+              HfApi(token=os.environ["HF_TOKEN"]).upload_folder,
+              folder_path="landing/static/dashboards",
+              path_in_repo="landing/dashboards",
+              repo_id="eddmpython/dartlab-data",
+              repo_type="dataset",
+              allow_patterns=["*.json"],
+              commit_message="갱신: dashboards JSON (mapBuild)",
+          )
+          print("uploaded landing/static/dashboards -> landing/dashboards")
+          EOF
+
+      - name: Validate map output
+        run: |
+          set -euo pipefail
+          count=$(find landing/static/map/companies -maxdepth 1 -name '*.json' | wc -l)
+          if [ "$count" -lt 2000 ]; then
+            echo "ERROR: companies JSON 개수 $count < 2000 (하한 미달)"
+            exit 1
+          fi
+          for f in atlas.json ecosystem.json meta.json; do
+            path="landing/static/map/$f"
+            if [ ! -f "$path" ]; then
+              echo "ERROR: $path 없음"
+              exit 1
+            fi
+            if ! jq empty "$path" >/dev/null 2>&1; then
+              echo "ERROR: $path JSON 파싱 실패"
+              exit 1
+            fi
+          done
+          atlas_size=$(stat -c%s landing/static/map/atlas.json)
+          if [ "$atlas_size" -lt 1024 ]; then
+            echo "ERROR: atlas.json 크기 $atlas_size < 1024 바이트"
+            exit 1
+          fi
+          jq empty landing/static/story/manifest.json
+          echo "validation OK: companies=$count atlas=${atlas_size}B"

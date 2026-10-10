@@ -1,0 +1,343 @@
+name: Paxeer / Database Tests
+on:
+  workflow_call:
+  pull_request:
+    paths:
+      - 'go.mod'
+      - 'go.sum'
+      - 'chain.mk'
+      - 'docker/layerx/Dockerfile'
+      - 'docker/layerx/Dockerfile.dockerignore'
+      - 'foundry.paxeer.toml'
+      - 'buf.gen.yaml'
+      - 'buf.lock'
+      - 'buf.yaml'
+      - 'codecov.yml'
+      - 'config.yml'
+      - '.golangci.yml'
+      - 'gen.go'
+      - 'link_directives_test.go'
+      - 'mod_test.go'
+      - 'run_blocktests.sh'
+      - 'version.json'
+      - 'admin/**'
+      - 'api/**'
+      - 'assets/**'
+      - 'benchmark/**'
+      - 'consensus/**'
+      - 'custodyproof/**'
+      - 'daemon/**'
+      - 'docker/**'
+      - 'engine/**'
+      - 'example/**'
+      - 'hpx/**'
+      - 'integration_test/**'
+      - 'interchain/**'
+      - 'loadtest/**'
+      - 'modules/**'
+      - 'node/**'
+      - 'occ_tests/**'
+      - 'parallelization/**'
+      - 'precompiles/**'
+      - 'ratelimiter/**'
+      - 'rpc/**'
+      - 'sdk/**'
+      - 'storage/**'
+      - 'store/**'
+      - 'sync/**'
+      - 'testutil/**'
+      - 'types/**'
+      - 'utils/**'
+      - 'wasm/**'
+      - 'wasm-runtime/**'
+      - 'wasmbinding/**'
+      - 'contracts/src/**'
+      - 'contracts/test/**'
+      - 'contracts/scripts/**'
+      - 'contracts/wasm/**'
+      - 'docs/swagger/**'
+      - 'docs/swagger-ui/**'
+      - 'tests/chain/**'
+      - 'tools/chain/**'
+      - 'tools/tx-scanner/**'
+      - 'tools/utils/**'
+      - 'contracts/config/client.toml'
+      - 'contracts/hardhat.config.js'
+      - 'contracts/package.json'
+      - 'contracts/package-lock.json'
+      - 'contracts/tsconfig.json'
+      - 'docs/evm_jsonrpc_unsupported.md'
+      - 'docs/paxeer-network.md'
+      - 'docs/paxeer-chain-docs.md'
+      - 'scripts/**'
+      - '!scripts/PaxeerBetaDeploy.s.sol'
+      - '!scripts/qualify-mirror-live.sh'
+      - '!scripts/qualify-mirror-verification-live.sh'
+      - '.github/workflows/paxeer-db-tests.yml'
+  merge_group:
+  push:
+    branches:
+      - main
+      - release/**
+    paths:
+      - 'go.mod'
+      - 'go.sum'
+      - 'chain.mk'
+      - 'docker/layerx/Dockerfile'
+      - 'docker/layerx/Dockerfile.dockerignore'
+      - 'foundry.paxeer.toml'
+      - 'buf.gen.yaml'
+      - 'buf.lock'
+      - 'buf.yaml'
+      - 'codecov.yml'
+      - 'config.yml'
+      - '.golangci.yml'
+      - 'gen.go'
+      - 'link_directives_test.go'
+      - 'mod_test.go'
+      - 'run_blocktests.sh'
+      - 'version.json'
+      - 'admin/**'
+      - 'api/**'
+      - 'assets/**'
+      - 'benchmark/**'
+      - 'consensus/**'
+      - 'custodyproof/**'
+      - 'daemon/**'
+      - 'docker/**'
+      - 'engine/**'
+      - 'example/**'
+      - 'hpx/**'
+      - 'integration_test/**'
+      - 'interchain/**'
+      - 'loadtest/**'
+      - 'modules/**'
+      - 'node/**'
+      - 'occ_tests/**'
+      - 'parallelization/**'
+      - 'precompiles/**'
+      - 'ratelimiter/**'
+      - 'rpc/**'
+      - 'sdk/**'
+      - 'storage/**'
+      - 'store/**'
+      - 'sync/**'
+      - 'testutil/**'
+      - 'types/**'
+      - 'utils/**'
+      - 'wasm/**'
+      - 'wasm-runtime/**'
+      - 'wasmbinding/**'
+      - 'contracts/src/**'
+      - 'contracts/test/**'
+      - 'contracts/scripts/**'
+      - 'contracts/wasm/**'
+      - 'docs/swagger/**'
+      - 'docs/swagger-ui/**'
+      - 'tests/chain/**'
+      - 'tools/chain/**'
+      - 'tools/tx-scanner/**'
+      - 'tools/utils/**'
+      - 'contracts/config/client.toml'
+      - 'contracts/hardhat.config.js'
+      - 'contracts/package.json'
+      - 'contracts/package-lock.json'
+      - 'contracts/tsconfig.json'
+      - 'docs/evm_jsonrpc_unsupported.md'
+      - 'docs/paxeer-network.md'
+      - 'docs/paxeer-chain-docs.md'
+      - 'scripts/**'
+      - '!scripts/PaxeerBetaDeploy.s.sol'
+      - '!scripts/qualify-mirror-live.sh'
+      - '!scripts/qualify-mirror-verification-live.sh'
+      - '.github/workflows/paxeer-db-tests.yml'
+
+defaults:
+  run:
+    working-directory: .
+
+concurrency:
+  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event_name == 'push' && github.sha || github.ref }}
+
+env:
+  GO_VERSION: '1.25.6'
+  GO_TEST_TIMEOUT: 30m
+  STATE_DB_PKG_PREFIX: github.com/Sidiora-Labs/Paxeer-X-Network/storage/state_db
+
+jobs:
+  test:
+    name: Race Detection
+    runs-on: ubuntu-latest
+    env:
+      GOFLAGS: -race -tags=ledger,test_ledger_mock
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 1
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        if: env.DOCKERHUB_USERNAME != ''
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Download modules
+        run: go mod download
+
+      - name: Go test
+        run: |
+          go test \
+            -timeout=${{ env.GO_TEST_TIMEOUT }} \
+            ./storage/state_db/...
+
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    # Skip coverage report for merge groups, since the queue is about safety check. The merge to main will run coverage anyway.
+    # GitHub does not support setting "Required" CI workflows for merge queue separately from PRs. If we skip the job at top
+    # level we then have to work around result not being present. Hence, the repeated if statements per step.
+    env:
+      GOFLAGS: -tags=ledger,test_ledger_mock
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          # Depth 0 for PRs so merge-base diff against the base branch works.
+          fetch-depth: ${{ github.event_name == 'pull_request' && '0' || '1' }}
+
+      - name: Check trigger
+        if: github.event_name == 'merge_group'
+        run: echo 'Coverage skipped in merge queue'
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        if: github.event_name != 'merge_group'
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        if: github.event_name != 'merge_group' && env.DOCKERHUB_USERNAME != ''
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Download modules
+        if: github.event_name != 'merge_group'
+        run: go mod download
+
+      - name: Determine coverage packages (PR)
+        id: cov-pkgs
+        if: github.event_name == 'pull_request'
+        run: |
+          set -euo pipefail
+
+          BASE_SHA="${{ github.event.pull_request.base.sha }}"
+          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+
+          # Use explicit SHAs — works regardless of checkout depth.
+          CHANGED=$(git diff --relative --name-only "$BASE_SHA"..."$HEAD_SHA")
+
+          # Keep only existing .go files (filters out deletions).
+          CHANGED_GO=$(printf "%s\n" "$CHANGED" \
+            | grep -E '\.go$' \
+            | while read -r f; do [ -f "$f" ] && echo "$f"; done \
+            || true)
+
+          if [[ -z "$CHANGED_GO" ]]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Resolve changed directories to Go packages, then keep only
+          # the state_db subtree — this workflow exclusively owns those
+          # packages, and the main go-test.yml workflow owns the rest.
+          DIRECT_PKGS=$(printf "%s\n" "$CHANGED_GO" \
+            | xargs -r -n1 dirname \
+            | sort -u \
+            | while read -r d; do go list "./$d" 2>/dev/null || true; done \
+            | sort -u \
+            | grep "^${STATE_DB_PKG_PREFIX}" || true)
+
+          if [[ -z "$DIRECT_PKGS" ]]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Find one level of reverse dependencies (packages that import
+          # the changed packages) so their tests exercise our changes too.
+          # Restrict reverse deps to the state_db subtree as well.
+          ALL_IMPORTS=$(go list -f '{{.ImportPath}} {{join .Imports " "}} {{join .TestImports " "}}' ./...)
+
+          REV_DEPS=$(awk '
+            NR == FNR { if (NF) targets[$1] = 1; next }
+            {
+              pkg = $1
+              for (i = 2; i <= NF; i++) {
+                if ($i in targets) { print pkg; break }
+              }
+            }
+          ' <(printf "%s\n" "$DIRECT_PKGS") <(printf "%s\n" "$ALL_IMPORTS") \
+            | sort -u \
+            | grep "^${STATE_DB_PKG_PREFIX}" || true)
+
+          # Merge direct + reverse-dep packages, deduplicate.
+          TEST_PKGS=$(printf "%s\n%s\n" "$DIRECT_PKGS" "$REV_DEPS" \
+            | awk 'NF && !seen[$0]++ { printf "%s ", $0 }')
+          TEST_PKGS="${TEST_PKGS% }"
+
+          # coverpkg stays as the direct changed packages — we want coverage
+          # measured on the code that actually changed, but tested via a wider
+          # set of packages (including reverse deps).
+          COV_PKGS=$(printf "%s\n" "$DIRECT_PKGS" \
+            | awk 'NF { printf "%s%s", sep, $0; sep = "," }')
+
+          echo "test_packages=$TEST_PKGS" >> "$GITHUB_OUTPUT"
+          echo "coverpkg=$COV_PKGS" >> "$GITHUB_OUTPUT"
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+      - name: Go test with coverage (PR fast path)
+        if: github.event_name == 'pull_request' && steps.cov-pkgs.outputs.skip != 'true'
+        run: |
+          go test \
+            -timeout=${{ env.GO_TEST_TIMEOUT }} \
+            -covermode=atomic \
+            -coverprofile=coverage.out \
+            -coverpkg=${{ steps.cov-pkgs.outputs.coverpkg }} \
+            ${{ steps.cov-pkgs.outputs.test_packages }}
+
+      - name: Go test with coverage (full path)
+        if: github.event_name != 'merge_group' && github.event_name != 'pull_request'
+        run: |
+          go test \
+            -timeout=${{ env.GO_TEST_TIMEOUT }} \
+            -covermode=atomic \
+            -coverprofile=coverage.out \
+            -coverpkg=./storage/state_db/... \
+            ./storage/state_db/...
+
+      - name: Upload coverage to Codecov
+        if: vars.CODECOV_ENABLED == 'true' && github.event_name != 'merge_group' && (github.event_name != 'pull_request' || steps.cov-pkgs.outputs.skip != 'true')
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
+        with:
+          use_oidc: true
+          fail_ci_if_error: true
+          disable_search: 'true'
+          # PR fast-path coverage is intentionally partial.
+          # Upload under a separate flag to avoid apples-to-oranges project comparisons.
+          name: ${{ github.event_name == 'pull_request' && 'pax-db-state-db-pr-coverage' || 'pax-db-state-db-coverage' }}
+          files: coverage.out
+          flags: ${{ github.event_name == 'pull_request' && 'pax-db-state-db-pr' || 'pax-db-state-db' }}

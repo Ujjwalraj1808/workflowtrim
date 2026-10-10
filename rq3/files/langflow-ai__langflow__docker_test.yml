@@ -1,0 +1,41 @@
+name: Test Docker images
+
+on:
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-docker-first:
+    name: Test Docker images (first attempt)
+    runs-on: [self-hosted, linux, ARM64, langflow-ai-arm64-40gb-ephemeral]
+    continue-on-error: true
+    outputs:
+      succeeded: ${{ steps.success.outputs.succeeded }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Build and test Docker images
+        run: bash scripts/ci/test_docker_images.sh
+
+      - name: Mark first attempt successful
+        id: success
+        run: |
+          echo "succeeded=true" >> "$GITHUB_OUTPUT"
+
+  test-docker-retry:
+    name: Test Docker images (verify or retry)
+    needs: test-docker-first
+    if: ${{ always() && !cancelled() && needs.test-docker-first.outputs.succeeded != 'true' }}
+    runs-on: [self-hosted, linux, ARM64, langflow-ai-arm64-40gb-ephemeral]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Build and test Docker images
+        run: bash scripts/ci/test_docker_images.sh

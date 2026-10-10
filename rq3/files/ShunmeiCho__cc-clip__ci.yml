@@ -1,0 +1,19 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # The gates themselves live in checks.yml so release.yml runs exactly the
+  # same set before publishing a tag, with no chance of the two drifting.
+  checks:
+    uses: ./.github/workflows/checks.yml

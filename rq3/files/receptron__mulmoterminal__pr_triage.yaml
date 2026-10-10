@@ -1,0 +1,147 @@
+# Enforce the "open an issue and agree on a plan first" contribution policy
+# (CONTRIBUTING.md). PRs from the maintainer / bot allowlist fall through with no
+# action. PRs from anyone else get a templated comment pointing at the policy and
+# are closed — there is no small-diff exemption.
+#
+# Why `pull_request_target` over `pull_request`:
+#   - Forked PRs running `pull_request` don't get a write-scoped GITHUB_TOKEN, so
+#     we couldn't comment + close them.
+#   - `pull_request_target` runs the base branch's copy of this workflow and we
+#     never check out the PR's code, so the usual `pull_request_target` concern
+#     (running attacker code with elevated permissions) doesn't apply.
+#
+# Maintainer list — keep in sync with the allowlist in CONTRIBUTING.md. Adding a
+# maintainer is a one-line edit in both places.
+
+name: PR triage (non-maintainer guard)
+
+on:
+  # zizmor: ignore[dangerous-triggers]
+  # PR-controlled fields (author login, PR number) reach the shell only through
+  # `env:` bindings and are referenced as quoted `${VAR}` inside bash. No
+  # `${{ github.event.pull_request.* }}` substitution happens inside a script
+  # body, so the template-injection vector is closed.
+  pull_request_target:
+    # No `branches:` filter on purpose: a PR opened against `dev_tool` or any
+    # other long-lived branch is just as unreviewable as one against `main`.
+    # `edited` still matters because a base-branch retarget arrives as `edited`,
+    # and re-running on it is harmless — the guards in the script below make a
+    # second run a no-op rather than a second comment.
+    types: [opened, reopened, edited]
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+concurrency:
+  group: pr-triage-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  triage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    env:
+      # Newline-separated allowlist. Match is exact (full GitHub login, including
+      # the `[bot]` suffix for App accounts).
+      MAINTAINERS: |
+        isamu
+        snakajima
+        ystknsh
+        dependabot[bot]
+        coderabbitai[bot]
+        sourcery-ai[bot]
+      # Marker embedded in the comment body so a re-run recognises its own
+      # previous comment and stays silent. `gh pr comment` is not idempotent, so
+      # without it an author who reopens the PR collects a second copy of the
+      # same template.
+      TRIAGE_MARKER: "<!-- mulmoterminal-pr-triage -->"
+    steps:
+      - name: Decide and act
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          SENDER: ${{ github.event.sender.login }}
+          DOC_LINK: https://github.com/${{ github.repository }}/blob/main/CONTRIBUTING.md
+        run: |
+          set -euo pipefail
+          echo "PR=#${PR_NUMBER} author=${PR_AUTHOR}"
+
+          # `grep -Fxq` requires whole-line equality against a fixed string, so
+          # the `[bot]` suffix isn't read as a regex character class and a login
+          # that merely contains a maintainer's name doesn't match.
+          is_allowlisted() {
+            echo "${MAINTAINERS}" | grep -Fxq "$1"
+          }
+
+          if is_allowlisted "${PR_AUTHOR}"; then
+            echo "maintainer / allowlisted bot — pass through"
+            exit 0
+          fi
+
+          # Any event a maintainer triggered is a deliberate human action on this
+          # PR — the automation must not fight it. `opened` always has
+          # sender == author, so the main path is untouched; what this protects is
+          # a maintainer retitling an outside PR they've chosen to keep (including
+          # the ones that predate this workflow), and CodeRabbit rewriting the
+          # title right after we closed.
+          if is_allowlisted "${SENDER}"; then
+            echo "event triggered by ${SENDER} (maintainer) — standing down"
+            exit 0
+          fi
+
+          # Live state, not the event payload: a `synchronize`/`edited` event
+          # generated moments before we closed still carries state=open.
+          STATE=$(gh pr view "${PR_NUMBER}" --repo "${REPO}" --json state --jq .state)
+          if [ "${STATE}" != "OPEN" ]; then
+            echo "already ${STATE} — nothing to do"
+            exit 0
+          fi
+
+          # Collect first, match second. `gh ... | grep -qF` would look equivalent,
+          # but `grep -q` exits on the first match and `gh` then dies of SIGPIPE
+          # (141); `pipefail` propagates that, the `if` reads it as "no marker",
+          # and the guard posts the duplicate comment it exists to prevent. It
+          # only misfires once the comment list is big enough to still be
+          # streaming — i.e. never in a small test, always on a busy PR.
+          COMMENTS=$(gh api --paginate "repos/${REPO}/issues/${PR_NUMBER}/comments" --jq '.[].body')
+          if grep -qF "${TRIAGE_MARKER}" <<< "${COMMENTS}"; then
+            # Already triaged but open again: the author reopened it (a
+            # maintainer reopening already returned above). Re-close, silently —
+            # the explanation is still sitting in the thread.
+            echo "already triaged — closing again without commenting twice"
+            gh pr close "${PR_NUMBER}" --repo "${REPO}"
+            exit 0
+          fi
+
+          # Quoted heredoc: nothing in the body is expanded by the shell, so
+          # backticks and `$` in the template are inert. The one variable we do
+          # need is substituted afterwards with bash parameter expansion.
+          BODY=$(cat <<'EOF'
+          <!-- mulmoterminal-pr-triage -->
+          ## この pull request は自動的にクローズされました / Closed automatically
+
+          送っていただいてありがとうございます。ただ、MulmoTerminal では **開発チーム外からの pull request は、規模によらずお受けしていません**。代わりに、次の流れでお願いしています。
+
+          1. **issue を立てて、問題と実装プランを説明してください。** メンテナが一目で判断できるよう、**最初の 3 行を要約**にしてください。詳しい背景はその後ろに。
+          2. **issue のスレッドでプランを合意します。** スコープの調整、再利用できる既存のヘルパー、進行中の作業との重複などをこちらから提示します。
+          3. **合意できたら、メンテナが実装して pull request を出します。** 実装へのコメントは歓迎です。
+
+          バグ報告・機能要望の **issue はいつでも歓迎**です。制限しているのは pull request だけです。理由と詳しい手順は [CONTRIBUTING.md](__DOC_LINK__) にあります。
+
+          ---
+
+          Thanks for sending this! MulmoTerminal **does not accept pull requests from outside the development team**, regardless of size. What we ask for instead:
+
+          1. **Open an issue** describing the problem and your proposed plan. Keep the **first three lines a compact summary** so a maintainer can decide whether to engage at a glance.
+          2. **Agree on the plan in the issue thread.** We may adjust scope, point at helpers you can reuse, or surface in-flight work that overlaps.
+          3. **A maintainer then writes the pull request.** You're welcome to follow along and comment on the implementation.
+
+          **Issues — bug reports and feature requests — are always welcome**; only pull requests are restricted. The full rationale is in [CONTRIBUTING.md](__DOC_LINK__).
+          EOF
+          )
+          gh pr comment "${PR_NUMBER}" --repo "${REPO}" --body "${BODY//__DOC_LINK__/${DOC_LINK}}"
+          gh pr close "${PR_NUMBER}" --repo "${REPO}"

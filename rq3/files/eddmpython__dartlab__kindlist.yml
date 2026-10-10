@@ -1,0 +1,200 @@
+name: Update KindList
+
+on:
+  schedule:
+    - cron: '0 0 * * *'  # 매일 UTC 00:00 (KST 09:00)
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# kindlist 경로 (dart/kindlist/*) 전용 group — 다른 카테고리와 분리.
+concurrency:
+  group: hf-kindlist-push
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      # dartlab 설치 — KindList·DartList 는 gather SSOT(getKindList/loadCorpCodes) 위임이라
+      # 발행 스텝 전에 필요. huggingface-hub = 업로드 스텝.
+      - name: Install dependencies
+        run: pip install -e . huggingface-hub
+
+      # ── KindList (KRX KIND) — gather SSOT 위임 발행 ──────────────────────────────
+      - name: Download existing KindList hash
+        run: |
+          mkdir -p dist
+          gh release download kindlist-latest \
+            --pattern "corpList.parquet" \
+            --dir dist/existing \
+            --clobber 2>/dev/null || true
+          if [ -f dist/existing/corpList.parquet ]; then
+            sha256sum dist/existing/corpList.parquet | awk '{print $1}' > dist/previous.sha256
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Crawl KRX KIND
+        run: python .github/scripts/meta/updateKindList.py
+
+      - name: Upload KindList to Release
+        if: ${{ !hashFiles('dist/SKIP') }}
+        run: |
+          if gh release view kindlist-latest > /dev/null 2>&1; then
+            gh release upload kindlist-latest \
+              dist/corpList.parquet \
+              --clobber
+            gh release edit kindlist-latest \
+              --title "KindList (auto-updated)" \
+              --notes "KRX KIND 상장법인 목록. 매일 자동 업데이트."
+          else
+            gh release create kindlist-latest \
+              dist/corpList.parquet \
+              --title "KindList (auto-updated)" \
+              --notes "KRX KIND 상장법인 목록. 매일 자동 업데이트." \
+              --latest=false
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload KindList to HuggingFace
+        if: ${{ !hashFiles('dist/SKIP') }}
+        run: |
+          python -c "
+          from datetime import datetime, timezone
+          from huggingface_hub import HfApi
+          api = HfApi(token='${{ secrets.HF_TOKEN }}')
+          api.upload_file(
+              repo_id='eddmpython/dartlab-data',
+              repo_type='dataset',
+              path_or_fileobj='dist/corpList.parquet',
+              path_in_repo='metadata/corpList.parquet',
+              commit_message='auto-update kindList',
+          )
+          # vintage 스냅샷: 내용 변경일에만 실행되는 스텝이라 변경분만 축적 (업종맵 과거 귀속의
+          # look-ahead 차단 자산. 소급 불가라 즉시 개시한다.
+          stamp = datetime.now(timezone.utc).strftime('%Y%m%d')
+          api.upload_file(
+              repo_id='eddmpython/dartlab-data',
+              repo_type='dataset',
+              path_or_fileobj='dist/corpList.parquet',
+              path_in_repo=f'metadata/corpListVintage/corpList_{stamp}.parquet',
+              commit_message=f'vintage kindList {stamp}',
+          )
+          print('KindList HuggingFace 업로드 완료 (+vintage 스냅샷)')
+          "
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+
+      # ── DartList (OpenDART CORPCODE.xml) ─────────────────
+      - name: Download existing DartList hash
+        run: |
+          gh release download kindlist-latest \
+            --pattern "dartList.parquet" \
+            --dir dist/existing_dart \
+            --clobber 2>/dev/null || true
+          if [ -f dist/existing_dart/dartList.parquet ]; then
+            sha256sum dist/existing_dart/dartList.parquet | awk '{print $1}' > dist/dartList_previous.sha256
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Fetch OpenDART CORPCODE.xml
+        run: |
+          export DART_API_KEY="${DART_API_KEYS%%,*}"
+          python .github/scripts/meta/updateDartList.py
+        env:
+          DART_API_KEYS: ${{ secrets.DART_API_KEYS }}
+          DARTLAB_DART_CONNECT_RETRY_ATTEMPTS: "6"  # OpenDART TCP 연결 불통(수 분) 대비, 약 4분 긴 백오프 재시도
+
+      - name: Upload DartList to Release
+        if: ${{ !hashFiles('dist/SKIP_DARTLIST') }}
+        run: |
+          if gh release view kindlist-latest > /dev/null 2>&1; then
+            gh release upload kindlist-latest \
+              dist/dartList.parquet \
+              --clobber
+          else
+            gh release create kindlist-latest \
+              dist/dartList.parquet \
+              --title "KindList (auto-updated)" \
+              --notes "KRX KIND + OpenDART 목록. 매일 자동 업데이트." \
+              --latest=false
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload DartList to HuggingFace
+        if: ${{ !hashFiles('dist/SKIP_DARTLIST') }}
+        run: |
+          python -c "
+          from huggingface_hub import HfApi
+          api = HfApi(token='${{ secrets.HF_TOKEN }}')
+          api.upload_file(
+              repo_id='eddmpython/dartlab-data',
+              repo_type='dataset',
+              path_or_fileobj='dist/dartList.parquet',
+              path_in_repo='metadata/dartList.parquet',
+              commit_message='auto-update dartList (CORPCODE.xml)',
+          )
+          print('DartList HuggingFace 업로드 완료')
+          "
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+
+      # ── corpProfile (DART companyInfo prefetch — fiscal + legal identity SSOT)
+      # dartlab 는 상단 'Install dependencies' 에서 이미 설치됨(gather SSOT 공용).
+      - name: Resume corpProfile from HF (incremental)
+        run: |
+          mkdir -p data/dart/scan
+          python -c "
+          from huggingface_hub import hf_hub_download
+          import shutil
+          try:
+              p = hf_hub_download(
+                  repo_id='eddmpython/dartlab-data',
+                  repo_type='dataset',
+                  filename='dart/scan/corpProfile.parquet',
+              )
+              shutil.copy(p, 'data/dart/scan/corpProfile.parquet')
+              print('corpProfile resume: HF parquet 다운로드 OK')
+          except Exception as e:
+              print(f'corpProfile resume skip (cold start): {e}')
+          "
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+
+      - name: Build corpProfile (incremental — DART companyInfo)
+        run: |
+          export OPEN_DART_KEY="${DART_API_KEYS%%,*}"
+          python -X utf8 .github/scripts/meta/buildCorpProfile.py --workers 5
+        env:
+          DART_API_KEYS: ${{ secrets.DART_API_KEYS }}
+
+      - name: Upload corpProfile to HuggingFace
+        if: ${{ hashFiles('data/dart/scan/corpProfile.parquet') != '' }}
+        run: |
+          python -c "
+          from huggingface_hub import HfApi
+          api = HfApi(token='${{ secrets.HF_TOKEN }}')
+          api.upload_file(
+              repo_id='eddmpython/dartlab-data',
+              repo_type='dataset',
+              path_or_fileobj='data/dart/scan/corpProfile.parquet',
+              path_in_repo='dart/scan/corpProfile.parquet',
+              commit_message='auto-update corpProfile (fiscal and legal identity SSOT)',
+          )
+          print('corpProfile HuggingFace 업로드 완료')
+          "
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}

@@ -1,0 +1,50 @@
+name: Publish Any Commit
+
+on:
+  - pull_request
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      # avoid calling too many workflows at same time
+      - name: Delay workflow start
+        run: sleep 40 # sec
+
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - run: corepack enable
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 24
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install
+
+      - name: Build
+        run: pnpm build
+
+      - name: Publish
+        run: |
+          # Create tarballs in the correct location for pkg-pr-new
+          for dir in ./packages/* ./frameworks/* ./frameworks-plugins/*; do
+            if [ -d "$dir" ] && [ -f "$dir/package.json" ]; then
+              echo "Packing $dir"
+              cd "$dir"
+              # Check if package has publishConfig.directory set to dist
+              if grep -q '"directory":\s*"dist"' package.json; then
+                npm pack ./dist
+              else
+                npm pack
+              fi
+              cd - > /dev/null
+            fi
+          done
+          pnpm dlx pkg-pr-new publish --no-template --pnpm './packages/*' './frameworks/*' './frameworks-plugins/*'

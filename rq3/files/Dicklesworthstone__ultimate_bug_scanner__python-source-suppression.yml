@@ -1,0 +1,79 @@
+name: Python Source Suppression
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/python-source-suppression.yml
+      - modules/helpers/ubs_core/py_scan.py
+      - modules/helpers/ubs_core/suppression.py
+      - modules/helpers/ubs_core/lexer.py
+      - modules/helpers/ubs_core/cache.py
+      - modules/helpers/ubs_core/py_ast.py
+      - modules/helpers/ubs_core/py_rules.py
+      - modules/helpers/ubs_core/py_patterns/**
+      - modules/helpers/ubs_core/py_detectors/**
+      - modules/helpers/ubs_core/analyzers/*_py.py
+      - modules/lib/ubs-common.sh
+      - modules/ubs-python.sh
+      - ubs
+      - test-suite/quality/test_python_suppression.py
+      - test-suite/quality/test_python_precision.py
+      - test-suite/quality/test_suppression_intervals.py
+      - test-suite/quality/test_cache.py
+  workflow_dispatch:
+
+# Test the committed production source, never a patched candidate checkout.
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+      UBS_NO_AUTO_UPDATE: '1'
+      ENABLE_UV_TOOLS: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install real scanner dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq jq ripgrep rsync shellcheck python3-yaml
+          npm install --global @ast-grep/cli@0.45.3
+          ast-grep --version
+      - name: Verify runtime integrity and shell syntax
+        run: |
+          ./scripts/verify_checksums.sh > "$RUNNER_TEMP/python-suppression-checksums.log"
+          ./scripts/verify_sha256sums.sh
+          for source in ubs modules/lib/ubs-common.sh scripts/new-module.sh modules/ubs-*.sh; do bash -n "$source"; done
+          shellcheck -S warning ubs modules/lib/ubs-common.sh scripts/new-module.sh modules/ubs-*.sh
+      - name: Exercise source markers, real CLI, cache and existing Python gates
+        run: |
+          set -o pipefail
+          for suite in test_python_suppression.py test_python_precision.py test_suppression_intervals.py test_ubs_core.py 'test_findings*.py' test_security_precision.py; do
+            python3 -m unittest discover -s test-suite/quality -p "$suite" -v 2>&1 | tee "$RUNNER_TEMP/python-suppression-${suite//\*/all}.log"
+          done
+          python3 -m unittest discover -s test-suite/quality -p test_cache.py -k python -v 2>&1 | tee "$RUNNER_TEMP/python-suppression-cache.log"
+          python3 test-suite/run_manifest.py --case python-resource-lifecycle --case python-suppression-intervals-markers --case python-suppression-intervals-nomarkers 2>&1 | tee "$RUNNER_TEMP/python-suppression-manifest.log"
+      - name: Scan changed Python sources with UBS
+        run: |
+          set -o pipefail
+          ./ubs --ci --fail-on-warning --no-cache --only=python modules/helpers/ubs_core/py_scan.py 2>&1 | tee "$RUNNER_TEMP/python-suppression-selfscan-core.log"
+          ./ubs --ci --fail-on-warning --no-cache --only=python test-suite/quality/test_python_suppression.py 2>&1 | tee "$RUNNER_TEMP/python-suppression-selfscan-tests.log"
+      - name: Require deterministic checksum closure and unchanged production source
+        run: |
+          git diff --check
+          python3 scripts/update_checksums.py
+          ./scripts/update_sha256sums.sh
+          git diff --exit-code
+          test -z "$(git ls-files --others --exclude-standard)"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: python-source-suppression-${{ github.sha }}
+          path: ${{ runner.temp }}/python-suppression-*
+          retention-days: 7

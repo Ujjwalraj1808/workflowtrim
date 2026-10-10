@@ -1,0 +1,54 @@
+name: Release
+on:
+  release:
+    types: [created]
+permissions: {}
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+env:
+  DEVELOCITY_ACCESS_KEY: ${{ secrets.DEVELOCITY_ACCESS_KEY }}
+  JAVA_VERSION: 11
+
+jobs:
+  release:
+    name: Release
+    runs-on: ubuntu-latest
+    if: github.event.repository.fork == false
+    permissions:
+      contents: read
+      id-token: write # Needed for signing
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          disable-sudo-and-containers: true
+          egress-policy: audit
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Verify the tag matches the project version
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          major=$(sed -n 's/^version\.major=//p' gradle.properties)
+          minor=$(sed -n 's/^version\.minor=//p' gradle.properties)
+          patch=$(sed -n 's/^version\.patch=//p' gradle.properties)
+          version="$major.$minor.$patch"
+          if [ "$TAG" != "v$version" ]; then
+            echo "::error::Release tag $TAG does not match the project version $version"
+            exit 1
+          fi
+      - name: Releasing
+        uses: $/.github/actions/run-gradle
+        env:
+          ORG_GRADLE_PROJECT_signingKey: ${{ secrets.OSSRH_GPG_SECRET_KEY }}
+          ORG_GRADLE_PROJECT_signingKeyId: ${{ secrets.OSSRH_GPG_SECRET_KEY_ID }}
+          ORG_GRADLE_PROJECT_signingPassword: ${{ secrets.OSSRH_GPG_SECRET_KEY_PASSWORD }}
+          ORG_GRADLE_PROJECT_centralPortalUsername: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
+          ORG_GRADLE_PROJECT_centralPortalPassword: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
+        with:
+          java: ${{ env.JAVA_VERSION }}
+          cache-encryption-key: ${{ secrets.GRADLE_ENCRYPTION_KEY }}
+          arguments: publishAggregationToCentralPortal -Pversion.release=true

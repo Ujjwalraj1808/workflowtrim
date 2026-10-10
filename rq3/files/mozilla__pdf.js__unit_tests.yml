@@ -1,0 +1,97 @@
+name: Unit tests
+on:
+  push:
+    paths:
+      - 'gulpfile.mjs'
+      - 'external/**'
+      - 'package-lock.json'
+      - 'src/**'
+      - 'test/test.mjs'
+      - 'test/unit/**'
+      - 'web/**'
+      - '.github/workflows/unit_tests.yml'
+    branches:
+      - master
+  pull_request:
+    paths:
+      - 'gulpfile.mjs'
+      - 'external/**'
+      - 'package-lock.json'
+      - 'src/**'
+      - 'test/test.mjs'
+      - 'test/unit/**'
+      - 'web/**'
+      - '.github/workflows/unit_tests.yml'
+    branches:
+      - master
+  workflow_dispatch:
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / ${{ matrix.browser }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: [lts/*]
+        os: [windows-latest, ubuntu-latest]
+        browser: [firefox, chrome]
+        include:
+          - browser: firefox
+            skip: --noChrome
+          - browser: chrome
+            skip: --noFirefox
+
+    runs-on: ${{ matrix.os }}
+    environment:
+      name: code-coverage
+      deployment: false
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Use Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Restore cached PDF files
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: test/pdfs/*.pdf
+          key: cached-pdf-files-${{ hashFiles('test/pdfs/*.pdf') }}
+          restore-keys: |
+            cached-pdf-files-
+          enableCrossOsArchive: true
+
+      - name: Run unit tests with code coverage
+        run: npx gulp unittest --headless --coverage --coverage-output build/coverage/unit ${{ matrix.skip }}
+
+      - name: Save cached PDF files
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: test/pdfs/*.pdf
+          key: cached-pdf-files-${{ hashFiles('test/pdfs/*.pdf') }}
+          enableCrossOsArchive: true
+
+      - name: Upload results to Codecov
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: true
+          files: ./build/coverage/unit/lcov.info
+          flags: unittest
+          name: codecov-umbrella
+          disable_search: true
+          disable_telem: true
+          verbose: true

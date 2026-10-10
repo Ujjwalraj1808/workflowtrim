@@ -1,0 +1,56 @@
+# skill-drift-check.yml
+# Version-coupling lint over the odl-pdf skill's agent-facing prose.
+# The skill is a durable procedure: it tells the agent to read the installed
+# tool's own --help at runtime and never bakes an option name, value, or version
+# as fact. sync-skill-refs.py is the mechanical floor that guards that contract
+# (a tripwire, not proof) and fails the check on a violation (exit code 1).
+
+name: Skill Lint (version-coupling)
+
+on:
+  push:
+    paths:
+      - 'skills/odl-pdf/SKILL.md'
+      - 'skills/odl-pdf/references/**'
+      - 'skills/odl-pdf-maintenance/sync-skill-refs.py'
+      - '.github/workflows/skill-drift-check.yml'
+  pull_request:
+    paths:
+      - 'skills/odl-pdf/SKILL.md'
+      - 'skills/odl-pdf/references/**'
+      - 'skills/odl-pdf-maintenance/sync-skill-refs.py'
+      - '.github/workflows/skill-drift-check.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Lint skill prose for version coupling
+        run: |
+          set +e
+          python skills/odl-pdf-maintenance/sync-skill-refs.py
+          EXIT_CODE=$?
+          if [ $EXIT_CODE -eq 1 ]; then
+            echo ""
+            echo "Version-coupling lint failed: SKILL.md or references/ contains a baked"
+            echo "version/option, or is missing the source-of-truth concept, in the skill's"
+            echo "prose. Express the intent as a capability and let the agent discover the"
+            echo "flag/value/version from the installed tool's --help at runtime; keep the"
+            echo "source-of-truth rule in SKILL.md. This lint is a tripwire, not proof —"
+            echo "authoring discipline + release review remain the real guard."
+            exit 1
+          elif [ $EXIT_CODE -ne 0 ]; then
+            echo ""
+            echo "Lint failed due to an input/script error (exit $EXIT_CODE)."
+            exit $EXIT_CODE
+          fi

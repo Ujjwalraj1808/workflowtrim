@@ -1,0 +1,456 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to release (e.g., v1.0.0)'
+        required: true
+        type: string
+      simple_release:
+        description: 'Simple release: only x86_64 GHCR image, skip other artifacts'
+        required: false
+        type: boolean
+        default: false
+
+# 环境变量：合并 workflow_dispatch 输入和 repository variable
+# tag push 触发时读取 vars.SIMPLE_RELEASE，workflow_dispatch 时使用输入参数
+env:
+  SIMPLE_RELEASE: ${{ github.event.inputs.simple_release == 'true' || vars.SIMPLE_RELEASE == 'true' }}
+  DOCKERHUB_ENABLED: ${{ secrets.DOCKERHUB_USERNAME != '' && secrets.DOCKERHUB_TOKEN != '' }}
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  # Update VERSION file with tag version
+  update-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.release-metadata.outputs.version }}
+      commit: ${{ steps.release-metadata.outputs.commit }}
+      build-date: ${{ steps.release-metadata.outputs.build-date }}
+      simple-release: ${{ steps.release-metadata.outputs.simple-release }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Prepare release metadata
+        id: release-metadata
+        env:
+          TAG_NAME: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          case "$TAG_NAME" in
+            v*) ;;
+            *)
+              echo "Release tag must start with v: $TAG_NAME" >&2
+              exit 1
+              ;;
+          esac
+
+          VERSION=${TAG_NAME#v}
+          COMMIT=$(git rev-parse HEAD)
+          BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+          echo "$VERSION" > backend/cmd/server/VERSION
+          echo "Updated VERSION file to: $VERSION"
+
+          {
+            echo "version=$VERSION"
+            echo "commit=$COMMIT"
+            echo "build-date=$BUILD_DATE"
+            echo "simple-release=$SIMPLE_RELEASE"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Upload VERSION artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: version-file
+          path: backend/cmd/server/VERSION
+          retention-days: 1
+
+  build-frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          package_json_file: frontend/package.json
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version-file: .node-version
+          cache: 'pnpm'
+          cache-dependency-path: frontend/pnpm-lock.yaml
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+        working-directory: frontend
+
+      - name: Build frontend
+        run: pnpm run build
+        working-directory: frontend
+
+      - name: Upload frontend artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: frontend-dist
+          path: backend/internal/web/dist/
+          retention-days: 1
+
+  # 标准发布把每个目标放到独立 runner，避免多个 Go 编译任务争抢同一台 4 核机器。
+  build-binaries:
+    needs: [update-version, build-frontend]
+    if: ${{ needs.update-version.outputs.simple-release != 'true' }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux_amd64
+            goos: linux
+            goarch: amd64
+          - target: linux_arm64
+            goos: linux
+            goarch: arm64
+          - target: windows_amd64
+            goos: windows
+            goarch: amd64
+          - target: darwin_amd64
+            goos: darwin
+            goarch: amd64
+          - target: darwin_arm64
+            goos: darwin
+            goarch: arm64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Download VERSION artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: version-file
+          path: backend/cmd/server/
+
+      - name: Download frontend artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: frontend-dist
+          path: backend/internal/web/dist/
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: backend/go.mod
+          check-latest: false
+          cache-dependency-path: backend/go.sum
+
+      - name: Build ${{ matrix.target }} binary
+        working-directory: backend
+        env:
+          CGO_ENABLED: 0
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOAMD64: v1
+          GOARM64: v8.0
+          RELEASE_COMMIT: ${{ needs.update-version.outputs.commit }}
+          RELEASE_DATE: ${{ needs.update-version.outputs.build-date }}
+          OUTPUT_NAME: tokenrouter_${{ matrix.target }}
+        run: |
+          mkdir -p ../prebuilt
+          go build \
+            -tags=embed \
+            -ldflags="-s -w -X main.Commit=${RELEASE_COMMIT} -X main.Date=${RELEASE_DATE} -X main.BuildType=release" \
+            -o "../prebuilt/${OUTPUT_NAME}" \
+            ./cmd/server
+
+      - name: Upload ${{ matrix.target }} binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-binary-${{ matrix.target }}
+          path: prebuilt/tokenrouter_${{ matrix.target }}
+          if-no-files-found: error
+          retention-days: 1
+
+  release:
+    needs: [update-version, build-frontend, build-binaries]
+    if: >-
+      ${{
+        always() &&
+        needs.update-version.result == 'success' &&
+        needs.build-frontend.result == 'success' &&
+        (
+          needs.build-binaries.result == 'success' ||
+          (
+            needs.update-version.outputs.simple-release == 'true' &&
+            needs.build-binaries.result == 'skipped'
+          )
+        )
+      }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Download VERSION artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: version-file
+          path: backend/cmd/server/
+
+      - name: Download frontend artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: frontend-dist
+          path: backend/internal/web/dist/
+
+      - name: Download prebuilt binaries
+        if: ${{ needs.update-version.outputs.simple-release != 'true' }}
+        uses: actions/download-artifact@v8
+        with:
+          pattern: release-binary-*
+          path: prebuilt/
+          merge-multiple: true
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: backend/go.mod
+          check-latest: false
+          cache-dependency-path: backend/go.sum
+
+      # Docker setup for GoReleaser
+      - name: Set up QEMU
+        if: ${{ needs.update-version.outputs.simple-release != 'true' }}
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to DockerHub
+        if: ${{ needs.update-version.outputs.simple-release != 'true' && env.DOCKERHUB_ENABLED == 'true' }}
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Get tag message
+        id: tag_message
+        env:
+          TAG_NAME: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          echo "Processing tag: $TAG_NAME"
+
+          # 获取完整的 tag message（跳过第一行标题）
+          TAG_MESSAGE=$(git tag -l --format='%(contents:body)' "$TAG_NAME")
+
+          # 调试输出
+          echo "Tag message length: ${#TAG_MESSAGE}"
+          echo "Tag message preview:"
+          echo "$TAG_MESSAGE" | head -10
+
+          # 使用 EOF 分隔符处理多行内容
+          echo "message<<EOF" >> $GITHUB_OUTPUT
+          echo "$TAG_MESSAGE" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Set lowercase owner for GHCR
+        id: lowercase
+        run: echo "owner=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" >> $GITHUB_OUTPUT
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          version: '~> v2'
+          args: release --clean --skip=validate ${{ needs.update-version.outputs.simple-release == 'true' && '--config=.goreleaser.simple.yaml' || '' }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_MESSAGE: ${{ steps.tag_message.outputs.message }}
+          GITHUB_REPO_OWNER: ${{ github.repository_owner }}
+          GITHUB_REPO_OWNER_LOWER: ${{ steps.lowercase.outputs.owner }}
+          GITHUB_REPO_NAME: ${{ github.event.repository.name }}
+          DOCKERHUB_USERNAME: ${{ env.DOCKERHUB_ENABLED == 'true' && secrets.DOCKERHUB_USERNAME || 'skip' }}
+          GORELEASER_PREBUILT_DIR: ${{ needs.update-version.outputs.simple-release != 'true' && format('{0}/prebuilt', github.workspace) || '' }}
+
+      # Update DockerHub description
+      - name: Update DockerHub description
+        if: ${{ env.SIMPLE_RELEASE != 'true' && env.DOCKERHUB_ENABLED == 'true' }}
+        continue-on-error: true
+        uses: peter-evans/dockerhub-description@v5
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          repository: ${{ secrets.DOCKERHUB_USERNAME }}/tokenrouter
+          short-description: "TokenRouter - AI API Gateway Platform"
+          readme-filepath: ./deploy/DOCKER.md
+
+      # Send Telegram notification
+      - name: Send Telegram Notification
+        if: ${{ env.SIMPLE_RELEASE != 'true' }}
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+        continue-on-error: true
+        run: |
+          # 检查必要的环境变量
+          if [ -z "$TELEGRAM_BOT_TOKEN" ] || [ -z "$TELEGRAM_CHAT_ID" ]; then
+            echo "Telegram credentials not configured, skipping notification"
+            exit 0
+          fi
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG_NAME=${{ github.event.inputs.tag }}
+          else
+            TAG_NAME=${GITHUB_REF#refs/tags/}
+          fi
+          VERSION=${TAG_NAME#v}
+          REPO="${{ github.repository }}"
+          GHCR_IMAGE="ghcr.io/${REPO,,}"  # ${,,} converts to lowercase
+
+          # 获取 tag message 内容并转义 Markdown 特殊字符
+          TAG_MESSAGE='${{ steps.tag_message.outputs.message }}'
+          TAG_MESSAGE=$(echo "$TAG_MESSAGE" | sed 's/\([_*`\[]\)/\\\1/g')
+
+          # 限制消息长度（Telegram 消息限制 4096 字符，预留空间给头尾固定内容）
+          if [ ${#TAG_MESSAGE} -gt 3500 ]; then
+            TAG_MESSAGE="${TAG_MESSAGE:0:3500}..."
+          fi
+
+          # 构建消息内容
+          MESSAGE="🚀 *TokenRouter 新版本发布！*"$'\n'$'\n'
+          MESSAGE+="📦 版本号: \`${VERSION}\`"$'\n'$'\n'
+
+          # 添加更新内容
+          if [ -n "$TAG_MESSAGE" ]; then
+            MESSAGE+="${TAG_MESSAGE}"$'\n'$'\n'
+          fi
+
+          MESSAGE+="🐳 *Docker 部署:*"$'\n'
+          MESSAGE+="\`\`\`bash"$'\n'
+          # 根据是否配置 DockerHub 动态生成
+          if [ -n "$DOCKERHUB_USERNAME" ]; then
+            DOCKER_IMAGE="${DOCKERHUB_USERNAME}/tokenrouter"
+            MESSAGE+="# Docker Hub"$'\n'
+            MESSAGE+="docker pull ${DOCKER_IMAGE}:${VERSION}"$'\n'
+            MESSAGE+="# GitHub Container Registry"$'\n'
+          fi
+          MESSAGE+="docker pull ${GHCR_IMAGE}:${VERSION}"$'\n'
+          MESSAGE+="\`\`\`"$'\n'$'\n'
+          MESSAGE+="🔗 *相关链接:*"$'\n'
+          MESSAGE+="• [GitHub Release](https://github.com/${REPO}/releases/tag/${TAG_NAME})"$'\n'
+          if [ -n "$DOCKERHUB_USERNAME" ]; then
+            MESSAGE+="• [Docker Hub](https://hub.docker.com/r/${DOCKER_IMAGE})"$'\n'
+          fi
+          MESSAGE+="• [GitHub Packages](https://github.com/${REPO}/pkgs/container/tokenrouter)"$'\n'$'\n'
+          MESSAGE+="#TokenRouter #Release #${TAG_NAME//./_}"
+
+          # 发送消息
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n \
+              --arg chat_id "${TELEGRAM_CHAT_ID}" \
+              --arg text "${MESSAGE}" \
+              '{
+                chat_id: $chat_id,
+                text: $text,
+                parse_mode: "Markdown",
+                disable_web_page_preview: true
+              }')"
+
+  sync-version-file:
+    needs: [release]
+    if: ${{ needs.release.result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout default branch
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: Sync VERSION file to released tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION=${{ github.event.inputs.tag }}
+            VERSION=${VERSION#v}
+          else
+            VERSION=${GITHUB_REF#refs/tags/v}
+          fi
+
+          CURRENT_VERSION=$(tr -d '\r\n' < backend/cmd/server/VERSION || true)
+          if [ "$CURRENT_VERSION" = "$VERSION" ]; then
+            echo "VERSION file already matches $VERSION"
+            exit 0
+          fi
+
+          echo "$VERSION" > backend/cmd/server/VERSION
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add backend/cmd/server/VERSION
+          git commit -m "chore: sync VERSION to ${VERSION} [skip ci]"
+          git push origin HEAD:${{ github.event.repository.default_branch }}
+
+  # 发布产物和版本回写成功后，再通知 Discord。
+  notify-discord:
+    needs: [update-version, release, sync-version-file]
+    # 通知服务故障通过警告报告，发布产物仍可使用。
+    continue-on-error: true
+    if: >-
+      ${{
+        !cancelled() &&
+        needs.update-version.result == 'success' &&
+        needs.release.result == 'success' &&
+        needs.sync-version-file.result == 'success'
+      }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout notification script
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Announce release on Discord
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DISCORD_RELEASE_WEBHOOK_URL: ${{ secrets.DISCORD_RELEASE_WEBHOOK_URL }}
+          RELEASE_TAG: v${{ needs.update-version.outputs.version }}
+          RELEASE_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ -z "$DISCORD_RELEASE_WEBHOOK_URL" ]; then
+            echo "::warning::DISCORD_RELEASE_WEBHOOK_URL is not configured; release notification skipped."
+            exit 0
+          fi
+
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --json name,tagName,url,body,isDraft,isPrerelease \
+            > "$RUNNER_TEMP/discord-release.json"
+          python3 tools/notify_discord_release.py "$RUNNER_TEMP/discord-release.json"

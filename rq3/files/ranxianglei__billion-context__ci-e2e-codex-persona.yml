@@ -1,0 +1,58 @@
+name: e2e-codex-persona
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: e2e-codex-persona-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  e2e-codex-persona:
+    name: real codex persona/continuity in BOTH modes (URL + launcher) vs fake upstream (zero tokens)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      # Pinned like ci-e2e-fake.yml (#815): codex releases change the baseline
+      # prompt/input assembly; bump deliberately after re-running this suite
+      # locally on the new version. A version bump is ALSO the one real-world
+      # trigger that drifts `instructions` mid-session (#2250) — if the bump
+      # flips assertInstructionsStable, that is the suite doing its job:
+      # re-verify the persona migrate path keeps the single-summarization
+      # contract before unpinning.
+      - name: Install codex CLI
+        run: npm i -g @openai/codex@0.147.0
+
+      - name: Print codex version
+        run: codex --version
+
+      - name: Install deps
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Run real-codex persona/continuity E2E (URL mode + launcher mode)
+        run: ACP_TEST_E2E_FAKE=1 node --import tsx --test tests/e2e/e2e-codex-persona.test.ts
+
+      - name: Collect E2E artifacts
+        if: failure()
+        run: |
+          mkdir -p tmp/e2e-artifacts
+          for d in tmp/e2e-codex-persona-*; do [ -d "$d" ] && cp -r "$d" tmp/e2e-artifacts/ || true; done
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: e2e-codex-persona-artifacts
+          path: tmp/e2e-artifacts
+          if-no-files-found: ignore

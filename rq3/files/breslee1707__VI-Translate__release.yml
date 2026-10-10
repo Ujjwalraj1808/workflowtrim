@@ -1,0 +1,148 @@
+name: Release
+
+# Tag the release and this publishes it. The in-app update check reads the
+# latest tag from this repository, so the tag and the asset name have to be
+# right every time - which is exactly the kind of thing manual uploads get
+# wrong once and then nobody notices for a month.
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Check the tag matches APP_VERSION
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}".TrimStart("v")
+          $line = Select-String -Path app/update.py -Pattern '^APP_VERSION = "(.+)"$'
+          $version = $line.Matches[0].Groups[1].Value
+          if ($tag -ne $version) {
+            throw "Tag $tag does not match APP_VERSION $version in app/update.py"
+          }
+          Write-Host "Releasing $version"
+
+      # build.ps1 requires a virtual environment at the repository root and
+      # installs the dependencies into it itself.
+      - name: Create the virtual environment
+        run: python -m venv .venv
+
+      - name: Ensure WebView2 Runtime
+        shell: pwsh
+        run: |
+          $runtimePaths = @(
+            'HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}',
+            'HKLM:\SOFTWARE\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}',
+            'HKCU:\SOFTWARE\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}'
+          )
+          $runtimePresent = $runtimePaths | ForEach-Object {
+            (Get-ItemProperty -LiteralPath $_ -Name pv -ErrorAction SilentlyContinue).pv
+          } | Where-Object { $_ -and $_ -ne '0.0.0.0' }
+          if (-not $runtimePresent) {
+            $installer = Join-Path $env:RUNNER_TEMP 'MicrosoftEdgeWebview2Setup.exe'
+            Invoke-WebRequest 'https://go.microsoft.com/fwlink/p/?LinkId=2124703' -OutFile $installer
+            $signature = Get-AuthenticodeSignature -LiteralPath $installer
+            if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch 'Microsoft Corporation') {
+              throw 'WebView2 bootstrapper signature is invalid'
+            }
+            $install = Start-Process -FilePath $installer -ArgumentList '/silent', '/install' -Wait -PassThru -WindowStyle Hidden
+            if ($install.ExitCode -ne 0) { throw "WebView2 installation failed: $($install.ExitCode)" }
+          }
+
+      - name: Build
+        run: .\build.ps1
+
+      - name: Validate
+        shell: pwsh
+        run: |
+          .\.venv\Scripts\python.exe -m pip install ruff==0.16.4
+          if ($LASTEXITCODE -ne 0) { throw 'Ruff installation failed' }
+          .\.venv\Scripts\python.exe -m unittest discover -s tests -v
+          if ($LASTEXITCODE -ne 0) { throw 'Unit tests failed' }
+          .\.venv\Scripts\python.exe -m pip check
+          if ($LASTEXITCODE -ne 0) { throw 'Dependency check failed' }
+          .\.venv\Scripts\python.exe -m ruff check pdf2zh scripts app tests --select E9,F63,F7,F82
+          if ($LASTEXITCODE -ne 0) { throw 'Ruff checks failed' }
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: PDFTranslate-windows
+          path: dist/PDFTranslate-windows.zip
+          if-no-files-found: error
+
+  macos:
+    name: macOS (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: apple-silicon
+            runner: macos-15
+          - arch: intel
+            runner: macos-15-intel
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Check the tag matches APP_VERSION
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          version="$(sed -n 's/^APP_VERSION = "\([^"]*\)"$/\1/p' app/update.py)"
+          if [[ "$tag" != "$version" ]]; then
+            echo "Tag $tag does not match APP_VERSION $version in app/update.py" >&2
+            exit 1
+          fi
+          echo "Releasing $version"
+
+      - name: Build app and DMG
+        shell: bash
+        run: bash build-macos.sh
+
+      - name: Validate
+        shell: bash
+        run: |
+          set -euo pipefail
+          .venv-macos/bin/python3 -m pip install ruff==0.16.4
+          .venv-macos/bin/python3 -m unittest discover -s tests -v
+          .venv-macos/bin/python3 -m pip check
+          .venv-macos/bin/python3 -m ruff check pdf2zh scripts app tests --select E9,F63,F7,F82
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: PDFTranslate-macos-${{ matrix.arch }}
+          path: dist/PDFTranslate-macos-${{ matrix.arch }}.dmg
+          if-no-files-found: error
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [windows, macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v3
+        with:
+          files: release-assets/*
+          generate_release_notes: true

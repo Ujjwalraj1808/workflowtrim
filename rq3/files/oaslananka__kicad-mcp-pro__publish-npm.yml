@@ -1,0 +1,155 @@
+name: Publish npm
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing published mcp-npm release tag to republish/backfill.
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    if: >-
+      (github.repository_owner == 'oaslananka' || github.repository_owner == 'oaslananka-ops') &&
+      ((github.event_name == 'workflow_dispatch' &&
+        startsWith(inputs.release_tag, 'mcp-npm-v')) ||
+       (github.event_name == 'release' &&
+        startsWith(github.event.release.tag_name, 'mcp-npm-v')))
+    runs-on: ubuntu-24.04
+    environment: npm
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    defaults:
+      run:
+        working-directory: packages/mcp-npm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.release_tag }}
+      - name: Verify immutable release source
+        id: source
+        working-directory: ${{ github.workspace }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          case "$RELEASE_TAG" in
+            mcp-npm-v*) ;;
+            *)
+              echo "Unexpected npm release tag: $RELEASE_TAG" >&2
+              exit 1
+              ;;
+          esac
+          tag_sha="$(git rev-list -n1 "refs/tags/${RELEASE_TAG}")"
+          head_sha="$(git rev-parse HEAD)"
+          test "$tag_sha" = "$head_sha"
+          gh release view "$RELEASE_TAG" --json isDraft,tagName --jq 'select(.isDraft == false) | .tagName' | grep -Fx "$RELEASE_TAG"
+          version="${RELEASE_TAG#mcp-npm-v}"
+          package_version="$(python -c 'import json; print(json.load(open("packages/mcp-npm/package.json"))["version"])')"
+          test "$version" = "$package_version"
+          echo "sha=$head_sha" >> "$GITHUB_OUTPUT"
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7
+        with:
+          enable-cache: false
+          version-file: uv.toml
+      - name: Install release-readiness dependencies
+        working-directory: ${{ github.workspace }}
+        run: uv sync --all-extras --frozen
+      - name: Enforce live-model release readiness
+        working-directory: ${{ github.workspace }}
+        run: uv run --all-extras python scripts/check_live_model_release_policy.py --require-ready release --ref HEAD
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version-file: .node-version
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+      - run: npm --version
+      - run: npm ci --ignore-scripts=false
+      - name: Pack npm launcher and generate evidence
+        id: npm-evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm pack --json > npm-pack.json
+          tarball="$(node -e "const fs = require('node:fs'); const pack = JSON.parse(fs.readFileSync('npm-pack.json', 'utf8')); console.log(pack[0].filename);")"
+          test -f "$tarball"
+          evidence_dir="../../release-assets/mcp-npm"
+          mkdir -p "$evidence_dir"
+          cp "$tarball" "$evidence_dir/"
+          (
+            cd "$evidence_dir"
+            sha256sum "$(basename "$tarball")" > SHA256SUMS.txt
+          )
+          npm sbom --sbom-format cyclonedx --sbom-type application > "$evidence_dir/sbom.cdx.json"
+          (cd "$evidence_dir" && sha256sum --check SHA256SUMS.txt)
+          echo "tarball=$tarball" >> "$GITHUB_OUTPUT"
+      - name: Attest npm launcher tarball
+        id: attest-npm
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
+        with:
+          subject-checksums: release-assets/mcp-npm/SHA256SUMS.txt
+          sbom-path: release-assets/mcp-npm/sbom.cdx.json
+      - name: Store npm release evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: npm-release-evidence
+          path: release-assets/mcp-npm
+          if-no-files-found: error
+          retention-days: 14
+      - name: Attach npm evidence to GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          upload_dir="../../release-assets/upload/mcp-npm"
+          mkdir -p "$upload_dir"
+          cp ../../release-assets/mcp-npm/*.tgz "$upload_dir/"
+          cp ../../release-assets/mcp-npm/SHA256SUMS.txt "$upload_dir/mcp-npm-SHA256SUMS.txt"
+          cp ../../release-assets/mcp-npm/sbom.cdx.json "$upload_dir/mcp-npm-sbom.cdx.json"
+          gh release upload "$RELEASE_TAG" "$upload_dir"/* --clobber
+      - name: Verify npm checksums before publish
+        run: (cd ../../release-assets/mcp-npm && sha256sum --check SHA256SUMS.txt)
+      - name: Check if version already published
+        id: check-published
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(node -p "require('./package.json').version")"
+          if npm view "kicad-mcp-pro@${version}" version --json >/dev/null 2>&1; then
+            echo "already_published=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "already_published=false" >> "$GITHUB_OUTPUT"
+          fi
+      - run: npm publish "${NPM_TARBALL}" --access public --provenance
+        if: steps.check-published.outputs.already_published != 'true'
+        env:
+          NPM_TARBALL: ${{ steps.npm-evidence.outputs.tarball }}
+      - name: Verify npm published tarball digest
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(node -p "require('./package.json').version")"
+          node ../../scripts/verify-npm-release.mjs \
+            --package kicad-mcp-pro \
+            --version "$version" \
+            --checksums ../../release-assets/mcp-npm/SHA256SUMS.txt \
+            --output-dir ../../release-assets/npm-verify
+      - name: Attach npm post-publish verification to GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.release_tag }}
+        run: gh release upload "$RELEASE_TAG" ../../release-assets/npm-verify/npm-published-digest.json --clobber

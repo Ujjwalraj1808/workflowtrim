@@ -1,0 +1,92 @@
+name: Update Upstream Manifests
+
+on:
+  # Weekly (Mondays 02:00 UTC); Renovate companion PRs cover day-to-day updates.
+  schedule:
+    - cron: '0 2 * * 1'
+  # Allow manual triggering
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  update-manifests:
+    name: Build and Update Upstream Manifests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        # Default to operator/ directory for most steps, but some steps explicitly
+        # change to repo root (for git commands) or pkg/manifests (for scripts)
+        working-directory: operator
+    steps:
+      - name: Generate GitHub App token
+        id: app-token
+        continue-on-error: true
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1  # v3
+        with:
+          app-id: ${{ secrets.UPDATE_BOT_APP_ID }}
+          private-key: ${{ secrets.UPDATE_BOT_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token || secrets.GITHUB_TOKEN }}
+
+      - name: Process all components
+        id: process
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token || secrets.GITHUB_TOKEN }}
+        run: |
+          cd "${{ github.workspace }}"
+
+          # Configure Git
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+
+          # Configure git to use app token for authentication (so pushes trigger CI)
+          # This ensures pushes are authenticated as the app, which triggers synchronize events
+          if [ -n "${GH_TOKEN}" ]; then
+            git config --local credential.https://github.com.helper '!f() { echo "username=x-access-token"; echo "password=${GH_TOKEN}"; }; f'
+          fi
+
+          # Ensure we're on main branch and up to date
+          git checkout main
+          git fetch origin main
+
+          # Process all components (script handles loop, processing, and JSON output)
+          bash operator/pkg/manifests/process-all-components.sh "${{ github.workspace }}"
+
+      - name: Read component results
+        id: results
+        if: always()
+        run: |
+          # Read JSON results file if it exists
+          if [ -f /tmp/component-results.json ]; then
+            echo "Component results file found"
+            cat /tmp/component-results.json
+          else
+            echo "Component results file not found, workflow may have failed before completion"
+            # Create empty JSON structure
+            echo '{"failed":[],"successful":[],"up_to_date":[]}' > /tmp/component-results.json
+          fi
+
+      - name: Notify on failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          WORKFLOW_NAME: Update Upstream Manifests
+        run: |
+          .github/scripts/create-or-update-issue.sh \
+            "⚠️ Upstream Manifests Update Workflow Failed" \
+            "The scheduled workflow to update upstream manifests has failed." \
+            /tmp/component-results.json

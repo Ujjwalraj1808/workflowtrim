@@ -1,0 +1,155 @@
+name: Update Translations
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'cps/**'
+      - 'scripts/compile_translations.sh'
+      - 'scripts/update_translations.sh'
+      - 'scripts/generate_translation_status.py'
+      - '.github/workflows/update-translations.yml'
+  workflow_dispatch:
+
+# Two merges to main in quick succession trigger two runs; both commit a
+# translation update and the loser's push is rejected non-fast-forward.
+# Serialize runs so only pushes from outside this workflow can race the
+# commit step (those are handled by the rebase-and-retry loop below).
+# cancel-in-progress stays false: cancelling a run mid-push could strand
+# a half-finished commit.
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  update-translations:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: true
+          # GH_PAT is a personal token belonging to new-usemame (the repo
+          # admin). The "main protection" ruleset blocks direct pushes to
+          # main for everyone except admins, so the default GITHUB_TOKEN
+          # (which authenticates as github-actions[bot]) gets rejected
+          # with GH013. Using GH_PAT lets the workflow's translation
+          # commit land on main under new-usemame's admin-bypass.
+          token: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+
+      - name: Install dependencies
+        run: pip install Babel polib jinja2
+
+      - name: Install gettext
+        run: sudo apt-get update && sudo apt-get install -y gettext
+
+      - name: Detect commit PAT
+        # The "main protection" ruleset blocks direct pushes to main for
+        # everyone except admins, and personal repos can't bypass that
+        # for the github-actions[bot] integration. Pushing the
+        # translation-status commit therefore requires GH_PAT (new-usemame's
+        # personal token, admin-bypass eligible). When the secret is
+        # missing, the workflow still runs — it just skips the commit and
+        # logs a notice. README translation status will go stale until
+        # someone runs `scripts/update_translations.sh` locally and pushes
+        # via a normal PR, or until GH_PAT is added to repo secrets.
+        id: commit_pat
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          if [ -n "${GH_PAT}" ]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::GH_PAT secret not set; skipping translation auto-commit. Add a new-usemame PAT as GH_PAT to enable README auto-updates."
+          fi
+
+      - name: Run update_translations.sh
+        run: bash scripts/update_translations.sh
+
+      - name: Refresh translation-status table in README
+        run: python scripts/generate_translation_status.py
+
+      - name: Commit translation updates
+        if: steps.commit_pat.outputs.available == 'true'
+        run: |
+          # Identity must be new-usemame: validate-author + the main
+          # branch ruleset bypass list both key off this committer email.
+          git config --global user.name "new-usemame"
+          git config --global user.email "248195428+new-usemame@users.noreply.github.com"
+          git add -f messages.pot cps/translations/*/LC_MESSAGES/messages.po README.md
+          if git diff --cached --quiet; then
+            echo "No translation changes to commit"
+          else
+            git commit -m "Update translations"
+            # The autopilot pushes docs commits to main minutes after each
+            # merge, so a bare `git push` here loses that race and fails
+            # non-fast-forward (3 of the last 30 runs). The commit holds
+            # only generated files; rebasing it onto updated main is safe.
+            # On a genuine rebase conflict, abort and fail — the push that
+            # beat us triggers its own run, which regenerates everything.
+            pushed=0
+            for attempt in 1 2 3; do
+              if git push; then
+                pushed=1
+                break
+              fi
+              echo "push rejected (attempt ${attempt}/3); rebasing onto updated main"
+              if ! git pull --rebase origin main; then
+                git rebase --abort
+                echo "::error::rebase conflict while retrying translation push"
+                exit 1
+              fi
+            done
+            if [ "${pushed}" != "1" ]; then
+              echo "::error::translation push failed after 3 attempts"
+              exit 1
+            fi
+          fi
+
+      # There is deliberately no "trigger a dev build" step here.
+      # 218f2bc11 (2026-01-30) added one — and simultaneously excluded main
+      # from the dev workflow's push trigger — because the translation
+      # commit was pushed with GITHUB_TOKEN, which GitHub deliberately does
+      # not run workflows for; the dispatch was the only way main ever got
+      # a :dev image. Both premises are gone. The push has ridden GH_PAT
+      # since d7e22c6fc (2026-05-02), and a PAT push triggers workflows on
+      # its own, so the translation commit has built itself since then. And
+      # 4ce64df8e (2026-06-06) restored push: branches: [main] on
+      # docker-image-build-dev.yml, so every merge touching image-relevant
+      # paths builds itself too. From then on the dispatch could only ever
+      # build a SHA the push trigger had already built — or one it had
+      # deliberately skipped: workflow_dispatch has no paths-ignore, so on
+      # a merge confined to the ignored paths (docs, tests, .github —
+      # editing this workflow is the live example) the dispatch force-built
+      # an image the push trigger correctly declines to build. Those merges
+      # now get ZERO dev builds, which is the intended behaviour, not a
+      # gap: the ignore list exists because such changes cannot alter image
+      # contents (the Dockerfile is not under .github/). Each redundant or
+      # unwanted build pushed a new :dev image that the operator's
+      # household server auto-deploys via watchtower; measured 2026-08-18
+      # at 2–3 builds per merge, i.e. duplicate user-visible restarts. The
+      # GITHUB_TOKEN the dispatch ran under also needed actions: write,
+      # which left with it.
+      # tests/unit/test_dev_image_build_once_when_image_relevant_never_when_ignored.py
+      # pins the policy: exactly one build per image-relevant merge, zero
+      # per ignored one. If the push above ever falls back to GITHUB_TOKEN,
+      # that file's premise test goes red and a trigger belongs back here —
+      # that is the only shape in which one does.
+
+      # The per-language translation-status table lives in the repo README
+      # (single source of truth) — see the "Translations" section of the
+      # wiki's Contributing page. The old steps here cloned the wiki and
+      # wrote the table into a `Contributing-Translations` page; that page
+      # was consolidated away, so the generator crashed on the missing file
+      # and this job went red on every push. The README refresh above is the
+      # canonical output, so the wiki-write steps are gone.

@@ -1,0 +1,57 @@
+name: release-data-migrator
+
+on:
+  push:
+    tags:
+      - 'v*'
+    branches: ['**']
+    paths:
+      - 'data-migrator/**'
+      - '**/migrations/**'                          # rebuild when any service's SQL changes
+      - '.github/workflows/release-data-migrator.yml'
+      - '.github/workflows/reusable-*.yml'
+      # 版本冻结提交（release/<x.y.z> 分支）触发全量重建
+      - 'VERSION'
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: 'Publish to GHCR (true) or verify build only (false)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  version:
+    uses: ./.github/workflows/reusable-version.yml
+
+  verify:
+    needs: version
+    uses: ./.github/workflows/reusable-release-verify.yml
+    with:
+      service-path: data-migrator
+      stack: chart-only
+
+  build:
+    needs: [version, verify]
+    uses: ./.github/workflows/reusable-container-image.yml
+    secrets: inherit
+    with:
+      service-path: data-migrator
+      dockerfile: Dockerfile
+      context: '..'                                 # monorepo root: Dockerfile needs to see all */migrations/**
+      image-name: core-data-migrator
+      version: ${{ needs.version.outputs.version }}
+      publish: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish) }}
+
+  chart:
+    needs: [version, verify, build]
+    uses: ./.github/workflows/reusable-chart.yml
+    with:
+      service-path: data-migrator
+      chart-path: helm/core-data-migrator
+      chart-name: core-data-migrator
+      version: ${{ needs.version.outputs.version }}
+      publish: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish) }}

@@ -1,0 +1,321 @@
+name: Release GUI
+
+# Unsigned Wails3 desktop GUI packages, one per platform the release and the
+# tingly-box-gui npm package distribute:
+#
+#   tingly-box-gui-macos-arm64.zip    TinglyBox.app (Apple Silicon)
+#   tingly-box-gui-windows-amd64.zip  tingly-box-gui.exe
+#   tingly-box-gui-linux-amd64.deb    Ubuntu 24.04+ / Debian 13+ (GTK4)
+#   tingly-box-gui-linux-amd64.rpm    Fedora 40+ (GTK4)
+#   tingly-box-gui-linux-amd64.zip    bare binary, GTK3 / WebKitGTK 4.1: Ubuntu 22.04+,
+#   tingly-box-gui-linux-arm64.zip    Debian 12+, Fedora 36+ (npx tingly-box-gui)
+#
+# Intel Macs are not built: the GUI targets Apple Silicon only (the CLI still
+# ships darwin/amd64). The deb/rpm are amd64 only and declare GTK4 / WebKitGTK
+# 6.0 (build/linux/nfpm/nfpm.yaml); the zips (amd64 and arm64) are built with
+# wails' `gtk3` tag on ubuntu-22.04 runners of the matching architecture (cgo
+# links GTK, so no cross-compile) so they also run on older distributions,
+# which the user's system libraries must then provide (the npm shim checks).
+#
+# The macOS name is a contract: build/npx/tingly-box-gui/bin.js downloads
+# exactly `tingly-box-gui-macos-arm64.zip` from the release tag. macOS apps
+# are ad-hoc signed only (no Developer ID, no notarization) — fine through npm,
+# which never sets the quarantine flag; a browser download needs one
+# "Open Anyway" (see the release notes).
+#
+# The GUI half of a release, independent of the CLI (release-cli.yml) and run in
+# parallel with it by release.yml. Build the packages, make sure the GitHub release exists
+# (whichever pipeline finishes first creates it), attach the packages, add the
+# desktop-app section to the notes, dispatch the GUI-only npm publish (pending its
+# `production` approval) and verify the result (verify-release-gui.yml).
+#
+# The web UI is not built here: every package embeds the same production build
+# (`frontend-dist`, build-frontend.yml), dropped into frontend/dist with
+# FRONTEND_PREBUILT=true so the Taskfile skips pnpm. No runner needs Node.
+#
+# Run by release.yml (tag push, or dispatch there), which builds that frontend
+# and runs the harness gate once for both pipelines (`orchestrated`). Or
+# dispatch it by hand with a release tag: it then builds its own frontend (no
+# harness) and works the same before, after or without the CLI release.
+
+on:
+  workflow_call:
+    inputs:
+      release_tag:
+        description: 'Release tag: the version baked into the binaries and the release the packages are attached to'
+        required: true
+        type: string
+      orchestrated:
+        description: 'Set by release.yml: the frontend-dist artifact and the harness gate come from the caller'
+        required: false
+        type: boolean
+        default: false
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Release tag (e.g. v1.6.2); the release is created if missing, same-named assets are replaced'
+        required: true
+        type: string
+
+env:
+  GO_VERSION: '1.26'
+  # Keep in lockstep with gui/wails3/go.mod and Taskfile.wails.yml's wails:check.
+  WAILS_VERSION: v3.0.0-beta.26
+
+permissions:
+  contents: read
+
+jobs:
+  # Only when run on its own: release.yml builds it once for both pipelines.
+  frontend:
+    name: Frontend
+    if: ${{ !inputs.orchestrated }}
+    uses: ./.github/workflows/build-frontend.yml
+
+  package:
+    name: Package (${{ matrix.platform }}-${{ matrix.arch }})
+    needs: frontend
+    # `frontend` is skipped when orchestrated; a skipped need would skip this too.
+    if: ${{ !failure() && !cancelled() }}
+    runs-on: ${{ matrix.os }}
+    env:
+      # build/Taskfile.yml: use frontend/dist as downloaded, no pnpm.
+      FRONTEND_PREBUILT: 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-latest, platform: macos, arch: arm64 }
+          - { os: windows-latest, platform: windows, arch: amd64 }
+          # 24.04: the oldest Ubuntu with WebKitGTK 6.0, which wails v3 links.
+          - { os: ubuntu-24.04, platform: linux, arch: amd64 }
+          # 22.04: the oldest glibc / WebKitGTK 4.1 the GTK3 zip should run on;
+          # a binary links forward-compatibly only, so build on the oldest.
+          - { os: ubuntu-22.04, platform: linux-gtk3, arch: amd64 }
+          - { os: ubuntu-22.04-arm, platform: linux-gtk3, arch: arm64 }
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          submodules: true
+
+      - name: Resolve version
+        id: ver
+        shell: bash
+        run: |
+          VERSION="${{ inputs.release_tag }}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "* \`${{ matrix.platform }}-${{ matrix.arch }}\`: version \`${VERSION}\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          # setup-go caches the module and build caches (keyed by OS/arch).
+          cache-dependency-path: '**/go.sum'
+
+      - name: Download frontend artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: frontend-dist
+          path: frontend/dist/
+
+      - name: Install GTK4 / WebKitGTK 6.0 headers (Linux)
+        if: matrix.platform == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libgtk-4-dev libwebkitgtk-6.0-dev pkg-config
+
+      - name: Install GTK3 / WebKitGTK 4.1 headers (Linux GTK3)
+        if: matrix.platform == 'linux-gtk3'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libgtk-3-dev libwebkit2gtk-4.1-dev pkg-config zip
+
+      - name: Install go-task and wails3
+        shell: bash
+        env:
+          # wails3 itself compiles its cgo `operatingsystem` package on Linux,
+          # which defaults to GTK4 / WebKitGTK 6.0; the GTK3 runners only have
+          # the 3 / 4.1 headers, so build the CLI with the same `gtk3` tag.
+          WAILS_TAGS: ${{ matrix.platform == 'linux-gtk3' && 'gtk3' || '' }}
+        run: |
+          go install github.com/go-task/task/v3/cmd/task@latest
+          go install -tags "${WAILS_TAGS}" github.com/wailsapp/wails/v3/cmd/wails3@${WAILS_VERSION}
+
+      - name: Package (macOS)
+        if: matrix.platform == 'macos'
+        shell: bash
+        run: |
+          set -euo pipefail
+          task darwin:package ARCH=${{ matrix.arch }} VERSION="${{ steps.ver.outputs.version }}"
+          codesign --verify --deep --strict --verbose=2 bin/TinglyBox.app
+          file bin/TinglyBox.app/Contents/MacOS/tingly-box-gui | tee /dev/stderr | grep -q "Mach-O 64-bit executable arm64"
+          mkdir -p dist
+          # --norsrc --noextattr: without them ditto stores extended attributes
+          # as "._*" entries, which unzip and the npm shim's unzipper write
+          # into the bundle as files and so break its signature.
+          ditto -c -k --norsrc --noextattr --keepParent bin/TinglyBox.app "dist/tingly-box-gui-macos-${{ matrix.arch }}.zip"
+          ls -la dist/
+
+      - name: Package (Windows)
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          task windows:build PRODUCTION=true ARCH=${{ matrix.arch }} VERSION="${{ steps.ver.outputs.version }}"
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Compress-Archive -Path bin/tingly-box-gui.exe -DestinationPath dist/tingly-box-gui-windows-${{ matrix.arch }}.zip
+          Get-ChildItem dist
+
+      - name: Package (Linux)
+        if: matrix.platform == 'linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          task linux:package VERSION="${{ steps.ver.outputs.version }}"
+          # Install the deb on this runner and check what a user would get:
+          # the binary under its own name (never the CLI's `tingly-box`), the
+          # launcher entry, and every shared library resolvable.
+          sudo apt-get install -y ./bin/tingly-box-gui-linux-amd64.deb
+          dpkg-deb -f bin/tingly-box-gui-linux-amd64.deb Package Version Depends
+          test -x /usr/bin/tingly-box-gui
+          test -f /usr/share/applications/dev.tingly.box.desktop
+          # Not `! ldd | grep`: set -e ignores a negated pipeline.
+          if ldd /usr/bin/tingly-box-gui | grep "not found"; then exit 1; fi
+          mkdir -p dist
+          cp bin/tingly-box-gui-linux-amd64.deb bin/tingly-box-gui-linux-amd64.rpm dist/
+          ls -la dist/
+
+      - name: Package (Linux GTK3 zip)
+        if: matrix.platform == 'linux-gtk3'
+        shell: bash
+        run: |
+          set -euo pipefail
+          task linux:build:gtk3 ARCH=${{ matrix.arch }} VERSION="${{ steps.ver.outputs.version }}"
+          BIN=bin/gtk3/tingly-box-gui
+          case "${{ matrix.arch }}" in
+            amd64) WANT_ELF="x86-64" ;;
+            arm64) WANT_ELF="ARM aarch64" ;;
+          esac
+          file "$BIN" | tee /dev/stderr | grep -q "ELF 64-bit.*$WANT_ELF"
+          # Every shared library resolves here (the -dev packages pulled in the
+          # runtime libs), and it links GTK3 / WebKitGTK 4.1, not the GTK4 stack.
+          if ldd "$BIN" | grep "not found"; then exit 1; fi
+          ldd "$BIN" | grep -q 'libgtk-3.so.0'
+          ldd "$BIN" | grep -q 'libwebkit2gtk-4.1.so.0'
+          if ldd "$BIN" | grep -qE 'libgtk-4|libwebkitgtk-6'; then echo "❌ linked the GTK4 stack"; exit 1; fi
+          # glibc floor: nothing newer than 22.04's 2.35, or the zip would not
+          # start on the distributions it is meant for.
+          NEWEST="$(objdump -T "$BIN" | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1)"
+          echo "newest glibc symbol: $NEWEST"
+          [ "$(printf '%s\n' "$NEWEST" GLIBC_2.35 | sort -V | tail -1)" = "GLIBC_2.35" ]
+          mkdir -p dist
+          # The binary at the zip's top level, which is what the npm shim extracts.
+          (cd bin/gtk3 && zip -j "$OLDPWD/dist/tingly-box-gui-linux-${{ matrix.arch }}.zip" tingly-box-gui)
+          ls -la dist/
+
+      - name: Upload package
+        uses: actions/upload-artifact@v7
+        with:
+          name: gui-${{ matrix.platform }}-${{ matrix.arch }}
+          path: |
+            dist/*.zip
+            dist/*.deb
+            dist/*.rpm
+          retention-days: 7
+
+  publish:
+    name: Publish to release ${{ inputs.release_tag }}
+    needs: package
+    # Explicit: a skipped ancestor (frontend when orchestrated) would skip it.
+    if: ${{ !cancelled() && needs.package.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: write
+    steps:
+      # For the local ensure-release action only.
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          sparse-checkout: .github
+
+      - name: Download GUI packages
+        uses: actions/download-artifact@v8
+        with:
+          pattern: gui-*
+          path: ./gui
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: ./gui
+        run: |
+          ls -la
+          sha256sum -- *.zip *.deb *.rpm > checksums-gui.txt
+
+      - name: Ensure the GitHub release exists
+        uses: ./.github/actions/ensure-release
+        with:
+          tag: ${{ inputs.release_tag }}
+
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.release_tag }}
+        working-directory: ./gui
+        run: |
+          gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber -- \
+            *.zip *.deb *.rpm checksums-gui.txt
+
+      # The notes are generated by whichever pipeline creates the release, so this
+      # section is added here. Bounded by markers so a re-run replaces it.
+      - name: Add desktop app section to the release notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.release_tag }}
+        run: |
+          START="<!-- DESKTOP_APP_INFO:START -->"
+          END="<!-- DESKTOP_APP_INFO:END -->"
+          CURRENT="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json body -q .body \
+            | sed "/$START/,/$END/d")"
+          {
+            printf '%s\n\n' "$CURRENT"
+            echo "$START"
+            cat <<'NOTES'
+          ## Desktop app (unsigned)
+
+          | Platform | Download |
+          | --- | --- |
+          | macOS Apple Silicon | `tingly-box-gui-macos-arm64.zip` |
+          | Windows x64 | `tingly-box-gui-windows-amd64.zip` |
+          | Linux x64 — Ubuntu 24.04+ / Debian 13+ | `tingly-box-gui-linux-amd64.deb` |
+          | Linux x64 — Fedora 40+ | `tingly-box-gui-linux-amd64.rpm` |
+          | Linux x64 — Ubuntu 22.04+ / Debian 12+ / Fedora 36+ (bare binary) | `tingly-box-gui-linux-amd64.zip` |
+          | Linux arm64 — same distributions (bare binary) | `tingly-box-gui-linux-arm64.zip` |
+
+          The desktop builds are not signed by Apple or Microsoft.
+
+          - **macOS**: easiest is `npx tingly-box-gui`, which skips Gatekeeper. For a browser download, unzip and open `TinglyBox.app`; when macOS blocks it, go to **System Settings → Privacy & Security → Open Anyway**, or run `xattr -dr com.apple.quarantine TinglyBox.app`.
+          - **Windows**: if SmartScreen appears, choose **More info → Run anyway**.
+          - **Linux**: `sudo apt install ./tingly-box-gui-linux-amd64.deb` or `sudo dnf install ./tingly-box-gui-linux-amd64.rpm` (pulls in GTK4 and WebKitGTK 6.0), then open **Tingly Box** from the app menu or run `tingly-box-gui`. On older distributions, or to try it without installing anything, run `npx tingly-box-gui` (or unzip the `.zip` for your architecture and run `tingly-box-gui`); that build needs GTK 3 and WebKitGTK 4.1 from your distribution. The tray icon needs a StatusNotifier host (KDE and most desktops have one; GNOME needs the AppIndicator extension).
+          NOTES
+            echo "$END"
+          } > desktop-notes.md
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --notes-file desktop-notes.md
+
+      - name: Dispatch GUI npm publish
+        uses: ./.github/actions/dispatch-npm
+        with:
+          tag: ${{ inputs.release_tag }}
+          publish_cli: false
+          publish_gui: true
+          build_docker: false
+
+  verify:
+    name: Verify GUI release ${{ inputs.release_tag }}
+    needs: publish
+    if: ${{ !cancelled() && needs.publish.result == 'success' }}
+    uses: ./.github/workflows/verify-release-gui.yml
+    with:
+      tag: ${{ inputs.release_tag }}

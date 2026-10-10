@@ -1,0 +1,327 @@
+name: test-flows
+
+on:
+  push:
+    branches: [ main ]
+    paths-ignore:
+      - '**/*.md'
+      - 'design/**'
+      - 'notes/**'
+  pull_request:
+    branches: [ main ]
+    # ready_for_review is what makes the draft gate below usable: without it,
+    # flipping a draft to ready fires no event and the PR would sit with no
+    # flow run until the next push. opened/synchronize/reopened are the
+    # Actions default set, restated because naming `types` at all replaces it.
+    #
+    # converted_to_draft is the other half of that gate, and it works by
+    # cancellation rather than by starting anything: pushing a PR back to
+    # draft fires an event in the concurrency group below, so
+    # cancel-in-progress kills the flows that are mid-flight and the run it
+    # schedules in their place skips (the PR is a draft again).
+    types: [ opened, synchronize, reopened, ready_for_review, converted_to_draft ]
+    # NOTE: same caveat as main.yml and conway's build.yml — this is a
+    # workflow-level skip, so a docs-only PR produces NO check run at all,
+    # whereas the job-level draft gate below produces a `skipped` conclusion
+    # that satisfies a required status check. If either job here is ever made
+    # required in branch protection, convert this to a per-job `if` gate or
+    # docs-only PRs will sit unmergeable forever.
+    paths-ignore:
+      - '**/*.md'
+      - 'design/**'
+      - 'notes/**'
+  workflow_dispatch:
+
+# The draft gate defers this workflow's cost; this bounds it. Flows run on
+# free standard runners (public repo: 4 vCPU / 16 GB), not the paid 8 GB
+# larger-runner pool, so they no longer compete for that 4-job cap. Cancel
+# still matters: three quick pushes to one ready PR would otherwise leave
+# a pile of 11-minute shard sets running for commits nobody will merge.
+#
+# Grouped per ref, so PRs never cancel each other (refs/pull/<n>/merge is
+# unique per PR). Cancel-always, matching main.yml: superseded runs die rather
+# than queue, on main as much as on a PR, because nothing ships from a flows
+# run and only the newest commit's result is worth a runner.
+#
+# Do NOT narrow this to `${{ github.event_name == 'pull_request' }}`. Leaving
+# main uncancelled makes its runs queue in this group, and `cancel-in-progress:
+# false` does not mean "never cancel" -- GitHub drops a run still PENDING in a
+# group when a newer one joins -- so three merges inside one flows window would
+# lose the middle commit's run anyway, while the others serialized. conway does
+# scope its cancellation that way, but only because an npm publish rides on the
+# ordering there (conway#468); that reason does not exist here.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Conway-engine flows, sharded across free standard runners.
+  #
+  # Share is public, so `ubuntu-24.04` is 4 vCPU / 16 GB / free-unlimited
+  # (docs: standard GitHub-hosted runners for public repositories). The
+  # paid `ubuntu-24.04-4vcpu-8gb-150gbssd` larger runner was 8 GB, and RAM
+  # — not vCPU — was the ceiling: 6 workers => 53 failed, 3 => 4 failed,
+  # 2 => green (starvation reads as click / `#viewer-container` timeouts).
+  # Larger runners are billed even on public repos; standard ones are not.
+  #
+  # Keep 2 workers per box (the density that stayed green on 8 GB, now
+  # with 2× the RAM). Packing 4 workers onto 4 vCPU would put four
+  # SwiftShader Chromiums on four cores; more shards at 2 workers use
+  # more machines instead, which is the cheaper way to cut wall clock
+  # because these specs are not timing-sensitive. Four shards × 2
+  # workers = 8 Chromiums.
+  #
+  # The SPA is built once (`playwright-build`) and downloaded by each
+  # shard as `yarn test-flows-build` left it (no map-stripping, no
+  # rewrite). Shards skip `yarn install` of the Share tree: they npm
+  # install `@playwright/test@1.56.1` plus `http-server` (browsers
+  # already in the image) and run `npx http-server` inside `docs/`.
+  # Specs import the runner plus
+  # dep-free constant modules (Notes/component.js, Search/component.ts,
+  # utils/constants.js).
+  #
+  # Screenshots stay on the Playwright noble container (chromium 1194),
+  # not the host image. 14 GB disk vs the old 150 GB is the thing to
+  # watch if a shard dies in yarn install; browsers come with the image.
+  #
+  # Branch protection requires the check name `playwright-run`. Matrix
+  # jobs would rename it to `playwright-run (1)` / `(2)` and the required
+  # check would never report, so the shards live here and a tiny
+  # aggregator below keeps that name.
+  playwright-build:
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      SKIP_MARKETING: 'true'
+      SHARE_CONFIG: playwright
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: 'yarn'
+          cache-dependency-path: 'yarn.lock'
+
+      - name: Mark workspace as safe for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - run: yarn install --frozen-lockfile --prefer-offline
+
+      - name: Build Playwright SPA
+        run: yarn test-flows-build
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: playwright-docs
+          path: docs
+          retention-days: 1
+          if-no-files-found: error
+
+  playwright-shard:
+    # Draft PRs don't run flows. This is still the longest thing CI does
+    # per PR; the draft gate keeps rework pushes from stacking shard sets
+    # for commits that will be rewritten. Netlify deploy previews are NOT
+    # affected — they come from Netlify's own GitHub integration, not from
+    # Actions — so a draft still gets a preview URL to click through by
+    # hand. See AGENTS.md "PR lifecycle".
+    #
+    # A job-level `if` (rather than a workflow-level trigger filter) is what
+    # keeps this compatible with required status checks: a skipped-by-if job
+    # reports a conclusion, a workflow that never triggers reports nothing and
+    # leaves the PR waiting forever.
+    #
+    # The event_name clause is defensive, not load-bearing. On push and
+    # workflow_dispatch `github.event.pull_request` is null, and Actions
+    # coerces both sides of `==` to a number when the types differ, so a bare
+    # `draft == false` would evaluate `0 == 0` and run anyway. Relying on that
+    # coercion would make CI on main hinge on a documented-but-obscure corner
+    # of the expression language. The clause states the intent instead.
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    needs: playwright-build
+    runs-on: ubuntu-24.04
+    # Image must match @playwright/test in package.json (Playwright caches
+    # by version + matches browser APIs). The -noble (Ubuntu 24.04) variant
+    # is chosen so screenshot baselines regenerated in the dev/sandbox env
+    # (also noble + chromium 1194) match CI's renders pixel-for-pixel.
+    container: mcr.microsoft.com/playwright:v1.56.1-noble
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    name: playwright-shard ${{ matrix.shard }}/4
+    # Headroom on a quarter of the suite plus a tiny Playwright npm
+    # install. The margin is for the degraded case — a failure drags a
+    # 30 s timeout plus a retry. With the light/heavy split below, each
+    # shard's two passes were estimated at 5.5-8.5 min of test time from
+    # the per-test durations of run 36732113798 (#1892).
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Mark workspace as safe for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: playwright-docs
+          path: docs
+
+      - name: Check docs artifact
+        run: test -f docs/index.html
+
+      # Specs import @playwright/test and a handful of dep-free constant
+      # modules (Notes/component.js, Search/component.ts, …). The image
+      # already has browsers for 1.56.1; this is just the test runner.
+      # Install into a throwaway prefix — `npm install` at the repo root
+      # still reads package.json and dies on ts-jest/babel-jest peers.
+      # PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD is set on the image.
+      - name: Install Playwright test runner
+        run: |
+          mkdir -p .pw-runner
+          echo '{"private":true}' > .pw-runner/package.json
+          npm install --prefix .pw-runner @playwright/test@1.56.1 http-server
+          ln -s .pw-runner/node_modules node_modules
+
+      - name: Playwright Info
+        run: npx playwright --version
+
+      # 2 workers on 4 vCPU matches Playwright's vCPU/2 heuristic and the
+      # density that stayed green when RAM was the limit. Do not bump this
+      # without re-measuring: four SwiftShader heaps on four cores contend.
+      #
+      # Two passes, same --shard=N/4, so every shard gets a quarter of the
+      # slow share-140 export specs instead of shard 2 getting all of them.
+      # Playwright 1.56.1 shards by test COUNT in file order, not duration
+      # (lib/runner/testGroups.js#filterForShard), and those specs run
+      # 11 s - 1.6 min per test next to each other in file order: one
+      # unsplit pass had shard 2 at 11-14.5 min vs 4.5-7 min for the rest,
+      # cancelled twice at the 15-min limit (#1892). The heavy list and
+      # why the two sets together are exactly the full suite:
+      # tools/playwrightSpecSets.js.
+      #
+      # The heavy pass writes its own report and output dirs: Playwright
+      # wipes `test-results` (outputDir) and the HTML report folder at the
+      # start of every run, so sharing them would delete the light pass's
+      # traces. `!cancelled()` runs it even when the light pass fails, so a
+      # red shard still reports on every test it owns; the job fails if
+      # either pass does.
+      - name: Run Playwright tests (light specs)
+        env:
+          PW_SPEC_SET: light
+        run: npx playwright test --config=tools/playwright.config.js --reporter=github,list,html --workers=2 --shard=${{ matrix.shard }}/4
+
+      - name: Run Playwright tests (heavy specs)
+        if: ${{ !cancelled() }}
+        env:
+          PW_SPEC_SET: heavy
+          PLAYWRIGHT_HTML_OUTPUT_DIR: playwright-report-heavy
+        run: npx playwright test --config=tools/playwright.config.js --reporter=github,list,html --workers=2 --shard=${{ matrix.shard }}/4 --output=test-results-heavy
+
+      # Always upload the HTML report (handy to debug failures)
+      - name: Upload Playwright HTML report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report-${{ matrix.shard }}
+          path: |
+            playwright-report
+            playwright-report-heavy
+          retention-days: 7
+          if-no-files-found: warn
+
+      # Optionally upload traces from failed tests
+      - name: Upload Playwright traces
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-traces-${{ matrix.shard }}
+          path: |
+            test-results
+            test-results-heavy
+          retention-days: 7
+          if-no-files-found: warn
+        # Ensure you have trace: 'on-first-retry' (or similar) in playwright.config.ts
+
+    env:
+      # Keep your app env similar to Cypress job (adjust as needed for tests/MSW)
+      GITHUB_BASE_URL: https://git.bldrs.dev.pw/p/gh
+      GITHUB_BASE_URL_UNAUTHENTICATED: https://api.github.com.pw
+      MSW_IS_ENABLED: true
+      PLAYWRIGHT_SERVE_ONLY: 'true'
+
+  # Required check name. Must stay `playwright-run` — branch protection
+  # matches on it. Tiny, not a large runner: it only AND-reduces the shards.
+  playwright-run:
+    name: playwright-run
+    needs: playwright-shard
+    # always() so a failed shard still produces this check (red, not missing).
+    # The draft clause matches the shards, so a draft skips this too and the
+    # required check is the skipped-by-if conclusion, not a hang.
+    if: always() && (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: All shards passed
+        run: |
+          echo "playwright-shard result: ${{ needs.playwright-shard.result }}"
+          test "${{ needs.playwright-shard.result }}" = "success"
+
+  # web-ifc ENGINE smoke: builds with USE_WEBIFC_SHIM=false (real web-ifc,
+  # not the Conway shim) and serves it cross-origin isolated, then loads
+  # index.ifc in the browser. Separate job from the Conway shards because it
+  # needs a different build + an isolated static server. web-ifc is pinned
+  # to its single-threaded engine (0.0.35's MT build is unshippable as
+  # packaged — see webIfcSingleThreadPlugin in tools/esbuild/plugins.js);
+  # this job is advisory and expected GREEN. It forwards the browser
+  # console so any isolated-runtime failure is legible without a local
+  # browser (see design/new/viewer-replacement.md §5f).
+  playwright-webifc-run:
+    # Draft-gated for the same reason as playwright-shard above.
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    runs-on: ubuntu-24.04
+    container: mcr.microsoft.com/playwright:v1.56.1-noble
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: 'yarn'
+          cache-dependency-path: 'yarn.lock'
+
+      - name: Mark workspace as safe for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - run: yarn install --frozen-lockfile --prefer-offline
+
+      - name: Playwright Info
+        run: npx playwright --version
+
+      - name: Run web-ifc engine Playwright smoke
+        run: yarn test-flows-webifc --reporter=github,list,html --workers=1
+
+      - name: Upload web-ifc Playwright HTML report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report-webifc
+          path: playwright-report-webifc
+          retention-days: 7
+          if-no-files-found: warn
+
+      - name: Upload web-ifc Playwright traces
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-traces-webifc
+          path: test-results
+          retention-days: 7
+          if-no-files-found: warn
+
+    env:
+      GITHUB_BASE_URL: https://git.bldrs.dev.pw/p/gh
+      GITHUB_BASE_URL_UNAUTHENTICATED: https://api.github.com.pw
+      MSW_IS_ENABLED: true

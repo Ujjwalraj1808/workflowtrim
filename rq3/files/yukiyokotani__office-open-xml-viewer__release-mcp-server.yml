@@ -1,0 +1,147 @@
+name: Release MCP Server Binaries
+
+# Builds prebuilt `ooxml-mcp-server` binaries for macOS (arm64/x64), Linux x64,
+# and Windows x64, and uploads them to the matching GitHub Release. The VS Code
+# extension downloads these on demand instead of bundling them, keeping the
+# extension small.
+#
+# Triggered when a `gh release create v*` is run (per the release procedure in
+# the root CLAUDE.md). Can also be invoked manually for an existing tag.
+
+on:
+  release:
+    # Only `created` — `gh release create` fires both `created` and `published`,
+    # so listening to both would build every binary twice.
+    types: [created]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to attach binaries to (e.g. v0.27.0)'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-14
+            binary: ooxml-mcp-server
+            asset: ooxml-mcp-server-aarch64-apple-darwin
+          # Build the x86_64 macOS binary by cross-compiling from the
+          # arm64 runner. Apple Silicon's clang / ld handle the x86_64
+          # target natively, so no extra linker setup is needed — and
+          # this avoids the macos-13 (Intel) runner queue, which GitHub
+          # Actions has stopped scheduling reliably (jobs sit in
+          # `queued` for 30+ minutes before dispatch).
+          - target: x86_64-apple-darwin
+            os: macos-14
+            binary: ooxml-mcp-server
+            asset: ooxml-mcp-server-x86_64-apple-darwin
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            binary: ooxml-mcp-server
+            asset: ooxml-mcp-server-x86_64-unknown-linux-gnu
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            binary: ooxml-mcp-server
+            asset: ooxml-mcp-server-aarch64-unknown-linux-gnu
+            cross: true
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            binary: ooxml-mcp-server.exe
+            asset: ooxml-mcp-server-x86_64-pc-windows-msvc.exe
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          # The repository's Cargo.toml declares a workspace at the root,
+          # so cargo's target directory is `<repo>/target`, not
+          # `packages/mcp-server/target` — point the cache action at the
+          # workspace root accordingly.
+          workspaces: . -> target
+          key: ${{ matrix.target }}
+
+      - name: Install cross-compile linker (aarch64-linux)
+        if: matrix.cross
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+          mkdir -p ~/.cargo
+          echo '[target.aarch64-unknown-linux-gnu]' >> ~/.cargo/config.toml
+          echo 'linker = "aarch64-linux-gnu-gcc"' >> ~/.cargo/config.toml
+
+      - name: Build
+        # `-p ooxml-mcp-server` so cargo builds only this crate; the target
+        # directory is the workspace's `<repo>/target/` regardless of which
+        # subdir we run from.
+        run: cargo build --release --target ${{ matrix.target }} -p ooxml-mcp-server
+
+      - name: Stage binary
+        shell: bash
+        run: |
+          mkdir -p staging
+          cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" "staging/${{ matrix.asset }}"
+
+      - name: Compute SHA256
+        shell: bash
+        working-directory: staging
+        run: |
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "${{ matrix.asset }}" > "${{ matrix.asset }}.sha256"
+          else
+            shasum -a 256 "${{ matrix.asset }}" > "${{ matrix.asset }}.sha256"
+          fi
+          cat "${{ matrix.asset }}.sha256"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.asset }}
+          path: staging/*
+          if-no-files-found: error
+
+  release:
+    name: Attach binaries to release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve tag name
+        id: tag
+        env:
+          DISPATCH_TAG: ${{ inputs.tag }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          if [ -n "${DISPATCH_TAG:-}" ]; then
+            echo "name=${DISPATCH_TAG}" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=${RELEASE_TAG}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Upload assets to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ steps.tag.outputs.name }}
+        run: |
+          ls -la artifacts
+          gh release upload "$TAG" artifacts/* --clobber

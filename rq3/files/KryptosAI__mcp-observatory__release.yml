@@ -1,0 +1,327 @@
+name: release
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+      id-token: write
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Test
+        run: npm test
+
+      - name: Build
+        run: npm run build
+
+      - name: Packed install verification
+        run: npm run verify:packed-install
+
+      - name: Validate checked-in artifacts
+        run: npm run validate:artifacts
+
+      - name: README smoke test
+        run: npm run smoke
+
+      - name: Verify npm auth
+        id: npm-auth
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if npm whoami; then
+            echo "valid=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "valid=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Release with npm token
+        if: steps.npm-auth.outputs.valid == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npx -y --package semantic-release@25.0.5 --package @semantic-release/changelog@6.0.3 --package @semantic-release/git@10.0.1 semantic-release
+
+      - name: Check npm trusted publishing
+        id: npm-oidc
+        continue-on-error: true
+        if: steps.npm-auth.outputs.valid != 'true'
+        run: |
+          oidc_response="$(curl -sSf \
+            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=npm:registry.npmjs.org")"
+          id_token="$(node -e 'const fs = require("node:fs"); process.stdout.write(JSON.parse(fs.readFileSync(0, "utf8")).value)' <<< "$oidc_response")"
+          status="$(curl -sS \
+            -o /tmp/npm-oidc-response.json \
+            -w "%{http_code}" \
+            -X POST \
+            -H "Authorization: Bearer ${id_token}" \
+            "https://registry.npmjs.org/-/npm/v1/oidc/token/exchange/package/%40kryptosai%2Fmcp-observatory")"
+          if [[ "$status" =~ ^2 ]]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          else
+            message="$(node -e 'const fs = require("node:fs"); try { process.stdout.write(JSON.parse(fs.readFileSync("/tmp/npm-oidc-response.json", "utf8")).message || "unknown error") } catch { process.stdout.write("unknown error") }')"
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::npm trusted publishing is not ready for @kryptosai/mcp-observatory: ${status} ${message}"
+          fi
+
+      - name: Release with npm trusted publishing
+        if: steps.npm-auth.outputs.valid != 'true' && steps.npm-oidc.outputs.configured == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npx -y --package semantic-release@25.0.5 --package @semantic-release/changelog@6.0.3 --package @semantic-release/git@10.0.1 semantic-release
+
+      - name: Check package version publication
+        id: package-version
+        run: |
+          package_name="$(node -p 'require("./package.json").name')"
+          package_version="$(node -p 'require("./package.json").version')"
+          echo "name=${package_name}" >> "$GITHUB_OUTPUT"
+          echo "version=${package_version}" >> "$GITHUB_OUTPUT"
+          for attempt in 1 2 3 4 5 6; do
+            if npm view "${package_name}@${package_version}" version >/tmp/npm-published-version.txt 2>/dev/null; then
+              echo "published=true" >> "$GITHUB_OUTPUT"
+              echo "Package ${package_name}@${package_version} is already published."
+              exit 0
+            fi
+            latest_version="$(npm view "${package_name}" version 2>/dev/null || true)"
+            if node -e 'const semver = require("semver"); const latest = process.argv[1]; const current = process.argv[2]; process.exit(latest && semver.valid(latest) && semver.gte(latest, current) ? 0 : 1)' "$latest_version" "$package_version"; then
+              echo "published=true" >> "$GITHUB_OUTPUT"
+              echo "Package ${package_name}@${package_version} is covered by published latest ${latest_version}."
+              exit 0
+            fi
+            echo "Package ${package_name}@${package_version} not visible yet (attempt ${attempt}/6)."
+            sleep 10
+          done
+          echo "published=false" >> "$GITHUB_OUTPUT"
+          echo "Package ${package_name}@${package_version} is not published yet."
+
+      - name: Publish package.json version with npm token
+        if: steps.package-version.outputs.published != 'true' && steps.npm-auth.outputs.valid == 'true'
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          package_name="${{ steps.package-version.outputs.name }}"
+          package_version="${{ steps.package-version.outputs.version }}"
+          if npm publish --access public; then
+            exit 0
+          fi
+          for attempt in 1 2 3 4 5 6; do
+            if npm view "${package_name}@${package_version}" version >/dev/null 2>&1; then
+              echo "Package ${package_name}@${package_version} is published; treating duplicate publish race as success."
+              exit 0
+            fi
+            echo "Package ${package_name}@${package_version} still not visible after publish failure (attempt ${attempt}/6)."
+            sleep 10
+          done
+          exit 1
+
+      - name: Publish package.json version with npm trusted publishing
+        if: steps.package-version.outputs.published != 'true' && steps.npm-auth.outputs.valid != 'true' && steps.npm-oidc.outputs.configured == 'true'
+        run: |
+          package_name="${{ steps.package-version.outputs.name }}"
+          package_version="${{ steps.package-version.outputs.version }}"
+          if npm publish --provenance --access public; then
+            exit 0
+          fi
+          for attempt in 1 2 3 4 5 6; do
+            if npm view "${package_name}@${package_version}" version >/dev/null 2>&1; then
+              echo "Package ${package_name}@${package_version} is published; treating duplicate publish race as success."
+              exit 0
+            fi
+            echo "Package ${package_name}@${package_version} still not visible after publish failure (attempt ${attempt}/6)."
+            sleep 10
+          done
+          exit 1
+
+      - name: Regenerate Safety Index API data
+        run: npx tsx scripts/populate-safety-index-kv.ts
+
+      - name: Deploy dashboard to Cloudflare Pages production
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: 385e00f98ceabbee25800bda2756cc75
+        run: npx wrangler pages deploy dashboard --project-name mcp-observatory
+
+      - name: Point action@v1 at the published package
+        if: steps.package-version.outputs.published == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          version="$(npm view @kryptosai/mcp-observatory version)"
+          git fetch --tags origin
+          if git rev-parse "v${version}" >/dev/null 2>&1; then
+            git tag -f v1 "v${version}"
+          else
+            git tag -f v1 HEAD
+          fi
+          git push --force "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" refs/tags/v1
+
+      - name: Ensure public domain is attached to Cloudflare Pages
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: 385e00f98ceabbee25800bda2756cc75
+        run: |
+          set -euo pipefail
+          domains_url="https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/pages/projects/mcp-observatory/domains"
+          existing_status="$(curl -fsS \
+            -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+            "${domains_url}" | jq -r '.result[]? | select(.name == "mcp-observatory.com") | .status' | head -n 1)"
+          if [ -n "${existing_status}" ]; then
+            echo "mcp-observatory.com is already attached to Cloudflare Pages (${existing_status})."
+            exit 0
+          fi
+          response="$(curl -fsS -X POST \
+            -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+            -H 'Content-Type: application/json' \
+            "${domains_url}" \
+            --data '{"name":"mcp-observatory.com"}')"
+          if ! printf '%s' "${response}" | jq -e '.success == true' >/dev/null; then
+            printf '%s\n' "${response}" | jq . >&2
+            exit 1
+          fi
+          printf '%s\n' "${response}" | jq -r '"Attached mcp-observatory.com to Cloudflare Pages (status: \(.result.status))."'
+
+      - name: Skip release until npm trusted publishing is configured
+        if: steps.npm-auth.outputs.valid != 'true' && steps.npm-oidc.outputs.configured != 'true'
+        run: |
+          echo "::warning::Skipping semantic-release because NPM_TOKEN is invalid and npm trusted publishing is not configured. Add GitHub Actions trusted publisher KryptosAI/mcp-observatory with workflow release.yml in npm package settings, then rerun this workflow."
+
+      - name: Prepare GitHub fallback package
+        id: fallback-package
+        if: steps.npm-auth.outputs.valid != 'true' && steps.npm-oidc.outputs.configured != 'true'
+        run: |
+          base_version="$(node -p 'require("./package.json").version')"
+          fallback_version="${base_version}-github.${GITHUB_RUN_NUMBER}"
+          npm version "$fallback_version" --no-git-tag-version
+          package_file="$(npm pack --json | node -e 'const fs = require("node:fs"); const pack = JSON.parse(fs.readFileSync(0, "utf8")); process.stdout.write(pack[0].filename)')"
+          echo "version=${fallback_version}" >> "$GITHUB_OUTPUT"
+          echo "file=${package_file}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload GitHub fallback package artifact
+        if: steps.npm-auth.outputs.valid != 'true' && steps.npm-oidc.outputs.configured != 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: mcp-observatory-${{ steps.fallback-package.outputs.version }}
+          path: ${{ steps.fallback-package.outputs.file }}
+          retention-days: 30
+
+      - name: Publish GitHub fallback prerelease
+        if: steps.npm-auth.outputs.valid != 'true' && steps.npm-oidc.outputs.configured != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: github-build-${{ github.run_number }}
+          PACKAGE_FILE: ${{ steps.fallback-package.outputs.file }}
+          FALLBACK_VERSION: ${{ steps.fallback-package.outputs.version }}
+        run: |
+          body_file="$(mktemp)"
+          cat > "$body_file" <<EOF
+          npm publishing is blocked because npm Trusted Publishing is not configured and NPM_TOKEN is invalid.
+
+          This fallback prerelease contains an installable npm tarball for commit ${GITHUB_SHA}.
+
+          Install directly:
+
+          \`\`\`sh
+          npm install "https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/${PACKAGE_FILE}"
+          \`\`\`
+
+          This does not update the npm \`latest\` dist-tag. Configure npm Trusted Publishing for package \`@kryptosai/mcp-observatory\`, repository \`${GITHUB_REPOSITORY}\`, workflow \`release.yml\`, then rerun the release workflow for the canonical npm release.
+          EOF
+          gh release delete "$RELEASE_TAG" --yes --cleanup-tag || true
+          gh release create "$RELEASE_TAG" "$PACKAGE_FILE" \
+            --title "MCP Observatory fallback package ${FALLBACK_VERSION}" \
+            --notes-file "$body_file" \
+            --target "$GITHUB_SHA" \
+            --prerelease
+
+  homebrew-formula:
+    needs: release
+    permissions:
+      actions: write
+      contents: write
+      pull-requests: write
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 24
+
+      - name: Prepare Homebrew formula update
+        id: formula
+        run: |
+          set -euo pipefail
+          version="$(npm view @kryptosai/mcp-observatory version)"
+          node scripts/update-homebrew-formula.mjs "$version"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          if git diff --quiet -- Formula/mcp-observatory.rb; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Open protected Homebrew formula update
+        if: steps.formula.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          version="${{ steps.formula.outputs.version }}"
+          branch="automation/homebrew-formula-v${version}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$branch"
+          git add Formula/mcp-observatory.rb
+          git commit -m "chore(formula): bump Homebrew formula to v${version}"
+          gh auth setup-git
+          git push --force-with-lease origin "$branch"
+          pr_url="$(gh pr list --head "$branch" --state open --json url --jq '.[0].url // empty')"
+          if [ -z "$pr_url" ]; then
+            pr_url="$(gh pr create \
+              --base main \
+              --head "$branch" \
+              --title "chore(formula): bump Homebrew formula to v${version}" \
+              --body "Updates the Homebrew formula to the npm package published by the release workflow. This PR is used so the automated update follows main branch protection.")"
+          fi
+          echo "Homebrew formula update: ${pr_url}"
+          for workflow in ci.yml coverage.yml action-test.yml codeql.yml; do
+            gh workflow run "$workflow" --ref "$branch"
+          done

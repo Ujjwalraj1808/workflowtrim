@@ -1,0 +1,37 @@
+name: Update Rule Metadata
+run-name: Update Rule Metadata
+
+on:
+  workflow_dispatch:
+    inputs:
+      rule-api-version:
+        description: Version of the rule-api tooling to be used for the workflow.
+        type: string
+      branch:
+        description: Branch to run the check against and create the PR for.
+        type: string
+        default: 'master'
+      rspec-branch:
+        description: |
+          Branch of the rspec repository to be used.
+          If not specified, the 'master' branch of the rspec repository will be used.
+        type: string
+        default: 'master'
+  schedule:
+    - cron: '0 5 * * 1-5'
+
+jobs:
+  update-rule-metadata:
+    name: Update Rule Metadata
+    runs-on: sonar-xs-public
+    permissions:
+      id-token: write
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: SonarSource/release-github-actions/update-rule-metadata@v1
+        id: update-rule-metadata
+        with:
+          rule-api-version: ${{ github.event.inputs.rule-api-version}}
+          branch: ${{ github.event.inputs.branch }}
+          rspec-branch: ${{ github.event.inputs.rspec-branch }}

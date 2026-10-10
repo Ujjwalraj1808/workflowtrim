@@ -1,0 +1,125 @@
+name: release-adp-agent-retrieval
+
+on:
+  push:
+    tags:
+      - 'v*'
+    branches: ['**']
+    paths:
+      - 'comm-go/**'
+      - 'adp/context-loader/agent-retrieval/**'
+      - '.github/workflows/release-adp-agent-retrieval.yml'
+      - '.github/workflows/reusable-*.yml'
+      # 版本冻结提交（release/<x.y.z> 分支）触发全量重建
+      - 'VERSION'
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: 'Publish to GHCR (true) or verify build only (false)'
+        type: boolean
+        default: false
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  version:
+    uses: ./.github/workflows/reusable-version.yml
+
+  verify:
+    needs: version
+    uses: ./.github/workflows/reusable-release-verify.yml
+    with:
+      service-path: adp/context-loader/agent-retrieval
+      stack: chart-only
+
+  # 发布产物的构建配置断言。这类偏差不出现在任何 .go 的 diff 里，源码评审覆盖
+  # 不到，所以判据落在产物上。背景与判据依据见内部文档。
+  no-dev-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/setup-helm@v4
+
+      - name: Verify health probe chart rendering
+        run: bash adp/context-loader/agent-retrieval/scripts/test_health_probes_chart.sh
+
+      - uses: docker/setup-buildx-action@v3
+
+      # 只造 runner 原生架构这一份：跨架构产物在这条性质上没有差别，qemu 不值。
+      - name: Build the release image (native arch only)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: adp/context-loader/agent-retrieval/docker/Dockerfile
+          platforms: linux/amd64
+          load: true
+          push: false
+          provenance: false
+          sbom: false
+          tags: agent-retrieval:no-dev-gate-check
+          cache-from: type=gha,scope=agent-retrieval-no-dev-gate
+          cache-to: type=gha,mode=max,scope=agent-retrieval-no-dev-gate
+
+      - name: Assert the release build configuration
+        run: |
+          # 路径来自 docker/Dockerfile 的 WORKDIR 与 COPY。那边改了目录结构这里
+          # 会 docker cp 非零退出（报的是 docker 原话，不是下面的 ::error::）。
+          cid=$(docker create agent-retrieval:no-dev-gate-check)
+          docker cp "$cid:/app/agent-retrieval/agent-retrieval" ./agent-retrieval.bin
+          docker rm "$cid" >/dev/null
+
+          # 三条断言，防的是三件不同的事。
+
+          # 一、手法自检。抠错路径、grep 退出码 2（文件不可读）都会让下面的否定
+          # 断言静默放过。哨兵取两种构型下都在的字符串，所以它只证明「抠到了正确
+          # 的二进制、grep 真的跑了」。放在最前面是有意的。
+          if ! grep -aqF 'entitlement: SetGate after Freeze' ./agent-retrieval.bin; then
+            echo "::error::检查手法失效：预期必然存在的符号未命中，产物或判据已不成立。"
+            exit 1
+          fi
+
+          # 二、正向断言。否定断言锁的是「某个符号不在」，而那条判据是外挂约定：
+          # 符号改名、实现换成不读环境变量的形式，否定断言都会一路绿灯。这条改为
+          # 直接要求发布构型独有的符号必须在，判据便不再依赖那个约定。
+          if ! grep -aqF 'entitlement: licence hub unusable; running as community' ./agent-retrieval.bin; then
+            echo "::error::发布产物里没有发布构型独有的符号，构建配置不符合预期。"
+            echo "::error::检查 Dockerfile 与构建参数；判据依据见内部文档。"
+            exit 1
+          fi
+
+          # 三、否定断言。与上一条互补：正向那条防「该有的没有」，这条防「不该有
+          # 的混进来」。两条同时成立才算构型正确。
+          if grep -aqF 'OPENBKN_EDITION' ./agent-retrieval.bin; then
+            echo "::error::发布产物的构建配置不符合预期，检查 Dockerfile 与构建参数。"
+            echo "::error::判据依据见内部文档；不要通过放宽本断言来绕过。"
+            exit 1
+          fi
+
+          echo "OK"
+
+  build:
+    # no-dev-gate 必须是前置而不是并发：Actions 不会因为一个 job 红就取消并发中
+    # 的其它 job，所以并发意味着推 tag 时镜像已经进了 GHCR 与 SWR，断言才变红。
+    # 那是事后告警，不是闸门。代价是发布路径多串行一次带缓存的编译。
+    needs: [version, verify, no-dev-gate]
+    uses: ./.github/workflows/reusable-container-image.yml
+    secrets: inherit
+    with:
+      service-path: adp/context-loader/agent-retrieval
+      dockerfile: docker/Dockerfile
+      context: '../../..'
+      image-name: agent-retrieval
+      version: ${{ needs.version.outputs.version }}
+      publish: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish) }}
+
+  chart:
+    needs: [version, verify, build]
+    uses: ./.github/workflows/reusable-chart.yml
+    with:
+      service-path: adp/context-loader/agent-retrieval
+      chart-path: helm/agent-retrieval
+      chart-name: agent-retrieval
+      version: ${{ needs.version.outputs.version }}
+      publish: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish) }}

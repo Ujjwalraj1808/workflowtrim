@@ -1,0 +1,182 @@
+name: Benchmarks
+permissions: {}
+on:
+  schedule:
+    - cron: '0 0 * * 6'
+  workflow_dispatch: {}
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+env:
+  DEVELOCITY_ACCESS_KEY: ${{ secrets.DEVELOCITY_ACCESS_KEY }}
+  ALLOWED_ENDPOINTS: >-
+    api.adoptium.net:443
+    api.adoptopenjdk.net:443
+    api.foojay.io:443
+    api.github.com:443
+    auth.docker.io:443
+    caffeine.develocity.cloud:443
+    dl-cdn.alpinelinux.org:80
+    dl-cdn.alpinelinux.org:443
+    download.java.net:443
+    download.oracle.com:443
+    downloads.gradle.org:443
+    downloads.gradle-dn.com:443
+    dragonwell-jdk.io:443
+    gds.oracle.com:443
+    github.com:443
+    hosted-compute-watchdog-prod-eus-01.githubapp.com:443
+    maven-central.storage-download.googleapis.com:443
+    objects.githubusercontent.com:443
+    plugins.gradle.org:443
+    plugins-artifacts.gradle.org:443
+    production.cloudfront.docker.com:443
+    registry-1.docker.io:443
+    release-assets.githubusercontent.com:443
+    repo.maven.apache.org:443
+    repo1.maven.org:443
+    raw.githubusercontent.com:443
+    services.gradle.org:443
+    uploads.github.com:443
+    www.graalvm.org:443
+
+jobs:
+  benchmark:
+    name: ${{ matrix.benchmark.name }} (${{ matrix.jdk.distribution }} ${{ matrix.jdk.java }})
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        benchmark:
+          - name: Compute
+            pattern: ComputeBenchmark
+            params: computeType=Caffeine,Guava,ConcurrentHashMap
+            gist-title-prefix: compute_results
+            gist-description: Compute JMH Results
+            gist-url: https://gist.githubusercontent.com/ben-manes/511298014cc5629cbc5e57f09fd4c430
+          - name: Get/Put
+            pattern: GetPutBenchmark
+            params: cacheType=Caffeine,Guava,ConcurrentHashMap
+            gist-title-prefix: getput_results
+            gist-description: Get/Put JMH Results
+            gist-url: https://gist.githubusercontent.com/ben-manes/b231cf57cf8e144e2247716e777edcf3
+          - name: Put/Remove
+            pattern: PutRemoveBenchmark
+            params: cacheType=Caffeine,Guava,ConcurrentHashMap
+            gist-title-prefix: putremove_results
+            gist-description: Put/Remove JMH Results
+            gist-url: https://gist.githubusercontent.com/ben-manes/1359c399cb717e81976ee635c513340b
+          - name: Eviction
+            pattern: EvictionBenchmark
+            params: cacheType=Caffeine,Guava
+            gist-title-prefix: eviction_results
+            gist-description: Eviction JMH Results
+            gist-url: https://gist.githubusercontent.com/ben-manes/2f5b54540c2e67edc0d1a7f28a1139f5
+          - name: FrequencySketch
+            pattern: FrequencySketchBenchmark
+            params: ''
+            gist-title-prefix: freq_results
+            gist-description: FrequencySketch JMH Results
+            gist-url: https://gist.githubusercontent.com/ben-manes/f93df1b66aa210bc23a1e672ef9bee16
+          - name: TimerWheel
+            pattern: TimerWheelBenchmark
+            params: ''
+            gist-title-prefix: timerwheel_results
+            gist-description: TimerWheel JMH Results
+            gist-url: https://gist.githubusercontent.com/ben-manes/9abafdbc76fe34c0e63cef386b0b9ac0
+          - name: HotEntry
+            pattern: HotEntryBenchmark
+            params: ''
+            gist-title-prefix: 'hotentry_results'
+            gist-description: 'HotEntry JMH Results'
+            gist-url: 'https://gist.githubusercontent.com/ben-manes/ce914bff9f87030ba395b0c1c8e927f6'
+        jdk:
+          - java: 11
+            distribution: temurin
+          - java: 26
+            distribution: temurin
+          - java: 28-ea
+            distribution: temurin
+          - java: 25
+            distribution: graalvm
+          - java: 26
+            distribution: semeru
+          - java: 25
+            distribution: dragonwell
+    env:
+      JAVA_VERSION: ${{ matrix.jdk.java }}
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          disable-sudo: true
+          egress-policy: block
+          allowed-endpoints: ${{ env.ALLOWED_ENDPOINTS }}
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Run ${{ matrix.benchmark.name }} benchmark
+        uses: $/.github/actions/run-benchmark
+        with:
+          name: ${{ matrix.benchmark.name }}
+          params: ${{ matrix.benchmark.params }}
+          pattern: ${{ matrix.benchmark.pattern }}
+          java: ${{ matrix.jdk.java }}
+          distribution: ${{ matrix.jdk.distribution }}
+          gist-auth: ${{ secrets.GIST_TOKEN }}
+          gist-url: ${{ matrix.benchmark.gist-url }}
+          gist-title-prefix: ${{ matrix.benchmark.gist-title-prefix }}
+          gist-description: ${{ matrix.benchmark.gist-description }}
+          cache-encryption-key: ${{ secrets.GRADLE_ENCRYPTION_KEY }}
+
+  publish:
+    name: Publish
+    needs: benchmark
+    runs-on: ubuntu-latest
+    if: github.event.repository.fork == false
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          disable-sudo-and-containers: true
+          egress-policy: block
+          allowed-endpoints: ${{ env.ALLOWED_ENDPOINTS }}
+      - name: Publish JMH benchmarks
+        run: |
+          {
+            echo '#### [Compute](https://jmh.morethan.io/?gists=511298014cc5629cbc5e57f09fd4c430)'
+            echo -n 'This benchmark that evaluates the overhead due to locking when the entry is '
+            echo -n 'present. The scenarios graphed are all threads retrieving a single entry '
+            echo -n '("sameKey") and threads retrieving different keys based on a Zipf '
+            echo -n 'distribution ("spread").'
+            echo -e '\n'
+            echo '#### [Get/Put](https://jmh.morethan.io/?gists=b231cf57cf8e144e2247716e777edcf3)'
+            echo -n 'A benchmark that evaluates the read/write performance of a cache. The cache '
+            echo -n 'is prepopulated for a 100% hit rate and a Zipf distribution of keys is used '
+            echo -n 'to mimic application usage patterns.'
+            echo -e '\n'
+            echo '#### [Put/Remove](https://jmh.morethan.io/?gists=1359c399cb717e81976ee635c513340b)'
+            echo -n 'A benchmark that evaluates the insert/update/remove performance of a cache. '
+            echo -n 'A Zipf distribution of keys is used but it is unpredictable if the entry is '
+            echo -n 'present given the competing operations.'
+            echo -e '\n'
+            echo '#### [Eviction](https://jmh.morethan.io/?gists=2f5b54540c2e67edc0d1a7f28a1139f5)'
+            echo -n 'A benchmark that evaluates the evictions rate by always inserting a new entry.'
+            echo -e '\n'
+            echo '#### [FrequencySketch](https://jmh.morethan.io/?gists=f93df1b66aa210bc23a1e672ef9bee16)'
+            echo -n 'A benchmark that evaluates the performance of a frequency sketch for use by '
+            echo -n 'size eviction.'
+            echo -e '\n'
+            echo '#### [TimerWheel](https://jmh.morethan.io/?gists=9abafdbc76fe34c0e63cef386b0b9ac0)'
+            echo -n 'A benchmark that evaluates the performance of the timer wheel for use by '
+            echo -n 'variable expiration.'
+            echo -e '\n'
+            echo '#### [HotEntry](https://jmh.morethan.io/?gists=ce914bff9f87030ba395b0c1c8e927f6)'
+            echo -n 'A benchmark that evaluates the performance of a hot entry.'
+            echo -e '\n'
+            echo -e '---'
+            echo -e "See the attached flame graphs for profiler's visualizations of the hot methods."
+          } >> $GITHUB_STEP_SUMMARY

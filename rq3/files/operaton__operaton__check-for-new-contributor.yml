@@ -1,0 +1,233 @@
+# HEADS-UP: pull_request_target runs in the context of the base repository and target branch and has access to secrets.
+name: First-time Contributor Check
+
+on:  # zizmor: ignore[dangerous-triggers] pull_request_target: metadata reads and issue/PR comments only, never checks out or executes PR head content
+  pull_request_target:
+    types: [opened]
+  issues:
+    types: [opened]
+  issue_comment:
+    types: [created]
+
+env:
+  # Whitelist of GitHub usernames who have already contributed to the repository
+  # These users will not receive first-time contributor greetings
+  # This list can be generated with:
+  # gh pr list --repo operaton/operaton --state closed --limit 1504 --json author --jq '[.[].author.login] | unique'
+  CONTRIBUTOR_WHITELIST: 'AlexanderSkrock AlexandraCiornei ArneDeutsch Brijeshthummar02 CBorowski-dev DzyhovskyiVladyslav ENate FlamieCyrex HamzaIddaoui HarshMehta112 HerrIves Jaehyeon-Han Kungi LimpBizgit MatthewIsayan Mojito060 Rapteon Satyam018 SevDan Tomnm1 Waize WoSchmo YUVI43 a-m-zill aashvgit abhayiscoding abmcmanu agoss94 ahmedfarhat alexh141048 alfh antoinecampbell aounhaider1 app/copilot-swe-agent app/dependabot app/github-actions asanderson-scottlogic ascheman atomfrede biswa1shaw cachescrubber cmoellerherm damien46061 datakurre dirk-olmes fml2 geduldia guido-marx hauptmedia herminagarg javahippie jmaster1985 joonseolee juliateles99 justfsl50 khawaja-abdullah kthoms lambdaschmied2 larsbaumeister lucabritten maxistar n1sp nevesrodrigo2 noahg9 poojary-nikesh1612 sanajitjana saumyapandey1998 sgorski00 sgort shiftyseaotter sogladev suraj9562 timtebeek tlb-lemrabott ungerts xProppi zeguilherme99'
+
+jobs:
+  greet-first-time-pr:
+    name: Greet First-Time PR Contributors
+    runs-on: ubuntu-slim
+    permissions:
+      contents: read
+      issues: read           # listForRepo only; the greeting goes on a PR
+      pull-requests: write   # commenting on a PR needs this, issues: write is not enough
+    # This job intentionally uses pull_request_target only for metadata reads and comments.
+    # Do not check out or execute PR code here.
+    # Only run for PRs from forks (different repository) and not from operaton/operaton
+    if: |
+      github.event_name == 'pull_request_target' && 
+      github.event.action == 'opened' && 
+      github.event.pull_request.head.repo.full_name != github.repository
+    steps:
+      - name: Check for first-time PR contributor
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const author = context.actor;
+            const { owner, repo } = context.repo;
+            const prTitle = context.payload.pull_request.title;
+            const prBody = context.payload.pull_request.body || "";
+
+            // Check if author is in the whitelist
+            const whitelist = (process.env.CONTRIBUTOR_WHITELIST || '')
+              .split(/\s+/)
+              .filter(Boolean);
+            if (whitelist.includes(author)) {
+              console.log(`${author} is in the contributor whitelist. Skipping greeting.`);
+              return;
+            }
+
+            console.log(`Checking for past PRs from ${author}...`);
+            const allIssues = await github.paginate(github.rest.issues.listForRepo, {
+              owner,
+              repo,
+              creator: author,
+              state: 'all'
+            });
+
+            const currentPrNumber = context.payload.pull_request.number;
+            const priorPrs = allIssues.filter(issue => issue.pull_request && issue.number !== currentPrNumber);
+            const priorPrCount = priorPrs.length;
+
+            console.log(`Found ${priorPrCount} prior PR(s) from ${author}.`);
+
+            const alreadyConfirmed =
+              /I\s+confirm/i.test(prBody) &&
+              /Apache\s+License\s*2\.0/i.test(prBody) &&
+              /Code\s+of\s+Conduct/i.test(prBody);
+
+            if ((priorPrCount === 0 || prTitle.includes('[FORCE GREETING]')) && !alreadyConfirmed) {
+              const { data } = await github.rest.repos.getContent({
+                owner,
+                repo,
+                path: '.github/templates/pr_welcome.md'
+              });
+              
+              let prMessage = Buffer.from(data.content, 'base64').toString('utf8');
+              prMessage = prMessage.replace(/\$\{author\}/g, author);
+
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number: context.issue.number,
+                body: prMessage
+              });
+            } else if (alreadyConfirmed) {
+              console.log("Contributor already confirmed license + CoC. Skipping greeting.");
+            }
+
+  greet-first-time-issue:
+    name: Greet First-Time Issue Creators
+    runs-on: ubuntu-slim
+    permissions:
+      contents: read
+      issues: write
+    if: |
+      github.event_name == 'issues' && 
+      github.event.action == 'opened'
+    steps:
+      - name: Check for first-time Issue creator
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const author = context.actor;
+            const { owner, repo } = context.repo;
+            const issueTitle = context.payload.issue.title;
+
+            // Check if author is in the whitelist
+            const whitelist = (process.env.CONTRIBUTOR_WHITELIST || '')
+              .split(/\s+/)
+              .filter(Boolean);
+            if (whitelist.includes(author)) {
+              console.log(`${author} is in the contributor whitelist. Skipping greeting.`);
+              return;
+            }
+
+            console.log(`Checking for past Issues from ${author}...`);
+            const allIssues = await github.paginate(github.rest.issues.listForRepo, {
+              owner,
+              repo,
+              creator: author,
+              state: 'all'
+            });
+
+            const currentIssueNumber = context.payload.issue.number;
+            const priorIssues = allIssues.filter(issue => !issue.pull_request && issue.number !== currentIssueNumber);
+            const priorIssueCount = priorIssues.length;
+
+            console.log(`Found ${priorIssueCount} prior Issue(s) from ${author}.`);
+
+            if (priorIssueCount === 0 || issueTitle.includes('[FORCE GREETING]')) {
+              const { data } = await github.rest.repos.getContent({
+                owner,
+                repo,
+                path: '.github/templates/issue_welcome.md'
+              });
+              
+              let issueMessage = Buffer.from(data.content, 'base64').toString('utf8');
+              issueMessage = issueMessage.replace(/\$\{author\}/g, author);
+
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number: context.issue.number,
+                body: issueMessage
+              });
+            }
+
+  greet-first-time-comment:
+    name: Greet First-Time Issue Commenters
+    runs-on: ubuntu-slim
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write   # this job also comments on PRs (issue_comment fires for both)
+    if: |
+      github.event_name == 'issue_comment' && 
+      github.event.action == 'created'
+    steps:
+      - uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const author = context.actor;
+            const { owner, repo } = context.repo;
+            const commentBody = context.payload.comment.body;
+            
+            // Check if author is in the whitelist
+            const whitelist = (process.env.CONTRIBUTOR_WHITELIST || '')
+              .split(/\s+/)
+              .filter(Boolean);
+            if (whitelist.includes(author)) {
+              console.log(`${author} is in the contributor whitelist. Skipping greeting.`);
+              return;
+            }
+            
+            const issueAuthor = context.payload.issue.user.login;
+            const isPullRequest = !!context.payload.issue.pull_request;
+            
+            // Skip if the author is commenting on their own issue/PR
+            if (author === issueAuthor) {
+              console.log(`${author} is the author of this issue/PR. Skipping greeting.`);
+              return;
+            }
+            
+            // Skip if this is a PR and the commenter has already opened a PR
+            // (they would have already been greeted in their PR)
+            if (isPullRequest) {
+              console.log(`Checking if ${author} has opened PRs before...`);
+              const allIssues = await github.paginate(github.rest.issues.listForRepo, {
+                owner,
+                repo,
+                creator: author,
+                state: 'all'
+              });
+              
+              const prs = allIssues.filter(issue => issue.pull_request);
+              if (prs.length > 0) {
+                console.log(`${author} has already opened ${prs.length} PR(s). Skipping comment greeting to avoid double posting.`);
+                return;
+              }
+            }
+            
+            console.log(`Checking for past comments from ${author}...`);
+            const allComments = await github.paginate(github.rest.issues.listCommentsForRepo, {
+              owner,
+              repo
+            });
+            
+            const currentCommentId = context.payload.comment.id;
+            const priorComments = allComments.filter(c => c.user.login === author && c.id !== currentCommentId);
+            const priorCommentCount = priorComments.length;
+
+            console.log(`Found ${priorCommentCount} prior comment(s) from ${author}.`);
+
+            if (priorCommentCount === 0 || commentBody.includes('[FORCE GREETING]')) {
+              const { data } = await github.rest.repos.getContent({
+                owner,
+                repo,
+                path: '.github/templates/first_comment_on_issue.md'
+              });
+              
+              let commentMessage = Buffer.from(data.content, 'base64').toString('utf8');
+              commentMessage = commentMessage.replace(/\$\{author\}/g, author);
+            
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number: context.issue.number,
+                body: commentMessage
+              });
+            }

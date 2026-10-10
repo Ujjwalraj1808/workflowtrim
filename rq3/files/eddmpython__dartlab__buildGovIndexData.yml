@@ -1,0 +1,83 @@
+name: Gov Index Sync (Bulk)
+
+# engines.gather — 공공데이터포털(data.go.kr) 일별 전 시장군 지수 → HF dataset publish.
+# 출력: gov/indices/date/{YYYY}.parquet (전지수 횡단) + gov/indices/index/{key}.parquet (지수별).
+# 엔진(benchmarkMap·macro)은 이 결과를 hfIndexBulk.loadFiltered(category=govIndices)로 소비.
+
+on:
+  schedule:
+    # 주가와 동일 — gov 는 각 거래일치를 '다음 영업일' 오후 발행, 신규 데이터는 평일에만 나온다
+    # (월=금요일치 … 금=목요일치, 토·일 발행 없음). fetch 슬롯 = gov 발행일과 동일한 월~금(1-5) +
+    # --lookback 4. ⚠ 옛 '1-5=금요일 영구누락'은 lookback=1 artifact — lookback 4 에선 월요일 run 이
+    # 금요일치를 수집하므로 1-5 완전. 화~토(2-6)은 월요일 사각지대+무의미한 토요일 fetch (2026-06-14 정정).
+    # 하루 2회(오후+저녁): 13시가 직전 거래일 전지수 1차 확보, 20시는 backstop+lookback. (2026-06-11 오전→13시)
+    - cron: '20 4  * * 1-5'  # KST 13:20 월~금 (UTC 04:20) — gov 갓 발행분(직전 거래일 전지수) 1차 수집
+    - cron: '20 11 * * 1-5'  # KST 20:20 월~금 (UTC 11:20) — backstop (lookback catch-up)
+  workflow_dispatch:
+    inputs:
+      basDt:
+        description: '기준일자 YYYYMMDD (기본 어제)'
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    # job 레벨 concurrency 를 쓴다. 워크플로 레벨은 run 생성 즉시 큐를 점유하고, GitHub 은
+    # 그룹당 pending 을 1 개만 유지해 새 트리거가 오면 기존 pending 을 취소한다
+    # (cancel-in-progress 와 무관한 기본 동작). 2026-08 hf-dart-push 에서 대기 중이던 run
+    # 8 건이 job 0 개인 채 취소됐다. 같은 그룹을 2 개 이상이 공유하면 같은 위험을 진다.
+    concurrency:
+      group: hf-dataset-push
+      cancel-in-progress: false
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Restore gov index parquet cache
+        uses: actions/cache/restore@v5
+        with:
+          path: data/gov/indices
+          key: dartlab-gov-indices-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: dartlab-gov-indices-
+
+      - name: Build gov index parquet + push to HF
+        env:
+          DATA_GO_KR_KEY: ${{ secrets.DATA_GO_KR_KEY }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          # 9회 = 대기 257초(govApi._GOV_BACKOFF_SECONDS) + connect 10초 x 9, 약 6분 연결 불통을 버틴다.
+          DARTLAB_GOV_RETRY_ATTEMPTS: "9"
+          DARTLAB_GOV_RETRY_MAX_SINGLE_WAIT_SECONDS: "60"
+          DARTLAB_HF_RETRY_ATTEMPTS: "5"
+          DARTLAB_HF_RETRY_MAX_SINGLE_WAIT_SECONDS: "300"
+        run: uv run python -X utf8 .github/scripts/sync/buildGovData.py --daily-index --lookback 4 ${{ github.event.inputs.basDt && format('--basDt {0}', github.event.inputs.basDt) || '' }}
+
+      - name: Save gov index parquet cache
+        uses: actions/cache/save@v5
+        if: always()
+        with:
+          path: data/gov/indices
+          key: dartlab-gov-indices-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "## Gov Index Sync (Bulk)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| 항목 | 값 |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Trigger | ${{ github.event_name }} ${{ github.event.schedule }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| HF dataset | \`eddmpython/dartlab-data/gov/indices\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| 출력 | \`gov/indices/date/{YYYY}.parquet\` + \`gov/indices/index/{key}.parquet\` |" >> $GITHUB_STEP_SUMMARY

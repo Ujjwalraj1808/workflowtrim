@@ -1,0 +1,163 @@
+name: iOS build
+
+# Verifies the iOS app, widget, and Share Extension still compile after web or
+# native changes, runs the Day Dial geometry package's tests on the runner,
+# and runs the widget extension's unit tests on a simulator. No code signing,
+# no device, no upload (ci.yml is Linux-only and never touches Swift).
+#
+# Runs on macOS (Xcode is macOS-only). Scoped to changes that can affect the iOS
+# build so ordinary web-only PRs don't spend a macOS runner. Note the Xcode
+# project is NOT committed — XcodeGen generates it from dayglance-ios/project.yml
+# on every run, so this builds exactly what that file declares.
+
+# Pushes build on main only; every other branch is built by its pull request.
+# Before this, a push to a PR branch and the PR's own trigger each started a
+# fifteen-minute macOS build of the same commit, and the runner cancelled one.
+# A newer push to the same PR cancels the build of the commit it replaced;
+# main runs are never cancelled.
+concurrency:
+  group: ios-${{ github.head_ref || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'dayglance-ios/**'
+      - 'src/**'
+      - 'public/**'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'vite.config.ios.js'
+      - 'scripts/gen-ios-project.sh'
+      - '.github/workflows/ios.yml'
+  pull_request:
+    paths:
+      - 'dayglance-ios/**'
+      - 'src/**'
+      - 'public/**'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'vite.config.ios.js'
+      - 'scripts/gen-ios-project.sh'
+      - '.github/workflows/ios.yml'
+  workflow_dispatch:
+
+jobs:
+  build:
+    # macos-15 for a recent Xcode: DayGlanceWidget targets iOS 17.0, above the
+    # app's and the Share Extension's 16.0.
+    runs-on: macos-15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select latest Xcode
+        run: sudo xcode-select -s "$(ls -d /Applications/Xcode_*.app | sort -V | tail -1)"
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      # The Day Dial geometry package has its own XCTest target that loads
+      # dayglance-ios/TestFixtures/dayDial.vectors.json and asserts every
+      # case against the Swift port. `swift test` runs it on the runner
+      # itself — no simulator — so this step RUNS tests where the xcodebuild
+      # step below only compiles. A green iOS build check therefore means:
+      # the app, widget and share extension compile, AND the geometry
+      # vectors pass.
+      - name: Run DayDialGeometry vector tests
+        run: swift test --package-path dayglance-ios/Packages/DayDialGeometry
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      # npm run ios = build:ios (vite → dayglance-ios/DayGlance/Resources/web)
+      # then ios:generate (scripts/gen-ios-project.sh → DayGlance.xcodeproj).
+      # BUILD_NUMBER is pinned so CI doesn't depend on the wall clock.
+      # DIAL_PREVIEW compiles the Day Dial preview widget into this CI build
+      # so its code is checked with everything else; a release build never
+      # sets the flag (project.yml), so it is not in what ships.
+      - name: Build web assets and generate Xcode project
+        run: npm run ios
+        env:
+          BUILD_NUMBER: '0.0'
+          DG_WIDGET_FLAGS: DIAL_PREVIEW
+
+      # The project's Copy Web Assets phase only *errors* on a Release build; on
+      # Debug it just warns. Without this check a green Debug build could still
+      # be packaging an app with no web content at all.
+      - name: Verify web assets were produced
+        run: |
+          ASSETS="dayglance-ios/DayGlance/Resources/web/index.html"
+          if [ ! -f "$ASSETS" ]; then
+            echo "::error::Web assets missing at $ASSETS — 'npm run build:ios' produced no index.html."
+            exit 1
+          fi
+          echo "Web assets present: $ASSETS"
+
+      # One scheme covers all three targets: project.yml declares DayGlance with
+      # `targets: DayGlance: all`, and the widget and Share Extension are embedded
+      # dependencies of the app.
+      - name: Build iOS app (no signing)
+        run: |
+          xcodebuild build \
+            -project dayglance-ios/DayGlance.xcodeproj \
+            -scheme DayGlance \
+            -configuration Debug \
+            -destination 'generic/platform=iOS Simulator' \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO
+
+      # The widget extension's own unit tests (dayglance-ios/DayGlanceWidgetTests):
+      # the live-shaped snapshot fixture, written by `npm run ios:vectors` from
+      # the real JS producers, through the widget's decoder, day resolution and
+      # face mapping, then a real ImageRenderer pass with the sky ring sampled.
+      # These need a simulator, so the device is whichever iPhone the selected
+      # Xcode ships on its newest iOS runtime, by udid (a name alone is
+      # ambiguous across runtimes).
+      - name: Run DayGlanceWidget tests (simulator)
+        run: |
+          UDID=$(xcrun simctl list devices available -j | python3 -c '
+          import json, sys
+          devices = json.load(sys.stdin)["devices"]
+          runtimes = sorted(r for r in devices if ".iOS-" in r)
+          for r in reversed(runtimes):
+              phones = [d for d in devices[r] if d["name"].startswith("iPhone")]
+              if phones:
+                  print(phones[-1]["udid"]); print(r, phones[-1]["name"], file=sys.stderr); break
+          ')
+          if [ -z "$UDID" ]; then echo "::error::no available iPhone simulator on this runner"; exit 1; fi
+          xcodebuild test \
+            -project dayglance-ios/DayGlance.xcodeproj \
+            -scheme DayGlanceWidgetTests \
+            -configuration Debug \
+            -destination "platform=iOS Simulator,id=$UDID" \
+            -resultBundlePath "$RUNNER_TEMP/widget-tests.xcresult" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO
+
+      # The widget tests attach rendered screenshots (the month grid at the
+      # smallest and largest systemLarge sizes, crowded and stale states) to
+      # the result bundle; export them as a downloadable artifact, pass or fail.
+      - name: Export widget screenshots
+        if: always()
+        run: |
+          mkdir -p "$RUNNER_TEMP/widget-shots"
+          if [ -d "$RUNNER_TEMP/widget-tests.xcresult" ]; then
+            xcrun xcresulttool export attachments \
+              --path "$RUNNER_TEMP/widget-tests.xcresult" \
+              --output-path "$RUNNER_TEMP/widget-shots" || echo "::warning::could not export attachments"
+          fi
+          ls -la "$RUNNER_TEMP/widget-shots"
+
+      - name: Upload widget screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: widget-screenshots
+          path: ${{ runner.temp }}/widget-shots
+          if-no-files-found: ignore

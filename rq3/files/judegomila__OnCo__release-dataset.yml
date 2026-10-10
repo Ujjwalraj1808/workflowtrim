@@ -1,0 +1,113 @@
+name: Release corpus
+
+# On a version tag (v0.5.0), validate and build the corpus, attach the API bundle to a GitHub release, and, when
+# a ZENODO_TOKEN secret is present, deposit the same files on Zenodo for a DOI. Without the token the Zenodo step
+# is skipped; once the owner has linked the repository at https://zenodo.org/account/settings/github/ the
+# GitHub-Zenodo integration archives every release on its own, reading .zenodo.json and CITATION.cff, and
+# issues a DOI per release plus one concept DOI for all versions. See docs/DISTRIBUTION.md, "Zenodo".
+#
+# To cut a release: bump "version" in package.json and CITATION.cff, move the Unreleased notes in CHANGELOG.md
+# under the new heading, commit, then `git tag v0.5.0 && git push origin v0.5.0`. Manual runs (workflow_dispatch)
+# build a dated snapshot as a workflow artefact without creating a release.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run validate
+      # Match CI and the ship chain, including tests with an explicit whole-page render guard.
+      - run: npx vitest run --testTimeout=600000 --hookTimeout=600000
+        env:
+          SLOW_TEST_MS: 600000
+      - name: Build the corpus files and feeds
+        run: npm run build:api
+      - name: Package
+        id: pkg
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          if [ "${GITHUB_REF_TYPE}" != "tag" ]; then TAG="snapshot-$(date -u +%Y%m%d)-${GITHUB_SHA::7}"; fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          mkdir -p dist
+          tar -C public/api -czf "dist/onco-corpus-$TAG.tar.gz" v1
+          (cd public/api/v1 && zip -q -r "../../../dist/onco-corpus-$TAG-csv.zip" ./*.csv schema.json meta.json openapi.json)
+          cp public/api/v1/all.json "dist/onco-all-$TAG.json"
+          cp public/api/v1/all.ndjson "dist/onco-all-$TAG.ndjson"
+          cp public/api/v1/schema.json "dist/onco-schema-$TAG.json"
+          cp public/api/v1/openapi.json "dist/onco-openapi-$TAG.json"
+          cp public/api/v1/meta.json "dist/onco-meta-$TAG.json"
+          cp public/llms.txt "dist/onco-llms-$TAG.txt"
+          cp public/llms-full.txt "dist/onco-llms-full-$TAG.txt"
+          cp CITATION.cff LICENSE-DATA dist/
+          (cd dist && sha256sum ./* > SHA256SUMS)
+          TOTAL=$(node -e "console.log(require('./public/api/v1/meta.json').total)")
+          COUNTS=$(node -e "const c=require('./public/api/v1/meta.json').counts; console.log(Object.entries(c).map(([k,v])=>k+': '+v).join(', '))")
+          {
+            echo "OnCo corpus $TAG: $TOTAL entities ($COUNTS)."
+            echo
+            echo "Files: full JSON tree with Markdown context files (tar.gz), CSV per kind plus schema and OpenAPI (zip), all.json, all.ndjson, schema.json, openapi.json, meta.json, llms.txt, llms-full.txt, CITATION.cff, LICENSE-DATA, SHA256SUMS."
+            echo "Data CC BY-NC 4.0, attribute \"Data from OnCo (onco.cc)\"; free for individual and educational use, commercial use must contact OnCo to pay for the data. Code MIT. Facts may be incomplete or out of date; verify at the primary source. Not medical advice."
+            echo
+            echo "Cite: https://github.com/${GITHUB_REPOSITORY}/blob/main/CITATION.cff"
+            echo
+            echo "Changelog: https://github.com/${GITHUB_REPOSITORY}/blob/main/CHANGELOG.md"
+          } > dist-notes.md
+      - name: GitHub release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.pkg.outputs.tag }}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" dist/* --title "OnCo corpus $TAG" --notes-file dist-notes.md --verify-tag
+          fi
+      - name: Snapshot artefact (manual runs)
+        if: github.ref_type != 'tag'
+        uses: actions/upload-artifact@v4
+        with:
+          name: onco-corpus-${{ steps.pkg.outputs.tag }}
+          path: dist/
+          retention-days: 30
+      - name: Zenodo deposit (skipped without ZENODO_TOKEN)
+        if: github.ref_type == 'tag'
+        env:
+          ZENODO_TOKEN: ${{ secrets.ZENODO_TOKEN }}
+          ZENODO_API: https://zenodo.org/api
+        run: |
+          set -euo pipefail
+          if [ -z "${ZENODO_TOKEN:-}" ]; then echo "No ZENODO_TOKEN secret; skipping direct deposit. Enable the GitHub-Zenodo integration or add the secret."; exit 0; fi
+          TAG="${{ steps.pkg.outputs.tag }}"
+          META=$(node -e "
+            const z = require('./.zenodo.json');
+            z.version = process.argv[1].replace(/^v/, '');
+            z.publication_date = new Date().toISOString().slice(0, 10);
+            z.related_identifiers = [...(z.related_identifiers || []), { identifier: 'https://github.com/' + process.env.GITHUB_REPOSITORY + '/releases/tag/' + process.argv[1], relation: 'isIdenticalTo', resource_type: 'dataset', scheme: 'url' }];
+            console.log(JSON.stringify({ metadata: z }));
+          " "$TAG")
+          DEP=$(curl -sS -f -H "Authorization: Bearer $ZENODO_TOKEN" -H "Content-Type: application/json" -d "$META" "$ZENODO_API/deposit/depositions")
+          ID=$(echo "$DEP" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>console.log(JSON.parse(s).id))")
+          BUCKET=$(echo "$DEP" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>console.log(JSON.parse(s).links.bucket))")
+          for f in dist/*; do
+            curl -sS -f -H "Authorization: Bearer $ZENODO_TOKEN" --upload-file "$f" "$BUCKET/$(basename "$f")" >/dev/null
+          done
+          PUB=$(curl -sS -f -X POST -H "Authorization: Bearer $ZENODO_TOKEN" "$ZENODO_API/deposit/depositions/$ID/actions/publish")
+          echo "$PUB" | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{const j=JSON.parse(s);console.log('DOI: '+j.doi);console.log('Record: '+(j.links&&j.links.record_html))})"

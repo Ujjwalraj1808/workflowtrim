@@ -1,0 +1,70 @@
+name: Tag (Reusable Workflow)
+
+on:
+  workflow_call:
+    inputs:
+      tag_name:
+        type: string
+        description: 'Tag name, e.g. 1.0.0'
+        required: true
+      tag_message:
+        type: string
+        description: 'Tag message (optional), e.g. "Release version 1.0.0"'
+        default: ''
+      override_tag:
+        type: boolean
+        description: 'If to override the tag if already exists'
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      # should work with actions/checkout@v6 with fetch-tags: true, BUT it doesn't work as expected!
+      # See https://github.com/actions/checkout/issues/1471.
+      # So we do workaround by manually fetching tags.
+      - name: Workaround of actions/checkout@v6 fetch-tags true doesn't work
+        run: git fetch --tags
+
+      - name: Create Tag ${{ inputs.tag_name }}
+        run: |
+          git config --local user.name "github-actions[bot]"
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          
+          if git rev-parse ${TAG_NAME} >/dev/null 2>&1; then
+            echo "Tag ${TAG_NAME} already exists"
+            if [ "${{ inputs.override_tag }}" == "true" ]; then
+              echo "Override is set to true, so moving the tag ..."
+              # delete the existing tag locally and remotely
+              git tag -d ${TAG_NAME}
+              git push origin :refs/tags/${TAG_NAME}
+              # create a new tag with the same name
+              if [ -n "${TAG_MESSAGE}" ]; then
+                git tag -a ${TAG_NAME} -m "${TAG_MESSAGE}"
+              else
+                git tag -a ${TAG_NAME}
+              fi
+              git push origin ${TAG_NAME}
+              echo "Tag ${TAG_NAME} moved." 
+            else
+              echo "Override is set to false, so do nothing."
+            fi
+          else
+            echo "Creating a tag ${TAG_NAME} ..."
+            if [ -n "${TAG_MESSAGE}" ]; then
+              git tag -a ${TAG_NAME} -m "${TAG_MESSAGE}"
+            else
+              git tag -a ${TAG_NAME}
+            fi
+            git push origin ${TAG_NAME}
+            echo "Tag ${TAG_NAME} created."
+          fi
+        env:
+          TAG_NAME: ${{ inputs.tag_name }}
+          TAG_MESSAGE: ${{ inputs.tag_message }}

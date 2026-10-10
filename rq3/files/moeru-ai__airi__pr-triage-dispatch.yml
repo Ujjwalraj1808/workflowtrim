@@ -1,0 +1,30 @@
+name: Issue and PR Triage Dispatch
+
+on:
+  pull_request_target:
+    types: [opened, reopened, edited, synchronize, ready_for_review, converted_to_draft]
+  issues:
+    types: [opened, reopened, edited, typed, untyped]
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  dispatch:
+    name: Dispatch Category Triage
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dispatch Copilot category workflow
+        uses: actions/github-script@v8
+        with:
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'copilot-labels.yml',
+              ref: context.payload.repository.default_branch,
+              inputs: {
+                item_number: String(context.payload.pull_request?.number ?? context.payload.issue.number),
+              },
+            });

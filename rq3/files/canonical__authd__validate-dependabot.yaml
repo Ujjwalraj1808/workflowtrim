@@ -1,0 +1,20 @@
+name: dependabot validate
+
+on:
+  pull_request:
+    paths:
+      - '.github/dependabot.yml'
+      - '.github/workflows/validate-dependabot.yaml'
+
+jobs:
+  validate:
+    runs-on: ubuntu-26.04 # ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - uses: marocchino/validate-dependabot@v3
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true

@@ -1,0 +1,924 @@
+name: CFn schema fixture refresh
+
+# Watches whether `tests/fixtures/cfn-schemas/*.json` is still current with what
+# AWS publishes (issue https://github.com/go-to-k/cdkd/issues/2718).
+#
+# WHY THIS EXISTS. `ProviderRegistry.getProviderFor` decides SDK-vs-Cloud-Control
+# from `src/provisioning/property-coverage.generated.ts`, which is derived
+# OFFLINE from those fixtures — there is no runtime `DescribeType` on the routing
+# path. A top-level property AWS publishes after the snapshot is in no fixture;
+# it routes through Cloud Control as an unrecognized property (issue #3713), so
+# it reaches AWS, but cdkd cannot hand it to an SDK provider or apply its
+# create-only / nested-required data until the fixture lands. Before this job
+# nothing in the repo watched for that: no workflow had a
+# `schedule:` trigger, and `scripts/refresh-cfn-schemas.mjs` needed credentials
+# and a human remembering to run it.
+#
+# NO AWS IDENTITY IS INVOLVED. The refresh reads AWS's PUBLIC schema bundle
+# (`--from-zip`), measured 2026-09-07 at 1729 type schemas and byte-identical to
+# the authenticated `DescribeType` capture on every probed type. Dropping that
+# prerequisite is what made an unattended job adoptable at all — provisioning a
+# CI role was the cost that kept this unbuilt.
+#
+# ACCEPTED RESIDUAL: that bundle cannot be pinned by content. AWS publishes no
+# checksum or signature for it, so TLS plus the origin host is the whole trust
+# story (the fetch uses `redirect: 'error'` and a size cap for that reason).
+# The poisoning that would survive the mechanical chain is subtle: moving a
+# WRITABLE property into `readOnlyProperties` makes `gen-property-coverage.ts`
+# omit it from `silentDrop`, so the resource stays on the SDK route and the
+# property is dropped for every user of the next release — and no human reading
+# a 132-file machine-generated JSON diff would catch one moved array element.
+# Two things bound it: compromising AWS's CDN or TLS is the price of entry, and
+# a property in neither `handled` nor `silentDrop` is exactly what
+# `reportUnrecognizedProperties` warns about at deploy time, so that specific
+# shape is the one this PR's other half already surfaces to the user.
+#
+# DAILY. An earlier revision ran monthly, reasoning that measured drift is only
+# ~3 writable properties per month so a tighter cycle would pay a full fixed
+# cost for a fraction of a property. That reasoning was wrong about where the
+# cost actually falls:
+#
+#   * a day with no drift opens NO PR — the job stops at the drift step, so the
+#     cost of a quiet day is one short run, not a review cycle. (With a refresh
+#     PR already OPEN a quiet day is no longer short: the regeneration, the five
+#     check families and the diagnosis all run, because that is the only way the
+#     PR's decision marking can be RE-EVALUATED and cleared. Nothing is
+#     committed on that arm.);
+#   * the open-PR guard below already bounds concurrency at ONE, so raising the
+#     frequency cannot produce a pile of PRs; it only shortens the wait before
+#     the next one opens after a merge;
+#   * a smaller diff is EASIER to classify than a batched one. The first
+#     measured cycle carried 9 drifted types at once; a day's worth is
+#     typically zero or one.
+#
+# What the cadence buys is a current snapshot: the backfill list, the SDK
+# route for newly wired properties, and the read-only / create-only data the
+# routing and replacement checks read. A new property already reaches AWS
+# between cycles through Cloud Control.
+#
+# THE PR IS ALLOWED TO LAND RED, and that is the hand-off rather than a bug. The
+# job touches almost nothing encoding judgment — no `unhandledByDesign`, no
+# `NESTED_KEY_ALLOW_LIST`, no provider code — and the ONE exception is bounded
+# by the argument that kept it out originally. A job that "self-healed" a
+# removal would be inventing the rationale, because the silencing option always
+# turns CI green and a rule choosing under UNCERTAINTY converges on it. So the
+# job settles a removal only on evidence that leaves one answer: the name is a
+# member of a shape REACHABLE FROM AN OPERATION INPUT in the type's own client
+# (a response-only model is not deliverable), the provider READS it off the
+# template as `properties['X']` (a `.X` access cannot tell sending from a drift
+# read-back), and no name on the type — added by this refresh OR already in its
+# schema — pairs with it as a possible rename.
+#
+# What is narrow is the EVIDENCE, not the frequency: measured 2026-09-08,
+# 907 of 1240 declared properties (73%) would qualify if AWS removed them
+# today. That is the point rather than a worry — the rule exists to take work
+# off a human — but it means this is the common path, and any weakening of the
+# three tests above is a weakening of the check itself.
+# `AWS::Route53::RecordSet.GeoProximityLocation` — the case that motivated this
+# — is settled that way. Everything else still lands RED: a removal whose SDK
+# member is gone (retiring it is a behaviour change), a possible rename, and new
+# nested keys on `AWS::Glue::Connection` taking
+# `audit:nested-key-coverage:check` from rc=0 to rc=1.
+on:
+  schedule:
+    # 04:37 UTC daily. Off the hour on purpose — the top of the hour is heavily
+    # contended on GitHub's shared cron pool and scheduled runs get delayed.
+    - cron: "37 4 * * *"
+  # Required, not a convenience: the reactive path when a user reports a dropped
+  # property mid-cycle, the recovery path if GitHub suspends the schedule on an
+  # inactive repo, and the only way to exercise this job before its first
+  # scheduled fire.
+  #
+  # How and when to use it, and what it will NOT fix:
+  # https://github.com/go-to-k/cdkd/blob/main/docs/schema-refresh-runbook.md
+  workflow_dispatch:
+
+# Deny by default, grant per job — the house style set by release.yml.
+permissions: {}
+
+concurrency:
+  group: cfn-schema-refresh
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    # observed at least 80 s. Its tail is AWS's rather than this
+    # repo's (a bundle download plus per-type DescribeType with retries), so the
+    # observed spread understates a bad day more than elsewhere.
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      # `pull-requests: write` covers the label and the assignee the marking
+      # step sets, as well as the PR and its comments — this is the permission
+      # `actions/labeler` asks for and nothing more.
+      #
+      # `issues: write` used to be here for the umbrella fold, which is now its
+      # own workflow (`backfill-umbrella-sync.yml`) driven by pushes to `main`.
+      # That move is why this job no longer touches an issue, and dropping the
+      # scope is the point rather than a side effect: this is the repo's only
+      # unattended job holding `contents: write`.
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          # `checkout` defaults to leaving the job's token in `.git/config`,
+          # and this is the repo's first job to hold `contents: write`. The
+          # steps below run `vp install --frozen-lockfile` and the whole
+          # generator chain — arbitrary dependency and codegen code — so a
+          # persisted write token would be reachable by one compromised
+          # transitive dev dependency, and a push to `main` is what
+          # release-please publishes to npm. The final step pushes with an
+          # explicit token instead. `release.yml` already does this.
+          persist-credentials: false
+
+      - uses: voidzero-dev/setup-vp@3754dd7dbdb32bd8f6d28b6043de13ad3a75f21f # v1
+        with:
+          node-version: "24"
+          cache: true
+          run-install: false
+
+      - run: vp install --frozen-lockfile
+
+      # At most ONE open refresh PR at a time — and when one is open the cycle
+      # UPDATES it rather than skipping.
+      #
+      # It skipped at first, on the reasoning that a human commits
+      # CLASSIFICATIONS onto that branch and a bot push would destroy them.
+      # That generalised "force-push destroys" into "push destroys", and the
+      # artifacts say otherwise: the human's work lives in provider sources and
+      # in `NESTED_KEY_ALLOW_LIST` (never touched here) and in
+      # `_todo-backfill.json`'s `bogusTolerated` block, which the generator
+      # explicitly PRESERVES across regeneration. Everything this job rewrites
+      # is DERIVED and is recomputed from the current sources, so an additive
+      # push reflects the human's classification rather than undoing it.
+      #
+      # Skipping was also the costlier answer where it mattered most: a RED PR
+      # is the one that stays open for days, and that is exactly the window in
+      # which every later refresh would have been held back behind it.
+      - name: Look for an open refresh PR
+        id: open_pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # `set -euo pipefail` is load-bearing, not hygiene: without it a `gh`
+          # transport failure leaves `number` empty, the guard reads "no open
+          # PR", and the cycle opens a SECOND PR competing with one a human is
+          # already classifying. Failing the step is the right answer — a red
+          # scheduled run is visible, a duplicate PR is not.
+          set -euo pipefail
+          # The owner filter is what stops ANYONE from disabling this job
+          # permanently. `gh pr list` includes PRs from forks, and a fork's
+          # head branch name is chosen by whoever opened it — so without this,
+          # a stranger pushing `bot/cfn-schema-refresh/2099-01` to their fork
+          # and opening a never-closed PR makes every future cycle find an
+          # "open refresh PR" and skip. The silent-drop class this whole job
+          # exists to watch would then go unwatched indefinitely, with no
+          # alert, which is strictly worse than the job not existing.
+          # `--limit 1000` rather than an `--author` filter, and that choice was
+          # settled between two conflicting review opinions by measuring:
+          # `--author` makes `gh` route through the eventually-consistent
+          # GraphQL SEARCH connection, so a PR created shortly before this step
+          # can be missing from the index — the guard then finds nothing, the
+          # cycle proceeds, and the live `--force-with-lease` read passes,
+          # force-pushing over a human's classification commits. The plain
+          # `pullRequests` connection is strongly consistent, and 1000 is far
+          # past floodable for this repo, so the window closes without taking
+          # on a consistency dependency (or coupling the guard to the token's
+          # identity, which a future PAT swap would silently break).
+          number=$(gh pr list --state open --limit 1000 \
+            --json number,headRefName,headRepositoryOwner \
+            --jq '[.[]
+                   | select(.headRepositoryOwner.login == "${{ github.repository_owner }}")
+                   | select(.headRefName | startswith("bot/cfn-schema-refresh/"))
+                  ][0].number // empty')
+          echo "number=${number}" >> "$GITHUB_OUTPUT"
+          if [ -n "${number}" ]; then
+            echo "An open refresh PR already exists: ${number}"
+          fi
+
+      # Land on the open PR's branch when there is one, so the refresh below
+      # computes drift against ITS fixtures — i.e. only what AWS has changed
+      # SINCE that PR, not the drift it already carries.
+      - name: Switch to the open refresh PR's branch
+        if: steps.open_pr.outputs.number != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Through `env:`, not a GitHub expression inside the shell body. The
+          # value is a jq-extracted JSON integer, so it is contained today —
+          # this removes the CLASS rather than a live bug, and costs one line.
+          # (In words rather than as the literal opener. Here it would be
+          # harmless — the YAML parser discards a comment, and the EXPRESSION
+          # parser never sees one — but the same sentence
+          # inside a `run:` body is PART OF THE STRING, and an empty expression
+          # there invalidated this whole file once (go-to-k/cdkd#3195). Telling
+          # the two apart by indentation is what failed, so the fence refuses
+          # both: tests/unit/scripts/workflow-expression-syntax.test.ts.)
+          PR_NUMBER: ${{ steps.open_pr.outputs.number }}
+        run: |
+          set -euo pipefail
+          branch=$(gh pr view "${PR_NUMBER}" --json headRefName --jq .headRefName)
+          echo "existing_branch=${branch}" >> "$GITHUB_ENV"
+          git fetch origin "${branch}"
+          git checkout "${branch}"
+
+      # Output is teed: the run log stays readable, and the diagnosis reads the
+      # skip list from the file. Without this the "Not refreshed" section was
+      # dead code — the flag existed and nothing ever passed it.
+      - name: Refresh fixtures from the public schema bundle
+        run: |
+          # `set -o pipefail` is REQUIRED here, not decoration: a `run:` with no
+          # `shell:` is `bash -e {0}`, which does NOT set pipefail, so the `tee`
+          # added for the skip list would report ITS status and swallow the
+          # refresh's. The refresh exits 2 on capture failures, so a bundle
+          # fetch failure would have become "no drift" and a green run — the
+          # silent watch failure this whole job exists to prevent.
+          set -o pipefail
+          vp run gen:cfn-schemas-from-zip 2>&1 | tee /tmp/refresh.log
+
+      # The change signal. `refresh-cfn-schemas.mjs --from-zip` writes ONLY
+      # fixtures that actually drifted (`generatedAt` excluded from the
+      # comparison), so a dirty fixtures directory IS the signal and no
+      # date-filtering is needed here. Measured: without that exclusion the
+      # first cycle rewrote 132 fixtures of which 114 differed in `generatedAt`
+      # alone, i.e. the job would open a no-op PR every month.
+      - name: Detect drift
+        id: drift
+        run: |
+          set -euo pipefail
+          # `git status --porcelain`, not `git diff --quiet`: the latter is
+          # blind to UNTRACKED files, and the refresh CREATES a fixture for a
+          # registered type that has none yet (an absent fixture counts as
+          # drift). That capture would then be silently discarded.
+          #
+          # Assigned on its own line, NOT inlined into `if [ -z "$(...)" ]`:
+          # `set -e` does not fire inside an `if` condition, so the inline form
+          # swallows a git failure as "no drift" — fail-OPEN, contradicting the
+          # fail-closed guard two steps up. A standalone assignment aborts.
+          changes=$(git status --porcelain -- tests/fixtures/cfn-schemas/)
+          if [ -z "${changes}" ]; then
+            echo "drifted=false" >> "$GITHUB_OUTPUT"
+            echo "No fixture drift — nothing to do."
+          else
+            echo "drifted=true" >> "$GITHUB_OUTPUT"
+            echo "${changes}"
+            git --no-pager diff --stat -- tests/fixtures/cfn-schemas/
+          fi
+
+      # The mechanical regeneration, and only the mechanical regeneration.
+      # `CDKD_GENERATE_BACKFILL` runs the coverage test in its WRITER mode; its
+      # exit code is deliberately tolerated because a red there is the designed
+      # hand-off (a removed property leaves a bogus declaration no generator can
+      # retire), and the PR's own CI reports it to the human anyway. Suppressing
+      # the report would be wrong; letting it stop the PR from being OPENED
+      # would be worse, since the PR is how the human finds out.
+      # BEFORE the checks, because the whole point is that `property-coverage`
+      # is green by the time it runs on a property nothing was going to decide
+      # differently. It holds NO token: it reads the checkout and rewrites one
+      # committed JSON file, and the step that can write to GitHub is further
+      # down.
+      #
+      # This is the one place the job touches a file that encodes judgement, and
+      # the narrowness is the whole licence for it — see the header note above.
+      # `--write-auto-tolerated` records what it settled and what it refused;
+      # the diagnosis renders both, so an automatic write is auditable in the PR
+      # rather than visible only as a diff hunk.
+      - name: Settle the removals that carry no judgement
+        id: settle
+        if: steps.drift.outputs.drifted == 'true' || steps.open_pr.outputs.number != ''
+        run: |
+          set -euo pipefail
+          node scripts/diagnose-schema-refresh.mjs \
+            --write-auto-tolerated /tmp/auto-tolerated.json
+          # The file is the report's input, and an ABSENT one reads to it as
+          # "the job settled nothing" — which would render every settled
+          # property as still needing a decision. That is the harmless
+          # direction, but it is also indistinguishable from this step not
+          # having run, so it is refused here instead.
+          [ -s /tmp/auto-tolerated.json ]
+          git --no-pager diff --stat -- tests/fixtures/cfn-schemas/_todo-backfill.json
+          # Whether anything was actually written — read from the TREE, not from
+          # the record's `written` array, because what has to be committed is a
+          # file that changed. A cycle that re-settles a property already in the
+          # tolerance file writes nothing and must not push an empty commit.
+          #
+          # This output widens Publish's guard, and without it the settlement is
+          # computed and THROWN AWAY on the arm that needs it most: an open PR
+          # carrying an outstanding removal, on a day AWS did not move. Publish
+          # was drift-only, so every quiet day would recompute the same entry
+          # and discard it, and the marking would correctly refuse to clear over
+          # a tree the branch does not carry — a stalemate that resolves only
+          # when AWS happens to drift again.
+          if [ -n "$(git status --porcelain -- tests/fixtures/cfn-schemas/_todo-backfill.json)" ]; then
+            echo "settled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "settled=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Runs on drift OR while a refresh PR is open, and the second arm is what
+      # makes the PR's decision marking CLEARABLE. The marking is derived from
+      # the checks below, and with a `drifted`-only guard the only day it could
+      # be recomputed was a day AWS happened to move: a human committing the
+      # classifications onto the PR branch settled the decisions, the next
+      # cycle stopped at "No fixture drift — nothing to do", and the label,
+      # title count and assignee kept asserting work that no longer existed.
+      # A signal that cannot be cleared teaches its reader to ignore it, which
+      # is the same defect as the umbrella listing rows `main` does not have.
+      # Nothing is committed on this arm — Publish still requires drift — so
+      # the cost is one regeneration pass on a day the job would otherwise
+      # have exited early.
+      - name: Regenerate the derived artifacts
+        if: steps.drift.outputs.drifted == 'true' || steps.open_pr.outputs.number != ''
+        run: |
+          # The one multi-command step that previously lacked this: a failing
+          # `gen:property-coverage` was swallowed and the PR opened on a
+          # half-regenerated tree. The `|| echo` line below is deliberately
+          # exempt — that failure IS the designed hand-off.
+          set -euo pipefail
+          vp run gen:property-coverage
+          # The status is CAPTURED, not merely tolerated. `|| echo` already stops
+          # `set -e` aborting, and for six rounds that was all it did — the red
+          # never reached the diagnosis, so a failing coverage check rendered as
+          # "nothing needs a decision" and the offending property was listed as
+          # "no decision needed". Its red is reached by an ordinary schema
+          # ADDITION (AWS re-adding a property a provider wrote off), which is
+          # what makes the silence expensive.
+          # EVERY fixture-driven CI check runs here, and every red is COLLECTED
+          # rather than tolerated. Each of these reads
+          # `tests/fixtures/cfn-schemas/` and hard-fails CI, and EVERY one of
+          # them is reddened by a pure schema ADDITION — the shape a reader is
+          # most likely to wave through, which is what made the silence
+          # expensive. `property-coverage`'s status was discarded for six review
+          # rounds and its red rendered as "nothing needs a decision"; the two
+          # audit checks were found the round after, and the unit-test family
+          # the round after that.
+          #
+          # Adding another is a line here and a `CHECK_GUIDANCE` row in
+          # scripts/diagnose-schema-refresh.mjs. The list is fenced against that
+          # table by tests/unit/scripts/cfn-schema-refresh-workflow.test.ts.
+          failed_checks=""
+          run_check() {
+            name="$1"
+            shift
+            if "$@"; then return 0; fi
+            failed_checks="${failed_checks:+${failed_checks},}${name}"
+            echo "::notice::${name} is red — a decision is needed on this PR"
+          }
+          # The filter matches `property-coverage.test.ts` and its two siblings
+          # (`.runtime.test.ts`, `scripts/gen-property-coverage.test.ts`); all
+          # three are fixture-driven, and the guidance says to run the filter
+          # rather than naming one file, so a red in any of them lands somewhere
+          # a reader can act on.
+          run_check property-coverage \
+            env CDKD_GENERATE_BACKFILL=true vp test run property-coverage
+          run_check audit:sdk-attr-coverage:check vp run audit:sdk-attr-coverage:check
+          run_check audit:enrichment-coverage:check vp run audit:enrichment-coverage:check
+          # Unit tests that read the fixtures DIRECTLY and assert about their
+          # contents. They run under ci.yml's whole-suite job, not under any
+          # audit task, so a schema change reddens CI with nothing in the
+          # diagnosis to explain it.
+          # Every member of the zero-headroom FAMILY, named. Five suites assert
+          # `silentDrop` is empty against the real coverage, so one writable
+          # property AWS adds to any of their types reds CI while
+          # `property-coverage` absorbs the same addition and stays green —
+          # naming one of them covered 1 of the 5.
+          #
+          # Named rather than matched by `props.test`, which also selects four
+          # unrelated suites and would attribute their red to a schema decision
+          # that does not exist. Naming is only safe because the fence in
+          # tests/unit/scripts/cfn-schema-refresh-workflow.test.ts DERIVES the
+          # family and fails when a sixth appears. Not `-props` either: vitest
+          # parses a leading dash as a FLAG and the step dies with
+          # `Unknown option \`-p\``.
+          run_check fixture-consumer-tests \
+            vp test run \
+              mutually-exclusive-properties \
+              ecs-deployment-configuration-subfield \
+              apigatewayv2-integration-props \
+              apigatewayv2-stage-route-props \
+              appsync-graphqlapi-config-props \
+              appsync-resolver-datasource-props \
+              ecs-service-config-props
+          # Through the environment FILE, not a shell variable: each `run:` is
+          # its own shell, so a plain assignment here is simply gone by the
+          # Diagnose step — and an absent `--failed-checks` reads as "nothing
+          # failed", so losing it would restore the exact silence this fixes.
+          echo "FAILED_CHECKS=${failed_checks}" >> "${GITHUB_ENV}"
+          vp run gen:all-matrices
+          vp run format
+
+      # Split from `Publish the refresh` so the step holding the write-scoped
+      # token runs neither the checker nor the diagnosis — the latter spawns
+      # `npm`, which inherits the environment. That is the same reasoning the
+      # checkout step gives for `persist-credentials: false`; leaving them in
+      # the token step would have widened exactly the surface that closed.
+      # Both only write /tmp, which survives across steps.
+      #
+      # Generated BEFORE the commit: the comparison against the COMMITTED
+      # fixtures is the whole source of "AWS removed this in THIS refresh".
+      - name: Diagnose what needs a decision
+        if: steps.drift.outputs.drifted == 'true' || steps.open_pr.outputs.number != ''
+        run: |
+          set -euo pipefail
+          # The checker is EXPECTED to exit non-zero here — a divergence is the
+          # hand-off this whole step exists to describe. `set +e` spans only the
+          # invocation, so a later pipeline in this step cannot silently inherit
+          # a relaxed shell (which is exactly how `tee` swallowed the refresh's
+          # exit code one step up).
+          set +e
+          vp run audit:nested-key-coverage:check > /tmp/nested-key.log 2>&1
+          nested_key_rc=$?
+          set -e
+          # The skip list is the tail of the refresh log, after its own header.
+          sed -n '/No entry in the public bundle/,$p' /tmp/refresh.log > /tmp/skipped.log || true
+          # The STATUS as well as the text: an empty log, a `task not found` and
+          # an OOM kill all carry no announcement to grep for, and all three
+          # rendered "additions only" over a checker that never ran.
+          # `--decision-count-out` is a SIDE EFFECT of this same invocation,
+          # never a second run. The marking step below turns the number into a
+          # label, a title suffix and an assignee, and a second invocation
+          # would re-read `--failed-checks` and `--nested-key-log` from its own
+          # argv — so a copy that drifted by one flag would mark the PR "no
+          # decisions needed" over the very report it sits next to. That is the
+          # shape `--failed-checks` already produced once here.
+          node scripts/diagnose-schema-refresh.mjs \
+            --nested-key-log /tmp/nested-key.log \
+            --nested-key-rc "${nested_key_rc}" \
+            --failed-checks "${FAILED_CHECKS}" \
+            --skipped-log /tmp/skipped.log \
+            --auto-tolerated /tmp/auto-tolerated.json \
+            --decision-count-out /tmp/decision-count.txt \
+            --changelog-out /tmp/changelog-fragment.md > /tmp/diagnosis.md
+
+      - name: Publish the refresh
+        id: publish
+        # Drift OR a settlement worth committing. The second arm only ever
+        # reaches the ADDITIVE path below: `Settle` runs on drift or an open PR,
+        # so a settle-only cycle implies an open PR, and the branch-creating arm
+        # refuses outright if it is ever reached without drift.
+        if: steps.drift.outputs.drifted == 'true' || steps.settle.outputs.settled == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Same reasoning as the switch step: no expression inside a shell body.
+          PR_NUMBER: ${{ steps.open_pr.outputs.number }}
+          DRIFTED: ${{ steps.drift.outputs.drifted }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add \
+            tests/fixtures/cfn-schemas/ \
+            src/provisioning/ \
+            docs/
+          git status --porcelain
+
+          if [ -n "${existing_branch:-}" ]; then
+            # Re-check the PR is STILL open. A squash merge with
+            # `--delete-branch` between the guard and here would make the plain
+            # push below CREATE the deleted branch again — an orphan ref with no
+            # PR, which this repo has a whole hook class about — and leave a
+            # diagnosis comment on an already-merged PR. Nothing is lost by
+            # bailing: the next cycle recomputes the same drift against main.
+            state=$(gh pr view "${PR_NUMBER}" --json state --jq .state)
+            if [ "${state}" != "OPEN" ]; then
+              echo "::warning::PR ${PR_NUMBER} is ${state}, not OPEN — it closed while this ran. Skipping; the next cycle recomputes."
+              exit 0
+            fi
+            # The BASE this commit sits on — the tip fetched in the switch step,
+            # minutes ago. Reading the REMOTE here instead was the bug: a human
+            # pushing during the refresh moves the remote BEFORE this line, so
+            # the post-failure comparison found the tip unmoved and declared a
+            # real lost race "not a lost race", exiting 1. A non-fast-forward
+            # rejection means the remote left the base we committed on, so the
+            # base is what it must be compared against.
+            base_sha=$(git rev-parse HEAD)
+            # ADDITIVE commit onto the open PR's branch. Never force: a
+            # non-fast-forward here means a human pushed while this ran, and
+            # overwriting that is the one outcome worth losing a cycle over.
+            # The message has to match the diff. A settlement-only cycle
+            # commits a tolerance the job decided, with no schema change behind
+            # it, and calling that "additional CFn schema drift" would make the
+            # branch history describe something that did not happen.
+            if [ "${DRIFTED}" = "true" ]; then
+              subject="chore(schemas): additional CFn schema drift ($(date -u +%Y-%m-%d))"
+            else
+              subject="chore(schemas): settle removals the evidence already answers ($(date -u +%Y-%m-%d))"
+            fi
+            git commit -m "${subject}"
+            if git push \
+                 "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+                 "${existing_branch}"; then
+              gh pr comment "${PR_NUMBER}" \
+                --body-file /tmp/diagnosis.md
+              pr_number="${PR_NUMBER}"
+            else
+              # A lost RACE and a broken push are different outcomes and must
+              # not share one green exit: a permission or branch-protection
+              # failure would otherwise give a green daily job that lands
+              # nothing, forever. The remote tip moving is what distinguishes
+              # them.
+              now=$(git ls-remote --heads origin "refs/heads/${existing_branch}" | awk 'NR==1{print $1}')
+              if [ -n "${now}" ] && [ "${now}" != "${base_sha}" ]; then
+                echo "::warning::Could not push to ${existing_branch} — a concurrent update won (tip is ${now}, this commit was built on ${base_sha}). The next run recomputes the same drift."
+                exit 0
+              fi
+              echo "::error::Push to ${existing_branch} failed while the remote tip is still the base this commit was built on (${base_sha}) — a fast-forward was possible, so this is not a lost race."
+              exit 1
+            fi
+          else
+            # A new branch is a REFRESH's output. Reaching here without drift
+            # would mean opening a PR whose only content is a tolerance the job
+            # decided on its own, with no schema change to explain it — and the
+            # guard above says it cannot happen, so this refuses rather than
+            # inventing a cycle.
+            if [ "${DRIFTED}" != "true" ]; then
+              echo "::error::Reached the branch-creating path with no fixture drift. A settlement-only cycle has no refresh to publish and must ride on the open PR the settle step ran against."
+              exit 1
+            fi
+            cycle=$(date -u +%Y-%m-%d)
+            branch="bot/cfn-schema-refresh/${cycle}"
+            # Explicit `--force-with-lease=<ref>:<sha>` when the branch already
+            # exists (a same-day re-dispatch whose PR was closed, not merged).
+            # The bare form compares against a remote-TRACKING ref that does not
+            # exist here, so git expects the branch to be ABSENT and rejects
+            # exactly the case this handles.
+            force=""
+            existing_sha=$(git ls-remote --heads origin "refs/heads/${branch}" | awk 'NR==1{print $1}')
+            if [ -n "${existing_sha}" ]; then
+              force="--force-with-lease=refs/heads/${branch}:${existing_sha}"
+            fi
+            git checkout -b "${branch}"
+            # `chore(...)` on purpose: release-please gives it no changelog
+            # section, so this never opens or advances the standing release PR.
+            git commit -m "chore(schemas): refresh CFn schema fixtures (${cycle})"
+            git push ${force} \
+              "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+              "${branch}"
+            {
+              cat .github/refresh-pr-preamble.md
+              echo
+              cat /tmp/diagnosis.md
+            } > /tmp/pr-body.md
+            # `gh pr create` prints the PR URL; it has no --json. The number
+            # is read back by head branch rather than parsed out of the URL.
+            gh pr create \
+              --title "chore(schemas): refresh CFn schema fixtures (${cycle})" \
+              --body-file /tmp/pr-body.md \
+              --head "${branch}" \
+              --base main
+            pr_number=$(gh pr list --head "${branch}" --state open --json number --jq '.[0].number // empty')
+          fi
+
+          # Read by the marking step below, which runs whether or not this one
+          # did. `// empty`-style absence matters: the marking step treats an
+          # empty value as "this cycle published nothing" and falls back to the
+          # open PR the guard found, so a lost race here does not also lose the
+          # marking on a PR that still exists.
+          echo "pr_number=${pr_number:-}" >> "$GITHUB_OUTPUT"
+
+      # A refresh that adds a writable property CHANGES WHAT THE SHIPPED BINARY
+      # DOES — the property moves from unrecognized to classified, which puts it
+      # on the backfill list and brings its create-only and nested-required data
+      # into the checks — so `changelog.d/_header.md`'s "WHEN
+      # an entry is required" section asks for a fragment. The job wrote none
+      # until go-to-k/cdkd#3167, where the delta was recorded only because a
+      # maintainer noticed and wrote one by hand.
+      #
+      # Its own step, AFTER Publish, for one reason: the fragment filename and
+      # body both carry the PR number, and Publish is where that number first
+      # exists. The BODY is rendered a step earlier by Diagnose, which is the
+      # only point at which the fixtures still differ from their committed
+      # copies — after Publish commits them, the same computation renders
+      # nothing. So the number is substituted here into text decided there.
+      - name: Record the refresh's changelog fragment
+        if: steps.publish.outputs.pr_number != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ steps.publish.outputs.pr_number }}
+        run: |
+          set -euo pipefail
+          # A MISSING file means Diagnose died before writing one; an EMPTY file
+          # means this cycle adds no writable property and ships no behaviour
+          # delta. Only the second is a silent no-op.
+          if [ ! -f /tmp/changelog-fragment.md ]; then
+            echo "::warning::no changelog fragment was rendered — write one by hand if this refresh adds a writable property"
+            exit 0
+          fi
+          if [ ! -s /tmp/changelog-fragment.md ]; then
+            exit 0
+          fi
+          # Refuse rather than commit a fragment whose provenance never
+          # resolved. BOTH placeholders are checked: the date is what keeps two
+          # cycles on one open PR from rendering the same headline, which the
+          # changelog uniqueness fence keys on.
+          if ! grep -q '__PR_NUMBER__' /tmp/changelog-fragment.md; then
+            echo "::error::the rendered fragment carries no __PR_NUMBER__ placeholder to substitute"
+            exit 1
+          fi
+          if ! grep -q '__CYCLE__' /tmp/changelog-fragment.md; then
+            echo "::error::the rendered fragment carries no __CYCLE__ placeholder to substitute"
+            exit 1
+          fi
+
+          cycle=$(date -u +%Y-%m-%d)
+          entry="changelog.d/entries/${cycle}-${PR_NUMBER}-cfn-schema-refresh.md"
+          # Create-only, keyed on THIS CYCLE plus the PR — date and number
+          # fixed, slug free. The job's promise is that it never overwrites a
+          # classification a human wrote, and `ENTRY_NAME` forces
+          # `<date>-<digits>-<slug>.md`, so a legal rename keeps both fixed
+          # parts and is still caught while the slug may be anything.
+          #
+          # Both halves are load-bearing, and each was WRONG on its own in an
+          # earlier round. Keying on the exact PATH missed a rename, so a
+          # same-day re-dispatch wrote a second copy with a byte-identical
+          # headline, which the changelog uniqueness fence rejects. Keying on
+          # the PR ALONE was worse: it matched cycle 1's own fragment, so every
+          # later cycle on the same open pull request silently wrote nothing —
+          # the loss this step exists to stop — and a leading `*` spanned the
+          # slug, so another lane's `2026-09-20-3200-revert-3173-regression.md`
+          # suppressed PR 3173's fragment too (measured, alongside a real
+          # `...-1821-cdk-local-0148.md` of that shape).
+          #
+          # A `for` probe rather than `ls`, because under `shopt -s nullglob`
+          # an unmatched glob leaves `ls` with no arguments: it lists the
+          # directory, exits 0, and the guard would read TRUE forever with no
+          # warning.
+          #
+          # Two shapes still escape, both deliberately. A rename that changes
+          # the DATE segment (legal under `ENTRY_NAME`) lets a same-day
+          # re-dispatch write a second copy — caught LOUDLY by the changelog
+          # uniqueness fence, on a pull request nobody has merged. A fragment
+          # the maintainer DELETED comes back on a same-day re-dispatch; the
+          # runbook asks for an edit rather than a deletion for that reason.
+          # Catching either needs a content probe over the entries, which would
+          # suppress the common legitimate cases instead — trading a loud, rare
+          # failure for a silent one.
+          # Substituted BEFORE the guard so the comparison below has something
+          # to compare against, and so one `sed` serves both paths.
+          sed -e "s/__PR_NUMBER__/${PR_NUMBER}/g" -e "s/__CYCLE__/${cycle}/g" \
+            /tmp/changelog-fragment.md > /tmp/fragment-final.md
+
+          existing=""
+          for f in changelog.d/entries/"${cycle}"-"${PR_NUMBER}"-*.md; do
+            if [ -e "${f}" ]; then
+              existing="${f}"
+              break
+            fi
+          done
+          if [ -n "${existing}" ]; then
+            # Create-only still, but not SILENT when the skip costs something.
+            # An ordinary same-day re-dispatch never reaches here — the
+            # fixtures are already committed, so the diagnosis renders nothing
+            # and the empty-file arm above exits first. Reaching here with a
+            # DIFFERENT rendering means this run found drift the existing
+            # fragment does not describe, which is exactly the case where
+            # skipping is wrong: say so rather than dropping it.
+            if ! cmp -s "${existing}" /tmp/fragment-final.md; then
+              echo "::warning::${existing} already exists for this cycle and differs from what this run rendered — new drift is NOT recorded in it; fold it in by hand before merging"
+            fi
+            exit 0
+          fi
+
+          cp /tmp/fragment-final.md "${entry}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "${entry}"
+          git commit -m "chore(schemas): record the routing delta this refresh ships"
+          # The branch is read from the checkout rather than threaded through an
+          # output, and NOT interpolated as a GitHub expression — the same rule
+          # the switch and publish steps state: no expression inside a shell
+          # body. NO comment in this file writes the literal opener any more,
+          # here or in a YAML comment, and the uniformity is the fix rather than
+          # tidiness. One of them DID write it, right here, and this is a `run:`
+          # BLOCK SCALAR, so the text is part of the string: Actions scans that
+          # whole string for openers without caring that one sits behind a `#`,
+          # and an EMPTY one is a parse error that invalidates the entire file —
+          # which is how this job stopped being scheduled at all
+          # (go-to-k/cdkd#3195). A YAML comment genuinely is safe, but telling
+          # the two apart by indentation is exactly what failed, so the fence
+          # refuses both: tests/unit/scripts/workflow-expression-syntax.test.ts.
+          # Publish left this working tree on the branch it pushed, both on the
+          # arm that created one and on the arm that reused the open PR's.
+          if ! git push \
+                 "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+                 "HEAD:$(git rev-parse --abbrev-ref HEAD)"; then
+            # Never RED over the fragment. Publish already landed the drift and
+            # opened or updated the PR, which is how the human finds out; a
+            # failed push here (a human pushing mid-run is the ordinary cause)
+            # costs a changelog line, and failing the job would instead leave
+            # the marking step below unrun on a PR that exists.
+            echo "::warning::could not push the changelog fragment for PR ${PR_NUMBER} — write one by hand before merging"
+          fi
+
+      # Make a PR that needs a decision distinguishable from one that does not,
+      # WITHOUT opening it — and make the marking go away once the decisions
+      # are settled.
+      #
+      # go-to-k/cdkd#2770 is the measurement this exists for: it carried two
+      # failed checks and three decisions in a 162-line body, and presented in
+      # every list view as no label, no assignee, and a title byte-identical to
+      # a refresh needing nothing. Its CI sat at `action_required` — GitHub
+      # holds workflows on a `GITHUB_TOKEN`-created PR until a maintainer
+      # approves them — so there was no red mark either. Nothing distinguished
+      # it from a clean cycle.
+      #
+      # Of the three marks only the ASSIGNEE produces a notification, and that
+      # is the load-bearing one: the maintainer does not routinely read the PR
+      # list, so a label and a title suffix are legible only to someone already
+      # looking. They earn their place by making the state readable AFTERWARDS
+      # — including "this was settled", which is the half a notification cannot
+      # carry.
+      - name: Mark whether the PR needs a decision
+        # Not `always()`: a failed earlier step means the count was never
+        # written, and marking from a missing count is how a PR gets labelled
+        # clean because the job broke. The count file is checked below too.
+        if: steps.publish.outputs.pr_number != '' || steps.open_pr.outputs.number != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # This cycle's PR when it published one, else the PR the guard found.
+          # Both can be set (an additive push republishes onto the open PR) and
+          # they are then the same number.
+          PUBLISHED_PR: ${{ steps.publish.outputs.pr_number }}
+          OPEN_PR: ${{ steps.open_pr.outputs.number }}
+          # Pre-created in the repository rather than created here. `gh pr edit
+          # --add-label` fails on a label that does not exist, and a workflow
+          # that creates one on demand would also recreate a label a maintainer
+          # deliberately deleted. Failing loudly is the honest half of that
+          # trade; the guard below names the fix.
+          DECISION_LABEL: needs-decision
+          # The one-line verdict this step owns at the TOP of the PR body.
+          # Delimited for the same reason the umbrella's checklist is: the rest
+          # of the body is the preamble plus the day-one diagnosis, and neither
+          # may be rewritten.
+          VERDICT_BEGIN: "<!-- BEGIN generated: decision verdict -->"
+          VERDICT_END: "<!-- END generated: decision verdict -->"
+        run: |
+          set -euo pipefail
+          pr="${PUBLISHED_PR:-${OPEN_PR}}"
+
+          # The PR must still be OPEN. `PUBLISHED_PR` is empty on Publish's
+          # closed-PR bail-out -- that arm `exit 0`s BEFORE writing the output
+          # -- so without this check the fallback to `OPEN_PR` marks the very
+          # PR Publish just refused to touch: a merged PR acquires a label, a
+          # "N decisions needed" title and an assignee, all still editable
+          # after a merge, and no later cycle can clear them because the
+          # open-PR guard will never find it again. The `drifted == false` path
+          # reaches here with no state check of its own at all.
+          state=$(gh pr view "${pr}" --json state --jq .state)
+          if [ "${state}" != "OPEN" ]; then
+            echo "::notice::PR ${pr} is ${state}, not OPEN -- leaving its marking alone."
+            exit 0
+          fi
+
+          # The count is written by the Diagnose step as a side effect of the
+          # same invocation that rendered the body. An ABSENT file means that
+          # step did not run or died before writing, and "absent" must never
+          # read as zero: that is the direction that silently clears a real
+          # decision. Refuse instead, leaving whatever marking is already on
+          # the PR standing.
+          if [ ! -s /tmp/decision-count.txt ]; then
+            echo "::error::/tmp/decision-count.txt is missing or empty -- the diagnosis did not report a decision count, so this step cannot tell a settled PR from an unexamined one. Leaving PR ${pr}'s marking as it is."
+            exit 1
+          fi
+          decisions=$(tr -d '[:space:]' < /tmp/decision-count.txt)
+          # A non-numeric value is the same fail-closed case as an absent one.
+          case "${decisions}" in
+            ''|*[!0-9]*)
+              echo "::error::decision count '${decisions}' is not a number -- refusing to re-mark PR ${pr} from a value this step did not understand."
+              exit 1
+              ;;
+          esac
+
+          # On the NO-DRIFT arm the count is not comparable to the one this PR
+          # was published with, and may only CLEAR it.
+          #
+          # Two independent reasons, both read off the code rather than
+          # reasoned about. First, `removed` is computed by diffing the working
+          # fixtures against the branch's committed ones, so with no drift it
+          # is empty BY CONSTRUCTION: a PR published as "2 decisions needed"
+          # (one removed type plus a red `property-coverage`) would be retitled
+          # "1 decision needed" the next morning with nothing settled. Second,
+          # this arm grades a tree it then throws away -- `Regenerate` rewrites
+          # the derived artifacts and Publish does not run -- so a human who
+          # fixed a provider WITHOUT regenerating would see the marking cleared
+          # while the PR's own CI, which builds the committed tree, stays red.
+          #
+          # Zero is still trustworthy: a bogus declaration keeps
+          # `property-coverage` red however the diff came out, and the
+          # clean-tree test below is what rules out the un-regenerated case.
+          # The predicate is "did this cycle PUBLISH", not "did AWS move".
+          # An earlier revision keyed on the drift step's output instead --
+          # that env entry is gone now -- and it let the lost-push-race case
+          # through: Publish `exit 0`s without writing `pr_number` while drift
+          # is still `true`, so the marking would be written from a count computed
+          # over the very tree that was thrown away -- the exact case the
+          # paragraph above is about -- and the clean-tree probe below, the
+          # thing that would have caught it, was skipped.
+          if [ -z "${PUBLISHED_PR}" ] && [ "${decisions}" != "0" ]; then
+            echo "::notice::Nothing published this cycle and ${decisions} decision(s) still outstanding on PR ${pr} -- leaving the existing marking, which was computed against a refresh that landed."
+            exit 0
+          fi
+          if [ -z "${PUBLISHED_PR}" ]; then
+            regen=$(git status --porcelain -- src/provisioning/ docs/ tests/fixtures/cfn-schemas/)
+            if [ -n "${regen}" ]; then
+              echo "::warning::PR ${pr} has no outstanding checks, but regenerating changed files this PR has not committed, so its own CI is still red. Leaving the marking. Run 'vp run gen:all-matrices' on the branch and push."
+              echo "${regen}"
+              exit 0
+            fi
+          fi
+
+          # The base title is the current one with any previous suffix removed,
+          # rather than a value threaded from the step that created the PR.
+          # Deriving it makes the step IDEMPOTENT and correct on the additive
+          # path, where the title was written by an earlier cycle this run has
+          # no output from -- and it cannot drift from the suffix it writes,
+          # because the same pattern produces and strips it.
+          current=$(gh pr view "${pr}" --json title --jq .title)
+          base=$(printf '%s' "${current}" | sed -E 's/ — [0-9]+ decisions? needed$//')
+          if [ "${decisions}" = "0" ]; then
+            title="${base}"
+            verdict="> **No decisions outstanding.** Everything this refresh raised has been settled on this branch; merge when CI is green."
+          elif [ "${decisions}" = "1" ]; then
+            title="${base} — 1 decision needed"
+            verdict="> **1 decision needs your call.** The sections below name it; this line and the title are rewritten by the job each cycle."
+          else
+            title="${base} — ${decisions} decisions needed"
+            verdict="> **${decisions} decisions need your call.** The sections below name them; this line and the title are rewritten by the job each cycle."
+          fi
+          if [ "${title}" != "${current}" ]; then
+            # `gh api -X PATCH`, the form /verify-pr uses for bodies: it is the
+            # endpoint itself, with no CLI-side interpretation between the
+            # value and the PR.
+            gh api -X PATCH "repos/${GITHUB_REPOSITORY}/pulls/${pr}" -f title="${title}" > /dev/null
+          fi
+
+          # The verdict block at the TOP of the body. The body is otherwise
+          # written once, on the day the PR opened, while later cycles add
+          # comments -- so without this the body's own summary ages while the
+          # title stays current.
+          B=$(mktemp); NB=$(mktemp)
+          # `tr -d '\r'` for the same reason the umbrella sync strips it: the
+          # markers are found with `grep -Fx`, and a body a human edited in the
+          # web UI is CRLF, so both counts come back 0 -- which lands on the
+          # INSERT arm below and prepends a SECOND verdict block on every
+          # cycle, the body-growth defect this splice was rewritten to remove.
+          if gh pr view "${pr}" --json body --jq .body | tr -d '\r' > "${B}" && [ -s "${B}" ]; then
+            vb=$(grep -Fxn -- "${VERDICT_BEGIN}" "${B}" | cut -d: -f1 || true)
+            ve=$(grep -Fxn -- "${VERDICT_END}" "${B}" | cut -d: -f1 || true)
+            vb_count=$(printf '%s' "${vb}" | wc -w | tr -d ' ')
+            ve_count=$(printf '%s' "${ve}" | wc -w | tr -d ' ')
+            if [ "${vb_count}" = "1" ] && [ "${ve_count}" = "1" ] && [ "${ve}" -gt "${vb}" ]; then
+              # Replace between the markers, by LINE NUMBER -- `sed -n '1,/re/p'`
+              # starts its addr2 search at line TWO, so a marker on line 1
+              # (exactly where this block sits) never closes the range and the
+              # head half emits the whole body.
+              head -n "${vb}" "${B}" > "${NB}"
+              printf '%s\n' "${verdict}" >> "${NB}"
+              tail -n "+${ve}" "${B}" >> "${NB}"
+            elif [ "${vb_count}" = "0" ] && [ "${ve_count}" = "0" ]; then
+              { printf '%s\n%s\n%s\n\n' "${VERDICT_BEGIN}" "${verdict}" "${VERDICT_END}"; cat "${B}"; } > "${NB}"
+            else
+              echo "::warning::PR ${pr}'s body has ${vb_count} verdict-begin and ${ve_count} verdict-end markers, so there is no unambiguous block to rewrite. Leaving the body; the title and label still carry the count."
+              cp "${B}" "${NB}"
+            fi
+            if ! cmp -s "${B}" "${NB}"; then
+              gh api -X PATCH "repos/${GITHUB_REPOSITORY}/pulls/${pr}" --field "body=@${NB}" > /dev/null
+            fi
+          else
+            echo "::warning::Could not read PR ${pr}'s body; refusing to write one. The title and label still carry the count."
+          fi
+
+          if [ "${decisions}" = "0" ]; then
+            # `--remove-label` on a PR that does not carry it is a no-op, not
+            # an error, so no membership test is needed. The ASSIGNEE is left
+            # in place on purpose: the PR is still the maintainer's to merge,
+            # and un-assigning would drop it out of their assigned view at the
+            # moment it became mergeable. The runbook says the same.
+            gh pr edit "${pr}" --remove-label "${DECISION_LABEL}"
+            echo "::notice::PR ${pr} needs no decision -- label and title suffix cleared; the assignee stays, since it is still theirs to merge."
+            exit 0
+          fi
+
+          # The assignee is attempted FIRST and neither mark may take the
+          # other down. Ordering alone was the first fix and it only moved the
+          # victim: with a bare `--add-assignee` under `set -e`, a 422 for an
+          # unassignable owner killed the LABEL instead, and with no
+          # `::error::` naming a fix. So the order is now a preference (the
+          # notification goes out before anything can fail) rather than the
+          # safety property — the collected `marks_failed` below is that.
+          # `--add-assignee` is idempotent, and the owner is read from the
+          # event rather than hard-coded so a fork or a transfer cannot
+          # silently assign a stranger.
+          marks_failed=0
+          if ! gh pr edit "${pr}" --add-assignee "${GITHUB_REPOSITORY_OWNER}"; then
+            echo "::error::Could not assign PR ${pr} to '${GITHUB_REPOSITORY_OWNER}'. This is the only mark that NOTIFIES, so the decision is now visible in list views only. An organisation owner is not assignable — set a user login if this repository was transferred."
+            marks_failed=1
+          fi
+          if ! gh pr edit "${pr}" --add-label "${DECISION_LABEL}"; then
+            echo "::error::Could not add the '${DECISION_LABEL}' label to PR ${pr}. Create the label once with 'gh label create needs-decision' and re-run; this job deliberately does not create it."
+            marks_failed=1
+          fi
+          if [ "${marks_failed}" != "0" ]; then
+            exit 1
+          fi
+          echo "::notice::PR ${pr} needs ${decisions} decision(s) -- assigned, labelled and retitled."

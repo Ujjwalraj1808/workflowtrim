@@ -1,0 +1,81 @@
+name: 🔑 Key Chest Test
+
+permissions:
+  id-token: write # Required for OIDC authentication with AWS
+  contents: read
+
+on:
+  workflow_dispatch: {}
+
+  pull_request:
+    branches:
+      - "*"
+    types:
+      - opened
+      - reopened
+      - synchronize
+      - ready_for_review
+    paths:
+      - ".github/workflows/test-action.yml"
+      - "github-action/action.yml"
+      - "src/envilder/apps/gha/**"
+      - "tests/envilder/apps/gha/**"
+      - "e2e/github-action.test.ts"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  test-action:
+    runs-on: ubuntu-latest
+    if: ${{ !github.event.pull_request.draft }}
+    timeout-minutes: 15
+
+    steps:
+      - name: 🧱 Enter the Pipe (Checkout)
+        uses: actions/checkout@v7
+
+      - name: 📦 Install pnpm
+        uses: pnpm/action-setup@v6
+
+      - name: 🍄 Grab a Mushroom (Setup Node.js with Cache)
+        uses: actions/setup-node@v7
+        with:
+          node-version: "22.x"
+          cache: "pnpm"
+
+      - name: 🪙 Collect Coins (Configure AWS credentials)
+        uses: aws-actions/configure-aws-credentials@v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: 📦 Open the ? Block (Install packages)
+        run: pnpm install --frozen-lockfile
+
+      - name: 🏗️ Build the Castle
+        run: pnpm build
+
+      - name: 📦 Bundle GitHub Action
+        run: pnpm run build:gha
+
+      - name: 🔐 Test Action - Pull Secrets
+        uses: ./github-action
+        with:
+          map-file: e2e/sample/envilder.json
+          env-file: .env.test
+
+      - name: ✅ Verify .env file was created
+        run: |
+          if [ ! -f .env.test ]; then
+            echo "❌ .env.test file was not created!"
+            exit 1
+          fi
+          echo "✅ .env.test file created successfully!"
+          echo "Contents:"
+          cat .env.test
+
+      - name: 🧹 Clean up test file
+        if: always()
+        run: rm -f .env.test

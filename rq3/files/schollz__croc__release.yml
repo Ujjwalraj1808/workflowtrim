@@ -1,0 +1,593 @@
+name: Prepare Release
+run-name: Prepare ${{ inputs.tag }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to prepare (for example, v11.2.5)
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: prepare-release
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Commit and tag release version
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      version: ${{ steps.version.outputs.version }}
+      sha: ${{ steps.prepare.outputs.sha }}
+    steps:
+      - name: Checkout default branch
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: '^1.27.0'
+
+      - name: Validate release tag
+        id: version
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          if [[ ! "${RELEASE_TAG}" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "Release tag must match vMAJOR.MINOR.PATCH; got '${RELEASE_TAG}'" >&2
+            exit 1
+          fi
+          echo "tag=${RELEASE_TAG}" >> "${GITHUB_OUTPUT}"
+          echo "version=${RELEASE_TAG#v}" >> "${GITHUB_OUTPUT}"
+
+      - name: Prepare versioned tag
+        id: prepare
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          git fetch --force --tags origin
+
+          if git rev-parse --verify --quiet "refs/tags/${RELEASE_TAG}" >/dev/null; then
+            if release_is_draft="$(gh release view "${RELEASE_TAG}" --json isDraft --jq .isDraft 2>/dev/null)"; then
+              if [[ "${release_is_draft}" != "true" ]]; then
+                echo "Release ${RELEASE_TAG} is already published and cannot be rebuilt" >&2
+                exit 1
+              fi
+            fi
+
+            release_sha="$(git rev-list -n 1 "${RELEASE_TAG}")"
+            if ! git merge-base --is-ancestor "${release_sha}" "origin/${DEFAULT_BRANCH}"; then
+              echo "Existing tag ${RELEASE_TAG} is not on ${DEFAULT_BRANCH}" >&2
+              exit 1
+            fi
+            expected_declaration="const Value = \"${RELEASE_VERSION}\""
+            declarations="$(git show "${RELEASE_TAG}:src/version/version.go" | grep '^const Value = ' || true)"
+            if [[ "${declarations}" != "${expected_declaration}" ]]; then
+              echo "Existing tag ${RELEASE_TAG} does not contain version ${RELEASE_VERSION}" >&2
+              exit 1
+            fi
+
+            echo "Reusing unpublished tag ${RELEASE_TAG} at ${release_sha}"
+            echo "sha=${release_sha}" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            echo "Release ${RELEASE_TAG} exists without a matching local tag" >&2
+            exit 1
+          fi
+
+          VERSION="${RELEASE_TAG}" go run ./src/install/updateversion.go
+          go test ./src/install
+
+          expected_declaration="const Value = \"${RELEASE_VERSION}\""
+          declarations="$(grep '^const Value = ' src/version/version.go || true)"
+          if [[ "${declarations}" != "${expected_declaration}" ]]; then
+            echo "Version stamp did not produce ${expected_declaration}" >&2
+            exit 1
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if ! git diff --quiet -- src/version/version.go; then
+            git add src/version/version.go
+            git commit -m "chore: bump version to ${RELEASE_VERSION}"
+          fi
+
+          release_sha="$(git rev-parse HEAD)"
+          git tag -a "${RELEASE_TAG}" "${release_sha}" -m "${RELEASE_TAG}"
+          git push --atomic origin \
+            "HEAD:refs/heads/${DEFAULT_BRANCH}" \
+            "refs/tags/${RELEASE_TAG}"
+
+          echo "sha=${release_sha}" >> "${GITHUB_OUTPUT}"
+
+  prepare-source:
+    needs: prepare
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout tagged commit
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: '^1.27.0'
+
+      - name: Prepare and verify offline source tarball
+        env:
+          RELEASE_SHA: ${{ needs.prepare.outputs.sha }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          python3 packaging/release.py source --ref "${RELEASE_SHA}" \
+            --version "${RELEASE_TAG}" --verify --output "croc_${RELEASE_TAG}_src.tar.gz"
+
+      - name: Upload source artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: source-tarball
+          path: "*.tar.gz"
+
+  build:
+    needs: prepare
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        include:
+          # Windows builds
+          - goos: windows
+            goarch: amd64
+            name: Windows-64bit
+            ext: .exe
+            archive: zip
+          - goos: windows
+            goarch: "386"
+            name: Windows-32bit
+            ext: .exe
+            archive: zip
+          - goos: windows
+            goarch: arm64
+            name: Windows-ARM64
+            ext: .exe
+            archive: zip
+          
+          # Linux builds
+          - goos: linux
+            goarch: amd64
+            name: Linux-64bit
+            ext: ""
+            archive: tar.gz
+          - goos: linux
+            goarch: "386"
+            name: Linux-32bit
+            ext: ""
+            archive: tar.gz
+          - goos: linux
+            goarch: arm
+            goarm: "7"
+            name: Linux-ARM
+            ext: ""
+            archive: tar.gz
+          - goos: linux
+            goarch: arm
+            goarm: "5"
+            name: Linux-ARMv5
+            ext: ""
+            archive: tar.gz
+          - goos: linux
+            goarch: arm64
+            name: Linux-ARM64
+            ext: ""
+            archive: tar.gz
+          - goos: linux
+            goarch: riscv64
+            name: Linux-RISCV64
+            ext: ""
+            archive: tar.gz
+          
+          # macOS builds
+          - goos: darwin
+            goarch: amd64
+            name: macOS-64bit
+            ext: ""
+            archive: tar.gz
+          - goos: darwin
+            goarch: arm64
+            name: macOS-ARM64
+            ext: ""
+            archive: tar.gz
+          
+          # BSD builds
+          - goos: dragonfly
+            goarch: amd64
+            name: DragonFlyBSD-64bit
+            ext: ""
+            archive: tar.gz
+          - goos: freebsd
+            goarch: amd64
+            name: FreeBSD-64bit
+            ext: ""
+            archive: tar.gz
+          - goos: freebsd
+            goarch: arm64
+            name: FreeBSD-ARM64
+            ext: ""
+            archive: tar.gz
+          - goos: netbsd
+            goarch: "386"
+            name: NetBSD-32bit
+            ext: ""
+            archive: tar.gz
+          - goos: netbsd
+            goarch: amd64
+            name: NetBSD-64bit
+            ext: ""
+            archive: tar.gz
+          - goos: netbsd
+            goarch: arm64
+            name: NetBSD-ARM64
+            ext: ""
+            archive: tar.gz
+          - goos: openbsd
+            goarch: amd64
+            name: OpenBSD-64bit
+            ext: ""
+            archive: tar.gz
+          - goos: openbsd
+            goarch: arm64
+            name: OpenBSD-ARM64
+            ext: ""
+            archive: tar.gz
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+
+      - name: Verify tagged source version
+        env:
+          RELEASE_SHA: ${{ needs.prepare.outputs.sha }}
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          actual_sha="$(git rev-parse HEAD)"
+          if [[ "${actual_sha}" != "${RELEASE_SHA}" ]]; then
+            echo "Tag moved from ${RELEASE_SHA} to ${actual_sha}" >&2
+            exit 1
+          fi
+          expected="const Value = \"${RELEASE_VERSION}\""
+          actual="$(grep '^const Value = ' src/version/version.go || true)"
+          if [[ "${actual}" != "${expected}" ]]; then
+            echo "Tagged source has '${actual}', expected '${expected}'" >&2
+            exit 1
+          fi
+
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: '^1.27.0'
+
+      - name: Build binary
+        env:
+          CGO_ENABLED: 0
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+        run: |
+          # Strip symbols, DWARF, build IDs, source paths, and VCS metadata.
+          case "${{ matrix.goos }}" in
+            "darwin")
+              LDFLAGS='-s -w -buildid= -extldflags "-sectcreate __TEXT __info_plist Info.plist"'
+              ;;
+            *)
+              LDFLAGS='-s -w -buildid= -extldflags "-static"'
+              ;;
+          esac
+          
+          echo "Building for ${{ matrix.goos }}/${{ matrix.goarch }} with LDFLAGS: $LDFLAGS"
+          go build -buildvcs=false -trimpath -tags netgo,osusergo -ldflags "$LDFLAGS" -o croc${{ matrix.ext }}
+
+      - name: Verify native binary version
+        if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
+        env:
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          actual="$(./croc --version)"
+          expected="croc version ${RELEASE_VERSION}"
+          if [[ "${actual}" != "${expected}" ]]; then
+            echo "Built binary reports '${actual}', expected '${expected}'" >&2
+            exit 1
+          fi
+
+      - name: Create archive
+        env:
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            zip "croc_${RELEASE_TAG}_${{ matrix.name }}.zip" croc${{ matrix.ext }} LICENSE THIRD_PARTY_NOTICES.md src/codephrase/wordlists/LICENSE.txt
+          else
+            tar -czvf "croc_${RELEASE_TAG}_${{ matrix.name }}.tar.gz" croc${{ matrix.ext }} LICENSE THIRD_PARTY_NOTICES.md src/codephrase/wordlists/LICENSE.txt
+          fi
+
+      - name: Upload unsigned Windows 64-bit artifact for signing
+        if: matrix.goos == 'windows' && matrix.goarch == 'amd64'
+        uses: actions/upload-artifact@v7
+        with:
+          name: unsigned-Windows-64bit
+          path: "*.zip"
+          retention-days: 1
+
+      - name: Upload build artifact
+        if: matrix.goos != 'windows' || matrix.goarch != 'amd64'
+        uses: actions/upload-artifact@v7
+        with:
+          name: build-${{ matrix.name }}
+          path: |
+            *.zip
+            *.tar.gz
+
+  build-web:
+    name: Build croc-web for Linux amd64
+    needs: prepare
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+
+      - name: Verify tagged commit
+        env:
+          RELEASE_SHA: ${{ needs.prepare.outputs.sha }}
+        run: |
+          actual_sha="$(git rev-parse HEAD)"
+          if [[ "${actual_sha}" != "${RELEASE_SHA}" ]]; then
+            echo "Tag moved from ${RELEASE_SHA} to ${actual_sha}" >&2
+            exit 1
+          fi
+
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: '^1.27.0'
+
+      - name: Setup Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Build embedded web client
+        run: |
+          npm ci --prefix web
+          npm run embed --prefix web
+
+      - name: Build and archive croc-web
+        env:
+          CGO_ENABLED: 0
+          GOOS: linux
+          GOARCH: amd64
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          go build -buildvcs=false -trimpath -tags netgo,osusergo \
+            -ldflags='-s -w -buildid= -extldflags "-static"' \
+            -o croc-web ./cmd/croc-web
+          tar -czvf "croc-web_${RELEASE_TAG}_Linux-amd64.tar.gz" \
+            croc-web LICENSE THIRD_PARTY_NOTICES.md src/codephrase/wordlists/LICENSE.txt
+
+      - name: Verify web binary version
+        env:
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          actual="$(./croc-web --version)"
+          expected="croc-web version ${RELEASE_VERSION}"
+          if [[ "${actual}" != "${expected}" ]]; then
+            echo "Built web binary reports '${actual}', expected '${expected}'" >&2
+            exit 1
+          fi
+
+      - name: Upload croc-web artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: build-croc-web-Linux-amd64
+          path: "croc-web_*.tar.gz"
+
+  sign-windows-amd64:
+    name: Sign Windows 64-bit release
+    needs: build
+    runs-on: windows-latest
+    steps:
+      - name: Download unsigned Windows 64-bit artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: unsigned-Windows-64bit
+          path: unsigned
+
+      - name: Prepare binary for signing
+        shell: powershell
+        run: |
+          $archives = @(Get-ChildItem -Path "${{ github.workspace }}\unsigned" -Filter "croc_*_Windows-64bit.zip" -File)
+          if ($archives.Count -ne 1) {
+            throw "Expected exactly one Windows 64-bit ZIP, found $($archives.Count)."
+          }
+
+          Expand-Archive -LiteralPath $archives[0].FullName -DestinationPath "${{ github.workspace }}\signed"
+
+          $executables = @(Get-ChildItem -Path "${{ github.workspace }}\signed" -Filter "*.exe" -File -Recurse)
+          if ($executables.Count -ne 1 -or $executables[0].Name -ne "croc.exe") {
+            throw "Expected exactly one executable named croc.exe, found: $($executables.FullName -join ', ')."
+          }
+
+      - name: Sign Windows 64-bit binary
+        uses: azure/trusted-signing-action@v2.0.0
+        with:
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          endpoint: ${{ secrets.AZURE_CODE_SIGNING_ENDPOINT }}
+          trusted-signing-account-name: ${{ secrets.AZURE_CODE_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ secrets.AZURE_CERT_PROFILE_NAME }}
+          files: ${{ github.workspace }}/signed/croc.exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      - name: Verify signature and recreate archive
+        shell: powershell
+        run: |
+          $binary = "${{ github.workspace }}\signed\croc.exe"
+          $signature = Get-AuthenticodeSignature -FilePath $binary
+          $signature | Format-List Status, StatusMessage, SignerCertificate, TimeStamperCertificate
+
+          if ($signature.Status -ne [System.Management.Automation.SignatureStatus]::Valid) {
+            throw "The croc.exe Authenticode signature is not valid: $($signature.StatusMessage)"
+          }
+          if (-not $signature.TimeStamperCertificate) {
+            throw "The croc.exe Authenticode signature does not contain a timestamp certificate."
+          }
+
+          $archives = @(Get-ChildItem -Path "${{ github.workspace }}\unsigned" -Filter "croc_*_Windows-64bit.zip" -File)
+          $destination = Join-Path "${{ github.workspace }}" $archives[0].Name
+          Compress-Archive -Path "${{ github.workspace }}\signed\*" -DestinationPath $destination -CompressionLevel Optimal
+
+      - name: Upload signed Windows 64-bit artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: build-Windows-64bit
+          path: "croc_*_Windows-64bit.zip"
+
+  linux-packages:
+    name: Package and verify all Linux targets
+    needs: [prepare, build]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout release commit
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: '^1.27.0'
+      - name: Install pinned package builder
+        run: go install "github.com/goreleaser/nfpm/v2/cmd/nfpm@$(cat packaging/nfpm-version)"
+      - name: Download Linux archives
+        uses: actions/download-artifact@v8
+        with:
+          pattern: build-Linux-*
+          merge-multiple: true
+          path: dist
+      - name: Package archive binaries
+        env:
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+        run: python3 packaging/release.py packages --version "${RELEASE_TAG}" --artifacts dist
+      - name: Inspect packages and exercise every architecture
+        env:
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y rpm rpm2cpio qemu-user zsh fish
+          python3 packaging/verify.py --version "${RELEASE_TAG}" --artifacts dist
+      - name: Upload Linux packages
+        uses: actions/upload-artifact@v7
+        with:
+          name: linux-packages
+          path: |
+            dist/*.deb
+            dist/*.rpm
+
+  package-lifecycle:
+    needs: [prepare, linux-packages]
+    uses: ./.github/workflows/package-lifecycle.yml
+    with:
+      version: ${{ needs.prepare.outputs.version }}
+      revision: ${{ needs.prepare.outputs.sha }}
+
+  release:
+    name: Create draft release
+    needs: [prepare, prepare-source, build, build-web, sign-windows-amd64, linux-packages, package-lifecycle]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout tagged commit
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+
+      - name: Verify tagged commit
+        env:
+          RELEASE_SHA: ${{ needs.prepare.outputs.sha }}
+        run: |
+          actual_sha="$(git rev-parse HEAD)"
+          if [[ "${actual_sha}" != "${RELEASE_SHA}" ]]; then
+            echo "Tag moved from ${RELEASE_SHA} to ${actual_sha}" >&2
+            exit 1
+          fi
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: build-*
+          merge-multiple: true
+          path: dist
+
+      - name: Download source artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: source-tarball
+          path: dist
+
+      - name: Download Linux packages
+        uses: actions/download-artifact@v8
+        with:
+          name: linux-packages
+          path: dist
+
+      - name: Verify exact asset set and generate checksums
+        env:
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          python3 packaging/release.py checksums --version "${RELEASE_TAG}" --artifacts dist
+          python3 packaging/release.py verify-assets --version "${RELEASE_TAG}" --artifacts dist
+
+      - name: Create or update draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+          python3 packaging/release.py verify-assets --version "${RELEASE_TAG}" --artifacts dist
+          assets=( dist/*.zip dist/*.tar.gz dist/*.deb dist/*.rpm dist/*_checksums.txt )
+
+          if release_is_draft="$(gh release view "${RELEASE_TAG}" --json isDraft --jq .isDraft 2>/dev/null)"; then
+            if [[ "${release_is_draft}" != "true" ]]; then
+              echo "Release ${RELEASE_TAG} was published while its artifacts were building" >&2
+              exit 1
+            fi
+            gh release upload "${RELEASE_TAG}" "${assets[@]}" --clobber
+          else
+            gh release create "${RELEASE_TAG}" "${assets[@]}" \
+              --draft \
+              --generate-notes \
+              --title "${RELEASE_TAG}" \
+              --verify-tag
+          fi
+
+          gh release view "${RELEASE_TAG}" --json isDraft,assets > release-assets.json
+          python3 packaging/release.py verify-draft --version "${RELEASE_TAG}" --metadata release-assets.json
+          release_url="$(gh release view "${RELEASE_TAG}" --json url --jq .url)"
+          echo "Draft release: ${release_url}" >> "${GITHUB_STEP_SUMMARY}"

@@ -1,0 +1,91 @@
+name: Paxeer / HPX Registry
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - hpx/registry/**
+      - .github/workflows/paxeer-hpx-registry.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: paxeer-hpx-registry-${{ github.sha }}
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/sidiora-labs/layerx-protocol/hpx-registry
+
+jobs:
+  release:
+    name: Publish registry runtimes
+    runs-on: macos-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: hpx/registry/go.mod
+          cache-dependency-path: hpx/registry/go.mod
+
+      - name: Set up Dockerless image publication
+        uses: ko-build/setup-ko@61b4d1d396f5b2e7d6bb6fefdce3dc38d1a13445 # v0.10
+        with:
+          version: v0.19.1
+
+      - name: Build revision-bound registry executables
+        working-directory: hpx/registry
+        env:
+          SOURCE_REVISION: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          for arch in amd64 arm64; do
+            output="dist/hpx-registry-linux-${arch}"
+            CGO_ENABLED=0 GOOS=linux GOARCH="$arch" \
+              go build -trimpath -ldflags "-s -w -X main.sourceRevision=${SOURCE_REVISION}" -o "$output" .
+            (cd dist && shasum -a 256 "hpx-registry-linux-${arch}" > "hpx-registry-linux-${arch}.sha256")
+          done
+
+      - name: Publish immutable public release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: hpx-registry-${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "Release already exists: $RELEASE_TAG"
+          else
+            gh release create "$RELEASE_TAG" \
+              hpx/registry/dist/hpx-registry-linux-amd64 \
+              hpx/registry/dist/hpx-registry-linux-amd64.sha256 \
+              hpx/registry/dist/hpx-registry-linux-arm64 \
+              hpx/registry/dist/hpx-registry-linux-arm64.sha256 \
+              --target "$GITHUB_SHA" \
+              --title "HPX Registry ${GITHUB_SHA::12}" \
+              --notes "Revision-bound HPX registry runtime for ${GITHUB_SHA}."
+          fi
+
+      - name: Publish revision-bound registry image
+        working-directory: hpx/registry
+        env:
+          KO_DOCKER_REPO: ${{ env.IMAGE }}
+          SOURCE_REVISION: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          ko build \
+            --bare \
+            --platform=linux/amd64,linux/arm64 \
+            --tags="main,sha-${SOURCE_REVISION}" \
+            --ldflags="-s -w -X main.sourceRevision=${SOURCE_REVISION}" \
+            --image-user=10001:10001 \
+            --image-label="org.opencontainers.image.source=https://github.com/Sidiora-Labs/Paxeer-X-Network" \
+            --image-label="org.opencontainers.image.revision=${SOURCE_REVISION}" \
+            --image-label="org.opencontainers.image.title=HyperPax HPX Registry" \
+            .

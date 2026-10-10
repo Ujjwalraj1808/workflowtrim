@@ -1,0 +1,241 @@
+name: Paxeer / Cross-Architecture Build Test
+
+on:
+  pull_request:
+    paths:
+      - 'go.mod'
+      - 'go.sum'
+      - 'chain.mk'
+      - 'docker/layerx/Dockerfile'
+      - 'docker/layerx/Dockerfile.dockerignore'
+      - 'foundry.paxeer.toml'
+      - 'buf.gen.yaml'
+      - 'buf.lock'
+      - 'buf.yaml'
+      - 'codecov.yml'
+      - 'config.yml'
+      - '.golangci.yml'
+      - 'gen.go'
+      - 'link_directives_test.go'
+      - 'mod_test.go'
+      - 'run_blocktests.sh'
+      - 'version.json'
+      - 'admin/**'
+      - 'api/**'
+      - 'assets/**'
+      - 'benchmark/**'
+      - 'consensus/**'
+      - 'custodyproof/**'
+      - 'daemon/**'
+      - 'docker/**'
+      - 'engine/**'
+      - 'example/**'
+      - 'hpx/**'
+      - 'integration_test/**'
+      - 'interchain/**'
+      - 'loadtest/**'
+      - 'modules/**'
+      - 'node/**'
+      - 'occ_tests/**'
+      - 'parallelization/**'
+      - 'precompiles/**'
+      - 'ratelimiter/**'
+      - 'rpc/**'
+      - 'sdk/**'
+      - 'storage/**'
+      - 'store/**'
+      - 'sync/**'
+      - 'testutil/**'
+      - 'types/**'
+      - 'utils/**'
+      - 'wasm/**'
+      - 'wasm-runtime/**'
+      - 'wasmbinding/**'
+      - 'contracts/src/**'
+      - 'contracts/test/**'
+      - 'contracts/scripts/**'
+      - 'contracts/wasm/**'
+      - 'docs/swagger/**'
+      - 'docs/swagger-ui/**'
+      - 'tests/chain/**'
+      - 'tools/chain/**'
+      - 'tools/tx-scanner/**'
+      - 'tools/utils/**'
+      - 'contracts/config/client.toml'
+      - 'contracts/hardhat.config.js'
+      - 'contracts/package.json'
+      - 'contracts/package-lock.json'
+      - 'contracts/tsconfig.json'
+      - 'docs/evm_jsonrpc_unsupported.md'
+      - 'docs/paxeer-network.md'
+      - 'docs/paxeer-chain-docs.md'
+      - 'scripts/**'
+      - '!scripts/PaxeerBetaDeploy.s.sol'
+      - '!scripts/qualify-mirror-live.sh'
+      - '!scripts/qualify-mirror-verification-live.sh'
+      - '.github/workflows/paxeer-cross-arch-build.yml'
+  merge_group:
+  push:
+    branches:
+      - main
+      - release/**
+    paths:
+      - 'go.mod'
+      - 'go.sum'
+      - 'chain.mk'
+      - 'docker/layerx/Dockerfile'
+      - 'docker/layerx/Dockerfile.dockerignore'
+      - 'foundry.paxeer.toml'
+      - 'buf.gen.yaml'
+      - 'buf.lock'
+      - 'buf.yaml'
+      - 'codecov.yml'
+      - 'config.yml'
+      - '.golangci.yml'
+      - 'gen.go'
+      - 'link_directives_test.go'
+      - 'mod_test.go'
+      - 'run_blocktests.sh'
+      - 'version.json'
+      - 'admin/**'
+      - 'api/**'
+      - 'assets/**'
+      - 'benchmark/**'
+      - 'consensus/**'
+      - 'custodyproof/**'
+      - 'daemon/**'
+      - 'docker/**'
+      - 'engine/**'
+      - 'example/**'
+      - 'hpx/**'
+      - 'integration_test/**'
+      - 'interchain/**'
+      - 'loadtest/**'
+      - 'modules/**'
+      - 'node/**'
+      - 'occ_tests/**'
+      - 'parallelization/**'
+      - 'precompiles/**'
+      - 'ratelimiter/**'
+      - 'rpc/**'
+      - 'sdk/**'
+      - 'storage/**'
+      - 'store/**'
+      - 'sync/**'
+      - 'testutil/**'
+      - 'types/**'
+      - 'utils/**'
+      - 'wasm/**'
+      - 'wasm-runtime/**'
+      - 'wasmbinding/**'
+      - 'contracts/src/**'
+      - 'contracts/test/**'
+      - 'contracts/scripts/**'
+      - 'contracts/wasm/**'
+      - 'docs/swagger/**'
+      - 'docs/swagger-ui/**'
+      - 'tests/chain/**'
+      - 'tools/chain/**'
+      - 'tools/tx-scanner/**'
+      - 'tools/utils/**'
+      - 'contracts/config/client.toml'
+      - 'contracts/hardhat.config.js'
+      - 'contracts/package.json'
+      - 'contracts/package-lock.json'
+      - 'contracts/tsconfig.json'
+      - 'docs/evm_jsonrpc_unsupported.md'
+      - 'docs/paxeer-network.md'
+      - 'docs/paxeer-chain-docs.md'
+      - 'scripts/**'
+      - '!scripts/PaxeerBetaDeploy.s.sol'
+      - '!scripts/qualify-mirror-live.sh'
+      - '!scripts/qualify-mirror-verification-live.sh'
+      - '.github/workflows/paxeer-cross-arch-build.yml'
+
+defaults:
+  run:
+    working-directory: .
+
+concurrency:
+  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event_name == 'push' && github.sha || github.ref }}
+
+env:
+  LEDGER_ENABLED: false
+
+jobs:
+  linux-amd64:
+    name: "Linux AMD64"
+    runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && 'ubuntu-latest' || vars.CI_LINUX_RUNNER || 'lx-runner' }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: '1.25.6'
+          cache-dependency-path: go.sum
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential
+
+      - name: Verify Go installation
+        run: |
+          go version
+          echo "GOARCH: $(go env GOARCH)"
+          echo "GOOS: $(go env GOOS)"
+
+      - name: Download Go dependencies
+        run: go mod download
+
+      - name: Run make -f chain.mk install
+        run: make -f chain.mk install
+
+      - name: Verify install binary
+        run: paxd version --long
+
+      - name: Run make -f chain.mk build
+        run: make -f chain.mk build
+
+      - name: Verify build binary
+        run: ./build/paxd version --long
+  macos-arm64:
+    name: "macOS ARM64"
+    runs-on: macos-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: '1.25.6'
+          cache-dependency-path: go.sum
+
+      - name: Install system dependencies
+        run: |
+          xcode-select --version || xcode-select --install
+
+      - name: Verify Go installation
+        run: |
+          go version
+          echo "GOARCH: $(go env GOARCH)"
+          echo "GOOS: $(go env GOOS)"
+
+      - name: Download Go dependencies
+        run: go mod download
+
+      - name: Run make -f chain.mk install
+        run: make -f chain.mk install
+
+      - name: Verify install binary
+        run: paxd version --long
+
+      - name: Run make -f chain.mk build
+        run: make -f chain.mk build
+
+      - name: Verify build binary
+        run: ./build/paxd version --long

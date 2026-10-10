@@ -1,0 +1,134 @@
+# The Windows gate that runs BEFORE merge, alongside windows-daily.yaml which runs after.
+#
+# Why it exists: every Windows portability mistake in this repo has been found by the daily job,
+# which means it was already on main. Fifteen issues say so — #478 #802 #816 #858 #934 #1079 #1212
+# #1267 #1396 #1459 #1481 #1484 #1539 #1653 #1709 — and #1653 sat red long enough to collect five
+# failing specs on top of the first one. Nearly all of them were test-side portability bugs (POSIX
+# path literals, chmod, HOME vs USERPROFILE, fs.watch, timeouts), which is exactly the class a
+# pre-merge run catches.
+#
+# What it does NOT do: lint, typecheck, build. Those answer the same on every platform and ci.yml
+# already runs them once. Only `yarn test` behaves differently here, so only `yarn test` runs
+# here — that is what keeps this cheap enough to put on every pull request.
+#
+# One node version, not the daily's 22/24 matrix: this runs on every PR, the daily still covers
+# both, and an ABI difference that only shows on one of them is not the class this gate is for.
+name: Windows (PR)
+
+# NO `paths-ignore` here, deliberately — see the scope step below.
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-pr-${{ github.ref }}
+  cancel-in-progress: true
+
+# Windows is the slowest leg of a pull request and `yarn test` is nearly all of it, so the suite
+# is split this many ways. Keep in step with the `shard:` matrix below.
+env:
+  TEST_SHARD_COUNT: "3"
+
+jobs:
+  test_windows:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        # Keep in step with TEST_SHARD_COUNT above; a matrix cannot be computed from it.
+        shard: [1, 2, 3]
+    steps:
+      # fetch-depth: 0 so the scope step can diff against the base commit.
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      # Docs, plans and markdown cannot change what a WINDOWS test run does — ci.yml's ubuntu leg
+      # runs the suite whatever changed, including the specs that read docs/guide and README.md,
+      # and with no code changed there is no platform difference left for this runner to find.
+      #
+      # The filter lives HERE rather than in `on:` because a workflow that `paths-ignore` skipped
+      # produces NO CHECK AT ALL — so the moment this becomes a required gate, every documentation-
+      # only pull request would sit on "Expected — waiting for status" and could never merge. A job
+      # that always runs and decides for itself always reports.
+      #
+      # Not a second job with an `if:` either: a skipped job is reported as successful to branch
+      # protection, but that is a rule about the platform rather than something this repo can see,
+      # and one job that genuinely succeeds needs no such rule to be true.
+      - uses: ./.github/actions/changed-scope
+        id: scope
+
+      # Deliberately no `cache: yarn`: restoring the yarn cache tar onto NTFS is slower than a
+      # fresh install. node_modules is cached directly instead (below). Same reasoning as
+      # windows-daily.yaml.
+      - uses: actions/setup-node@v6
+        if: steps.scope.outputs.code == 'true'
+        id: setup-node
+        with:
+          node-version: 22.x
+
+      # NOTE: windows-daily.yaml disables Defender realtime monitoring here, because its realtime
+      # scanning makes yarn's atomic renames fail with EPERM mid-install. This workflow does NOT,
+      # and the difference is the trust boundary rather than an oversight.
+      #
+      # `pull_request` runs code the pull request supplies — install lifecycle scripts and the test
+      # files themselves — and on a public repository anyone can open one. Turning the runner's
+      # protection off first, and only then executing that code, is a bigger concession than a
+      # flaky install is worth. The daily job runs on `main`, a schedule and manual dispatch, so
+      # the code it executes is already trusted; the workaround stays there.
+      #
+      # If this does turn out to be EPERM-flaky, the answer is a retry or a narrower exclusion —
+      # not disabling Defender ahead of untrusted code.
+
+      # The key is windows-daily.yaml's key verbatim, so a pull request restores the tree main
+      # already built rather than resolving its own. The restore-keys prefix keeps a changed
+      # lockfile starting from the previous tree instead of from nothing.
+      #
+      # Only the first shard carries the save half. Three shards missing the same key would each
+      # upload the same tree and two of the three would be rejected as duplicates; the others
+      # restore whatever a previous run left, and yarn reconciles the difference.
+      - uses: actions/cache@v5
+        if: steps.scope.outputs.code == 'true' && matrix.shard == 1
+        with:
+          path: node_modules
+          key: win-node-modules-22.x-${{ hashFiles('yarn.lock') }}
+          restore-keys: |
+            win-node-modules-22.x-
+
+      - uses: actions/cache/restore@v5
+        if: steps.scope.outputs.code == 'true' && matrix.shard != 1
+        with:
+          path: node_modules
+          key: win-node-modules-22.x-${{ hashFiles('yarn.lock') }}
+          restore-keys: |
+            win-node-modules-22.x-
+
+      # Restored BEFORE install so puppeteer's postinstall skips its ~120 MB download.
+      # Split the same way as node_modules above, so a lockfile change still leaves one shard
+      # holding the save half rather than waiting for windows-daily.yaml to write the key.
+      - uses: actions/cache@v5
+        if: steps.scope.outputs.code == 'true' && matrix.shard == 1
+        with:
+          path: ~/.cache/puppeteer
+          key: puppeteer-${{ runner.os }}-${{ hashFiles('yarn.lock') }}
+
+      - uses: actions/cache/restore@v5
+        if: steps.scope.outputs.code == 'true' && matrix.shard != 1
+        with:
+          path: ~/.cache/puppeteer
+          key: puppeteer-${{ runner.os }}-${{ hashFiles('yarn.lock') }}
+
+      # Also exercises the postinstall (server/fix-pty-perms.js) on Windows.
+      - name: Install
+        if: steps.scope.outputs.code == 'true'
+        run: yarn install --frozen-lockfile --network-timeout 120000
+
+      # vitest partitions the file list, so the shards together run exactly the files one
+      # unsharded run would.
+      - name: Test
+        if: steps.scope.outputs.code == 'true'
+        run: yarn test --shard=${{ matrix.shard }}/${{ env.TEST_SHARD_COUNT }}

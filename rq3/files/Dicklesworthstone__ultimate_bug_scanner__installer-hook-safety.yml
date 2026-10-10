@@ -1,0 +1,60 @@
+name: Installer Hook Safety
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - install.sh
+      - ubs
+      - SHA256SUMS
+      - .claude/hooks/**
+      - modules/**
+      - scripts/update_checksums.py
+      - scripts/update_sha256sums.sh
+      - scripts/verify_checksums.sh
+      - scripts/verify_sha256sums.sh
+      - test-suite/install/**
+      - .github/workflows/installer-hook-safety.yml
+  pull_request:
+    paths:
+      - install.sh
+      - ubs
+      - SHA256SUMS
+      - .claude/hooks/**
+      - modules/**
+      - scripts/update_checksums.py
+      - scripts/update_sha256sums.sh
+      - scripts/verify_checksums.sh
+      - scripts/verify_sha256sums.sh
+      - test-suite/install/**
+      - .github/workflows/installer-hook-safety.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  installer-hooks:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 10
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install test dependencies
+        run: sudo apt-get update && sudo apt-get install -y jq ripgrep rsync shellcheck
+      - name: Check syntax, lint, and checksum chain
+        run: |
+          bash -n install.sh
+          bash -n test-suite/install/run_tests.sh
+          shellcheck -S warning install.sh
+          ./scripts/verify_sha256sums.sh
+          ./scripts/verify_checksums.sh
+      - name: Exercise hook scope, upgrades, and sandboxed HOME installs
+        run: python3 test-suite/install/test_claude_hook_scope.py -v
+      - name: Verify checksum regeneration is stable
+        run: |
+          python3 scripts/update_checksums.py
+          git diff --exit-code

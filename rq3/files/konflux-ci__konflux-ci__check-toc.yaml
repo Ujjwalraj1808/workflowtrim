@@ -1,0 +1,30 @@
+name: Check for README updates
+
+on:
+  pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+  merge_group:
+    types: [checks_requested]
+
+jobs:
+  check-toc:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+
+      - name: Verify ToC
+        run: |
+          find . -name "*.md" -not -path "./operator/docs/*" -not -path "./.cursor/*" -not -path "./skills/*" | while read -r file; do
+              npx markdown-toc $file -i
+          done
+          if [[ $(git status --porcelain) ]]; then
+              echo ERROR: "Did you forget to update markdowns table of contents?" >&2
+              echo ERROR: "Check CONTRIBUTING.md for instructions and update your PR" >&2
+              git diff >&2
+              exit 1
+          fi
+          echo "Markdowns table of contents are up to date" >&2

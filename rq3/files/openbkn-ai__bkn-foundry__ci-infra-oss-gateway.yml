@@ -1,0 +1,34 @@
+name: ci-infra-oss-gateway
+
+# Build and unit-test gate for PRs touching infra/oss-gateway-backend.
+
+on:
+  pull_request:
+    paths:
+      - 'infra/oss-gateway-backend/**'
+      - '.github/workflows/ci-infra-oss-gateway.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-infra-oss-gateway-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: infra/oss-gateway-backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: infra/oss-gateway-backend/go.mod
+      - name: Static analysis
+        uses: ./.github/actions/golangci-lint
+        with:
+          working-directory: infra/oss-gateway-backend
+      - run: go build ./...
+      - run: go test ./...

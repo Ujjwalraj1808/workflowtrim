@@ -1,0 +1,327 @@
+# Release pipeline: tag -> signed installers for macOS, Windows and Linux ->
+# one GitHub Release -> the Homebrew and Flathub channels.
+#
+# Why a matrix of real runners rather than one cross-build: three things in
+# this tree are bound to the host that produces them.
+#   * ffmpeg-static/ffprobe-static download a binary for the *install* host at
+#     `npm ci`, and src/main/ffmpeg.ts ships whatever it finds.
+#   * The Keynote importer is a PyInstaller freeze, and PyInstaller has no
+#     cross-compilation mode — not even between macOS architectures, which is
+#     why arm64 and x64 macOS are separate entries here.
+#   * Notarization runs only on macOS; Azure Trusted Signing runs only on
+#     Windows (electron-builder drives it through a PowerShell module).
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Build and sign, but publish nothing'
+        type: boolean
+        default: true
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  NODE_VERSION: '22'
+
+jobs:
+  # ---------------------------------------------------------------------------
+  version:
+    name: Resolve version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      publish: ${{ steps.resolve.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: resolve
+        # A tag that disagrees with package.json would produce a release whose
+        # assets are named for one version and whose auto-update manifests
+        # advertise another. Fail here rather than halfway through publishing.
+        run: |
+          PKG=$(node -p "require('./package.json').version")
+          echo "version=$PKG" >> "$GITHUB_OUTPUT"
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            TAG="${GITHUB_REF_NAME#v}"
+            if [ "$TAG" != "$PKG" ]; then
+              echo "::error::tag v$TAG does not match package.json version $PKG"
+              exit 1
+            fi
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          elif [ "${{ inputs.dry_run }}" = "false" ]; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ---------------------------------------------------------------------------
+  build:
+    name: ${{ matrix.label }}
+    needs: version
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Runner images come and go: macos-13 was retired in December 2025
+          # and macos-14 is deprecated. Check the table at
+          # github.com/actions/runner-images before bumping these.
+          - label: macOS arm64
+            os: macos-15
+            platform: mac
+            arch: arm64
+          # Intel macOS needs its own runner purely for the importer freeze;
+          # the `-intel` images are the x64 hosts GitHub still offers.
+          - label: macOS x64
+            os: macos-15-intel
+            platform: mac
+            arch: x64
+          # Oldest supported glibc wins: a .deb or AppImage linked against a
+          # newer glibc simply refuses to start on older distributions, while
+          # the reverse is fine. ubuntu-22.04 enters deprecation on
+          # 2026-09-17 and is removed 2027-04-17; move to ubuntu-24.04 then.
+          - label: Linux x64
+            os: ubuntu-22.04
+            platform: linux
+            arch: x64
+          - label: Windows x64
+            os: windows-latest
+            platform: win
+            arch: x64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      # Every platform freezes its own importer: PyInstaller cannot
+      # cross-compile, and the frozen binary is what lets an installed DeckWerk
+      # import .key files on a machine with no Python.
+      - name: Set up Python for the Keynote importer
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - run: npm ci
+
+      - name: Build the Keynote importer
+        run: npm run build:importer
+
+      - name: Import Apple signing certificate
+        if: matrix.platform == 'mac'
+        env:
+          CSC_LINK: ${{ secrets.CSC_LINK }}
+        # electron-builder consumes CSC_LINK itself; this only turns its
+        # absence into a legible message instead of a signing failure 20
+        # minutes later.
+        run: |
+          if [ -z "$CSC_LINK" ]; then
+            echo "::warning::CSC_LINK is unset — producing an UNSIGNED macOS build"
+          fi
+
+      - name: Package
+        env:
+          # Apple. electron-builder signs when CSC_LINK is present and
+          # notarizes when the three APPLE_* values are; the config turns both
+          # off together when they are missing, so a fork still builds.
+          CSC_LINK: ${{ secrets.CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          # Azure Trusted Signing. The three credentials are secrets; the three
+          # account identifiers are not, and live in repository variables.
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          AZURE_CODE_SIGNING_ENDPOINT: ${{ vars.AZURE_CODE_SIGNING_ENDPOINT }}
+          AZURE_CODE_SIGNING_ACCOUNT: ${{ vars.AZURE_CODE_SIGNING_ACCOUNT }}
+          AZURE_CODE_SIGNING_PROFILE: ${{ vars.AZURE_CODE_SIGNING_PROFILE }}
+          # Lets electron-builder resolve the GitHub publish config for the
+          # latest*.yml update manifests without actually uploading.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npm run dist:${{ matrix.platform }} -- --${{ matrix.arch }}
+
+      - name: Collect installers
+        shell: bash
+        # electron-builder also leaves unpacked app trees in release/; only the
+        # distributable files, the update manifests and their blockmaps are
+        # worth carrying between jobs. The blockmaps are what let a future
+        # electron-updater download a delta instead of a whole 250 MB app.
+        run: |
+          mkdir -p upload
+          find release -maxdepth 1 -type f \
+            \( -name '*.dmg' -o -name '*.zip' -o -name '*.exe' \
+               -o -name '*.AppImage' -o -name '*.deb' -o -name '*.tar.gz' \
+               -o -name '*.blockmap' -o -name 'latest*.yml' \) \
+            -exec cp {} upload/ \;
+          ls -la upload
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: installers-${{ matrix.platform }}-${{ matrix.arch }}
+          path: upload/
+          if-no-files-found: error
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  release:
+    name: Publish GitHub Release
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: installers-*
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          cd artifacts
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create or update the release
+        if: needs.version.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.version.outputs.version }}
+        # Created as a draft: the release is only visible once the assets are
+        # attached, so nobody follows a link to a half-uploaded release.
+        run: |
+          if ! gh release view "v$VERSION" >/dev/null 2>&1; then
+            gh release create "v$VERSION" \
+              --draft --title "DeckWerk $VERSION" --generate-notes
+          fi
+          gh release upload "v$VERSION" artifacts/* --clobber
+          # Only now, with every asset attached, does the release become
+          # visible — and become the target of the install instructions the
+          # Homebrew/Flathub jobs are about to publish.
+          gh release edit "v$VERSION" --draft=false
+
+  # ---------------------------------------------------------------------------
+  homebrew:
+    name: Update Homebrew tap
+    needs: [version, release]
+    if: needs.version.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      # Until the tap repository and its PAT exist, the release itself must
+      # still succeed: skip this job's work instead of failing the run.
+      - id: tap
+        env:
+          TAP_GITHUB_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
+        run: |
+          if [ -z "$TAP_GITHUB_TOKEN" ]; then
+            echo "::warning::TAP_GITHUB_TOKEN is unset — not updating the Homebrew tap (see docs/RELEASING.md §3)"
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/checkout@v4
+        if: steps.tap.outputs.enabled == 'true'
+      - uses: actions/download-artifact@v4
+        if: steps.tap.outputs.enabled == 'true'
+        with:
+          path: artifacts
+          pattern: installers-mac-*
+          merge-multiple: true
+
+      - name: Check out the tap
+        if: steps.tap.outputs.enabled == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: vsitzmann/homebrew-tap
+          path: tap
+          # A PAT with contents:write on the tap repository — the default
+          # GITHUB_TOKEN is scoped to this repository only.
+          token: ${{ secrets.TAP_GITHUB_TOKEN }}
+
+      - name: Render the cask
+        if: steps.tap.outputs.enabled == 'true'
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          mkdir -p tap/Casks
+          node scripts/render-homebrew-cask.mjs "$VERSION" \
+            "artifacts/deckwerk-$VERSION-mac-x64.dmg" \
+            "artifacts/deckwerk-$VERSION-mac-arm64.dmg" \
+            > tap/Casks/deckwerk.rb
+          cat tap/Casks/deckwerk.rb
+
+      - name: Commit
+        if: steps.tap.outputs.enabled == 'true'
+        working-directory: tap
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Casks/deckwerk.rb
+          git commit -m "deckwerk $VERSION" || { echo "cask unchanged"; exit 0; }
+          git push
+
+  # ---------------------------------------------------------------------------
+  flatpak:
+    name: Update Flathub manifest
+    needs: [version, release]
+    if: needs.version.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: installers-linux-*
+          merge-multiple: true
+
+      - name: Point the manifest at this release
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          node scripts/render-flatpak-manifest.mjs "$VERSION" \
+            "artifacts/deckwerk-$VERSION-linux-x64.tar.gz"
+          git --no-pager diff -- flatpak/
+
+      - name: Push the regenerated manifest
+        # The manifest is mirrored to github.com/flathub/org.deckwerk.DeckWerk
+        # by hand (or by a second workflow) once the initial submission is
+        # accepted; until then this keeps the in-repo manifest honest and gives
+        # a reviewable diff to copy across. The branch push needs only
+        # contents:write; opening the pull request additionally needs the
+        # repository setting "Allow GitHub Actions to create and approve pull
+        # requests", so that step is allowed to fail with a pointer instead.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          BRANCH="flatpak/$VERSION"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B "$BRANCH"
+          git add flatpak/
+          if git diff --cached --quiet; then
+            echo "manifest already points at v$VERSION"; exit 0
+          fi
+          git commit -m "flatpak: DeckWerk $VERSION"
+          git push --force origin "$BRANCH"
+          if ! gh pr create --base "${{ github.event.repository.default_branch }}" --head "$BRANCH" \
+               --title "flatpak: DeckWerk $VERSION" \
+               --body "Regenerated Flathub manifest for v$VERSION. Copy this diff into a PR against flathub/org.deckwerk.DeckWerk to ship the Flatpak update."; then
+            echo "::warning::Could not open the pull request (enable 'Allow GitHub Actions to create and approve pull requests' under Settings > Actions). Branch pushed: https://github.com/${GITHUB_REPOSITORY}/compare/$BRANCH"
+          fi

@@ -1,0 +1,1363 @@
+name: Release
+
+# @task release-pipeline (foundational — see T9540 / Saga T9787 release-system).
+# Triggers:
+#   1. Automatic: push a v* tag (e.g. v2026.3.14, v2026.3.14-beta.1)
+#   2. Manual break-glass: workflow_dispatch with a version input
+#      (use if the tag push triggered a failed run that needs a retry)
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release (e.g. 2026.3.14). Tag must already exist on main.'
+        required: true
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  # worktree-napi: 4 triples. The reusable workflow builds them — or, when the
+  # native SOURCE is unchanged since a verified build, restores that bundle
+  # from the Actions cache and skips the build matrix (see the source-hash
+  # notes in worktree-napi-prebuild.yml). darwin-x64 stays out of the matrix
+  # (T10479: the macos-13 Intel pool queues indefinitely and `needs:` waits for
+  # queued jobs forever).
+  prebuild:
+    name: worktree-napi prebuild (4 triples)
+    uses: ./.github/workflows/worktree-napi-prebuild.yml
+
+  # T12382: the .cant parser addon for every OS + the WASI fallback. The
+  # reusable workflow's gate job fails unless all 8 native triples and the
+  # wasm built, loaded on their own hardware and matched WASI — or a bundle
+  # that did so for the SAME native source is restored from the cache — so
+  # `publish` (which needs it) cannot start with a triple missing.
+  cant-napi:
+    name: cant-napi (8 native triples + WASI)
+    uses: ./.github/workflows/cant-napi-build.yml
+
+  # Everything that does NOT need a native binary, off the critical path: it
+  # starts at t=0 alongside the native builds instead of after them. The build
+  # output (dist/, studio-dist/ and the version-synced manifests) travels to
+  # `publish` as an artifact, so publish never rebuilds.
+  build-verify:
+    name: Build & Verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    # Published so downstream jobs consume ONE derivation of these values.
+    # execute-payload used to re-derive `version` with a copy of the shell below
+    # that omitted the dist-tag branch entirely, so on workflow_dispatch the two
+    # could disagree and nothing would say so.
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      dist_tag: ${{ steps.version.outputs.dist_tag }}
+      rc_version: ${{ steps.version.outputs.rc_version }}
+      is_prerelease: ${{ steps.version.outputs.is_prerelease }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+          cache: 'pnpm'
+
+      # Resolve version from tag push or manual workflow_dispatch input
+      - name: Get version
+        id: version
+        env:
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+          REF_NAME: ${{ github.ref_name }}
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          if [[ -n "$INPUT_VERSION" ]]; then
+            VERSION="$INPUT_VERSION"
+          else
+            VERSION="${REF_NAME#v}"
+          fi
+          # Determine npm dist-tag from version suffix.
+          #
+          # A stable version is gated by a release candidate first (T13181):
+          # Publish puts `<version>-rc.ci.<run number>` on the `canary` dist-tag
+          # through OIDC, proves that rc installable from npm and runs the
+          # sandbox soak against it, and only then publishes `<version>` to
+          # `latest` from the same commit, also through OIDC. No npm token is
+          # involved anywhere. The run number keeps the rc stable across
+          # re-runs of this run, so a re-run skips what already published; the
+          # `ci.` segment keeps it apart from a hand-cut `-rc.N` prerelease tag.
+          RC_VERSION=""
+          if [[ "$VERSION" == *"-alpha"* ]] || [[ "$VERSION" == *"-dev"* ]]; then
+            DIST_TAG="dev"
+          elif [[ "$VERSION" == *"-beta"* ]] || [[ "$VERSION" == *"-rc"* ]]; then
+            DIST_TAG="beta"
+          else
+            DIST_TAG="latest"
+            RC_VERSION="${VERSION}-rc.ci.${RUN_NUMBER}"
+          fi
+          IS_PRERELEASE=$([[ "$VERSION" == *"-"* ]] && echo "true" || echo "false")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "dist_tag=$DIST_TAG" >> "$GITHUB_OUTPUT"
+          echo "rc_version=$RC_VERSION" >> "$GITHUB_OUTPUT"
+          echo "is_prerelease=$IS_PRERELEASE" >> "$GITHUB_OUTPUT"
+          echo "Version: $VERSION | dist-tag: $DIST_TAG | rc: ${RC_VERSION:-none} | prerelease: $IS_PRERELEASE"
+
+      # CalVer validation: YYYY.M.PATCH (stable) or YYYY.M.PATCH-suffix (pre-release)
+      - name: Validate CalVer
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          BASE_VERSION="${VERSION#v}"; BASE_VERSION="${BASE_VERSION%%-*}"
+          TAG_YEAR="${BASE_VERSION%%.*}"
+          TAG_MONTH="${BASE_VERSION#*.}"; TAG_MONTH="${TAG_MONTH%%.*}"
+          CURRENT_YEAR=$(date -u +%Y)
+          CURRENT_MONTH=$(date -u +%-m)
+          NEXT_MONTH=$(( CURRENT_MONTH == 12 ? 1 : CURRENT_MONTH + 1 ))
+          NEXT_YEAR=$(( CURRENT_MONTH == 12 ? CURRENT_YEAR + 1 : CURRENT_YEAR ))
+
+          if [[ "$VERSION" == *"-"* ]]; then
+            # Pre-release: allow current or next month
+            if [[ "$TAG_YEAR" != "$CURRENT_YEAR" && "$TAG_YEAR" != "$NEXT_YEAR" ]] || \
+               [[ "$TAG_MONTH" != "$CURRENT_MONTH" && "$TAG_MONTH" != "$NEXT_MONTH" ]]; then
+              echo "ERROR: Pre-release $VERSION outside allowed CalVer range"
+              exit 1
+            fi
+            echo "CalVer OK (pre-release): $VERSION"
+          else
+            # Stable: strict current month required
+            if [[ "$TAG_YEAR" != "$CURRENT_YEAR" || "$TAG_MONTH" != "$CURRENT_MONTH" ]]; then
+              echo "ERROR: $VERSION does not match current CalVer ${CURRENT_YEAR}.${CURRENT_MONTH}"
+              exit 1
+            fi
+            echo "CalVer OK (stable): $VERSION"
+          fi
+
+      # Sync all package.json versions from the tag.
+      #
+      # The git tag is the canonical source of truth for the release version.
+      # The root package.json AND every publishable workspace package.json are
+      # synced from the tag in the same step so they cannot drift.
+      #
+      # Prevents "cannot publish over previously published" errors when a
+      # developer forgets to bump package.json files before pushing the tag,
+      # and prevents the root package.json from lying about the workspace
+      # version (which it did from v2026.4.5 through v2026.4.8).
+      - name: Sync package versions from tag
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        # The same manifest list the Publish job re-versions for the release
+        # candidate and then the release (T13181).
+        run: scripts/release-sync-versions.sh "$VERSION"
+
+      # T13184: a hotfix is flagged inside @cleocode/cleo's own manifest
+      # (`"cleo": { "hotfix": true }`), read from the committed release plan's
+      # releaseKind. Trusted Publishing (OIDC) cannot move dist-tags, so the flag
+      # ships with the package; installed CLIs read it from the latest version's
+      # registry manifest and show a stronger HOTFIX update notice. Runs before
+      # the tarball gates so they verify the manifest that is published, and the
+      # modified manifest travels to `publish` with the build output.
+      - name: Flag a hotfix release in the cleo manifest (T13184)
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: node scripts/mark-hotfix-release.mjs "$VERSION"
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Install ripgrep (required for T1605 callsite-coverage validator)
+        uses: ./.github/actions/install-ripgrep
+
+      # Hard gate — biome ci must pass BEFORE any build/publish step runs.
+      # No untrusted user input used here; "pnpm biome ci ." is a static command.
+      # Prevents ship-to-npm while the parallel ci.yml workflow fails on format
+      # or lint drift (observed v2026.4.68-73 consistently).
+      - name: Biome CI (format + lint gate)
+        run: pnpm biome ci .
+
+      # Wipe all dist directories AND tsbuildinfo before building. tsc --composite
+      # short-circuits when tsbuildinfo is fresh even if dist/ has been wiped,
+      # which produced an empty @cleocode/playbooks tarball in v2026.4.94
+      # (fixed in v2026.4.95). Nuking both guarantees a fresh emit.
+      - name: Clean dist + tsbuildinfo (prevent stale cache)
+        run: |
+          pnpm -r exec -- sh -c 'rm -rf dist tsconfig.tsbuildinfo' 2>/dev/null || true
+          echo "All dist directories + tsbuildinfo files wiped"
+
+      - name: Build
+        run: pnpm run build
+
+      # T12011: Build the Studio SvelteKit bundle and stage it into
+      # packages/cleo/studio-dist/ BEFORE any verification or publish step.
+      #
+      # Context: packages/cleo/package.json lists "studio-dist" in its files[]
+      # array, but build.mjs never builds @cleocode/studio (it is a SvelteKit
+      # app, not a TypeScript library). Without this step the packages/cleo/
+      # postbuild script (scripts/copy-studio-dist.mjs) silently exits 0
+      # because packages/studio/build/ does not exist in CI, which means
+      # studio-dist is absent at publish time and npm silently omits it from
+      # the tarball. cleo web then boots the gateway but serves a blank Studio
+      # from every npm install.
+      #
+      # The Studio build is a SvelteKit adapter-node compilation and is the
+      # only heavyweight step outside build.mjs. No incremental caching is
+      # possible here — always rebuild from scratch.
+      # T12011: Build the Studio SvelteKit bundle and stage it into
+      # packages/cleo/studio-dist/ BEFORE any verification or publish step.
+      #
+      # Context: packages/cleo/package.json lists "studio-dist" in its files[]
+      # array, but build.mjs never builds @cleocode/studio (it is a SvelteKit
+      # app, not a TypeScript library). Without this step the packages/cleo/
+      # postbuild script (scripts/copy-studio-dist.mjs) silently exits 0
+      # because packages/studio/build/ does not exist in CI, which means
+      # studio-dist is absent at publish time and npm silently omits it from
+      # the tarball. cleo web then boots the gateway but serves a blank Studio
+      # from every npm install.
+      #
+      # Build order:
+      #   1. @cleocode/brain — depends on contracts+core+paths (all built by
+      #      build.mjs above). brain is a Studio runtime dependency that
+      #      build.mjs does not include in its wave graph.
+      #   2. @cleocode/studio — SvelteKit adapter-node build. Depends on
+      #      brain, core, runtime (all now present after step 1).
+      #   3. copy-studio-dist.mjs — copies packages/studio/build/ into
+      #      packages/cleo/studio-dist/ (the existing staging mechanism from
+      #      T11979/#1074).
+      - name: Build Studio bundle and stage into packages/cleo
+        run: |
+          set -euo pipefail
+
+          echo "--- Building @cleocode/brain (Studio runtime dep, not in build.mjs) ---"
+          pnpm --filter @cleocode/brain run build
+
+          echo "--- Building @cleocode/studio (SvelteKit adapter-node) ---"
+          pnpm --filter @cleocode/studio run build
+
+          echo "--- Staging studio build → packages/cleo/studio-dist ---"
+          node packages/cleo/scripts/copy-studio-dist.mjs
+
+          echo "--- Verifying studio-dist was staged ---"
+          if [[ ! -d "packages/cleo/studio-dist/client" ]]; then
+            echo "::error::packages/cleo/studio-dist/client not found after staging"
+            exit 1
+          fi
+          echo "studio-dist/client present after staging"
+
+      # Hard gate: ESM module-load smoke test — runs AFTER build, BEFORE publish.
+      #
+      # Imports @cleocode/core and @cleocode/cleo directly from the local built
+      # dist (not from npm, not from src). Catches runtime crashes caused by
+      # TypeScript patterns like `export declare const releaseCoreOps` which
+      # compile without error but produce undefined at runtime, breaking any
+      # consumer that destructures or calls the export. (T1606)
+      #
+      # Uses an explicit Node.js script written to /tmp to avoid heredoc quoting
+      # issues with GitHub Actions multi-line run: blocks. The script paths are
+      # static (no user-controlled input), satisfying the injection-safe
+      # requirement for workflow files.
+      - name: ESM module-load smoke test (@cleocode/core + @cleocode/cleo)
+        run: |
+          # Write the smoke-test script to a temp file to avoid heredoc quoting issues.
+          # All paths are static — no user-controlled input reaches this script.
+          cat > /tmp/esm-smoke-test.mjs << 'SMOKE_EOF'
+          import { pathToFileURL } from 'url';
+          import path from 'path';
+
+          async function smokeTest(pkgLabel, distPath) {
+            const absPath = path.resolve(distPath);
+            let mod;
+            try {
+              mod = await import(pathToFileURL(absPath).href);
+            } catch (err) {
+              throw new Error(`${pkgLabel}: import failed — ${err.message}`);
+            }
+
+            if (mod === null || typeof mod !== 'object') {
+              throw new Error(`${pkgLabel}: module loaded but returned a non-object`);
+            }
+
+            // Catch the "export declare const" pattern: default export is undefined
+            if ('default' in mod && mod.default === undefined) {
+              throw new Error(
+                `${pkgLabel}: default export is undefined — ` +
+                `possible "export declare const" runtime crash (type-only declaration leaked into dist)`
+              );
+            }
+
+            const namedExports = Object.keys(mod).filter(k => k !== 'default');
+            if (namedExports.length === 0 && !('default' in mod)) {
+              throw new Error(`${pkgLabel}: no exports found in dist — build may be empty or misconfigured`);
+            }
+
+            const exportCount = namedExports.length + ('default' in mod ? 1 : 0);
+            console.log(`PASS  ${pkgLabel} — ${exportCount} export(s), dist: ${distPath}`);
+          }
+
+          let failed = false;
+          for (const [label, distPath] of [
+            ['@cleocode/core', 'packages/core/dist/index.js'],
+          ]) {
+            try {
+              await smokeTest(label, distPath);
+            } catch (err) {
+              console.error(`FAIL  ${err.message}`);
+              failed = true;
+            }
+          }
+
+          if (failed) {
+            console.error('');
+            console.error('ESM smoke test FAILED — fix the export pattern before publishing.');
+            process.exit(1);
+          }
+
+          console.log('');
+          console.log('ESM module-load smoke tests passed.');
+          SMOKE_EOF
+
+          node /tmp/esm-smoke-test.mjs
+
+      # Hard gate: verify critical .js files are present in the @cleocode/core
+      # tarball before any publish step runs. Catches the regression pattern
+      # where tsc incremental compilation emits only .d.ts outputs. (T721)
+      - name: Verify @cleocode/core tarball contents
+        run: |
+          cd packages/core
+          npm pack --dry-run > /tmp/core-pack-list.txt 2>&1
+          REQUIRED_FILES=(
+            "dist/store/nexus-sqlite.js"
+            "dist/store/memory-sqlite.js"
+            "dist/index.js"
+            "dist/internal.js"
+            "dist/memory/transcript-scanner.js"
+            "dist/memory/transcript-extractor.js"
+          )
+          MISSING=()
+          for file in "${REQUIRED_FILES[@]}"; do
+            if ! grep -qF "$file" /tmp/core-pack-list.txt; then
+              MISSING+=("$file")
+            fi
+          done
+          if [[ ${#MISSING[@]} -gt 0 ]]; then
+            echo "::error::@cleocode/core tarball is missing required JS files:"
+            for f in "${MISSING[@]}"; do echo "  MISSING: $f"; done
+            echo "--- Full pack contents (dist/store section) ---"
+            grep "dist/store" /tmp/core-pack-list.txt || true
+            exit 1
+          fi
+          echo "✅ @cleocode/core tarball verification passed"
+
+      - name: Verify @cleocode/playbooks tarball contents
+        run: |
+          cd packages/playbooks
+          npm pack --dry-run > /tmp/playbooks-pack-list.txt 2>&1
+          REQUIRED_FILES=(
+            "dist/index.js"
+            "dist/runtime.js"
+            "dist/parser.js"
+            "dist/state.js"
+            "dist/approval.js"
+            "dist/policy.js"
+          )
+          MISSING=()
+          for file in "${REQUIRED_FILES[@]}"; do
+            if ! grep -qF "$file" /tmp/playbooks-pack-list.txt; then
+              MISSING+=("$file")
+            fi
+          done
+          if [[ ${#MISSING[@]} -gt 0 ]]; then
+            echo "::error::@cleocode/playbooks tarball missing required JS files"
+            for f in "${MISSING[@]}"; do echo "  MISSING: $f"; done
+            cat /tmp/playbooks-pack-list.txt
+            exit 1
+          fi
+          echo "Playbooks tarball verification passed"
+
+      # T12011: Hard gate — verify that @cleocode/cleo's npm tarball contains
+      # every entry declared in packages/cleo/package.json files[] AND that
+      # the Studio bundle (studio-dist/client/) is present with at least an
+      # index entry. A silently-thinner cleo tarball must never ship again.
+      #
+      # This gate runs AFTER the "Build Studio bundle and stage" step above, so
+      # studio-dist should already be populated. If it is missing, the gate
+      # fails loudly with the missing entry name rather than silently omitting
+      # it from the published package.
+      - name: Verify @cleocode/cleo tarball contents (T12011)
+        run: node scripts/assert-cleo-tarball.mjs
+
+      # The size budget, deliberately the step immediately after the presence
+      # gate above. The two answer opposite questions and neither covers the
+      # other: `assert-cleo-tarball.mjs` asks "is anything MISSING?" using
+      # existsSync, so re-adding the 48.5 MB that gh#1472 removed would make
+      # every one of its assertions MORE true. This one asks "is there too
+      # much, or suspiciously little?".
+      #
+      # It belongs HERE and not in a tag-triggered workflow: by this point the
+      # job has run build.mjs, the brain + studio builds and copy-studio-dist,
+      # so this is the exact tree `pnpm publish` uploads ~300 lines below. A
+      # separate workflow would neither build Studio nor run in time to gate
+      # anything.
+      #
+      # INSTALL-TIME budget only. It is not a remedy for npm publish latency
+      # and must never be justified as one — see gh#1478 and the script's own
+      # docblock.
+      - name: Assert @cleocode/cleo size budget (T12252)
+        run: node packages/cleo/scripts/check-cleo-tarball-size.mjs
+
+      # T12012: Hard gate — packed-install smoke test. Catches the class of
+      # regression where a published package's dist imports a workspace-private
+      # package that is NOT declared in that package's dependencies (and therefore
+      # absent from npm). This is the third packaged-install-only failure in 24h
+      # (DHQ-096 entry path, DHQ-098 studio-dist, DHQ-099 @cleocode/utils in
+      # selfimprove/fix-gen.js). The workspace resolves everything via symlinks so
+      # CI passes, but a fresh `npm install` trips ERR_MODULE_NOT_FOUND.
+      #
+      # Mechanism: npm pack all published packages into a temp dir, then npm
+      # install @cleocode/cleo into an isolated app with package.json `overrides`
+      # mapping every @cleocode/* to its local tarball (no registry traffic), then
+      # run `cleo --version` and assert exit 0 + non-empty version string.
+      - name: Packed-install smoke test (T12012)
+        run: node scripts/packed-install-smoke.mjs
+
+      - name: Validate build output
+        run: |
+          declare -a required_artifacts=(
+            "packages/contracts/dist/index.js"
+            "packages/caamp/dist/index.js"
+            "packages/lafs/dist/src/index.js"
+            "packages/cant/dist/index.js"
+            "packages/nexus/dist/src/index.js"
+            "packages/runtime/dist/index.js"
+            "packages/core/dist/index.js"
+            "packages/cleo/dist/cli/index.js"
+            "packages/cleo-os/dist/cli.js"
+          )
+          for path in "${required_artifacts[@]}"; do
+            [[ -e "$path" ]] || { echo "ERROR: Missing required artifact: $path"; exit 1; }
+          done
+          # adapters build is best-effort (may not have a dist if type-only)
+          [[ -e "packages/adapters/dist/index.js" ]] \
+            && echo "packages/adapters/dist/index.js present" \
+            || echo "WARN: packages/adapters/dist/index.js missing (skipping — may be type-only)"
+          echo "All required build artifacts present"
+
+      # ── CHANGELOG gate ────────────────────────────────────────────────────────
+      # T9937 (Saga T9862): the legacy inline `grep -qF "## [${VERSION}]"`
+      # check was brittle — during the v2026.5.94 hotfix-2 ship the
+      # aggregator emitted `## [vVERSION]` (with v) while this grep expected
+      # `## [VERSION]` (no v), and the workflow silently passed. Routing
+      # through the canonical CLEO verb (`cleo release validate-changelog`)
+      # centralises the header shape in ONE place (ADR-028 §2.5) so the
+      # workflow can't drift from the aggregator.
+
+      - name: Verify CHANGELOG section (cleo release validate-changelog)
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          # The CLI was just built via `pnpm run build`; invoke the bundled
+          # entry point directly to avoid relying on a `cleo` bin on PATH.
+          node packages/cleo/dist/cli/index.js release validate-changelog "${VERSION}"
+
+      # ── GitHub Release ────────────────────────────────────────────────────────
+
+      - name: Build release tarball and checksums
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          STAGING="staging/cleocode-${VERSION}"
+          mkdir -p "$STAGING"
+
+          # Root metadata
+          cp LICENSE README.md CHANGELOG.md "$STAGING/"
+
+          # Core package (standalone business logic kernel)
+          mkdir -p "$STAGING/packages/core"
+          cp -r packages/core/dist packages/core/package.json "$STAGING/packages/core/"
+          for extra in migrations schemas templates; do
+            [[ -d "packages/core/$extra" ]] \
+              && cp -r "packages/core/$extra" "$STAGING/packages/core/" || true
+          done
+
+          # Contracts package (type-only interfaces)
+          mkdir -p "$STAGING/packages/contracts"
+          cp -r packages/contracts/dist packages/contracts/package.json "$STAGING/packages/contracts/"
+
+          # LAFS package
+          mkdir -p "$STAGING/packages/lafs"
+          cp -r packages/lafs/dist packages/lafs/package.json "$STAGING/packages/lafs/"
+          for extra in schemas lafs.md README.md LICENSE; do
+            [[ -e "packages/lafs/$extra" ]] && cp -r "packages/lafs/$extra" "$STAGING/packages/lafs/" || true
+          done
+
+          # CAAMP package
+          mkdir -p "$STAGING/packages/caamp"
+          cp -r packages/caamp/dist packages/caamp/package.json "$STAGING/packages/caamp/"
+          for extra in providers README.md LICENSE; do
+            [[ -e "packages/caamp/$extra" ]] && cp -r "packages/caamp/$extra" "$STAGING/packages/caamp/" || true
+          done
+
+          # CANT package
+          if [[ -d packages/cant/dist ]]; then
+            mkdir -p "$STAGING/packages/cant"
+            cp -r packages/cant/dist packages/cant/package.json "$STAGING/packages/cant/"
+            for extra in wasm README.md LICENSE; do
+              [[ -e "packages/cant/$extra" ]] && cp -r "packages/cant/$extra" "$STAGING/packages/cant/" || true
+            done
+          fi
+
+          # Runtime package
+          if [[ -d packages/runtime/dist ]]; then
+            mkdir -p "$STAGING/packages/runtime"
+            cp -r packages/runtime/dist packages/runtime/package.json "$STAGING/packages/runtime/"
+            for extra in README.md LICENSE; do
+              [[ -e "packages/runtime/$extra" ]] && cp -r "packages/runtime/$extra" "$STAGING/packages/runtime/" || true
+            done
+          fi
+
+          # Adapters package
+          if [[ -d packages/adapters/dist ]]; then
+            mkdir -p "$STAGING/packages/adapters"
+            cp -r packages/adapters/dist packages/adapters/package.json "$STAGING/packages/adapters/"
+          fi
+
+          # Playbooks package (T889 / T904 — playbook DSL runtime + schema)
+          if [[ -d packages/playbooks/dist ]]; then
+            mkdir -p "$STAGING/packages/playbooks"
+            cp -r packages/playbooks/dist packages/playbooks/package.json "$STAGING/packages/playbooks/"
+            for extra in README.md LICENSE starter-playbooks; do
+              [[ -e "packages/playbooks/$extra" ]] && cp -r "packages/playbooks/$extra" "$STAGING/packages/playbooks/" || true
+            done
+          fi
+
+          # Skills package (data)
+          if [[ -d packages/skills/skills ]]; then
+            mkdir -p "$STAGING/packages/skills"
+            cp -r packages/skills/skills packages/skills/package.json "$STAGING/packages/skills/"
+            for f in packages/skills/*.json packages/skills/*.js packages/skills/*.d.ts; do
+              [[ -f "$f" ]] && cp "$f" "$STAGING/packages/skills/" || true
+            done
+          fi
+
+          # Agents package (templates)
+          if [[ -d packages/agents ]]; then
+            mkdir -p "$STAGING/packages/agents"
+            cp -r packages/agents/* "$STAGING/packages/agents/" 2>/dev/null || true
+          fi
+
+          # CLI/MCP package (the assembled product)
+          mkdir -p "$STAGING/packages/cleo"
+          cp -r packages/cleo/dist packages/cleo/package.json "$STAGING/packages/cleo/"
+          for extra in schemas migrations templates completions bin; do
+            [[ -d "packages/cleo/$extra" ]] \
+              && cp -r "packages/cleo/$extra" "$STAGING/packages/cleo/" || true
+          done
+
+          # Make executables runnable. The historical second path
+          # (packages/cleo/dist/mcp/index.js) was removed when internal MCP
+          # dispatch was deleted in commit 480fa01a — the external MCP bridge
+          # now lives at packages/mcp-adapter/dist/cli.js and is published as
+          # its own @cleocode/mcp-adapter package, NOT bundled into this
+          # cleocode tarball. Do NOT re-add a path that does not exist.
+          chmod +x "$STAGING/packages/cleo/dist/cli/index.js"
+
+          tar -czf "cleocode-${VERSION}.tar.gz" -C staging "cleocode-${VERSION}"
+
+          # ── Separate cleo-os TUI bundle ───────────────────────────────────────
+          # cleo-os is the TUI release that wraps the cleo CLI + Pi systems.
+          # Shipped as its own tarball so consumers can fetch the TUI without
+          # pulling the full monorepo snapshot.
+          CLEOOS_STAGING="staging/cleoos-${VERSION}"
+          mkdir -p "$CLEOOS_STAGING"
+          cp LICENSE README.md CHANGELOG.md "$CLEOOS_STAGING/"
+          mkdir -p "$CLEOOS_STAGING/packages/cleo-os"
+          cp -r packages/cleo-os/dist \
+                packages/cleo-os/package.json \
+                "$CLEOOS_STAGING/packages/cleo-os/"
+          for extra in extensions bin README.md LICENSE; do
+            [[ -e "packages/cleo-os/$extra" ]] \
+              && cp -r "packages/cleo-os/$extra" "$CLEOOS_STAGING/packages/cleo-os/" || true
+          done
+          chmod +x "$CLEOOS_STAGING/packages/cleo-os/dist/cli.js" 2>/dev/null || true
+          tar -czf "cleoos-${VERSION}.tar.gz" -C staging "cleoos-${VERSION}"
+
+          # Combined checksums for both tarballs
+          sha256sum "cleocode-${VERSION}.tar.gz" "cleoos-${VERSION}.tar.gz" > SHA256SUMS
+          echo "cleocode tarball size: $(ls -lh "cleocode-${VERSION}.tar.gz" | awk '{print $5}')"
+          echo "cleoos   tarball size: $(ls -lh "cleoos-${VERSION}.tar.gz" | awk '{print $5}')"
+          cat SHA256SUMS
+
+      - name: Generate release notes from CHANGELOG
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          if grep -q "## \[${VERSION}\]" CHANGELOG.md 2>/dev/null; then
+            sed -n "/## \[${VERSION}\]/,/## \[/p" CHANGELOG.md | head -n -1 | tail -n +2 > release-notes.txt
+            echo "Source: CHANGELOG.md"
+          else
+            echo "### Changes" > release-notes.txt
+            PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+            if [[ -n "$PREV_TAG" ]]; then
+              git log --pretty=format:"- %s" --no-merges "${PREV_TAG}..HEAD" >> release-notes.txt
+            else
+              git log --pretty=format:"- %s" --no-merges -20 >> release-notes.txt
+            fi
+            echo "Source: git log"
+          fi
+          cat release-notes.txt
+
+      # Hand the build to `publish`. Everything the build produced that git does
+      # not track (dist/, studio-dist/, tsbuildinfo, ...) plus every tracked file
+      # it modified (the version-synced package.json manifests), minus
+      # node_modules and the Studio app's own build dirs (already staged into
+      # packages/cleo/studio-dist; @cleocode/studio is not published) —
+      # publish restores this over a fresh checkout, so it packs exactly the
+      # tree the gates above verified.
+      - name: Package build output for publish
+        run: |
+          set -euo pipefail
+          {
+            git ls-files --others --ignored --exclude-standard --directory -- packages crates
+            git ls-files --modified
+          } | grep -v -E '(^|/)node_modules(/|$)' \
+            | grep -v -E '^packages/studio/(build|\.svelte-kit)(/|$)' \
+            | sort -u > /tmp/build-output.list
+          echo "Packaging $(wc -l < /tmp/build-output.list) paths"
+          tar -czf build-output.tgz -T /tmp/build-output.list
+          ls -lh build-output.tgz
+
+      - name: Upload build output
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-build-output
+          path: build-output.tgz
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload GitHub Release assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-assets
+          path: |
+            cleocode-${{ steps.version.outputs.version }}.tar.gz
+            cleoos-${{ steps.version.outputs.version }}.tar.gz
+            SHA256SUMS
+            release-notes.txt
+          if-no-files-found: error
+          retention-days: 7
+
+  # The only job that needs the native binaries, and the only one with side
+  # effects (GitHub Release + npm). It waits for build-verify AND both native
+  # workflows, restores the verified build output, stages the binaries, proves
+  # they were built from THIS release's native source, then publishes.
+  publish:
+    name: Publish
+    needs: [build-verify, prebuild, cant-napi]
+    runs-on: ubuntu-latest
+    # gh#1479 recorded a single @cleocode/cleo publish taking 55m33s (npm
+    # accepted it; the registry sat on it). 60 minutes left ~4 minutes for the
+    # other 17 packages, the GitHub Release and the stage/verify steps, so one
+    # slow registry day would kill the job mid-wave. 180 is headroom, not a
+    # target: a healthy publish finishes in minutes.
+    timeout-minutes: 180
+    env:
+      VERSION: ${{ needs.build-verify.outputs.version }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Computed from the tagged commit's own index, in THIS job, before the
+      # build output (which rewrites tracked manifests) is restored. This is
+      # the value every staged binary must carry: a binary restored from the
+      # native build cache passes only when its source is byte-identical to
+      # this release's, which is T12382's guarantee.
+      - name: Compute this release's native source hashes
+        run: |
+          set -euo pipefail
+          echo "CANT_SOURCE_HASH=$(node scripts/native-source-hash.mjs cant)" >> "$GITHUB_ENV"
+          echo "WORKTREE_SOURCE_HASH=$(node scripts/native-source-hash.mjs worktree)" >> "$GITHUB_ENV"
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+          cache: 'pnpm'
+
+      - name: Download build output
+        uses: actions/download-artifact@v4
+        with:
+          name: release-build-output
+
+      - name: Restore build output
+        run: |
+          set -euo pipefail
+          tar -xzf build-output.tgz
+          rm build-output.tgz
+          test -f packages/cleo/dist/cli/index.js
+          test -d packages/cleo/studio-dist/client
+          echo "Restored the build-verify output (dist/, studio-dist/, synced manifests)."
+
+      # `pnpm publish` runs each package's prepack/prepublishOnly lifecycle
+      # (lafs, animations, caamp, cleo-os rebuild themselves), which needs the
+      # toolchain in node_modules.
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Download GitHub Release assets
+        uses: actions/download-artifact@v4
+        with:
+          name: release-assets
+
+      # ── worktree-napi prebuilt binaries ──────────────────────────────────────
+      # T10434 / T10438: Download the per-triple .node binaries produced by the
+      # prebuild job in THIS release.yml run (built, or restored from the
+      # verified cache for an unchanged native source). `publish` has `needs:
+      # prebuild`, so it cannot start until all required prebuild artifacts
+      # are present.
+      - name: Download worktree-napi prebuilt binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: crates/worktree-napi
+          pattern: worktree-napi-*
+          merge-multiple: true
+
+      - name: Validate prebuilt artifacts
+        run: |
+          # T10479: darwin-x64 was REMOVED from the prebuild matrix because
+          # macos-13 Intel runners stay queued indefinitely under pool
+          # saturation, blocking the entire release. Only the 4 buildable
+          # triples are validated here.
+          REQUIRED_TRIPLES="linux-x64-gnu linux-arm64-gnu darwin-arm64 win32-x64-msvc"
+          for triple in $REQUIRED_TRIPLES; do
+            file="crates/worktree-napi/worktree-napi.${triple}.node"
+            if [ ! -f "$file" ]; then
+              echo "ERROR: Missing required artifact $file"
+              exit 1
+            fi
+            size=$(stat -c%s "$file" 2>/dev/null || stat -f%z "$file" 2>/dev/null)
+            if [ "$size" -eq 0 ]; then
+              echo "ERROR: Empty required artifact $file"
+              exit 1
+            fi
+            # Built from THIS release's native source (see "Compute this
+            # release's native source hashes"), never a stale leftover.
+            if ! LC_ALL=C grep -aq "worktree-napi-source-rev:${WORKTREE_SOURCE_HASH}" "$file"; then
+              echo "ERROR: $file lacks the native source stamp ${WORKTREE_SOURCE_HASH}"
+              exit 1
+            fi
+            echo "OK (required): $file ($size bytes, source ${WORKTREE_SOURCE_HASH})"
+          done
+
+      - name: Stage worktree-napi bundled binaries
+        run: |
+          set -euo pipefail
+
+          mkdir -p packages/worktree/native
+          cp crates/worktree-napi/index.cjs packages/worktree/native/worktree-napi.cjs
+
+          stage_platform_binary() {
+            local triple="$1"
+            local source="crates/worktree-napi/worktree-napi.${triple}.node"
+            local dest="packages/worktree/native/worktree-napi.${triple}.node"
+
+            if [ ! -f "$source" ]; then
+              echo "ERROR: Missing prebuilt artifact $source"
+              exit 1
+            fi
+
+            cp "$source" "$dest"
+            size=$(stat -c%s "$dest" 2>/dev/null || stat -f%z "$dest" 2>/dev/null)
+            if [ "$size" -eq 0 ]; then
+              echo "ERROR: Empty staged platform artifact $dest"
+              exit 1
+            fi
+            echo "Staged $dest ($size bytes)"
+          }
+
+          stage_platform_binary linux-x64-gnu
+          stage_platform_binary linux-arm64-gnu
+          stage_platform_binary darwin-arm64
+          stage_platform_binary win32-x64-msvc
+
+      # ── cant-napi: 8 native triples + WASI fallback (T12382) ─────────────────
+      # Built in THIS run by the `cant-napi` job (cant-napi-build.yml) and
+      # bundled into @cleocode/cant itself: no per-platform npm packages. The
+      # napi-rs generated loader (napi/index.cjs) prefers the native binary and
+      # falls back to napi/cant.wasm32-wasi.wasm when none matches the host.
+      - name: Download cant-napi binaries (8 native triples + WASI)
+        uses: actions/download-artifact@v4
+        with:
+          path: packages/cant/napi
+          pattern: cant-napi-*
+          merge-multiple: true
+
+      # Fails the release unless `npm pack` of @cleocode/cant ships every
+      # triple, the .wasm and the loader, and each binary carries the stamp
+      # `cant-napi-source-rev:<this release's native source hash>`: a missing
+      # triple or a stale / leftover binary cannot be published.
+      - name: Verify packed @cleocode/cant (every triple, built from this native source)
+        run: node scripts/lint-no-committed-native-binaries.mjs --packed packages/cant --expect-source-hash "${CANT_SOURCE_HASH}"
+
+      - name: Create GitHub Release (idempotent)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IS_PRERELEASE: ${{ needs.build-verify.outputs.is_prerelease }}
+        run: |
+          # Delete any existing release for this tag (keeps the tag itself).
+          # This makes the step idempotent — safe to re-run on workflow retries.
+          gh release delete "v${VERSION}" --yes 2>/dev/null || true
+          PRERELEASE_FLAG=""
+          [[ "$IS_PRERELEASE" == "true" ]] && PRERELEASE_FLAG="--prerelease"
+          gh release create "v${VERSION}" \
+            --title "v${VERSION}" \
+            --notes-file release-notes.txt \
+            $PRERELEASE_FLAG \
+            "cleocode-${VERSION}.tar.gz" \
+            "cleoos-${VERSION}.tar.gz" \
+            SHA256SUMS
+          echo "GitHub release v${VERSION} published"
+
+      # ── npm Publish (OIDC Trusted Publishing) ─────────────────────────────────
+      # Publish in dependency WAVES: every package in a wave depends only on
+      # packages in earlier waves, so a wave publishes concurrently and the
+      # waves run in order. A consumer installing mid-release can still only
+      # resolve a @cleocode/* dependency that was accepted before it.
+
+      # npm Trusted Publishing via OIDC — no NPM_TOKEN secret needed.
+      # Requires: each @cleocode/* package on npmjs.com configured with
+      # GitHub Actions trusted publishing (Settings → Publishing access).
+      - name: Publish packages to npm
+        env:
+          TAG: ${{ needs.build-verify.outputs.dist_tag }}
+          RC_VERSION: ${{ needs.build-verify.outputs.rc_version }}
+        run: |
+          # `publish_release <version> <dist-tag>` publishes every package at
+          # that version under that tag through OIDC, in dependency waves. It
+          # runs twice for a stable version (T13181): the release candidate to
+          # `canary`, then — once that candidate installs from npm and passes
+          # the sandbox soak — the release itself to `latest`. VERSION and TAG
+          # are function-local, so every helper below reads the phase's values.
+          publish_release() {
+            local VERSION="$1"
+            local TAG="$2"
+            PUBLISH_ARGS="--tag $TAG --access public --no-git-checks --provenance"
+            # Publishes run in background subshells, which cannot append to a
+            # parent array; failures are collected in a file instead.
+            FAILED_LOG="/tmp/publish-failed-$VERSION.txt"
+            : > "$FAILED_LOG"
+
+            # Returns 0 if @cleocode/$1@$VERSION is already on npm (idempotent re-runs).
+            # Uses explicit @VERSION qualifier so the check is correct regardless of
+            # which dist-tag (canary/beta/dev) was used and regardless of npm registry
+            # cache state for the "latest" pointer.
+            already_published() {
+              local pkg="$1"
+              local published_version
+              published_version=$(npm view "@cleocode/$pkg@$VERSION" version 2>/dev/null || true)
+              [[ "$published_version" == "$VERSION" ]]
+            }
+
+            # gh#1479: record when each publish was CALLED and when it RETURNED.
+            # Three agents spent a night reconstructing @cleocode/cleo's 55m33s by
+            # extracting timestamps from a log ZIP; two `date -u` calls make it a
+            # subtraction. The comparison group is the point — 17 siblings
+            # converging in seconds is what made cleo's delay legible — so the
+            # SKIP branches are logged too, not just the interesting ones.
+            PUBLISH_LOG="/tmp/publish-timeline-$VERSION.tsv"
+            printf 'pkg\toutcome\tcall_ts\tdone_ts\n' > "$PUBLISH_LOG"
+
+            _publish_pkg_impl() {
+              # $1 = directory name under packages/ (or an explicit relative path
+              #      when it contains a slash).
+              # $2 = npm name without @cleocode/ prefix (defaults to the last
+              #      path segment when the directory and npm name match; pass
+              #      explicitly when they differ, e.g. packages/cleo-git-shim →
+              #      @cleocode/git-shim).
+              local pkg_dir="$1"
+              local resolved_dir
+              if [[ "$pkg_dir" == */* ]]; then
+                # Explicit path.
+                resolved_dir="$pkg_dir"
+              else
+                resolved_dir="packages/$pkg_dir"
+              fi
+              local default_name="${pkg_dir##*/}"
+              local npm_name="${2:-$default_name}"
+              echo "--- Publishing @cleocode/$npm_name (from $resolved_dir) ---"
+              if [[ ! -d "$resolved_dir" ]]; then
+                PUBLISH_OUTCOME=SKIP-ABSENT
+                echo "SKIP: $resolved_dir does not exist"
+                return 0
+              fi
+              if [[ "$pkg_dir" == "adapters" ]] && [[ ! -d "$resolved_dir/dist" ]]; then
+                PUBLISH_OUTCOME=SKIP-NODIST
+                echo "SKIP: no dist (may be type-only)"
+                return 0
+              fi
+              if already_published "$npm_name"; then
+                PUBLISH_OUTCOME=SKIP-EXISTS
+                echo "✓ SKIP: @cleocode/$npm_name@$VERSION already on npm (idempotent re-run)"
+                return 0
+              fi
+              pushd "$resolved_dir" > /dev/null
+              # GitHub Actions runs with `bash -eo pipefail`; if pnpm publish
+              # exits non-zero inside a `$(...)` substitution, the whole step
+              # aborts and the graceful-failure branches below become
+              # unreachable. `|| PUBLISH_EXIT=$?` catches the non-zero code so
+              # we can classify (SKIP-CONFLICT / OIDC error / real failure)
+              # and track via FAILED_LOG instead of dying mid-publish.
+              # Retry up to 3x on transient Sigstore TLOG errors
+              # (rekor.sigstore.dev sometimes aborts mid-fetch — caused
+              # @cleocode/worktree@2026.5.24 to fail despite trusted publisher
+              # being correctly configured). Real OIDC/permission errors
+              # surface immediately; only TLOG_CREATE_ENTRY_ERROR retries.
+              PUBLISH_EXIT=0
+              PUBLISH_OUTPUT=""
+              for attempt in 1 2 3; do
+                PUBLISH_EXIT=0
+                PUBLISH_OUTPUT=$(pnpm publish $PUBLISH_ARGS 2>&1) || PUBLISH_EXIT=$?
+                if [[ $PUBLISH_EXIT -eq 0 ]]; then
+                  break
+                fi
+                if echo "$PUBLISH_OUTPUT" | grep -qi "TLOG_CREATE_ENTRY_ERROR\|rekor.sigstore.dev.*aborted\|tlog entry"; then
+                  echo "  ⚠ Sigstore TLOG transient error (attempt $attempt/3) — retrying after 10s..."
+                  sleep 10
+                  continue
+                fi
+                # Non-transient error — break so classification logic below runs.
+                break
+              done
+              echo "$PUBLISH_OUTPUT"
+              if [[ $PUBLISH_EXIT -eq 0 ]]; then
+                PUBLISH_OUTCOME=PUBLISHED
+                echo "✓ PUBLISHED: @cleocode/$npm_name@$VERSION"
+              else
+                # Re-check after failure: distinguish between version-conflict 403
+                # (already published — safe to skip) vs real OIDC/permission errors.
+                if already_published "$npm_name"; then
+                  PUBLISH_OUTCOME=SKIP-RACE
+                  echo "✓ SKIP-RACE: @cleocode/$npm_name@$VERSION was published concurrently or pre-exists"
+                elif echo "$PUBLISH_OUTPUT" | grep -qi "cannot publish over the previously published"; then
+                  # 403 "cannot publish over" — version exists but registry cache missed our pre-check
+                  PUBLISH_OUTCOME=SKIP-CONFLICT
+                  echo "✓ SKIP-CONFLICT: @cleocode/$npm_name@$VERSION already published (403 version conflict)"
+                elif echo "$PUBLISH_OUTPUT" | grep -qi "OIDC\|trusted publish\|403\|401\|Unauthorized\|Forbidden"; then
+                  PUBLISH_OUTCOME=FAIL-OIDC
+                  echo "✗ FAIL: @cleocode/$npm_name publish failed — possible OIDC/permission error"
+                  echo "  Error detail: $(echo "$PUBLISH_OUTPUT" | grep -i 'OIDC\|403\|401\|error\|npm ERR' | head -5)"
+                  echo "$npm_name" >> "$FAILED_LOG"
+                else
+                  PUBLISH_OUTCOME=FAIL
+                  echo "✗ FAIL: @cleocode/$npm_name publish failed"
+                  echo "$npm_name" >> "$FAILED_LOG"
+                fi
+              fi
+              popd > /dev/null
+            }
+
+            # Timing wrapper (gh#1479). Deliberately a WRAPPER rather than a line
+            # added to each of the eight outcome branches: a wrapper cannot miss a
+            # branch, and a branch that forgets to set PUBLISH_OUTCOME shows up as
+            # UNKNOWN rather than vanishing from the table. Each row is one short
+            # append, so concurrent publishes in a wave cannot interleave a row.
+            _publish_one() {
+              local name="${2:-${1##*/}}"
+              local call_ts done_ts
+              PUBLISH_OUTCOME=UNKNOWN
+              call_ts=$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)
+              _publish_pkg_impl "$@"
+              local rc=$?
+              done_ts=$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)
+              printf '%s\t%s\t%s\t%s\n' "$name" "$PUBLISH_OUTCOME" "$call_ts" "$done_ts" >> "$PUBLISH_LOG"
+              return $rc
+            }
+
+            # `publish_pkg <dir> [npmName]` ENQUEUES into the current wave (and is
+            # the npm publish-surface SSoT line, arch gate 9 / execute-payload);
+            # `run_wave` publishes the queued packages concurrently and waits for
+            # all of them. Both live in scripts/release-publish-waves.sh so the
+            # failure handling is unit-tested with fake publishers: a publish that
+            # CRASHES (nonzero exit, no classified outcome) is a failure, and after
+            # any wave with a failure no later wave is published — a later wave
+            # depends on the earlier ones. SKIP-EXISTS/RACE/CONFLICT stay
+            # successes, so a re-run of the same release is idempotent.
+            WAVE_LOG_DIR=/tmp
+            # shellcheck source=scripts/release-publish-waves.sh
+            source scripts/release-publish-waves.sh
+
+            # Waves are the dependency levels of the published @cleocode/*
+            # graph (dependencies + peerDependencies + optionalDependencies).
+            #
+            # Wave 1 — no @cleocode/* dependency at all.
+            publish_pkg paths
+            publish_pkg lafs
+            publish_pkg agents
+            publish_pkg skills
+            run_wave 1
+            # Wave 2 — contracts depends on lafs.
+            publish_pkg contracts
+            run_wave 2
+            # Wave 3 — contracts/paths only. worktree carries the bundled
+            # worktree-napi binaries (staged above; OIDC-only, no per-platform
+            # @cleocode/worktree-napi-* packages).
+            publish_pkg worktree
+            publish_pkg git-shim
+            publish_pkg animations
+            publish_pkg nexus
+            run_wave 3
+            # Wave 4 — a dependency CYCLE: core -> adapters -> caamp -> cant ->
+            # core (caamp also peers on core). No order satisfies a cycle, so its
+            # members publish together, after everything they need outside it.
+            publish_pkg core
+            publish_pkg caamp
+            publish_pkg cant
+            publish_pkg adapters
+            run_wave 4
+            # Wave 5 — depend on core (and earlier waves).
+            publish_pkg brain
+            publish_pkg runtime
+            publish_pkg playbooks
+            publish_pkg cleo-os
+            run_wave 5
+            # Wave 6 — the CLI depends on playbooks + runtime (wave 5).
+            publish_pkg cleo
+            run_wave 6
+            # mcp-adapter (external-only MCP bridge) and studio (SvelteKit web
+            # frontend) were REMOVED from the publish surface (T11399 / E1 ·
+            # SG-PACKAGE-ARCH). Neither is depended-on by any published
+            # @cleocode/* package: mcp-adapter talks to `cleo` only via runtime
+            # subprocess, and studio is an app, not a consumed library. Dropping
+            # them reduces the publish surface 20 → 18 on the path to the owner's
+            # single-artifact target (1, via R8/R10 internalization). This
+            # reverses the 2026-05-05 Issue #102 / PR #103 addition of studio.
+
+            # gh#1479 — emit the timeline BEFORE the failure gate, so a failing
+            # publish still leaves the record of what happened and when.
+            {
+              echo "### npm publish timeline — v$VERSION"
+              echo ""
+              echo "\`npm publish\` returning 0 means ACCEPTED, not published. The gap between"
+              echo "\`returned\` here and the package becoming installable is what the post-deploy"
+              echo "job measures; the sibling rows are the comparison group that makes an"
+              echo "outlier legible (gh#1478)."
+              echo ""
+              echo "| package | outcome | publish call (UTC) | returned (UTC) |"
+              echo "|---|---|---|---|"
+              tail -n +2 "$PUBLISH_LOG" | sort -t$'\t' -k3,3 | awk -F'\t' '{printf "| `%s` | %s | %s | %s |\n", $1,$2,$3,$4}'
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "--- publish timeline ---"
+            cat "$PUBLISH_LOG"
+
+            mapfile -t FAILED_PKGS < <(sort -u "$FAILED_LOG")
+            if [[ ${#FAILED_PKGS[@]} -gt 0 ]]; then
+              echo "::error::Real publish failures for: ${FAILED_PKGS[*]}"
+              echo ""
+              echo "Diagnosis guide:"
+              echo "  If error mentions OIDC / 401 / Unauthorized:"
+              echo "    → npm Trusted Publisher not configured or misconfigured"
+              echo "    → Fix: npmjs.com → package → Settings → Publishing access"
+              echo "         → Add GitHub Actions trusted publisher (org=kryptobaseddev,"
+              echo "           repo=cleo, workflow=.github/workflows/release.yml)"
+              echo ""
+              echo "  If error mentions 403 / permission denied (not 'cannot publish over'):"
+              echo "    → Package may be private or missing publishConfig.access=public"
+              echo ""
+              echo "  If error mentions 'cannot publish over previously published':"
+              echo "    → Version conflict: this version already exists on npm"
+              echo "    → This should have been caught as SKIP — check already_published() logic"
+              echo ""
+              echo "  NOTE: 403 'cannot publish over' is NOT an OIDC failure."
+              echo "        OIDC trusted publisher IS working if any packages published successfully."
+              exit 1
+            fi
+            echo "✓ All packages published or skipped (idempotent re-run safe)"
+            echo "  (accepted by npm — installability is decided by the post-deploy job)"
+          }
+
+          # A re-run after the release itself published skips the candidate:
+          # `latest` already carries this version.
+          FINAL_ON_NPM=$(npm view "@cleocode/cleo@$VERSION" version 2>/dev/null || true)
+          if [[ -n "$RC_VERSION" && "$FINAL_ON_NPM" != "$VERSION" ]]; then
+            echo "=== Release candidate $RC_VERSION -> canary ==="
+            scripts/release-sync-versions.sh "$RC_VERSION"
+            publish_release "$RC_VERSION" canary
+            # The gate. Both are blocking: no continue-on-error, no `|| true`.
+            # The candidate must resolve from npm (metadata, tarball and the
+            # canary dist-tag, every package) ...
+            POSTDEPLOY_TIMEOUT_MS=900000 node scripts/execute-payload.mjs \
+              --version "$RC_VERSION" \
+              --dist-tag canary \
+              --output-dir /tmp/rc-postdeploy
+            # ... and install and run from npm in a sandbox (install, coherent
+            # @cleocode versions, --version, init, session, saga/epic write,
+            # show, find, doctor).
+            node scripts/release-canary-soak.mjs --version "$RC_VERSION" --out /tmp/rc-postdeploy/canary-soak.json
+            echo "=== Release candidate passed: publishing $VERSION -> $TAG ==="
+            scripts/release-sync-versions.sh "$VERSION"
+          fi
+          publish_release "$VERSION" "$TAG"
+
+      # Consumed by release-verdict to render the call -> created -> delay table
+      # alongside the registry's own creation timestamps (gh#1479).
+      - name: Upload publish timeline
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: publish-timeline-${{ needs.build-verify.outputs.version }}
+          path: /tmp/publish-timeline-*.tsv
+          if-no-files-found: warn
+          retention-days: 30
+
+  # ── Post-Deploy Execution Payload ──────────────────────────────────────────
+  # T1403: execute-payload job — runs AFTER all packages have been published.
+  #
+  # Purpose: close the CI execution gap where the release pipeline shipped
+  # code but never ran post-deploy steps (registry verification, deployment
+  # summary artifact, smoke confirmation). Filed as a process pump during
+  # v2026.4.141; implemented here so the gap is actually closed, not just
+  # filed as a task.
+  #
+  # What it does:
+  #   1. Verifies every @cleocode/* package at <VERSION> is resolvable on npm.
+  #   2. Writes a structured deploy-summary-<VERSION>.json artifact.
+  #   3. Writes a smoke-<VERSION>.txt artifact confirming end-to-end execution.
+  #   4. Uploads both as a GitHub Actions artifact for audit/traceability.
+  #
+  # Failure behavior (rewritten — gh#1474, gh#1416):
+  #   - This job's verdict is BINDING. `continue-on-error: true` was removed.
+  #
+  #     It was there so "a transient npm propagation delay never rolls back a
+  #     good publish", and that concern is real — but nothing here CAN roll
+  #     anything back. By the time this job starts, the tag, the GitHub Release
+  #     and all 18 `npm publish` calls are done and irreversible. This workflow
+  #     triggers on tag push, so a red gates no merge and blocks no required
+  #     check. The mask bought nothing and cost everything: v2026.9.6 and
+  #     v2026.9.7 both recorded `{"verified": false, "reason": "metadata 404"}`
+  #     for @cleocode/cleo in their own artifacts, and both runs concluded
+  #     `success`.
+  #
+  #   - A run conclusion is stamped once and never revised, while @cleocode/cleo
+  #     has taken anywhere from 4m55s to 2h55m to become installable. So the run
+  #     cannot be the durable answer to "is this version installable?" It answers
+  #     the bounded question "did THIS RUN prove installability inside its
+  #     budget?" — permanently true either way. The live answer lives in the
+  #     tracking issue opened by release-verdict and closed by
+  #     release-installability-watch.yml.
+  #
+  #   - Three outcomes, not two. `pending` (published, not yet installable) and
+  #     `defect` (a package is wrong or missing) share a red but differ in
+  #     annotation title, step summary and follow-up. See scripts/release-verdict.mjs.
+
+  execute-payload:
+    name: Post-Deploy Execution Payload
+    runs-on: ubuntu-latest
+    needs: [build-verify, publish]
+    # Consumed by release-verdict, which runs `if: always()` and must be able to
+    # read these even though this job now FAILS in the pending/defect cases.
+    outputs:
+      verdict: ${{ steps.payload.outputs.verdict }}
+      pending_pkgs: ${{ steps.payload.outputs.pending_pkgs }}
+      converged: ${{ steps.payload.outputs.converged }}
+      total: ${{ steps.payload.outputs.total }}
+    # Must exceed POSTDEPLOY_TIMEOUT_MS below, or the runner kills the job
+    # mid-poll and the artifacts never get written — a worse outcome than a
+    # clean "not installable at deadline" failure (gh#1377).
+    #
+    # This relationship is ASSERTED, not merely documented: the run step below
+    # fails fast if the budget meets or exceeds the cap, and
+    # scripts/lint-postdeploy-budget.mjs binds this literal to the
+    # POSTDEPLOY_JOB_CAP_MINUTES env var so the two cannot drift apart. The
+    # previous wording stated the requirement in prose only, which is the same
+    # shape as every other "by convention" enforcement in this repo (gh#1394,
+    # gh#1412) — a rule nothing checks.
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      # NOTE: there is deliberately no `Get version` step here. It used to
+      # re-derive VERSION with a copy of the release job's shell that dropped
+      # the dist-tag branch, so this job could not know whether it was verifying
+      # a `canary`, `beta` or `dev` release. Both values now come from
+      # needs.build-verify.outputs.
+
+      # Run the post-deploy payload script:
+      #   1. Verify all @cleocode/* packages at VERSION are on npm
+      #   2. Write deploy-summary-<VERSION>.json
+      #   3. Write smoke-<VERSION>.txt
+      # Uses --output-dir so artifacts land in a predictable path for upload.
+      - name: Run execute-payload
+        id: payload
+        env:
+          VERSION: ${{ needs.build-verify.outputs.version }}
+          DIST_TAG: ${{ needs.build-verify.outputs.dist_tag }}
+          # HOW LONG THIS RUNNER WAITS — not a prediction of npm's queue.
+          #
+          # budget-basis: 2026-09-18 p100-sibling=377s factor=2.4x
+          #
+          # The previous comment derived 1800000 from a size->propagation causal
+          # claim ("@cleocode/cleo is 22.2 MB packed, 2.5x the next largest").
+          # That claim is FALSIFIED (gh#1478). Do not re-derive this number from
+          # package size:
+          #   - Six releases at a byte-identical 80.6 MB / 1059 files spanned
+          #     4m55s .. 55m11s. Size varied by zero; the delay varied 11x.
+          #   - v2026.9.7 cut the package to 32.1 MB / 728 files and took
+          #     2h55m09s — 3.2x LONGER than the 80.6 MB v2026.9.6.
+          #   - In the v2026.9.7 run itself, @cleocode/core (42.8 MB, 5319
+          #     files — larger, and 7x the file count) converged in 3m47s while
+          #     @cleocode/cleo took 175m. Same run, same token, same minute.
+          # Packed size is now 10.17 MB, so the old comment's premise is stale
+          # twice over.
+          #
+          # Nor is the budget derived from the outlier: 55m and 2h55m both
+          # exceed any workable JOB CAP, so no poll budget fits inside a job at
+          # all. That is what release-installability-watch.yml exists for.
+          #
+          # What IS predictable is the sibling distribution: 17 of 18 packages
+          # converged within 246s on v2026.9.7, and the worst sibling on record
+          # is @cleocode/contracts at 377s. 900000ms is 2.4x that.
+          #
+          # Lowering 1800000 -> 900000 changes no outcome on the record: four of
+          # the six measured releases converged under 15 minutes (4m55s, 9m00s,
+          # 9m59s, 11m02s) and two converged under neither budget (55m11s,
+          # 2h55m09s). Same green, same handoff — half the runner time, and the
+          # handoff starts 15 minutes sooner.
+          POSTDEPLOY_TIMEOUT_MS: '900000'
+          POSTDEPLOY_INTERVAL_MS: '15000'
+          # Mirrors `timeout-minutes` above. Bound to it by
+          # scripts/lint-postdeploy-budget.mjs; asserted against the budget below.
+          POSTDEPLOY_JOB_CAP_MINUTES: '25'
+        run: |
+          # Fail fast if the poll budget meets or exceeds the job cap. In that
+          # configuration the runner kills the job mid-poll, so the step never
+          # reaches its own failure branch: no "NOT INSTALLABLE" line, no
+          # package named, no artifacts uploaded. A red with no diagnosis is
+          # strictly less useful than the red this budget exists to produce.
+          CAP_MS=$(( POSTDEPLOY_JOB_CAP_MINUTES * 60000 ))
+          if [ "$POSTDEPLOY_TIMEOUT_MS" -ge "$CAP_MS" ]; then
+            echo "::error::POSTDEPLOY_TIMEOUT_MS (${POSTDEPLOY_TIMEOUT_MS}ms) must be LESS than the job cap (${POSTDEPLOY_JOB_CAP_MINUTES}min = ${CAP_MS}ms)."
+            echo "The runner would kill this job mid-poll and no diagnosis would be written."
+            exit 1
+          fi
+          echo "budget ${POSTDEPLOY_TIMEOUT_MS}ms < cap ${CAP_MS}ms — ok"
+          ARTIFACT_DIR="/tmp/postdeploy-artifacts"
+          echo "artifact_dir=$ARTIFACT_DIR" >> "$GITHUB_ENV"
+
+          # The verdict must reach release-verdict even when this step fails,
+          # which is now the whole point of the step. Capture the exit code,
+          # publish the outputs, THEN propagate — and fail closed to `infra` if
+          # the summary is missing or unparseable, so a broken verifier can
+          # never render as `installable`.
+          set +e
+          node scripts/execute-payload.mjs \
+            --version "$VERSION" \
+            --dist-tag "$DIST_TAG" \
+            --output-dir "$ARTIFACT_DIR"
+          EP_EXIT=$?
+          set -e
+
+          node -e '
+            const fs = require("node:fs");
+            let s = {};
+            try { s = JSON.parse(fs.readFileSync(process.argv[1], "utf8")); } catch {}
+            const out = [
+              `verdict=${s.verdict ?? "infra"}`,
+              `pending_pkgs=${(s.pendingPackages ?? []).join(",")}`,
+              `converged=${s.stats?.verified ?? 0}`,
+              `total=${s.stats?.total ?? 0}`,
+            ].join("\n") + "\n";
+            fs.appendFileSync(process.env.GITHUB_OUTPUT, out);
+            process.stdout.write(out);
+          ' "$ARTIFACT_DIR/deploy-summary-$VERSION.json" || echo "verdict=infra" >> "$GITHUB_OUTPUT"
+
+          exit $EP_EXIT
+
+      # Upload both artifacts regardless of whether execute-payload succeeded.
+      # The deploy-summary JSON captures pass/fail per-package so failures
+      # are auditable even when the job itself exits non-zero.
+      - name: Upload post-deploy artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: postdeploy-${{ needs.build-verify.outputs.version }}
+          path: /tmp/postdeploy-artifacts/
+          if-no-files-found: warn
+          retention-days: 30
+
+  # ── Release Verdict ─────────────────────────────────────────────────────────
+  # The single place that decides what this run CLAIMS, and the only job whose
+  # conclusion an operator should read (gh#1474, gh#1416).
+  #
+  # Deliberately appended at the END of this file. scripts/lint-postdeploy-budget.mjs
+  # locates the post-deploy job with indexOf('Post-Deploy Execution Payload'),
+  # which matches the COMMENT BANNER above that job — not its `name:` — and then
+  # takes the FIRST `timeout-minutes:` after it. A job carrying its own
+  # `timeout-minutes` inserted between that banner and line ~963 would silently
+  # retarget the linter onto the wrong number. Appending here is safe.
+  release-verdict:
+    name: Release Verdict
+    runs-on: ubuntu-latest
+    needs: [build-verify, publish, execute-payload]
+    if: always()
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write   # opens/updates the installability tracking issue
+      actions: write  # kicks the watcher immediately rather than waiting for cron
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Download post-deploy artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: postdeploy-${{ needs.build-verify.outputs.version }}
+          path: /tmp/postdeploy-artifacts
+        continue-on-error: true
+
+      - name: Download publish timeline
+        uses: actions/download-artifact@v4
+        with:
+          name: publish-timeline-${{ needs.build-verify.outputs.version }}
+          path: /tmp/publish-timeline
+        continue-on-error: true
+
+      - name: Render verdict
+        env:
+          VERSION: ${{ needs.build-verify.outputs.version }}
+          DIST_TAG: ${{ needs.build-verify.outputs.dist_tag }}
+          # The first non-success of the two halves of what used to be one job.
+          RELEASE_RESULT: ${{ needs.build-verify.result != 'success' && needs.build-verify.result || needs.publish.result }}
+          PAYLOAD_RESULT: ${{ needs.execute-payload.result }}
+          VERDICT: ${{ needs.execute-payload.outputs.verdict }}
+          PENDING_PKGS: ${{ needs.execute-payload.outputs.pending_pkgs }}
+          CONVERGED: ${{ needs.execute-payload.outputs.converged }}
+          TOTAL: ${{ needs.execute-payload.outputs.total }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          POSTDEPLOY_DIR: /tmp/postdeploy-artifacts
+          PUBLISH_TIMELINE_DIR: /tmp/publish-timeline
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: node scripts/release-verdict.mjs

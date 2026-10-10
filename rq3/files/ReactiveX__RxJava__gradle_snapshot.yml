@@ -1,0 +1,95 @@
+# This workflow will build a Java project with Gradle
+# For more information see: https://help.github.com/actions/language-and-framework-guides/building-and-testing-java-with-gradle
+
+name: Snapshot
+
+on:
+  push:
+    branches: [ '4.x' ]
+    
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    if: github.repository == 'ReactiveX/RxJava'
+    env:
+      # ------------------------------------------------------------------------------ 
+      CI_BUILD_NUMBER: ${{ github.run_number }}
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+    - name: Set up JDK 26
+      uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+      with:
+        distribution: 'zulu'
+        java-version: '26'
+    - name: Cache Gradle packages
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ~/.gradle/caches
+        key: ${{ runner.os }}-gradle-${{ secrets.CACHE_VERSION }}-${{ hashFiles('**/*.gradle') }}
+        restore-keys: ${{ runner.os }}-gradle-${{ secrets.CACHE_VERSION }}
+    - name: Grant execute permission for gradlew
+      run: chmod +x gradlew
+    - name: Run Validity Tests Upfront
+      run: ./gradlew test --tests "io.reactivex.rxjava4.validators.*" --stacktrace --no-daemon
+    - name: Build RxJava
+      run: ./gradlew build --stacktrace --no-daemon
+
+    - name: Publish Test Results
+      uses: EnricoMi/publish-unit-test-result-action@d0a4676d0e0b938bc201470d88276b7c74c712b3 # v2.24.0
+      if: always()                      # important: run even if tests failed
+      with:
+        files: |
+          **/build/test-results/**/TEST-*.xml
+          **/build/test-results/**/*.xml
+          **/build/test-results/testNG/TEST-*.xml
+        check_run: false
+        comment_mode: failures
+        fail_on: test failures
+        check_name: "🧪 RxJava Test Results"
+        report_individual_runs: true
+
+    - name: Upload to Codecov  
+      uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+      with:
+        token: ${{ secrets.CODECOV_TOKEN }}
+
+  prerelease:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      CI_BUILD_NUMBER: ${{ github.run_number }}
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+    - name: Set up JDK 26
+      uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+      with:
+        distribution: 'zulu'
+        java-version: '26'
+    - name: Cache Gradle packages
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ~/.gradle/caches
+        key: ${{ runner.os }}-gradle-${{ secrets.CACHE_VERSION }}-${{ hashFiles('**/*.gradle') }}
+        restore-keys: ${{ runner.os }}-gradle-${{ secrets.CACHE_VERSION }}
+    - name: Grant execute permission for gradlew
+      run: chmod +x gradlew
+    - name: Grant execute permission for push
+      run: chmod +x push_javadoc.sh
+    - name: Upload Snapshot
+      run: ./gradlew -PreleaseMode=branch publishAllPublicationsToMavenCentralRepository --no-daemon --no-parallel --stacktrace
+      env:
+        # Define secrets at https://github.com/ReactiveX/RxJava/settings/secrets/actions
+        # ------------------------------------------------------------------------------ 
+        ORG_GRADLE_PROJECT_mavenCentralUsername: ${{ secrets.SONATYPE_USER }}
+        ORG_GRADLE_PROJECT_mavenCentralPassword: ${{ secrets.SONATYPE_PASSWORD }}
+    - name: Push Javadoc
+      run: ./push_javadoc.sh
+        # Define secrets at https://github.com/ReactiveX/RxJava/settings/secrets/actions
+        # ------------------------------------------------------------------------------
+      env:
+        JAVADOCS_TOKEN: ${{ secrets.JAVADOCS_TOKEN }}

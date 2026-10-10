@@ -1,0 +1,51 @@
+name: Build Compaction Modules
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/chunk-compaction.yaml'
+      - '.github/workflows/chunk.yaml'
+      - '.github/config/chunks.yaml'
+      - 'code-style/checkstyle*.xml'
+      - 'code-style/spotbugs*.xml'
+      - 'java/pom.xml'
+      - 'java/compaction/pom.xml'
+      - 'java/partitions/pom.xml'
+      - 'java/bulk-export/pom.xml'
+      - 'java/compaction/compaction-datafusion/**'
+      - 'java/compaction/compaction-job-execution/**'
+      - 'java/compaction/compaction-task-creation/**'
+      - 'java/compaction/compaction-job-creation/**'
+      - 'java/compaction/compaction-job-creation-lambda/**'
+      - 'java/compaction/compaction-tracker/**'
+      - 'java/compaction/compaction-core/**'
+      - 'java/partitions/splitter/**'
+      - 'java/partitions/splitter-lambda/**'
+      - 'java/garbage-collector/**'
+      - 'java/bulk-export/bulk-export-core/**'
+      - 'java/bulk-export/bulk-export-planner/**'
+      - 'java/bulk-export/bulk-export-task-creator/**'
+      - 'java/bulk-export/bulk-export-task-execution/**'
+      - 'java/common/common-task/**'
+      - 'java/ingest/ingest-runner/**'
+      - 'java/common/common-job/**'
+      - 'java/ingest/ingest-tracker/**'
+      - 'java/common/sketches/**'
+      - 'java/ingest/ingest-core/**'
+      - 'java/statestore/**'
+      - 'java/common/common-invoke-tables/**'
+      - 'java/configuration/**'
+      - 'java/common/dynamodb-tools/**'
+      - 'java/common/parquet/**'
+      - 'java/common/localstack-test/**'
+      - 'java/example-iterators/**'
+      - 'java/core/**'
+      - 'java/common/foreign-bridge/**'
+      - 'java/common/arrow/**'
+      - 'java/query/query-datafusion/**'
+      - 'java/query/query-core/**'
+
+jobs:
+  chunk-workflow:
+    uses: ./.github/workflows/chunk.yaml
+    with:
+      chunkId: compaction

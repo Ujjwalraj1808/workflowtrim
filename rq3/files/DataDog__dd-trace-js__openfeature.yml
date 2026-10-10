@@ -1,0 +1,101 @@
+name: OpenFeature
+
+on:
+  pull_request:
+  push:
+    branches: [master, mq-working-branch-master-*]
+  schedule:
+    - cron: 0 4 * * *
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref == 'refs/heads/master' && github.run_id || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit:
+    strategy:
+      fail-fast: false
+      matrix:
+        version: [oldest, maintenance, active, latest]
+    name: ${{ github.workflow }} / unit (node-${{ matrix.version }})
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/node
+        with:
+          version: ${{ matrix.version }}
+      - uses: ./.github/actions/install
+      - run: npm run test:openfeature:ci
+      - uses: ./.github/actions/coverage
+        with:
+          flags: openfeature-unit-${{ matrix.version }}
+      - uses: ./.github/actions/upload-junit-artifacts
+        if: "!cancelled()"
+        with:
+          id: ${{ github.job }}-${{ strategy.job-index }}
+
+  macos:
+    name: ${{ github.workflow }} / macos
+    runs-on: macos-latest
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/node/latest
+      - uses: ./.github/actions/install
+      - run: npm run test:integration:openfeature:coverage
+      - uses: ./.github/actions/coverage
+        with:
+          flags: openfeature-macos
+      - uses: ./.github/actions/upload-junit-artifacts
+        if: "!cancelled()"
+        with:
+          id: ${{ github.job }}
+
+  ubuntu:
+    name: ${{ github.workflow }} / ubuntu
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/node/oldest-maintenance-lts
+      - uses: ./.github/actions/install
+      - run: npm run test:integration:openfeature:coverage
+      - uses: ./.github/actions/node/newest-maintenance-lts
+      - run: npm run test:integration:openfeature:coverage
+      - uses: ./.github/actions/node/active-lts
+      - run: npm run test:integration:openfeature:coverage
+      - uses: ./.github/actions/node/latest
+      - run: npm run test:integration:openfeature:coverage
+      - uses: ./.github/actions/coverage
+        with:
+          flags: openfeature-ubuntu
+      - uses: ./.github/actions/upload-junit-artifacts
+        if: "!cancelled()"
+        with:
+          id: ${{ github.job }}
+
+  windows:
+    name: ${{ github.workflow }} / windows
+    runs-on: windows-2022
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/node
+        with:
+          version: 24.14.1 # TODO: remove pin when https://github.com/nodejs/node/issues/62991 is fixed
+      - uses: ./.github/actions/install
+      - run: npm run test:integration:openfeature:coverage
+      - uses: ./.github/actions/node-crash-report
+        if: failure()
+      - uses: ./.github/actions/coverage
+        with:
+          flags: openfeature-windows
+      - uses: ./.github/actions/upload-junit-artifacts
+        if: "!cancelled()"
+        with:
+          id: ${{ github.job }}

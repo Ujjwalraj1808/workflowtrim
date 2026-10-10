@@ -1,0 +1,23 @@
+name: Build
+
+on:
+  push:
+    branches:
+      - main
+      - release/*
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  common:
+    uses: $/.github/workflows/build-common.yml
+    with:
+      cache-read-only: ${{ github.ref_name != github.event.repository.default_branch }}
+    secrets:
+      DEVELOCITY_ACCESS_KEY: ${{ secrets.DEVELOCITY_ACCESS_KEY }}
+
+  # Link check is disabled for push events to avoid unnecessary CI failures
+  # (these failures will instead be captured by the daily scheduled run)
+  # and for release branches to avoid unnecessary maintenance if external links break

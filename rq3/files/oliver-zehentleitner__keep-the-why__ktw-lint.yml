@@ -1,0 +1,26 @@
+name: ktw-lint
+
+# This repository's own context/ is linted the same way any other project
+# does it — the consumer snippet from references/ci-linting.md, verbatim
+# (only actions/checkout is SHA-pinned, the repo-wide policy for third-party
+# actions). Testing the linter *code* is lint-package.yml's job, not this one's.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Read-only token: nothing here writes to the repository.
+permissions:
+  contents: read
+
+jobs:
+  ktw-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: oliver-zehentleitner/keep-the-why@lint-latest   # rolling; @lint-v<version> pins action and linter together
+        with:
+          path: "."
+          strict: "false"    # "true" turns warnings (e.g. missing Type on old entries) into failures
+          # version: "0.10.1.0"   # optional: pin the linter instead of tracking latest

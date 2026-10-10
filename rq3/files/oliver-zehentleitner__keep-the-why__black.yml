@@ -1,0 +1,28 @@
+name: Black
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Read-only token: nothing here writes to the repository.
+permissions:
+  contents: read
+
+jobs:
+  black:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Install black
+        run: pip install black==26.5.1
+
+      # Eval fixtures are materialized sample projects, not this repo's code —
+      # their formatting is part of the scenario, so they stay as written.
+      - name: Check formatting
+        run: black --check --diff --extend-exclude 'tools/evals/fixtures' .

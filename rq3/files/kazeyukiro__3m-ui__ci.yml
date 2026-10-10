@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches: [main, 'agent/**', 'feat/**']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: backend/go.mod
+          cache: true
+      - name: Go format check
+        run: |
+          echo "GOFMT_FILES:"
+          gofmt -l .
+          test -z "$(gofmt -l .)"
+      - name: Go vet
+        run: go vet ./...
+      - name: Go tests
+        run: go test ./...
+      - name: Telegram race/security tests
+        run: go test -race ./internal/telegram -run 'Test(Concurrent|UpdateOffset|HTMLSplit|SplitTelegramHTML|ParseUpdates|SetCommands)'
+      - name: Static release driver and initialization tests
+        run: go test -tags sqlite_modernc ./...
+      - name: Initialization race tests
+        run: go test -race -tags sqlite_modernc ./internal/bootstrap ./internal/config ./cmd/server
+      - name: Go build
+        run: go build ./...
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          if ! npm ci --no-audit --no-fund; then
+            echo "::warning::npm ci failed (lock out of sync); falling back to npm install"
+            npm install --no-audit --no-fund
+          fi
+      - run: npm run lint
+      - run: npm run test:unit
+      - run: npm run build
+
+  scripts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate POSIX shell scripts
+        run: |
+          set -eu
+          for script in scripts/install.sh scripts/update.sh scripts/uninstall.sh scripts/3m-ui.sh scripts/3m-ui scripts/download-mihomo.sh scripts/build-release-bundle.sh; do
+            sh -n "$script"
+          done
+      - name: Distribution and lifecycle regression tests
+        run: python3 -m unittest discover -s scripts/tests -v

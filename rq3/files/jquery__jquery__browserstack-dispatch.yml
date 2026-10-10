@@ -1,0 +1,70 @@
+name: Browserstack (Manual Dispatch)
+
+on:
+  workflow_dispatch:
+    inputs:
+      module:
+        description: 'Module to test'
+        required: true
+        type: choice
+        options:
+          - 'basic'
+          - 'ajax'
+          - 'animation'
+          - 'attributes'
+          - 'callbacks'
+          - 'core'
+          - 'css'
+          - 'data'
+          - 'deferred'
+          - 'deprecated'
+          - 'dimensions'
+          - 'effects'
+          - 'event'
+          - 'manipulation'
+          - 'offset'
+          - 'queue'
+          - 'selector'
+          - 'serialize'
+          - 'support'
+          - 'traversing'
+          - 'tween'
+      browser:
+        description: 'Browser to test, in form of \"browser_[browserVersion | :device]_os_osVersion\"'
+        required: false
+        type: string
+        default: 'chrome__windows_11'
+
+permissions:
+  contents: read # to fetch code (actions/checkout)
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    environment: browserstack
+    env:
+      BROWSERSTACK_USERNAME: ${{ secrets.BROWSERSTACK_USERNAME }}
+      BROWSERSTACK_ACCESS_KEY: ${{ secrets.BROWSERSTACK_ACCESS_KEY }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 20
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build jQuery
+        run: npm run build:all
+
+      - name: Pretest script
+        run: npm run pretest
+
+      - name: Run tests
+        env:
+          BROWSER: ${{ inputs.browser }}
+          MODULE: ${{ inputs.module }}
+        run: npm run test:unit -- \
+          -v --browserstack "$BROWSER" \
+          -f "module=$MODULE"

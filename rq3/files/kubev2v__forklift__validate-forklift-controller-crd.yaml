@@ -1,0 +1,28 @@
+name: Validate ForkliftController CRD
+on:
+  pull_request:
+    paths:
+      - "operator/config/crd/**"
+      - "pkg/apis/forklift/v1beta1/**"
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Regenerate CRD manifests
+        run: make manifests
+      - name: Check for CRD drift
+        run: |
+          if ! git diff --quiet operator/config/crd/; then
+            echo "ERROR: CRD files are out of date. Run 'make manifests' and commit the result."
+            git diff operator/config/crd/
+            exit 1
+          fi

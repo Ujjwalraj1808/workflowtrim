@@ -1,0 +1,193 @@
+name: PiT
+run-name: PiT ${{ inputs.version }} (lin=${{inputs.linux}} win=${{inputs.windows}} skip=${{inputs.skipcurrent}}) ${{inputs.starters}}
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version'
+        required: false
+        type: string
+      starters:
+        description: 'Starters to run, separated by comma'
+        required: false
+        type: string
+      skipcurrent:
+        description: 'Skip running tests in current version'
+        required: false
+        type: boolean
+        default: false
+      skipdev:
+        description: 'Skip running tests in dev mode'
+        required: false
+        type: boolean
+        default: false
+      debug:
+        description: 'Be verbose when running PiT steps'
+        required: false
+        type: boolean
+        default: false
+      linux:
+        description: 'Run build in linux runner'
+        required: false
+        type: boolean
+        default: true
+      windows:
+        description: 'Run build in windows runner'
+        required: false
+        type: boolean
+        default: false
+      screenshots:
+        description: 'Save screenshots of all starters before and after'
+        required: false
+        type: boolean
+        default: false
+      demos:
+        description: 'Checkout and run all demos'
+        required: false
+        type: boolean
+        default: false
+      join:
+        description: 'Number of apps to run per container (default 1)'
+        required: false
+        type: choice
+        options: ["1", "2", "3", "4"]
+        default: "1"
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set.outputs.matrix }}
+    steps:
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+      - name: Compute Arguments and Matrix
+        id: set
+        shell: bash
+        run: |
+          echo "Computing matrix ..."
+          [ -z "${{secrets.GHTK}}" -o -z "${{secrets.TB_LICENSE}}" -o -z "${{secrets.SS_LICENSE}}" -o -z "${CE_LICENSE}" ] && exit 1
+          V="${{inputs.version}}"
+          [ -n "$V" ] && echo "$V" | grep -Eqv '^[0-9]+(\.[0-9]+)*(-SNAPSHOT|[\.-]alpha[0-9]+|[\.-]beta[0-9]+|[\.-]rc[0-9]+)?$' && echo "Invalid version"
+
+          git clone -q https://${{secrets.GHTK}}@github.com/vaadin/platform-in-test-script.git pit
+          W="${{inputs.windows}}"
+          L="${{inputs.linux}}"
+          [ true != "$W" -a true != "$L" ] && W=true
+          [ true != "$L" -a true != "$W" ] && L=true
+          A="$A --starters=${{inputs.starters}}"
+          cmd="./pit/scripts/pit/run.sh $A --list=${{inputs.join}}"
+          echo "Generating list of starters: $cmd"
+          S=`eval $cmd`
+          M='{"include":['
+          for i in `echo $S`; do
+            J='{"app":"'$i'"'
+            [ -n "$V" ] && J=$J',"version":"'$V'"'
+            [ true = "$W" -a control-center != "$i" ] && M=$M$J',"os":"windows-latest"},'
+            [ true = "$L" ] && M=$M$J',"os":"ubuntu-22.04"},'
+          done
+          M=`echo $M | sed -e s/,$//`']}'
+          echo "Generated Matrix: $M"
+          echo "matrix=$M" >> $GITHUB_OUTPUT
+        env:
+          CE_LICENSE: ${{secrets.CE_LICENSE}}
+  run:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix: ${{fromJson(needs.prepare.outputs.matrix)}}
+    runs-on: ${{matrix.os}}
+    services:
+      docker:
+        image: ${{ (matrix.app == 'control-center' ) && 'docker:dind' || '' }}
+        options: --privileged --shm-size=2g
+    steps:
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+      - name: Install PiT
+        run: |
+          git clone https://${{secrets.GHTK}}@github.com/vaadin/platform-in-test-script.git pit
+          cd pit && git rev-parse --short HEAD
+        shell: bash
+      - name: Setup License
+        run: |
+          mkdir -p ~/.vaadin/
+          echo '{"username":"'${TB%%/*}'","proKey":"'${TB#*/}'"}' > ~/.vaadin/proKey
+          echo "$SS" > ~/vaadin.spreadsheet.developer.license
+        shell: bash
+        env:
+          TB: ${{secrets.TB_LICENSE}}
+          SS: ${{secrets.SS_LICENSE}}
+      - uses: browser-actions/setup-chrome@v2
+        with:
+          chrome-version: stable
+          install-dependencies: ${{ env.ACT == 'true' }}
+      - uses: actions/setup-java@v5
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+      - uses: stCarolas/setup-maven@v5.1
+        with:
+          maven-version: '3.9.0'
+      - name: Set up Helm
+        if: ${{ matrix.app == 'control-center' }}
+        uses: azure/setup-helm@v3.5
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+      - name: Create k8s Kind Cluster
+        if: ${{ matrix.app == 'control-center' }}
+        uses: helm/kind-action@v1
+        with:
+          install_only: false
+      - name: Pre-install WildFly for CDI starter
+        if: ${{ contains(matrix.app, 'cdi') }}
+        shell: bash
+        run: |
+          WILDFLY_VERSION=38.0.1.Final
+          WILDFLY_HOME=$HOME/wildfly-$WILDFLY_VERSION
+          curl -sL "https://github.com/wildfly/wildfly/releases/download/$WILDFLY_VERSION/wildfly-$WILDFLY_VERSION.zip" -o /tmp/wildfly.zip
+          unzip -q /tmp/wildfly.zip -d $HOME
+          rm /tmp/wildfly.zip
+          echo "WILDFLY_HOME=$WILDFLY_HOME" >> $GITHUB_ENV
+      - name: Run PiT
+        run: |
+          echo "${{toJSON(inputs)}}"
+          [ -n "${{inputs.version}}" ] && ARG="--version=${{inputs.version}}"
+          [ true = "${{inputs.skipcurrent}}" ] && ARG="$ARG --skip-current"
+          [ true = "${{inputs.skipdev}}" ] && ARG="$ARG --skip-dev"
+          [ true = "${{inputs.debug}}" ] && ARG="$ARG --debug"
+          [ true = "${{inputs.screenshots}}" ] && ARG="$ARG --screenshots"
+          ./pit/scripts/pit/run.sh --path
+          CMD="./pit/scripts/pit/run.sh $ARG --starters=${{matrix.app}} --gh-token=${{secrets.GHTK}}"
+          # Output the PiT command to execute, so as we can run the same locally
+          echo "$CMD"
+          # Run PiT in test mode, so as we can copy and paste commands when reporting
+          $CMD --test
+          # Run PiT
+          $CMD
+        env:
+            CE_LICENSE: ${{secrets.CE_LICENSE}}
+            OPENAI_TOKEN: ${{secrets.OPENAI_TOKEN}}
+            MAVEN_ARGS: ${{env.MAVEN_ARGS}}
+            CC_CERT: ${{secrets.CC_CERT}}
+            CC_KEY: ${{secrets.CC_KEY}}
+        shell: bash
+      - if: ${{always()}}
+        name: Set artifact_name
+        run: echo artifact_name=`echo ${{matrix.app}} | sed -e 's/[^a-zA-Z0-9._-]/_/g'` >> $GITHUB_ENV
+        shell: bash
+      - if: ${{failure()}}
+        uses: actions/upload-artifact@v6
+        with:
+          name: failures-${{env.artifact_name}}
+          path: tmp/**/*.out
+          if-no-files-found: ignore
+          retention-days: 7
+      - if: ${{ true == inputs.screenshots }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: screenshots-${{env.artifact_name}}
+          path: tmp/**/screenshots.out
+          if-no-files-found: ignore
+          retention-days: 2

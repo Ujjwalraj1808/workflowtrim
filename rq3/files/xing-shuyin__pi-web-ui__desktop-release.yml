@@ -1,0 +1,197 @@
+name: Desktop installer
+
+# 打 tag 后构建桌面安装包（Windows/macOS/Linux），并挂到该 tag 的 GitHub Release 上
+# （Release 本体由 release-notes.yml 创建；两者同时被 tag 触发，这里会等它出现）。
+# 现在是无证书出包：
+#   - Windows：首启有 SmartScreen「未知发布者」提示（SignPath Foundation 获批后在本 workflow 签名）
+#   - macOS：dmg 未签名 → Gatekeeper 会拦，首次运行要右键→打开（SignPath 不管 mac）
+#   - Linux：AppImage 无签名概念
+# 手动跑（只出 workflow artifact、不动 Release 资产）：Actions → Desktop installer → Run workflow
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows-installer:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      # 桌面壳复用 dist/server + web/dist，所以先跑常规打包
+      - name: Build (web + server)
+        run: npm run build
+
+      - name: Build desktop shell
+        run: npm run build:desktop
+
+      # npmRebuild:false：node-pty 1.1.0 是 N-API 预编译，不需要按 Electron ABI 重编，
+      # 也就不用装 Visual Studio（见 desktop/electron-builder.yml 注释）。
+      # 产物名由 yml 的 artifactName 定（无空格，feed 与 asset 名一致，issue #180B）。
+      - name: Package Windows installer
+        run: npx electron-builder -c desktop/electron-builder.yml --win --publish never
+
+      # ───────────────────────────────────────────────────────────────────────────
+      # TODO（拿到 SignPath Foundation 资格后在这里启用签名）
+      #   SignPath 只签 CI 产物，所以流程必须是：本 workflow 产出的未签名 exe
+      #   → SignPath 签名 → 下载签名后的文件 → 再挂到 Release。
+      #   用官方 action `signpath/github-action-submit-signing-request`，需要的
+      #   secret/变量（api-token、organization-id、project-slug、
+      #   signing-policy-slug、artifact-configuration-slug）以批准后他们发来的
+      #   文档为准，别照抄记忆里的参数名。步骤顺序：先 upload-artifact 把未签名
+      #   包传上去 → 调 SignPath action 拿回签名包 → 改下面的 upload 路径。
+      # ───────────────────────────────────────────────────────────────────────────
+
+      - name: Upload installer as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pi-web-ui-desktop-windows
+          path: |
+            release/*.exe
+            release/*.exe.blockmap
+            release/latest.yml
+          if-no-files-found: error
+
+      - name: Attach installer to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          # release-notes.yml 并行跑，等 Release 建出来（最多 3 分钟）再挂资产
+          for _ in $(seq 1 36); do
+            if gh release view "$TAG" >/dev/null 2>&1; then break; fi
+            echo "waiting for release $TAG …"
+            sleep 5
+          done
+          gh release view "$TAG" >/dev/null
+          ASSETS=()
+          for f in release/*.exe release/*.exe.blockmap release/latest.yml; do
+            if [ -f "$f" ]; then ASSETS+=("$f"); fi
+          done
+          printf 'uploading: %s\n' "${ASSETS[@]}"
+          gh release upload "$TAG" "${ASSETS[@]}" --clobber
+          gh release view "$TAG" --json assets --jq '.assets[].name'
+
+  macos-installer:
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build (web + server)
+        run: npm run build
+
+      - name: Build desktop shell
+        run: npm run build:desktop
+
+      # 未签名 dmg：macOS 用户首次运行需要 右键 → 打开（Gatekeeper）
+      # 产物含 dmg（手装）+ zip（electron-updater 原地更新只吃 zip，issue #180A）
+      - name: Package macOS app (dmg + zip)
+        run: npx electron-builder -c desktop/electron-builder.yml --mac --publish never
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pi-web-ui-desktop-macos
+          path: |
+            release/*.dmg
+            release/*.zip
+            release/latest-mac.yml
+          if-no-files-found: error
+
+      - name: Attach to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          for _ in $(seq 1 36); do
+            if gh release view "$TAG" >/dev/null 2>&1; then break; fi
+            sleep 5
+          done
+          gh release view "$TAG" >/dev/null
+          ASSETS=()
+          for f in release/*.dmg release/*.zip release/latest-mac.yml; do
+            if [ -f "$f" ]; then ASSETS+=("$f"); fi
+          done
+          printf 'uploading: %s\n' "${ASSETS[@]}"
+          gh release upload "$TAG" "${ASSETS[@]}" --clobber
+
+  linux-installer:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build (web + server)
+        run: npm run build
+
+      - name: Build desktop shell
+        run: npm run build:desktop
+
+      - name: Package Linux AppImage
+        run: npx electron-builder -c desktop/electron-builder.yml --linux AppImage --publish never
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pi-web-ui-desktop-linux
+          path: |
+            release/*.AppImage
+            release/*.blockmap
+            release/latest-linux.yml
+          if-no-files-found: error
+
+      - name: Attach to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          for _ in $(seq 1 36); do
+            if gh release view "$TAG" >/dev/null 2>&1; then break; fi
+            sleep 5
+          done
+          gh release view "$TAG" >/dev/null
+          ASSETS=()
+          for f in release/*.AppImage release/*.blockmap release/latest-linux.yml; do
+            if [ -f "$f" ]; then ASSETS+=("$f"); fi
+          done
+          printf 'uploading: %s\n' "${ASSETS[@]}"
+          gh release upload "$TAG" "${ASSETS[@]}" --clobber

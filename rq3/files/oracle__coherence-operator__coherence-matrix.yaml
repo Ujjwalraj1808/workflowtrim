@@ -1,0 +1,311 @@
+# Copyright 2021, 2026, Oracle Corporation and/or its affiliates.  All rights reserved.
+# Licensed under the Universal Permissive License v 1.0 as shown at
+# http://oss.oracle.com/licenses/upl.
+
+# ---------------------------------------------------------------------------
+# Coherence Operator GitHub Actions Coherence Certification build.
+# ---------------------------------------------------------------------------
+name: Coherence Certification
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 0 * * *'
+  push:
+    branches-ignore:
+    - gh-pages
+    - 1.0.0
+    - 2.x
+    - 3.x
+
+
+env:
+  MAVEN_USER: ${{ secrets.MAVEN_USER }}
+  MAVEN_PASSWORD: ${{ secrets.MAVEN_PASSWORD }}
+  LOAD_KIND: true
+  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  SKIP_SPRING_CNBP: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        matrixName:
+          - "15.1.1-0-SNAPSHOT"
+          - "15.1.1-0-SNAPSHOT-Graal"
+          - "25.03"
+          - "25.03-Graal"
+          - "14.1.2-0"
+          - "14.1.2-0-SNAPSHOT"
+          - "22.06"
+          - "14.1.1-2206-SNAPSHOT"
+          - "14.1.1-0-SNAPSHOT"
+          - "14.1.1-0"
+          - "14.1.1.0.0"
+          - "12.2.1.4.0"
+          - "12.2.1-4-SNAPSHOT"
+        include:
+          - matrixName: "15.1.1-0-SNAPSHOT"
+            coherenceVersion: "15.1.1-0-5-SNAPSHOT"
+            coherenceImage: "iad.ocir.io/odx-stateservice/test/coherence:15.1.1-0-5-SNAPSHOT-java17"
+            javaVersion: 17
+            coherenceIsJava8: false
+            baseImage: "gcr.io/distroless/java17-debian12"
+
+          - matrixName: "15.1.1-0-SNAPSHOT-Graal"
+            coherenceVersion: "15.1.1-0-3-SNAPSHOT"
+            coherenceImage: "iad.ocir.io/odx-stateservice/test/coherence:15.1.1-0-3-SNAPSHOT-graal"
+            javaVersion: 17
+            coherenceIsJava8: false
+            baseImage: "gcr.io/distroless/java17-debian12"
+
+          - matrixName: "25.03"
+            coherenceVersion: "25.03.2"
+            coherenceImage: "ghcr.io/oracle/coherence-ce:25.03.2"
+            javaVersion: 17
+            coherenceIsJava8: false
+            baseImage: "gcr.io/distroless/java17-debian12"
+
+          - matrixName: "25.03-Graal"
+            coherenceVersion: "25.03.2"
+            coherenceImage: "ghcr.io/oracle/coherence-ce:25.03.2-graal"
+            javaVersion: 17
+            coherenceIsJava8: false
+            baseImage: "gcr.io/distroless/java17-debian12"
+
+          - matrixName: "14.1.2-0-SNAPSHOT"
+            coherenceVersion: "14.1.2-0-7-SNAPSHOT"
+            coherenceImage: "iad.ocir.io/odx-stateservice/test/coherence:14.1.2-0-7-SNAPSHOT"
+            javaVersion: 17
+            coherenceIsJava8: false
+            baseImage: "gcr.io/distroless/java17-debian12"
+
+          - matrixName: "14.1.2-0"
+            coherenceVersion: "14.1.2-0-2"
+            javaVersion: 17
+            coherenceIsJava8: false
+            coherenceImage: "ghcr.io/oracle/coherence-ce:14.1.2-0-2"
+            baseImage: "gcr.io/distroless/java17-debian12"
+
+          - matrixName: "22.06"
+            coherenceVersion: "22.06.13"
+            coherenceImage: "ghcr.io/oracle/coherence-ce:22.06.13"
+            javaVersion: 11
+            coherenceIsJava8: false
+            baseImage: "gcr.io/distroless/java11-debian11"
+
+          - matrixName: "14.1.1-2206-SNAPSHOT"
+            coherenceVersion: "14.1.1-2206-17-SNAPSHOT"
+            coherenceImage: "iad.ocir.io/odx-stateservice/test/coherence:14.1.1-2206-17-SNAPSHOT"
+            javaVersion: 11
+            coherenceIsJava8: false
+            baseImage: "gcr.io/distroless/java11-debian11"
+
+          - matrixName: "14.1.1-0-SNAPSHOT"
+            coherenceVersion: "14.1.1-0-26-SNAPSHOT"
+            coherenceImage: "iad.ocir.io/odx-stateservice/test/coherence:14.1.1-0-26-SNAPSHOT"
+            javaVersion: 11
+            coherenceIsJava8: false
+            baseImage: "gcr.io/distroless/java11-debian11"
+
+          - matrixName: "14.1.1-0"
+            coherenceVersion: "14.1.1-0-22"
+            javaVersion: 11
+            coherenceIsJava8: false
+            coherenceImage: "ghcr.io/oracle/coherence-ce:14.1.1-0-22"
+            baseImage: "gcr.io/distroless/java11-debian11"
+
+          - matrixName: "14.1.1.0.0"
+            coherenceVersion: "14.1.1.0.0"
+            coherenceImage: "container-registry.oracle.com/middleware/coherence:14.1.1.0.0"
+            javaVersion: 8
+            coherenceIsJava8: true
+            baseImage: "gcr.io/distroless/java11-debian11"
+
+          - matrixName: "12.2.1.4.0"
+            coherenceVersion: "12.2.1.4.0"
+            coherenceImage: "container-registry.oracle.com/middleware/coherence:12.2.1.4.0"
+            javaVersion: 8
+            coherenceIsJava8: true
+            baseImage: "gcr.io/distroless/java11-debian11"
+
+          - matrixName: "12.2.1-4-SNAPSHOT"
+            coherenceVersion: "12.2.1-4-30-SNAPSHOT"
+            coherenceImage: "iad.ocir.io/odx-stateservice/test/coherence:12.2.1-4-30-SNAPSHOT"
+            javaVersion: 8
+            coherenceIsJava8: true
+            baseImage: "gcr.io/distroless/java11-debian11"
+
+    steps:
+    - uses: actions/checkout@v5
+      with:
+        fetch-depth: 0
+
+#   This step will free up disc space on the runner by removing
+#   lots of things that we do not need.
+    - name: disc
+      shell: bash
+      run: |
+        echo "Listing 100 largest packages"
+        dpkg-query -Wf '${Installed-Size}\t${Package}\n' | sort -n | tail -n 100
+        df -h
+        echo "Removing large packages"
+        sudo apt-get remove -y '^dotnet-.*' || true
+        sudo apt-get remove -y '^llvm-.*' || true
+        sudo apt-get remove -y 'monodoc-http' || true
+        sudo apt-get remove -y 'php.*' || true
+        sudo apt-get remove -y azure-cli google-cloud-sdk hhvm google-chrome-stable firefox powershell mono-devel || true
+        sudo apt-get autoremove -y || true
+        sudo apt-get clean
+        df -h
+        echo "Removing large directories"
+        sudo rm -rf /usr/share/dotnet/
+        sudo rm -rf /usr/local/lib/android
+        df -h
+
+    - name: Set up JDK
+      uses: oracle-actions/setup-java@v1
+      with:
+        website: oracle.com
+        release: 21
+
+#    - name: Set up Go
+#      uses: actions/setup-go@v5
+#      with:
+#        go-version-file: go.mod
+
+    - name: Cache Go Modules
+      uses: actions/cache@v5
+      with:
+        path: ~/go/pkg/mod
+        key: ${{ runner.os }}-go-mods-${{ hashFiles('**/go.sum') }}
+        restore-keys: |
+          ${{ runner.os }}-go-mods-
+
+    - name: Cache Maven packages
+      uses: actions/cache@v5
+      with:
+        path: ~/.m2
+        key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
+        restore-keys: ${{ runner.os }}-m2
+
+    - name: Edit DNS Resolve
+      shell: bash
+      run: |
+        # Use sudo tee so the resolver override is written with elevated
+        # permissions; this keeps the DNS behavior while avoiding redirect
+        # failures when the runner user does not own the systemd stub file.
+        printf 'nameserver 8.8.8.8\n' | sudo tee /run/systemd/resolve/stub-resolv.conf > /dev/null
+
+    - name: Start KinD Cluster
+      shell: bash
+      env:
+        COHERENCE_IMAGE: ${{ matrix.coherenceImage }}
+        OCR_DOCKER_USERNAME: ${{ secrets.OCR_DOCKER_USERNAME }}
+        OCR_DOCKER_PASSWORD: ${{ secrets.OCR_DOCKER_PASSWORD }}
+      run: |
+        make kind
+        kubectl version
+        kubectl get nodes
+        echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u $ --password-stdin
+        # Only authenticate to OCR when credentials exist. Public GHCR matrix entries
+        # should continue without being blocked by Docker's non-TTY login failure.
+        if [[ -n "${OCR_DOCKER_USERNAME}" && -n "${OCR_DOCKER_PASSWORD}" ]]; then
+          echo "${OCR_DOCKER_PASSWORD}" | docker login container-registry.oracle.com -u "${OCR_DOCKER_USERNAME}" --password-stdin
+        elif [[ "${COHERENCE_IMAGE}" == container-registry.oracle.com/* ]]; then
+          echo "::error::OCR_DOCKER_USERNAME and OCR_DOCKER_PASSWORD are required to pull ${COHERENCE_IMAGE}"
+          exit 1
+        else
+          echo "Skipping OCR login because this matrix image is not hosted by container-registry.oracle.com"
+        fi
+        docker login "${{ secrets.OCI_REGISTRY }}" -u "${{ secrets.OCI_USERNAME }}" -p "${{ secrets.OCI_PASSWORD }}"
+        docker pull gcr.io/distroless/java
+        docker pull gcr.io/distroless/java11-debian11
+        docker pull gcr.io/distroless/java17-debian11
+        docker pull gcr.io/distroless/java17-debian12
+        docker pull gcr.io/distroless/java21-debian12
+        docker pull "${COHERENCE_IMAGE}"
+
+    - name: Health mutator protocol regressions
+      shell: bash
+      run: |
+        make generate
+        go test ./pkg/probe ./controllers/finalizer ./controllers/statefulset
+        ./mvnw -B -f java -pl coherence-operator -am test -Dtest=SecretLoginModuleTest,HealthSSLProviderConfigTest -Dsurefire.failIfNoSpecifiedTests=false
+        if [[ "${{ matrix.matrixName }}" == "15.1.1-0-SNAPSHOT" ]]; then
+          test/health-mutator/extract-coherence-jar.sh \
+            "${{ matrix.coherenceImage }}" \
+            "${{ matrix.coherenceVersion }}" \
+            /tmp/health-mutator/coherence.jar
+          ./mvnw -B -f java -pl coherence-operator -am test \
+            -Dtest=HealthSecuritySupportTest \
+            -Dhealth.mutator.coherence.jar=/tmp/health-mutator/coherence.jar \
+            -Dsurefire.failIfNoSpecifiedTests=false
+        fi
+
+    - name: Coherence Certification Tests
+      shell: bash
+      run: |
+        export COHERENCE_IMAGE=${{ matrix.coherenceImage }}
+        echo "COHERENCE_IMAGE=${COHERENCE_IMAGE}"
+        export BUILD_JAVA_VERSION=${{ matrix.javaVersion }}
+        echo "BUILD_JAVA_VERSION=${BUILD_JAVA_VERSION}"
+        export COHERENCE_TEST_BASE_IMAGE_17=${{ matrix.baseImage }}
+        echo "COHERENCE_TEST_BASE_IMAGE_17=${COHERENCE_TEST_BASE_IMAGE_17}"
+        export COHERENCE_TEST_BASE_IMAGE_21=${{ matrix.baseImage }}
+        echo "COHERENCE_TEST_BASE_IMAGE_21=${COHERENCE_TEST_BASE_IMAGE_17}"
+        export OPERATOR_COHERENCE_JAVA_8=${{ matrix.coherenceIsJava8 }}
+        make clean
+        echo "Building Operator Image"
+        make build-operator-images
+        echo "Building Coherence Compatibility Image"
+        make build-compatibility-image
+        echo "Loading Images to Kind"
+        make kind-load
+        make kind-load-compatibility
+        make remove-all-images
+        sudo docker image prune --all --force
+        sudo docker builder prune -a
+        df -h
+        echo "Running Coherence Compatibility Tests"
+        export TEST_LOGS_DIR=build/_output/test-logs/${{ matrix.matrixName }}
+        make coherence-compatibility-test 
+
+    - name: Collect failure diagnostics
+      if: ${{ failure() || cancelled() }}
+      shell: bash
+      continue-on-error: true
+      run: |
+        DIAG_DIR="build/_output/test-logs/${{ matrix.matrixName }}/diagnostics"
+        mkdir -p "${DIAG_DIR}"
+
+        collect() {
+          local name="$1"
+          shift
+          echo "Collecting ${name}"
+          {
+            echo "$ $*"
+            "$@"
+          } > "${DIAG_DIR}/${name}.log" 2>&1 || true
+        }
+
+        collect nodes kubectl get nodes -o wide
+        collect pods-all-namespaces kubectl get pods -A -o wide
+        collect events-all-namespaces kubectl get events -A --sort-by=.lastTimestamp
+        collect operator-test-all kubectl -n operator-test get all
+        collect operator-pods kubectl -n operator-test get pod -l control-plane=coherence -o wide
+        collect operator-pod-describe kubectl -n operator-test describe pod -l control-plane=coherence
+        collect operator-logs kubectl -n operator-test logs -l control-plane=coherence --all-containers --prefix --tail=-1
+        collect operator-logs-previous kubectl -n operator-test logs -l control-plane=coherence --all-containers --previous --prefix --tail=-1
+        collect coherence-crds kubectl get crd coherence.coherence.oracle.com coherencejob.coherence.oracle.com
+        collect coherence-resources kubectl get coherence.coherence.oracle.com,coherencejob.coherence.oracle.com -A
+
+    - uses: actions/upload-artifact@v6
+      if: ${{ failure() || cancelled() }}
+      with:
+        name: test-output-${{ matrix.matrixName }}
+        path: build/_output/test-logs
+        if-no-files-found: ignore

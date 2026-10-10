@@ -1,0 +1,248 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  backend:
+    name: Backend (lint, typecheck, test, build)
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: amcp
+          POSTGRES_PASSWORD: testpassword
+          POSTGRES_DB: anythingmcp_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      DATABASE_URL: postgresql://amcp:testpassword@localhost:5432/anythingmcp_test
+      # CI-only secrets — long enough to pass our boot validation, never used
+      # outside the test database.
+      JWT_SECRET: ci-test-jwt-secret-at-least-32-chars-aaaaaa
+      ENCRYPTION_KEY: ci-test-encryption-key-32-chars-aaaaaaaa
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Validate adapter catalog
+        run: node scripts/validate-adapters.mjs
+
+      - name: Test adapter validator diagnostics
+        run: node --test scripts/validate-adapters.test.mjs scripts/adapter-new.test.mjs
+
+      - name: Test the satellite generator
+        run: node --test scripts/satellites/satellites.test.mjs
+
+      - name: Verify the quoted adapter count and license wording
+        run: node scripts/adapter-count.mjs --check
+
+      # The Docker image ships only hoisted dependencies; a nested one passes
+      # every test here and then crashes the container (see the script).
+      - name: Verify no backend dependency is nested out of the image
+        run: |
+          node --test scripts/check-runtime-deps.test.mjs
+          node scripts/check-runtime-deps.mjs
+
+      - name: Verify catalog.ts is up-to-date with adapter JSONs
+        run: |
+          node scripts/regenerate-catalog.mjs
+          if ! git diff --quiet packages/backend/src/adapters/catalog.ts; then
+            echo "::error::catalog.ts is out of sync with adapter JSON files."
+            echo "Run: node scripts/regenerate-catalog.mjs && commit the result."
+            git diff packages/backend/src/adapters/catalog.ts
+            exit 1
+          fi
+
+      - name: Generate Prisma client
+        run: npx prisma generate
+        working-directory: packages/backend
+
+      - name: Run Prisma migrations
+        run: npx prisma migrate deploy
+        working-directory: packages/backend
+
+      - name: Lint
+        run: npm run lint
+        working-directory: packages/backend
+
+      - name: Type-check
+        run: npx tsc --noEmit -p tsconfig.json
+        working-directory: packages/backend
+
+      - name: Run tests
+        run: npm test
+        working-directory: packages/backend
+
+      - name: Build backend
+        run: npm run build
+        working-directory: packages/backend
+
+  frontend:
+    name: Frontend (lint, typecheck, build)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+        working-directory: packages/frontend
+
+      - name: Type-check
+        run: npx tsc --noEmit -p tsconfig.json
+        working-directory: packages/frontend
+
+      - name: Build frontend
+        run: npm run build
+        working-directory: packages/frontend
+        env:
+          NEXT_PUBLIC_API_URL: http://localhost:4000
+
+  release-script:
+    name: Cloud release script (blue/green)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      # deploy/cloud/release.sh swaps the cloud's app containers blue/green;
+      # it only ever runs in anger in production. Exercise it on every PR,
+      # under load through Caddy: the migration from the single-container
+      # layout, healthy releases with zero failed requests, broken image,
+      # broken compose, wrong Caddyfile, a failure after the switch, repeated
+      # releases, the cold fallback — and nothing orphaned after any of them.
+      - name: Exercise release.sh against a throwaway stack
+        run: bash deploy/cloud/release.test.sh
+
+  stuck-users-report:
+    name: Cloud stuck-users report
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      # deploy/cloud/stuck-users-report.sh runs once a week on the droplet with
+      # SQL written against the production schema. Run it against every
+      # migration and fake data on each PR, so a schema change that breaks it
+      # fails here instead of as a Monday without a report.
+      - name: Exercise the weekly report against a throwaway database and SMTP
+        run: bash deploy/cloud/stuck-users-report.test.sh
+
+  docker:
+    name: Docker build
+    runs-on: ubuntu-latest
+    needs: [backend, frontend]
+    # Every push to main, and the pull requests that can break the image
+    # without breaking a unit test (decided in the first step). js-yaml 5
+    # (#809) passed every PR check and only failed here, after the merge.
+    if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'pull_request'
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Decide whether this change can break the image
+        id: scope
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          if [ "$EVENT" != "pull_request" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          changed=$(git diff --name-only "origin/$BASE_REF...HEAD")
+          if echo "$changed" | grep -qE '(^|/)package(-lock)?\.json$|^Dockerfile$|^\.dockerignore$|^start\.sh$|^packages/backend/prisma/|^packages/backend/prisma\.config\.ts$|^packages/backend/(tsconfig(\.build)?|nest-cli)\.json$'; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No dependency, Dockerfile, build config or startup change: skipping the image boot."
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build unified image
+        if: steps.scope.outputs.run == 'true'
+        run: docker build -t anythingmcp:ci .
+
+      # Building proves the image assembles, not that it runs. v0.8.0 shipped a
+      # backend that threw MODULE_NOT_FOUND at import time because a relative
+      # require resolved differently under dist/ than under src/: the image
+      # built clean, every test passed, and the container crash-looped. Boot it.
+      - name: Boot the image and wait for /health
+        if: steps.scope.outputs.run == 'true'
+        run: |
+          set -euo pipefail
+          docker network create amcp-ci
+          docker run -d --name amcp-ci-db --network amcp-ci \
+            -e POSTGRES_USER=amcp -e POSTGRES_PASSWORD=amcp -e POSTGRES_DB=anythingmcp \
+            postgres:17-alpine
+          # The entrypoint runs migrations and then starts the backend whether or
+          # not they succeeded, so starting both containers at once just means the
+          # app comes up against an empty schema. docker-compose gates on
+          # service_healthy; a bare docker run has to do it by hand.
+          for i in $(seq 1 30); do
+            docker exec amcp-ci-db pg_isready -U amcp -d anythingmcp -q && break
+            sleep 2
+          done
+          docker exec amcp-ci-db pg_isready -U amcp -d anythingmcp
+          # Booted the way the cloud runs it: OAuth2 on, and Sentry on. On
+          # 2026-09-24 Sentry's Express instrumentation renamed every middleware
+          # layer, @rekog/mcp-nest-auth's bootstrap check stopped finding
+          # cookie-parser, and the backend refused to start in production. The
+          # default boot (auth mode none, no DSN) loads neither module and
+          # could not have caught it. The DSN points at a .invalid host, so
+          # nothing is ever sent.
+          docker run -d --name amcp-ci-app --network amcp-ci -p 4000:4000 \
+            -e MCP_AUTH_MODE=oauth2 \
+            -e SENTRY_DSN=https://public@o0.ingest.sentry.invalid/0 \
+            -e DATABASE_URL=postgresql://amcp:amcp@amcp-ci-db:5432/anythingmcp \
+            -e JWT_SECRET="$(openssl rand -hex 32)" \
+            -e ENCRYPTION_KEY="$(openssl rand -hex 32)" \
+            -e NODE_ENV=production -e PORT=4000 \
+            -e CORS_ORIGIN=http://localhost:3000 \
+            -e SERVER_URL=http://localhost:4000 \
+            -e FRONTEND_URL=http://localhost:3000 \
+            anythingmcp:ci
+          for i in $(seq 1 60); do
+            if curl -sf http://localhost:4000/health > /dev/null; then
+              echo "backend healthy after ${i}0s"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::the image built but the backend never became healthy"
+          docker logs amcp-ci-app 2>&1 | head -120
+          echo '--- last 60 lines ---'
+          docker logs amcp-ci-app 2>&1 | tail -60
+          exit 1
+
+      - name: Tear down
+        if: always()
+        run: |
+          docker rm -f amcp-ci-app amcp-ci-db 2>/dev/null || true
+          docker network rm amcp-ci 2>/dev/null || true

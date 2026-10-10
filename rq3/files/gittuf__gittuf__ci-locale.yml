@@ -1,0 +1,38 @@
+name: tests-locale
+on:
+  push:
+    branches: ['main']
+    paths-ignore:
+      - "docs/*"
+      - "**.md"
+  pull_request:
+    paths-ignore:
+      - "docs/*"
+      - "**.md"
+permissions: read-all
+jobs:
+  test:
+    strategy:
+      matrix:
+        go-version: ['1.27']
+    runs-on: ubuntu-latest
+    steps:
+    - name: Set locale
+      run: |
+        sudo apt-get update && sudo apt-get install tzdata locales -y
+        sudo sed -i '/fr_FR.UTF-8/s/^# //g' /etc/locale.gen && sudo locale-gen
+    - name: Checkout code
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        persist-credentials: false
+    - name: Install Go
+      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+      with:
+        go-version: ${{ matrix.go-version }}
+        cache: true
+    - name: Test
+      run: go test -timeout 20m ./...
+      env:
+        LANG: "fr_FR.UTF-8"
+        LANGUAGE: "fr_FR:fr"
+        LC_ALL: "fr_FR.UTF-8"

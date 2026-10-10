@@ -1,0 +1,79 @@
+# SPDX-FileCopyrightText: 2026 Edward Kmett
+# SPDX-License-Identifier: UPL-1.0 AND BSD-3-Clause
+name: Native Windows runtime
+on:
+  workflow_call:
+    inputs:
+      testGroup:
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      testGroup:
+        description: Native Windows test group
+        type: choice
+        options: [Runtime]
+        default: Runtime
+        required: true
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: native-windows-${{ inputs.testGroup }}-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  windows:
+    name: Windows (${{ inputs.testGroup }})
+    runs-on: windows-2025
+    timeout-minutes: 45
+    # Upstream submodules do not inherit the root .gitattributes file.
+    env:
+      THC_WINDOWS_TEST_GROUP: ${{ inputs.testGroup }}
+      GIT_CONFIG_COUNT: '1'
+      GIT_CONFIG_KEY_0: core.autocrlf
+      GIT_CONFIG_VALUE_0: 'false'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          submodules: true
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - uses: ./.github/actions/jam
+      - name: Build and test on native Windows
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:THC_WINDOWS_TEST_GROUP -ne 'Runtime') {
+            throw 'Only Runtime is admitted; Driver fixtures are quarantined'
+          }
+          New-Item -ItemType Directory -Force build | Out-Null
+          $env:LLD_REPRODUCE = Join-Path $PWD 'build/windows-native-link.tar'
+          & {
+            . ./bin/bootstrap-windows.ps1 -Prefix "$env:RUNNER_TEMP/thc-tools"
+            & ./bin/test-windows-python.ps1
+            & ./bin/test-windows-cabal-config.ps1
+            Invoke-ThcTool $env:CABAL @('update')
+            & ./bin/windows.ps1 -Action Test -Jobs 4 -TestGroup $env:THC_WINDOWS_TEST_GROUP
+          } *>&1 | Tee-Object build/windows-ci.log
+      - name: Preserve native evidence
+        if: always()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: native-windows-evidence-${{ inputs.testGroup }}
+          if-no-files-found: warn
+          path: |
+            build/ci/setup-results/
+            build/windows-ci.log
+            build/windows-native-link.tar
+            build/generated/stdio-abi/
+            build/native-addresses/
+            build/native-malloc/
+            build/*-arrays/
+            build/tuple-arithmetic/
+            build/test-results/testDefault/
+            build/test-results/testDense/
+            build/generated/cbits/
+            dist-newstyle/**/test/*.log

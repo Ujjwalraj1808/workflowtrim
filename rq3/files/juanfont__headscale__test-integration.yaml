@@ -1,0 +1,416 @@
+name: integration
+# To debug locally on a branch, and when needing secrets
+# change this to include `push` so the build is ran on
+# the main repository.
+on: [pull_request]
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+defaults:
+  run:
+    shell: nix develop --fallback --command bash -e {0}
+jobs:
+  # build: Builds binaries and Docker images once, uploads as artifacts for reuse.
+  # build-postgres: Pulls postgres image separately to avoid Docker Hub rate limits.
+  # build-tailscale-released: Pre-pulls released Tailscale images from ghcr.io
+  # so fork PRs (no DOCKERHUB_USERNAME secret) don't hit Docker Hub rate
+  # limits at test time.
+  # sqlite: Runs all integration tests with SQLite backend.
+  # postgres: Runs a subset of tests with PostgreSQL to verify database compatibility.
+  build:
+    runs-on: ubuntu-24.04-arm
+    outputs:
+      files-changed: ${{ steps.changed-files.outputs.files }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 2
+      - name: Get changed files
+        id: changed-files
+        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+        with:
+          filters: |
+            files:
+              - '*.nix'
+              - 'go.*'
+              - '**/*.go'
+              - 'flake.lock'
+              - 'flakehashes.json'
+              - 'integration/**'
+              - 'config-example.yaml'
+              - 'Makefile'
+              - '.github/workflows/test-integration.yaml'
+              - '.github/workflows/integration-test-template.yml'
+              - 'Dockerfile.*'
+      - uses: NixOS/nix-installer-action@62c1943b776c509394b550f3f983adc14e9212d6 # main
+        if: steps.changed-files.outputs.files == 'true'
+      - uses: Mic92/hestia@dfed9ced335d28978ba74e513939a10db1f71025 # v3.1.0
+        if: steps.changed-files.outputs.files == 'true'
+      - name: Build binaries
+        if: steps.changed-files.outputs.files == 'true'
+        run: |
+          # Build once for the native worker architecture. Static binaries
+          # also run in the minimal Headscale image without a Go toolchain.
+          go build -o hi ./cmd/hi
+          CGO_ENABLED=0 GOOS=linux go build -o headscale ./cmd/headscale
+          CGO_ENABLED=0 GOOS=linux go test -c ./integration -o integration.test
+      - name: Upload hi binary
+        if: steps.changed-files.outputs.files == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: hi-binary
+          path: hi
+          retention-days: 10
+      - name: Upload integration test binary
+        if: steps.changed-files.outputs.files == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: integration-test-binary
+          path: integration.test
+          retention-days: 10
+      - name: Force overlay2 storage driver
+        if: steps.changed-files.outputs.files == 'true'
+        run: |
+          # Docker 29 runner images default to overlayfs, which breaks
+          # docker build via Go SDK libraries and docker save/load
+          # tarball formats. overlay2 is the long-standing default.
+          # https://github.com/actions/runner-images/issues/13474
+          sudo mkdir -p /etc/docker
+          echo '{"storage-driver":"overlay2"}' | sudo tee /etc/docker/daemon.json
+          sudo systemctl restart docker
+          docker version
+      - name: Login to Docker Hub
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_CI_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_CI_TOKEN }}
+        if: env.DOCKERHUB_USERNAME != ''
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          username: ${{ env.DOCKERHUB_USERNAME }}
+          password: ${{ env.DOCKERHUB_TOKEN }}
+      - name: Build headscale image
+        if: steps.changed-files.outputs.files == 'true'
+        run: |
+          docker build \
+            --file Dockerfile.integration-ci \
+            --tag headscale:${{ github.sha }} \
+            .
+          docker save headscale:${{ github.sha }} | gzip > headscale-image.tar.gz
+      - name: Build tailscale HEAD image
+        if: steps.changed-files.outputs.files == 'true'
+        run: |
+          docker build \
+            --file Dockerfile.tailscale-HEAD \
+            --tag tailscale-head:${{ github.sha }} \
+            .
+          docker save tailscale-head:${{ github.sha }} | gzip > tailscale-head-image.tar.gz
+      - name: Upload headscale image
+        if: steps.changed-files.outputs.files == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: headscale-image
+          path: headscale-image.tar.gz
+          retention-days: 10
+      - name: Upload tailscale HEAD image
+        if: steps.changed-files.outputs.files == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: tailscale-head-image
+          path: tailscale-head-image.tar.gz
+          retention-days: 10
+  build-postgres:
+    runs-on: ubuntu-24.04-arm
+    needs: build
+    if: needs.build.outputs.files-changed == 'true'
+    steps:
+      - name: Force overlay2 storage driver
+        shell: bash
+        run: |
+          sudo mkdir -p /etc/docker
+          echo '{"storage-driver":"overlay2"}' | sudo tee /etc/docker/daemon.json
+          sudo systemctl restart docker
+          docker version
+      - name: Login to Docker Hub
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_CI_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_CI_TOKEN }}
+        if: env.DOCKERHUB_USERNAME != ''
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          username: ${{ env.DOCKERHUB_USERNAME }}
+          password: ${{ env.DOCKERHUB_TOKEN }}
+      - name: Pull and save postgres image
+        shell: bash
+        run: |
+          docker pull postgres:latest
+          docker tag postgres:latest postgres:${{ github.sha }}
+          docker save postgres:${{ github.sha }} | gzip > postgres-image.tar.gz
+      - name: Upload postgres image
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: postgres-image
+          path: postgres-image.tar.gz
+          retention-days: 10
+  build-tailscale-released:
+    runs-on: ubuntu-24.04-arm
+    needs: build
+    if: needs.build.outputs.files-changed == 'true'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: NixOS/nix-installer-action@62c1943b776c509394b550f3f983adc14e9212d6 # main
+      - uses: Mic92/hestia@dfed9ced335d28978ba74e513939a10db1f71025 # v3.1.0
+      - name: Force overlay2 storage driver
+        run: |
+          sudo mkdir -p /etc/docker
+          echo '{"storage-driver":"overlay2"}' | sudo tee /etc/docker/daemon.json
+          sudo systemctl restart docker
+          docker version
+      - name: Login to Docker Hub
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_CI_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_CI_TOKEN }}
+        if: env.DOCKERHUB_USERNAME != ''
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          username: ${{ env.DOCKERHUB_USERNAME }}
+          password: ${{ env.DOCKERHUB_TOKEN }}
+      - name: List Tailscale versions to pre-pull
+        id: versions
+        run: |
+          versions=$(go run ./cmd/hi list-versions --set=must --exclude=head)
+          echo "versions=${versions}" >> "$GITHUB_OUTPUT"
+          echo "Pre-pulling: ${versions}"
+      - name: Pull Tailscale images
+        run: |
+          # Releases come from ghcr.io (anonymous, unmetered). The
+          # "unstable" floating tag on ghcr.io has been stale since 2022,
+          # so it still needs to come from Docker Hub. xargs -P 0 fans
+          # out one process per tag and returns non-zero if any pull
+          # fails.
+          refs=""
+          for v in ${{ steps.versions.outputs.versions }}; do
+            if [ "${v}" = "unstable" ]; then
+              refs="${refs} tailscale/tailscale:${v}"
+            else
+              refs="${refs} ghcr.io/tailscale/tailscale:${v}"
+            fi
+          done
+          echo "${refs}" | tr ' ' '\n' | grep -v '^$' \
+            | xargs -P 0 -I{} docker pull "{}"
+          echo "REFS=${refs}" >> "$GITHUB_ENV"
+      - name: Save Tailscale images to tarball
+        run: |
+          # Single docker save with all refs: one consistent snapshot, no
+          # parallel-daemon race.
+          docker save ${REFS} | gzip > tailscale-released-images.tar.gz
+          ls -lh tailscale-released-images.tar.gz
+      - name: Upload Tailscale released images
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: tailscale-released-images
+          path: tailscale-released-images.tar.gz
+          retention-days: 10
+  sqlite:
+    needs: [build, build-tailscale-released]
+    if: needs.build.outputs.files-changed == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        test:
+          - TestACLHostsInNetMapTable
+          - TestACLAllowUser80Dst
+          - TestACLDenyAllPort80
+          - TestACLAllowUserDst
+          - TestACLAllowStarDst
+          - TestACLNamedHostsCanReachBySubnet
+          - TestACLNamedHostsCanReach
+          - TestACLDevice1CanAccessDevice2
+          - TestPolicyUpdateWhileRunningWithCLIInDatabase
+          - TestACLAutogroupMember
+          - TestACLAutogroupTagged
+          - TestACLAutogroupSelf
+          - TestACLPolicyPropagationOverTime
+          - TestACLTagPropagation
+          - TestACLTagPropagationPortSpecific
+          - TestACLGroupWithUnknownUser
+          - TestACLGroupAfterUserDeletion
+          - TestACLGroupDeletionExactReproduction
+          - TestACLDynamicUnknownUserAddition
+          - TestACLDynamicUnknownUserRemoval
+          - TestAPIAuthenticationBypass
+          - TestAPIAuthenticationBypassCurl
+          - TestRemoteCLIAuthenticationBypass
+          - TestCLIWithConfigAuthenticationBypass
+          - TestAuthKeyLogoutAndReloginSameUser
+          - TestAuthKeyLogoutAndReloginNewUser
+          - TestAuthKeyLogoutAndReloginSameUserExpiredKey
+          - TestAuthKeyDeleteKey
+          - TestAuthKeyLogoutAndReloginRoutesPreserved
+          - TestOIDCAuthenticationPingAll
+          - TestOIDCExpireNodesBasedOnTokenExpiry
+          - TestOIDC024UserCreation
+          - TestOIDCAuthenticationWithPKCE
+          - TestOIDCReloginSameNodeNewUser
+          - TestOIDCFollowUpUrl
+          - TestOIDCMultipleOpenedLoginUrls
+          - TestOIDCReloginSameNodeSameUser
+          - TestOIDCExpiryAfterRestart
+          - TestOIDCACLPolicyOnJoin
+          - TestOIDCReloginSameUserRoutesPreserved
+          - TestAuthWebFlowAuthenticationPingAll
+          - TestAuthWebFlowLogoutAndReloginSameUser
+          - TestAuthWebFlowReloginExpiredNode
+          - TestAuthWebFlowLogoutAndReloginNewUser
+          - TestApiKeyCommand
+          - TestApiKeyCommandValidation
+          - TestAuthCommandValidation
+          - TestNodeCommand
+          - TestNodeExpireCommand
+          - TestNodeRenameCommand
+          - TestPreAuthKeyCorrectUserLoggedInCommand
+          - TestTaggedNodesCLIOutput
+          - TestNodeExpireFlagsCommand
+          - TestNodeCommandValidation
+          - TestNodeTagCommand
+          - TestNodeRouteCommands
+          - TestNodeBackfillIPsCommand
+          - TestOAuthClientCommand
+          - TestOAuthClientCommandValidation
+          - TestPolicyCheckCommand
+          - TestSSHTestsRejectFailingPolicy
+          - TestPolicyCommand
+          - TestPolicyBrokenConfigCommand
+          - TestPreAuthKeyCommand
+          - TestPreAuthKeyCommandWithoutExpiry
+          - TestPreAuthKeyCommandReusableEphemeral
+          - TestPreAuthKeyDeleteCommand
+          - TestPreAuthKeyCommandValidation
+          - TestServerInfoCommands
+          - TestUserCommand
+          - TestUserCreateCommand
+          - TestUserCommandValidation
+          - TestDERPVerifyEndpoint
+          - TestResolveMagicDNS
+          - TestResolveMagicDNSExtraRecordsPath
+          - TestDERPServerScenario
+          - TestDERPServerWebsocketScenario
+          - TestPingAllByIP
+          - TestPingAllByIPPublicDERP
+          - TestEphemeral
+          - TestEphemeralInAlternateTimezone
+          - TestEphemeral2006DeletedTooQuickly
+          - TestPingAllByHostname
+          - TestTaildrop
+          - TestUpdateHostnameFromClient
+          - TestHostinfoChangeReachesPeersOnlyWhenPeerVisible
+          - TestExpireNode
+          - TestSetNodeExpiryInFuture
+          - TestDisableNodeExpiry
+          - TestNodeOnlineStatus
+          - TestPingAllByIPManyUpDown
+          - TestNodeDeletionEndsLongPoll
+          - Test2118DeletingOnlineNodePanics
+          - TestGrantCapRelay
+          - TestGrantCapDrive
+          - TestK8sOperator
+          - TestEnablingRoutes
+          - TestHASubnetRouterFailover
+          - TestSubnetRouteACL
+          - TestEnablingExitRoutes
+          - TestExitRoutesWithAutogroupInternetACL
+          - TestSubnetRouterMultiNetwork
+          - TestSubnetRouterMultiNetworkExitNode
+          - TestAutoApproveMultiNetwork/authkey-tag.*
+          - TestAutoApproveMultiNetwork/authkey-user.*
+          - TestAutoApproveMultiNetwork/authkey-group.*
+          - TestAutoApproveMultiNetwork/webauth-tag.*
+          - TestAutoApproveMultiNetwork/webauth-user.*
+          - TestAutoApproveMultiNetwork/webauth-group.*
+          - TestSubnetRouteACLFiltering
+          - TestGrantViaSubnetSteering
+          - TestHASubnetRouterPingFailover
+          - TestHASubnetRouterFailoverBothOffline
+          - TestHASubnetRouterFailoverBothOfflineCablePull
+          - TestHASubnetRouterFailoverDockerDisconnect
+          - TestHeadscale
+          - TestTailscaleNodesJoiningHeadcale
+          - TestSSHOneUserToAll
+          - TestSSHMultipleUsersAllToAll
+          - TestSSHNoSSHConfigured
+          - TestSSHRulesRemovedDeniesAccess
+          - TestSSHIsBlockedInACL
+          - TestSSHUserOnlyIsolation
+          - TestSSHAutogroupSelf
+          - TestSSHOneUserToOneCheckModeCLI
+          - TestSSHOneUserToOneCheckModeOIDC
+          - TestSSHCheckModeUnapprovedTimeout
+          - TestSSHCheckModeCheckPeriodCLI
+          - TestSSHCheckModeAutoApprove
+          - TestSSHCheckModeSessionLossReDelegates
+          - TestSSHCheckModeNegativeCLI
+          - TestSSHLocalpart
+          - TestTagsAuthKeyWithTagRequestDifferentTag
+          - TestTagsAuthKeyWithTagNoAdvertiseFlag
+          - TestTagsAuthKeyWithTagCannotAddViaCLI
+          - TestTagsAuthKeyWithTagCannotChangeViaCLI
+          - TestTagsAuthKeyWithTagAdminOverrideReauthPreserves
+          - TestTagsReauthDifferentKeyRetagsNode
+          - TestTagsReauthDifferentKeyRemovesTag
+          - TestTagsAuthKeyWithTagCLICannotModifyAdminTags
+          - TestTagsAuthKeyWithoutTagCannotRequestTags
+          - TestTagsAuthKeyWithoutTagRegisterNoTags
+          - TestTagsAuthKeyWithoutTagCannotAddViaCLI
+          - TestTagsAuthKeyWithoutTagCLINoOpAfterAdminWithReset
+          - TestTagsAuthKeyWithoutTagCLINoOpAfterAdminWithEmptyAdvertise
+          - TestTagsAuthKeyWithoutTagCLICannotReduceAdminMultiTag
+          - TestTagsUserLoginOwnedTagAtRegistration
+          - TestTagsUserLoginNonExistentTagAtRegistration
+          - TestTagsUserLoginUnownedTagAtRegistration
+          - TestTagsUserLoginAddTagViaCLIReauth
+          - TestTagsUserLoginRemoveTagViaCLIReauth
+          - TestTagsUserLoginCLINoOpAfterAdminAssignment
+          - TestTagsUserLoginCLICannotRemoveAdminTags
+          - TestTagsAuthKeyWithTagRequestNonExistentTag
+          - TestTagsAuthKeyWithTagRequestUnownedTag
+          - TestTagsAuthKeyWithoutTagRequestNonExistentTag
+          - TestTagsAuthKeyWithoutTagRequestUnownedTag
+          - TestTagsAdminAPICannotSetNonExistentTag
+          - TestTagsAdminAPICanSetUnownedTag
+          - TestTagsAdminAPICannotRemoveAllTags
+          - TestTagsIssue2978ReproTagReplacement
+          - TestTagsAdminAPICannotSetInvalidFormat
+          - TestTagsUserLoginReauthWithEmptyTagsRemovesAllTags
+          - TestTagsAuthKeyWithoutUserInheritsTags
+          - TestTagsAuthKeyWithoutUserRejectsAdvertisedTags
+          - TestTagsAuthKeyConvertToUserViaCLIRegister
+          - TestTaggedNodeLogoutReloginSingleUseKeyOnline
+          - TestTaggedNodeLogoutReloginReusableKeyOnline
+          - TestTagsOIDCReauthAddOwnedTag
+          - TestTagsReauthEmptyTagsReturnsToUserSurvives
+          - TestTS2021WebSocketGET
+          - TestTS2021WASMClientUnderNode
+          - TestTailscaleRustAxum
+    uses: ./.github/workflows/integration-test-template.yml
+    secrets: inherit
+    with:
+      test: ${{ matrix.test }}
+      postgres_flag: "--postgres=0"
+      database_name: "sqlite"
+  postgres:
+    needs: [build, build-postgres, build-tailscale-released]
+    if: needs.build.outputs.files-changed == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        test:
+          - TestACLAllowUserDst
+          - TestPingAllByIP
+          - TestEphemeral2006DeletedTooQuickly
+          - TestPingAllByIPManyUpDown
+          - TestSubnetRouterMultiNetwork
+    uses: ./.github/workflows/integration-test-template.yml
+    secrets: inherit
+    with:
+      test: ${{ matrix.test }}
+      postgres_flag: "--postgres=1"
+      database_name: "postgres"

@@ -1,0 +1,438 @@
+name: Release
+
+on:
+  push:
+    tags: [ "v*" ]
+
+permissions:
+  contents: write
+
+jobs:
+  distro-amd64:
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Checkout Spinifex
+        uses: actions/checkout@v7
+        with:
+          path: spinifex
+
+      - name: Checkout Predastore
+        uses: actions/checkout@v7
+        with:
+          repository: mulgadc/predastore
+          path: predastore
+
+      - name: Checkout Viperblock
+        uses: actions/checkout@v7
+        with:
+          repository: mulgadc/viperblock
+          path: viperblock
+
+      - name: Checkout Northstar
+        uses: actions/checkout@v7
+        with:
+          repository: mulgadc/northstar
+          path: northstar
+
+      - name: Checkout Bluebottle
+        uses: actions/checkout@v7
+        with:
+          repository: mulgadc/bluebottle
+          path: bluebottle
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: spinifex/go.mod
+
+      - name: Build microVM artifacts (lb-agent + kernel + initramfs)
+        run: cd spinifex && make build-microvm-image
+
+      - name: Build amd64 Tarball
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: cd spinifex && make distro-amd64 VERSION="$VERSION"
+
+      - name: Upload amd64 Artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: distro-amd64
+          path: |
+            spinifex/dist/spinifex-${{ github.ref_name }}-linux-amd64.tar.gz
+            spinifex/dist/spinifex-${{ github.ref_name }}-linux-amd64.tar.gz.sha256
+            spinifex/scripts/setup.sh
+
+  distro-arm64:
+    runs-on: ubuntu-26.04-arm
+    steps:
+      - name: Checkout Spinifex
+        uses: actions/checkout@v7
+        with:
+          path: spinifex
+
+      - name: Checkout Predastore
+        uses: actions/checkout@v7
+        with:
+          repository: mulgadc/predastore
+          path: predastore
+
+      - name: Checkout Viperblock
+        uses: actions/checkout@v7
+        with:
+          repository: mulgadc/viperblock
+          path: viperblock
+
+      - name: Checkout Northstar
+        uses: actions/checkout@v7
+        with:
+          repository: mulgadc/northstar
+          path: northstar
+
+      - name: Checkout Bluebottle
+        uses: actions/checkout@v7
+        with:
+          repository: mulgadc/bluebottle
+          path: bluebottle
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build arm64 Tarball
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: cd spinifex && make distro-arm64 VERSION="$VERSION"
+
+      - name: Upload arm64 Artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: distro-arm64
+          path: |
+            spinifex/dist/spinifex-${{ github.ref_name }}-linux-arm64.tar.gz
+            spinifex/dist/spinifex-${{ github.ref_name }}-linux-arm64.tar.gz.sha256
+
+  release:
+    needs: [ distro-amd64, distro-arm64 ]
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Download amd64 Artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: distro-amd64
+          path: artifacts
+
+      - name: Download arm64 Artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: distro-arm64
+          path: artifacts
+
+      - name: Create Draft GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          draft: true
+          files: |
+            artifacts/**/*.tar.gz
+            artifacts/**/*.sha256
+            artifacts/**/setup.sh
+          generate_release_notes: true
+
+      - name: Upload Tarball for Verify Job
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-assets
+          path: artifacts/
+
+  verify:
+    needs: release
+    runs-on: [ self-hosted, ci-single ]
+    # Shared with the e2e workflows: this job provisions on the same runner
+    # pools and the same hypervisors, so two in flight compete for their disks
+    # and their libvirt guests. Job-level, so the build jobs are not queued
+    # behind a nightly that has nothing to do with them.
+    concurrency:
+      group: e2e-hypervisors
+      cancel-in-progress: false
+    timeout-minutes: 25
+    env:
+      TOFU_LOG: /tmp/release-verify-${{ github.run_id }}.log
+      TAG: ${{ github.ref_name }}
+      REPO: ${{ github.repository }}
+    steps:
+      - name: Clean Workspace
+        run: |
+          awk -v w="$GITHUB_WORKSPACE" '$2 ~ "^"w {print $2}' /proc/mounts \
+            | sort -r | xargs -r -I{} sudo umount -l -R {} || true
+          sudo rm -rf --one-file-system "$GITHUB_WORKSPACE"/*
+
+      - uses: actions/create-github-app-token@v3
+        id: app-token
+        with:
+          client-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          repositories: mulga
+
+      - uses: actions/checkout@v7
+        with:
+          repository: mulgadc/mulga
+          token: ${{ steps.app-token.outputs.token }}
+          sparse-checkout: scripts/tofu-cluster
+          path: mulga
+
+      # Only the shared shell helpers: this job builds nothing from source, but
+      # it drives the same libvirt provider the e2e cells retry around.
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout: .github/scripts
+          path: spinifex
+
+      - name: Download Release Assets
+        uses: actions/download-artifact@v8
+        with:
+          name: release-assets
+          path: release-assets
+
+      - name: Provision VM
+        working-directory: mulga/scripts/tofu-cluster
+        run: |
+          source "${GITHUB_WORKSPACE}/spinifex/.github/scripts/ci-fmt.sh"
+          tofu init -input=false >> "$TOFU_LOG" 2>&1
+          tofu workspace select -or-create "${SPINIFEX_CI_ENV}" >> "$TOFU_LOG" 2>&1
+          tofu destroy -var-file=envs/${SPINIFEX_CI_ENV}.tfvars -auto-approve -input=false >> "$TOFU_LOG" 2>&1 || true
+          ./scrub-env.sh "${SPINIFEX_CI_ENV}" >> "$TOFU_LOG" 2>&1 || true
+          retry_run "tofu apply" "$TOFU_LOG" tofu apply -var-file=envs/${SPINIFEX_CI_ENV}.tfvars -auto-approve -input=false
+
+      - name: Bootstrap via Binary Install
+        working-directory: mulga/scripts/tofu-cluster
+        run: |
+          SETUP_SH=$(find "${GITHUB_WORKSPACE}/release-assets" -name "setup.sh" | head -1)
+          TARBALL=$(find "${GITHUB_WORKSPACE}/release-assets" -name "*-linux-amd64.tar.gz" | head -1)
+          ./bootstrap-install.sh "${SPINIFEX_CI_ENV}" "$SETUP_SH" "$TARBALL"
+
+      - name: Teardown
+        if: always()
+        working-directory: mulga/scripts/tofu-cluster
+        run: |
+          source "${GITHUB_WORKSPACE}/spinifex/.github/scripts/ci-fmt.sh"
+          tofu workspace select -or-create "${SPINIFEX_CI_ENV}" >> "$TOFU_LOG" 2>&1
+          retry_run "tofu destroy" "$TOFU_LOG" tofu destroy -var-file=envs/${SPINIFEX_CI_ENV}.tfvars -auto-approve -input=false
+          ./scrub-env.sh "${SPINIFEX_CI_ENV}" >> "$TOFU_LOG" 2>&1 || true
+
+  baremetal:
+    needs: release
+    permissions:
+      contents: read
+      statuses: write
+    uses: ./.github/workflows/e2e-baremetal.yml
+    secrets: inherit
+
+  promote:
+    needs: [ verify, baremetal ]
+    runs-on: ubuntu-26.04
+    env:
+      TAG: ${{ github.ref_name }}
+      REPO: ${{ github.repository }}
+    steps:
+      - name: Promote Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [[ "$TAG" =~ -(dev|rc|alpha|beta) ]]; then
+            gh release edit "$TAG" --repo "$REPO" --draft=false --prerelease
+            echo "Release ${TAG} promoted as prerelease"
+          else
+            gh release edit "$TAG" --repo "$REPO" --draft=false
+            echo "Release ${TAG} promoted to latest"
+          fi
+
+  # Refresh the system AMIs on the R2 mirror only once the release is out of
+  # draft. Shares the ci-single runner with `iso`, so it queues behind it.
+  system-images:
+    needs: promote
+    permissions:
+      contents: read
+    uses: ./.github/workflows/publish-system-ami.yml
+    with:
+      variant: all
+    secrets: inherit
+
+  # Annotate the (still-draft) release if either gate failed.
+  mark-failed:
+    needs: [ verify, baremetal ]
+    if: failure()
+    runs-on: ubuntu-26.04
+    env:
+      TAG: ${{ github.ref_name }}
+      REPO: ${{ github.repository }}
+    steps:
+      - name: Mark Release Failed
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          EXISTING_BODY=$(gh release view "$TAG" --repo "$REPO" --json body -q .body)
+          NOTES_FILE=$(mktemp)
+          printf 'Verification failed (tofu install or bare-metal boot) — see workflow run for details.\n\n%s' "$EXISTING_BODY" > "$NOTES_FILE"
+          gh release edit "$TAG" --repo "$REPO" --notes-file "$NOTES_FILE"
+          rm -f "$NOTES_FILE"
+
+  iso:
+    needs: release
+    runs-on: [ self-hosted, ci-single ]
+    # ISO build (~60-90m) overlaps the parallel baremetal run (~120m); the
+    # upload gate then waits for baremetal to finish, so the job must outlast it.
+    timeout-minutes: 180
+    steps:
+      - name: Clean Workspace
+        run: |
+          ROOTFS="${GITHUB_WORKSPACE}/mulga/scripts/iso-builder/.cache/rootfs"
+          sudo umount -l -R "${ROOTFS}" 2>/dev/null || true
+          sudo umount -l "${ROOTFS}/dev/pts" 2>/dev/null || true
+          sudo umount -l "${ROOTFS}/dev" 2>/dev/null || true
+          sudo umount -l "${ROOTFS}/sys" 2>/dev/null || true
+          sudo umount -l "${ROOTFS}/proc" 2>/dev/null || true
+          sudo rm -rf --one-file-system "$GITHUB_WORKSPACE"/*
+
+      - uses: actions/create-github-app-token@v3
+        id: app-token
+        with:
+          client-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          repositories: mulga
+
+      - name: Checkout Spinifex
+        uses: actions/checkout@v7
+        with:
+          path: spinifex
+          ref: ${{ github.ref }}
+
+      - name: Checkout Predastore
+        uses: actions/checkout@v7
+        with:
+          repository: mulgadc/predastore
+          path: predastore
+
+      - name: Checkout Viperblock
+        uses: actions/checkout@v7
+        with:
+          repository: mulgadc/viperblock
+          path: viperblock
+
+      - name: Checkout Northstar
+        uses: actions/checkout@v7
+        with:
+          repository: mulgadc/northstar
+          path: northstar
+
+      - name: Checkout Bluebottle
+        uses: actions/checkout@v7
+        with:
+          repository: mulgadc/bluebottle
+          path: bluebottle
+
+      - name: Checkout Mulga iso-builder
+        uses: actions/checkout@v7
+        with:
+          repository: mulgadc/mulga
+          token: ${{ steps.app-token.outputs.token }}
+          sparse-checkout: scripts/iso-builder
+          path: mulga
+
+      - name: Clean ISO builder cache
+        run: sudo make -C mulga/scripts/iso-builder clean
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: spinifex/go.mod
+          cache: false
+
+      - name: Configure Go workspace
+        run: go work init ./spinifex ./predastore ./viperblock ./northstar ./bluebottle
+
+      - name: Install ISO builder dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y \
+            debootstrap squashfs-tools xorriso grub-pc-bin grub-efi-amd64-bin \
+            grub-common mtools busybox-static ovmf zstd \
+            nbdkit nbdkit-plugin-dev pkg-config gcc
+
+      - name: Build spinifex binaries
+        run: cd spinifex && make build
+
+      - name: Build viperblock
+        run: cd viperblock && make build
+
+      - name: Build release ISO
+        id: build-iso
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          sudo make -C mulga/scripts/iso-builder release \
+            VERSION="${VERSION}" \
+            SPINIFEX_SRC="${GITHUB_WORKSPACE}/spinifex" \
+            VIPERBLOCK_SRC="${GITHUB_WORKSPACE}/viperblock" \
+            SPINIFEX_BIN="${GITHUB_WORKSPACE}/spinifex/bin/spx" \
+            INSTALLER_BIN="${GITHUB_WORKSPACE}/spinifex/bin/spinifex-installer"
+
+      - name: Wait for verify + baremetal
+        id: wait-verify
+        if: steps.build-iso.outcome == 'success'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "Waiting for verify + baremetal jobs to complete..."
+          while true; do
+            JOBS=$(gh api \
+              "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/jobs" --paginate)
+            VERIFY=$(echo "$JOBS" | jq -r '.jobs[] | select(.name == "verify") | .conclusion // empty')
+            BAREMETAL=$(echo "$JOBS" | jq -r '.jobs[] | select(.name | startswith("baremetal")) | .conclusion // empty')
+            if [ -n "$VERIFY" ] && [ -n "$BAREMETAL" ]; then
+              echo "verify=$VERIFY baremetal=$BAREMETAL"
+              { [ "$VERIFY" = "success" ] && [ "$BAREMETAL" = "success" ]; } && exit 0
+              exit 1
+            fi
+            echo "Still waiting (verify=${VERIFY:-pending} baremetal=${BAREMETAL:-pending}), retry 30s..."
+            sleep 30
+          done
+
+      - name: Ensure AWS CLI is installed
+        if: steps.build-iso.outcome == 'success' && steps.wait-verify.outcome == 'success'
+        run: |
+          if ! command -v aws &>/dev/null; then
+            curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
+            unzip -q /tmp/awscliv2.zip -d /tmp/aws-install
+            sudo /tmp/aws-install/aws/install
+            rm -rf /tmp/awscliv2.zip /tmp/aws-install
+          fi
+
+      - name: Upload ISO to Cloudflare R2
+        id: upload
+        if: steps.build-iso.outcome == 'success' && steps.wait-verify.outcome == 'success'
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.CF_R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.CF_R2_SECRET_ACCESS_KEY }}
+          CF_R2_ENDPOINT_URL: ${{ secrets.CF_R2_ENDPOINT_URL }}
+        run: |
+          aws --endpoint-url="${CF_R2_ENDPOINT_URL}" \
+            s3 cp "mulga/scripts/iso-builder/dist/spinifex.iso" \
+                  "s3://spinifex-iso/spinifex.iso"
+          aws --endpoint-url="${CF_R2_ENDPOINT_URL}" \
+            s3 cp "mulga/scripts/iso-builder/dist/spinifex.iso.sha256" \
+                  "s3://spinifex-iso/spinifex.iso.sha256"
+
+      - name: Mark ISO failed
+        if: always() && (steps.build-iso.outcome == 'failure' || steps.upload.outcome == 'failure')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          EXISTING_BODY=$(gh release view "$TAG" --repo "$REPO" --json body -q .body)
+          NOTES_FILE=$(mktemp)
+          printf 'ISO build/upload failed — see workflow run for details.\n\n%s' "$EXISTING_BODY" > "$NOTES_FILE"
+          gh release edit "$TAG" --repo "$REPO" --notes-file "$NOTES_FILE"
+          rm -f "$NOTES_FILE"

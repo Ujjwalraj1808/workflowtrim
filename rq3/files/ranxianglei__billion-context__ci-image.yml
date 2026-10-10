@@ -1,0 +1,63 @@
+name: ci-image
+
+on:
+  # The image-billing surfaces only: this lane exists to pin the #1857
+  # verification (parser truth, bytes-prior poison ratio, learned-cost
+  # rescue) — it costs nothing to run but there is no reason to spend a
+  # runner on doc-only diffs. Manual dispatch covers everything else.
+  pull_request:
+    branches: [master]
+    paths:
+      - "src/image-*.ts"
+      - "src/preflight.ts"
+      - "src/server.ts"
+      - "src/cache-ledger.ts"
+      - "tests/e2e/e2e-image-billing.test.ts"
+      - ".github/workflows/ci-image.yml"
+      # The in-repo kernel (kernel/) is bundled INLINE into the pipeline —
+      # a kernel change IS a pipeline change (#1289-class guard; #2092).
+      - "kernel/**"
+      - "package-lock.json"
+  workflow_dispatch:
+
+concurrency:
+  group: ci-image-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  image-billing:
+    name: real-image billing e2e (hermetic corpus, zero tokens)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install deps
+        run: npm ci
+
+      # The suite drives src/*.ts through tsx like the other hermetic lanes —
+      # no build step needed, but a typecheck pass keeps the lane from going
+      # green on a tree that cannot compile.
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Run real-image billing E2E
+        run: npm run test:e2e:image
+
+      - name: Collect E2E artifacts
+        if: failure()
+        run: |
+          mkdir -p tmp/e2e-artifacts
+          for d in /tmp/e2e-image-billing-*; do [ -d "$d" ] && cp -r "$d" tmp/e2e-artifacts/ || true; done
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        name: image-corpus-artifacts
+        with:
+          path: tmp/e2e-artifacts
+          if-no-files-found: ignore

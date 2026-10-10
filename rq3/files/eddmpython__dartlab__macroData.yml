@@ -1,0 +1,85 @@
+name: Macro Data Sync (Bulk)
+
+# 운영자 cron 벌크 (FRED/ECOS API) → HF dataset publish.
+# 사용자 기본 gather("macro") 는 이 결과를 HF 에서 소비한다.
+
+on:
+  schedule:
+    - cron: '30 21 * * *'   # KST 06:30 daily
+  workflow_dispatch:
+    inputs:
+      source:
+        description: 'fred | ecos | customs | all'
+        required: true
+        default: 'all'
+        type: choice
+        options:
+          - fred
+          - ecos
+          - customs
+          - all
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    # job 레벨 concurrency 를 쓴다. 워크플로 레벨은 run 생성 즉시 큐를 점유하고, GitHub 은
+    # 그룹당 pending 을 1 개만 유지해 새 트리거가 오면 기존 pending 을 취소한다
+    # (cancel-in-progress 와 무관한 기본 동작). 2026-08 hf-dart-push 에서 대기 중이던 run
+    # 8 건이 job 0 개인 채 취소됐다. 같은 그룹을 2 개 이상이 공유하면 같은 위험을 진다.
+    concurrency:
+      group: hf-dataset-push
+      cancel-in-progress: false
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Restore macro parquet cache
+        uses: actions/cache/restore@v5
+        with:
+          path: data/macro
+          key: dartlab-macro-${{ github.run_id }}
+          restore-keys: dartlab-macro-
+
+      # 통합 진입점(dartlab.pipeline) — macro stage 가 buildMacroData(--source --push) +
+      # buildMacroCycle(--push) 를 동형 호출. source 는 MACRO_SOURCE env 로 전달.
+      - name: Build macro (FRED/ECOS/customs + cycle) → HF
+        env:
+          FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+          ECOS_API_KEY: ${{ secrets.ECOS_API_KEY }}
+          # customs(관세청) 합류 후 필수 — 누락 시 CredentialError 로 전체 크래시 (6/11 연속 실패 원인)
+          DATA_GO_KR_KEY: ${{ secrets.DATA_GO_KR_KEY }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          MACRO_SOURCE: ${{ github.event.inputs.source || 'all' }}
+        run: uv run python -X utf8 -m dartlab.pipeline macro
+
+      - name: Save macro parquet cache
+        uses: actions/cache/save@v5
+        if: always()
+        with:
+          path: data/macro
+          key: dartlab-macro-${{ github.run_id }}
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "## Macro Data Sync (Bulk)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| 항목 | 값 |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Trigger | ${{ github.event_name }} ${{ github.event.schedule }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Source | ${{ github.event.inputs.source || 'all' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| HF dataset | \`eddmpython/dartlab-data\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| 출력 | \`macro/fred/*.parquet\`, \`macro/ecos/*.parquet\`, \`macro/customs/*.parquet\` |" >> $GITHUB_STEP_SUMMARY

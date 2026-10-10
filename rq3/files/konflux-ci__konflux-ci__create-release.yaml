@@ -1,0 +1,158 @@
+name: Create Release
+
+on:
+  repository_dispatch:
+    types: [konflux-build-complete]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (e.g., v0.0.1). Required for manual releases'
+        required: false
+        type: string
+      git_ref:
+        description: 'Git ref to release (commit SHA, branch, or tag). Required for manual releases'
+        required: false
+        type: string
+      image_tag:
+        description: 'Image tag (e.g., release-sha-abc1234). Required for manual releases'
+        required: false
+        type: string
+      draft:
+        description: 'Create as draft release'
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  create-release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+    defaults:
+      run:
+        working-directory: operator
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Extract event payload
+        id: payload
+        working-directory: ${{ github.workspace }}
+        run: |
+          result=$(.github/scripts/extract-payload.sh \
+            "${{ github.event_name }}" \
+            "${{ inputs.version }}" \
+            "${{ inputs.image_tag }}" \
+            "${{ inputs.git_ref }}" \
+            "${{ github.event.client_payload.version }}" \
+            "${{ github.event.client_payload.image_tag }}" \
+            "${{ github.event.client_payload.git_ref }}")
+          echo "${result}" | grep "^version=" >> $GITHUB_OUTPUT
+          echo "${result}" | grep "^image_tag=" >> $GITHUB_OUTPUT
+          echo "${result}" | grep "^git_ref=" >> $GITHUB_OUTPUT
+          echo "${result}" | grep "^source=" >> $GITHUB_OUTPUT
+          echo ""
+          echo "=== Extracted Payload ==="
+          echo "${result}"
+          echo ""
+          echo "=== Full Event JSON (for debugging) ==="
+          echo '${{ toJSON(github.event) }}' | jq '.' || echo "Event data not available"
+
+      - name: Checkout target commit
+        working-directory: ${{ github.workspace }}
+        run: |
+          TARGET_REF="${{ steps.payload.outputs.git_ref }}"
+          CURRENT_SHA=$(git rev-parse HEAD)
+          TARGET_SHA=$(git rev-parse "${TARGET_REF}")
+          if [ "${TARGET_SHA}" != "${CURRENT_SHA}" ]; then
+            echo "Checking out target ref: ${TARGET_REF}"
+            git checkout "${TARGET_REF}"
+          else
+            echo "Already on target ref: ${TARGET_REF}"
+          fi
+
+      - name: Set version
+        id: version
+        working-directory: ${{ github.workspace }}
+        run: |
+          VERSION="${{ steps.payload.outputs.version }}"
+          # Ensure version starts with 'v' prefix
+          if [[ ! "${VERSION}" =~ ^v ]]; then
+            VERSION="v${VERSION}"
+          fi
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "Using version: ${VERSION}"
+
+      - name: Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7
+        with:
+          go-version-file: operator/go.mod
+
+      - name: Generate release artifacts
+        working-directory: ${{ github.workspace }}
+        run: |
+          .github/scripts/generate-release-artifacts.sh \
+            "${{ steps.payload.outputs.image_tag }}" \
+            "${{ steps.version.outputs.version }}"
+
+      - name: Prepare release notes
+        id: release-notes
+        working-directory: ${{ github.workspace }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          .github/scripts/prepare-release-notes.sh \
+            "${{ steps.version.outputs.version }}" \
+            "${{ steps.payload.outputs.image_tag }}" \
+            "${{ steps.payload.outputs.git_ref }}" \
+            /tmp/release-notes.md
+          echo "notes_file=/tmp/release-notes.md" >> $GITHUB_OUTPUT
+
+      # Use a GitHub App token so that:
+      # 1) The release event triggers other workflows (GITHUB_TOKEN would not).
+      # 2) The token has workflow scope, required when the release target commit touches workflow files.
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1  # v3
+        with:
+          app-id: ${{ secrets.UPDATE_BOT_APP_ID }}
+          private-key: ${{ secrets.UPDATE_BOT_PRIVATE_KEY }}
+          permission-contents: write
+          permission-workflows: write
+
+      - name: Create GitHub Release
+        working-directory: ${{ github.workspace }}
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          .github/scripts/create-release.sh \
+            "${{ steps.version.outputs.version }}" \
+            "${{ steps.payload.outputs.git_ref }}" \
+            /tmp/release-notes.md \
+            operator/dist \
+            "${{ inputs.draft || false }}"
+
+      - name: Create issue on release failure
+        if: failure()
+        working-directory: ${{ github.workspace }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          WORKFLOW_NAME: Create Release
+          # Pass release information from step outputs (may be empty if steps failed)
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+          RELEASE_GIT_REF: ${{ steps.payload.outputs.git_ref }}
+          RELEASE_IMAGE_TAG: ${{ steps.payload.outputs.image_tag }}
+          RELEASE_SOURCE: ${{ steps.payload.outputs.source }}
+        run: |
+          .github/scripts/create-or-update-issue.sh \
+            "Release Failure" \
+            "Release failed."

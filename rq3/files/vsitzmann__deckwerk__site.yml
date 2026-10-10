@@ -1,0 +1,56 @@
+# Publishes deckwerk.org from site/ through GitHub Pages.
+#
+# One-time setup outside this file:
+#   * GitHub Pages must be available for the repository (public repo, or a
+#     plan that allows Pages on private ones). configure-pages creates the
+#     Pages site with "GitHub Actions" as the source on first run.
+#   * DNS at the registrar: apex A records to GitHub Pages' IPs and a CNAME
+#     from www to vsitzmann.github.io. site/CNAME pins the custom domain.
+name: Website
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'site/**'
+      - 'scripts/build-site.mjs'
+      - '.github/workflows/site.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      # Only `marked` is needed; a full `npm ci` would pull Electron and the
+      # platform ffmpeg binaries for nothing.
+      - run: npm install --no-save --no-audit --no-fund marked@15
+      - run: node scripts/build-site.mjs
+      - uses: actions/configure-pages@v5
+        with:
+          enablement: true
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist-site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

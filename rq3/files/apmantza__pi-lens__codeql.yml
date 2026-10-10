@@ -1,0 +1,101 @@
+name: CodeQL
+
+# Advanced setup (#3801). PR-time analysis is the advisory `codeql` job in
+# ci.yml (it waits on the required jobs, and `needs:` cannot cross workflows).
+# This file keeps the default-branch baseline and the weekly re-scan.
+#
+# Two jobs (#4077): `analyze` holds no write scope and runs on a dispatch from
+# any ref (its SARIF is a run artifact, `upload: never`); `upload` is the only
+# job with `security-events: write`, is guarded to the schedule or master, and
+# sends that SARIF to code scanning.
+on:
+  push:
+    branches: [master]
+    paths-ignore: ["**/*.md", ".changelog/**", "docs/**"]
+  schedule:
+    - cron: "17 4 * * 2"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    # The `(advisory)` suffix is what scripts/lib/ci-checks.mjs reads; the
+    # `baseline` word keeps this name distinct from ci.yml's PR-time job.
+    name: CodeQL baseline (${{ matrix.language }}) (advisory)
+    runs-on: ubuntu-latest
+    # refs #3123: bounds a hang against GitHub's 360-min default.
+    # Measured max over the last 6 default-setup runs (javascript-typescript,
+    # the slowest language): 479s; timeout = ~2.5x.
+    timeout-minutes: 20
+    # `security-events: read` is what a fork pull_request token holds for the
+    # same analysis; the write scope lives on `upload` below.
+    permissions:
+      security-events: read
+      actions: read
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [actions, javascript-typescript]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: github/codeql-action/init@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: none
+          config: |
+            paths-ignore:
+              - cases
+              - tests/fixtures
+              - dist
+      - uses: github/codeql-action/analyze@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
+        with:
+          category: "/language:${{ matrix.language }}"
+          upload: never
+          upload-database: false
+          output: ${{ runner.temp }}/codeql-sarif-${{ matrix.language }}
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: codeql-sarif-${{ matrix.language }}
+          path: ${{ runner.temp }}/codeql-sarif-${{ matrix.language }}
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 1
+
+  # The only writer (#4077): code scanning accepts the baseline from the
+  # default branch or the schedule, never from a branch dispatch. `!cancelled()`
+  # keeps one language's upload when the other leg's analysis failed; the
+  # missing artifact then reds only that leg's download.
+  upload:
+    if: ${{ !cancelled() && (github.event_name == 'schedule' || github.ref == 'refs/heads/master') }}
+    needs: analyze
+    # Same `(advisory)` suffix rule as `analyze`'s name above.
+    name: CodeQL baseline upload (${{ matrix.language }}) (advisory)
+    runs-on: ubuntu-latest
+    # SARIF processing is the long part (`wait-for-processing` defaults on);
+    # the analysis above measured 479s at most, and this job only uploads.
+    timeout-minutes: 10
+    permissions:
+      security-events: write
+      actions: read
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [actions, javascript-typescript]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        with:
+          name: codeql-sarif-${{ matrix.language }}
+          path: ${{ runner.temp }}/codeql-sarif-${{ matrix.language }}
+      - uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
+        with:
+          sarif_file: ${{ runner.temp }}/codeql-sarif-${{ matrix.language }}
+          category: "/language:${{ matrix.language }}"

@@ -1,0 +1,17 @@
+name: autofix.ci # needed to securely identify the workflow
+
+on:
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions: {}
+
+jobs:
+  fix:
+    name: Run automated fix
+    uses: prettier/shared-workflows/.github/workflows/automated-fix.yml@c3ac99dd39893c2592fc5e6029420a1b90ad647b # main
+    with:
+      repository: prettier/prettier

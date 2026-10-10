@@ -1,0 +1,158 @@
+###========================================
+##  Go CI/CD Test Coverage
+#==========================================
+# This adds support for the test coverage report in Pull Request.
+#
+# Ref: https://github.com/rytswd/go-cicd-template
+#
+# Also, this mirrors most of the setup from _reusable-build-changed.yaml
+
+name: Test coverage check
+run-name: Run Go CI/CD for `${{ github.ref }}`, triggered by @${{ github.actor }}
+
+# This is "reusable workflow", meaning the whole job definitions can be used
+# without copying the code. In order to use this workflow, refer to this job
+# with something like the following
+#
+# jobs:
+#   build:
+#     uses: rytswd/go-cicd-template/.github/workflows/reusable-go-cicd-for-pr.yaml@main
+#     with:
+#       COVERAGE_THRESHOLD: 10
+#     secrets: inherit
+#
+# Ref: https://docs.github.com/en/actions/using-workflows/reusing-workflows
+on:
+  workflow_call:
+    inputs:
+      COVERAGE_THRESHOLD:
+        required: true
+        type: number
+
+jobs:
+  build-test-coverage:
+    name: Build, Test, and Check Test Coverage
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      # Initial setup
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: ./go.mod
+          cache: false # Manual cache control below
+
+      # Restore cache
+      # Note that this also restores "~/.cache/coverage.txt" to check the
+      # coverage diff.
+      - name: Restore build cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cache/coverage.txt
+            ~/.cache/go-build
+            ~/go/pkg/mod
+            bin
+          key: ${{ runner.os }}-go-coverage-${{ hashFiles('**/go.sum', 'Makefile') }}
+          restore-keys: |
+            ${{ runner.os }}-go-coverage-
+            ${{ runner.os }}-go-build-
+
+      - name: Build
+        run: make build
+
+      - name: Test and generate coverage report
+        run: make test-coverage
+
+      # Get test coverage from cache and coverage.out -- at this point, only
+      # work out the summary files, and some environment variables for more
+      # checks and steps to take place.
+      - name: Get test coverage
+        run: |
+          ## Step 1. Check previous coverage
+          if [[ -f ~/.cache/coverage.txt ]]; then
+          prevCoverage=$(cat ~/.cache/coverage.txt | grep total | grep -Eo '[0-9]+\.[0-9]+' || echo "unknown")
+          # When it reports "unknown %", it means cache contained malformed data.
+          echo "Previous test coverage: ${prevCoverage}% (taken from the cache)"
+          else
+          echo "Previous test coverage: Not found"
+          fi
+
+          ## Step 2. Check new coverage
+          # Get into directory so that go tool cover can work
+          go tool cover -func=coverage/combined.out > /tmp/coverage.txt
+          newCoverage=$(cat /tmp/coverage.txt | grep total | grep -Eo '[0-9]+\.[0-9]+')
+          echo "New test coverage:      ${newCoverage}%"
+
+          ## Step 3. Set environment variables
+          echo "PREV_COVERAGE=$prevCoverage" >> $GITHUB_ENV
+          echo "NEW_COVERAGE=$newCoverage" >> $GITHUB_ENV
+
+      # Upload coverage data as an artifact so that a separate workflow_run
+      # workflow can post the PR comment. This is required because fork PRs
+      # receive a read-only GITHUB_TOKEN and cannot create comments directly.
+      - name: Prepare coverage artifact
+        if: always() && github.event_name == 'pull_request'
+        run: |
+          mkdir -p /tmp/coverage-artifact
+          echo "${{ github.event.number }}" > /tmp/coverage-artifact/pr_number
+          echo "${{ inputs.COVERAGE_THRESHOLD }}" > /tmp/coverage-artifact/threshold
+          echo "${NEW_COVERAGE}" > /tmp/coverage-artifact/new_coverage
+          echo "${PREV_COVERAGE}" > /tmp/coverage-artifact/prev_coverage
+          if [[ -f /tmp/coverage.txt ]]; then
+            cp /tmp/coverage.txt /tmp/coverage-artifact/coverage_report.txt
+          else
+            echo "No coverage report generated (Build likely failed)." > /tmp/coverage-artifact/coverage_report.txt
+          fi
+
+      - name: Upload coverage artifact
+        if: always() && github.event_name == 'pull_request'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: coverage-report
+          path: /tmp/coverage-artifact/
+          retention-days: 1
+
+      # Exit with non-zero value if the test coverage has not reached the threshold.
+      - name: Check coverage status
+        run: |
+          echo "Coverage Threshold:     ${{ inputs.COVERAGE_THRESHOLD }}%"
+          echo "Previous test coverage: ${{ env.PREV_COVERAGE || 'Unknown' }}%"
+          echo "New test coverage:      ${{ env.NEW_COVERAGE }}%"
+          echo
+
+          if (( $(echo "${{ inputs.COVERAGE_THRESHOLD }} > ${{ env.NEW_COVERAGE }}" | bc -l) )); then
+            echo "❌ ERROR: The test coverage (${{ env.NEW_COVERAGE }}%) is below the threshold (${{ inputs.COVERAGE_THRESHOLD }}%)."
+            exit 1
+          fi
+
+          echo "✅ PASS: Coverage (${{ env.NEW_COVERAGE }}%) meets the threshold (${{ inputs.COVERAGE_THRESHOLD }}%)."
+
+      # If triggered from non-PR setup, copy the new coverage as the new cached data.
+      - name: Copy coverage information for cache
+        if: always() &&
+          github.event_name != 'pull_request'
+        run: |
+          cp /tmp/coverage.txt ~/.cache/coverage.txt
+
+      # If triggered from non-PR setup, save the cache.
+      # The key includes the git SHA so that every main push creates a fresh
+      # cache entry (actions/cache/save is a no-op when the exact key already
+      # exists). PR runs restore via the prefix in restore-keys and always
+      # get the latest main coverage data.
+      - name: Save cache
+        if: always() &&
+          github.event_name != 'pull_request'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          key: ${{ runner.os }}-go-coverage-${{ hashFiles('**/go.sum', 'Makefile') }}-${{ github.sha }}
+          # Any location that we generate the test coverage report in
+          path: |
+            ~/.cache/coverage.txt
+            ~/.cache/go-build
+            ~/go/pkg/mod
+            bin

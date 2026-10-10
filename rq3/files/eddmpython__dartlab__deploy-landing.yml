@@ -1,0 +1,194 @@
+name: Deploy Landing
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'landing/**'
+      # 워크스페이스 패키지·루트 lockfile - landing 빌드 의존 (단계-3부터, 4a-2에서 paths 편입.
+      # 누락 시 패키지만 바뀐 push 가 deploy 를 건너뛰어 고장난 lock/패키지가 다음 배포까지 잠복)
+      - 'ui/packages/**'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'src/dartlab/skills/**'
+      - 'blog/**'
+      - '.github/workflows/deploy-landing.yml'
+      - '.github/scripts/search/buildSkillMarket.py'
+  discussion:
+    types: [created, edited, answered, unanswered, labeled, unlabeled]
+  discussion_comment:
+    types: [created, edited, deleted]
+  schedule:
+    # Skill Market discussion event delivery is not the only source of truth.
+    # Daily rebuild keeps the static index in sync if preview events are missed.
+    - cron: '0 15 * * *'
+  workflow_run:
+    workflows: ["Industry Map Build", "Lens Product Build"]
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  discussions: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Set up Python (for HF seed)
+        run: uv python install 3.12
+
+      - name: Install Python deps
+        run: uv sync
+
+      - name: Test blog publish pipeline
+        run: >-
+          uv run python -X utf8 -m pytest
+          blog/_scripts/test_audit_blog_gate.py
+          blog/_scripts/test_publishBlogAssets.py
+          blog/_scripts/test_publishGate.py -q
+
+      - name: Gate changed blog posts
+        if: ${{ github.event_name == 'push' }}
+        run: >-
+          uv run python -X utf8 blog/_scripts/publishGate.py
+          --changed-from "${{ github.event.before }}"
+          --head "${{ github.sha }}"
+
+      # HF SSoT: map JSON 은 git 에 없음 (.gitignore). 빌드 전 HF 에서 내려받아
+      # landing/static/map/ 에 풀어둠 → SvelteKit static adapter 가 build/ 에 복사.
+      - name: Seed industry map from HF
+        run: uv run python -X utf8 .github/scripts/sync/seedFromHf.py --category industryMap
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          DARTLAB_DATA_DIR: ${{ github.workspace }}
+
+      # dashboards 는 git 사본이 최후 폴백 - HF seed 가 있으면 덮어써 신선화 (mapBuild 가 매일 publish).
+      # ⚠ seedFromHf 는 HF 에 dir 부재 시 EntryNotFoundError 크래시 (로컬 실측) - mapBuild 첫 publish
+      # 전·HF 장애 시에도 배포가 죽지 않도록 본 스텝만 내성형 (실패 = git 사본으로 빌드).
+      - name: Seed dashboards from HF (tolerant)
+        # block scalar 필수 - plain scalar 는 'WARN:' 콜론에서 YAML 파싱이 깨진다 (0초 워크플로 failure 실측)
+        run: |
+          uv run python -X utf8 .github/scripts/sync/seedFromHf.py --category dashboards || echo "WARN: dashboards HF seed 실패 - git 사본으로 빌드"
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          DARTLAB_DATA_DIR: ${{ github.workspace }}
+
+      - name: Seed lens products from HF (tolerant)
+        run: |
+          uv run python -X utf8 .github/scripts/sync/seedFromHf.py --category lensProducts || echo "WARN: lens products HF seed 실패"
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          DARTLAB_DATA_DIR: ${{ github.workspace }}
+
+      - name: Move HF seed to landing/static
+        run: |
+          set -euo pipefail
+          # seedFromHf 는 HF 의 dir (landing/map/ · landing/dashboards/) 을 $DARTLAB_DATA_DIR 아래에 그대로 복제.
+          # landing/{map,dashboards}/ → landing/static/ 으로 이동 (SvelteKit static path).
+          if [ -d landing/map ]; then
+            mkdir -p landing/static/map
+            cp -r landing/map/. landing/static/map/
+            rm -rf landing/map
+          fi
+          if [ -d landing/dashboards ]; then
+            mkdir -p landing/static/dashboards
+            cp -r landing/dashboards/. landing/static/dashboards/
+            rm -rf landing/dashboards
+            echo "dashboards seeded: $(ls landing/static/dashboards)"
+          else
+            echo "WARN: HF dashboards seed 없음 - git 사본으로 빌드 (mapBuild publish 전 과도기)"
+          fi
+          if [ -d landing/lenses ]; then
+            mkdir -p landing/static/lenses
+            cp -r landing/lenses/. landing/static/lenses/
+            rm -rf landing/lenses
+            echo "lens products seeded: $(find landing/static/lenses -maxdepth 1 -name '*.json' | wc -l)"
+          else
+            echo "WARN: HF lens products seed 없음"
+          fi
+          count=$(find landing/static/map/companies -maxdepth 1 -name '*.json' 2>/dev/null | wc -l)
+          echo "map companies count: $count"
+          [ "$count" -ge 2000 ] || { echo "ERROR: map seed 부족 ($count)"; exit 1; }
+
+      - name: Build Skill Market index
+        run: uv run python -X utf8 .github/scripts/search/buildSkillMarket.py --out landing/static/skills/market --category "Skill Market" --write-comment
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          DARTLAB_MARKET_CURATORS: ${{ github.repository_owner }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "20"
+
+      - name: Build site
+        # 루트 npm 워크스페이스 (플랫폼 단계-1a): 설치는 repo 루트 lockfile 단일,
+        # landing 빌드는 -w 로 실행. heap 옵션은 landing build 스크립트(viteHeap.mjs)에 내장.
+        env:
+          # 공시 Q&A 질문 수집 Worker(공개 URL, secret 아님) - 빌드에 심어야 prod 토글 노출.
+          VITE_FEEDBACK_URL: https://dartlab-question-collector.eddmpython.workers.dev
+          # Web Push 알림(pushHub Worker) - 공개값(secret 아님). 비우면 NotifyOptIn graceful hidden·SW 재구독 skip.
+          # VAPID 공개키 = genVapid.mjs raw 65B base64url. 허브 base = 배포한 dartlab-push-hub.<sub>.workers.dev.
+          VITE_VAPID_PUBLIC_KEY: ${{ vars.VITE_VAPID_PUBLIC_KEY }}
+          VITE_PUSHHUB_URL: ${{ vars.VITE_PUSHHUB_URL }}
+          # HF parquet 레인지 프록시(콜드 403 흡수 + range 헤더 보존, infra/workers/hfProxy). 비우면 HF 직결로 가역.
+          VITE_DARTLAB_HF_RESOLVE: https://dartlab-hf-proxy.eddmpython.workers.dev/hf
+          # 캐러셀/회사 이미지(dartlab-media) 엣지 캐시 프록시(/media 라우트). 브라우저가 HF resolve 를 직접
+          # 다량 요청해 익명 throttle 당하던 것을 엣지 1년 캐시로 흡수. 비우면 HF 직결로 가역.
+          VITE_DARTLAB_HF_MEDIA_RESOLVE: https://dartlab-hf-proxy.eddmpython.workers.dev/media
+          # 네이버 fchart fresh-tail 프록시(같은 hfProxy 워커 /naver 라우트). gov(T+1 지연) 미발행 최신 거래일을
+          # 표시용으로 채움. 비우면 미동작(EOD 까지만)으로 가역. infra/workers/hfProxy worker.js /naver.
+          VITE_DARTLAB_NAVER_PROXY: https://dartlab-hf-proxy.eddmpython.workers.dev/naver
+          # 종목 뉴스 헤드라인 프록시(같은 hfProxy 워커 /news 라우트). private 데이터셋을 read 토큰으로
+          # 서버사이드 read 해 표시(라이브 표시 = 의도된 용도). 워커 시크릿 HF_NEWS_TOKEN 미설정 시 빈배열 noop, 가역.
+          VITE_DARTLAB_NEWS_PROXY: https://dartlab-hf-proxy.eddmpython.workers.dev/news
+          # 시장 전반 뉴스 라이브 오버레이 프록시(같은 hfProxy 워커 /market-news 라우트). 네이버 검색 API 를
+          # 서버사이드 fetch → HF 누적 shard 위에 머지. cron(일 2회) 사이 갭을 10분급으로 메움. 비우면 HF base 만, 가역.
+          VITE_DARTLAB_MARKET_NEWS_PROXY: https://dartlab-hf-proxy.eddmpython.workers.dev/market-news
+          # 당일 공시 라이브 오버레이 프록시(같은 hfProxy 워커 /market-filings 라우트). DART list.json 을 당일
+          # 전체로 서버사이드 fetch → HF 누적 위에 머지. 배치(14:30) 사이 갭을 조회시점으로 메움. 비우면 HF base 만, 가역.
+          VITE_DARTLAB_MARKET_FILINGS_PROXY: https://dartlab-hf-proxy.eddmpython.workers.dev/market-filings
+          # IPO 발굴 라이브 프록시(같은 hfProxy 워커 /ipo-filings 라우트). DART list corp_cls=E + 지분증권 신고를
+          # 서버사이드 fetch(85일). 상장 전 발행사는 HF bake 부재라 이 라이브가 유일 데이터원. 비우면 발굴 빈값, 가역.
+          VITE_DARTLAB_IPO_FILINGS_PROXY: https://dartlab-hf-proxy.eddmpython.workers.dev/ipo-filings
+          # 라이브 데이터 API 워커(infra/workers/dataCsv, /v1 라우트). HF parquet→CSV/TSV 온더플라이 → 데이터센터가
+          # 구글시트 =IMPORTDATA / 엑셀 Power Query 용 라이브 URL 생성. 비우면 Tier2 비활성·Tier1 다운로드만, 가역.
+          VITE_DARTLAB_CSV_PROXY: https://dartlab-data-csv.eddmpython.workers.dev
+          # Cloudflare Web Analytics 공개 beacon site token 또는 Cloudflare 제공 script snippet.
+          # 비우면 analytics beacon 을 로드하지 않음.
+          VITE_CLOUDFLARE_WEB_ANALYTICS_TOKEN: ${{ vars.CLOUDFLARE_WEB_ANALYTICS_TOKEN }}
+        run: |
+          npm ci
+          npm test -w landing
+          BASE_PATH=/dartlab npm run build -w landing
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: landing/build/
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v5

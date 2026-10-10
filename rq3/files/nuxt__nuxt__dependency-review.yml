@@ -1,0 +1,17 @@
+name: 'Dependency review'
+
+on:
+  pull_request:
+    branches:
+      - main
+      - 4.x
+      - '!v[0-9]*'
+
+permissions:
+  contents: read
+
+jobs:
+  dependency-review:
+    uses: nuxt/.github/.github/workflows/dependency-review.yml@main # zizmor: ignore[unpinned-uses] first-party reusable workflow from nuxt/.github
+    with:
+      fail-on-provenance-change: false

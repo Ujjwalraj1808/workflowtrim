@@ -1,0 +1,201 @@
+name: Paxeer / Build Docker Image
+
+on:
+  pull_request:
+    branches:
+      - main
+      - release/**
+    paths:
+      - 'go.mod'
+      - 'go.sum'
+      - 'chain.mk'
+      - 'docker/layerx/Dockerfile'
+      - 'docker/layerx/Dockerfile.dockerignore'
+      - 'foundry.paxeer.toml'
+      - 'buf.gen.yaml'
+      - 'buf.lock'
+      - 'buf.yaml'
+      - 'codecov.yml'
+      - 'config.yml'
+      - '.golangci.yml'
+      - 'gen.go'
+      - 'link_directives_test.go'
+      - 'mod_test.go'
+      - 'run_blocktests.sh'
+      - 'version.json'
+      - 'admin/**'
+      - 'api/**'
+      - 'assets/**'
+      - 'benchmark/**'
+      - 'consensus/**'
+      - 'custodyproof/**'
+      - 'daemon/**'
+      - 'docker/**'
+      - 'engine/**'
+      - 'example/**'
+      - 'hpx/**'
+      - 'integration_test/**'
+      - 'interchain/**'
+      - 'loadtest/**'
+      - 'modules/**'
+      - 'node/**'
+      - 'occ_tests/**'
+      - 'parallelization/**'
+      - 'precompiles/**'
+      - 'ratelimiter/**'
+      - 'rpc/**'
+      - 'sdk/**'
+      - 'storage/**'
+      - 'store/**'
+      - 'sync/**'
+      - 'testutil/**'
+      - 'types/**'
+      - 'utils/**'
+      - 'wasm/**'
+      - 'wasm-runtime/**'
+      - 'wasmbinding/**'
+      - 'contracts/src/**'
+      - 'contracts/test/**'
+      - 'contracts/scripts/**'
+      - 'contracts/wasm/**'
+      - 'docs/swagger/**'
+      - 'docs/swagger-ui/**'
+      - 'tests/chain/**'
+      - 'tools/chain/**'
+      - 'tools/tx-scanner/**'
+      - 'tools/utils/**'
+      - 'contracts/config/client.toml'
+      - 'contracts/hardhat.config.js'
+      - 'contracts/package.json'
+      - 'contracts/package-lock.json'
+      - 'contracts/tsconfig.json'
+      - 'docs/evm_jsonrpc_unsupported.md'
+      - 'docs/paxeer-network.md'
+      - 'docs/paxeer-chain-docs.md'
+      - 'scripts/**'
+      - '!scripts/PaxeerBetaDeploy.s.sol'
+      - '!scripts/qualify-mirror-live.sh'
+      - '!scripts/qualify-mirror-verification-live.sh'
+      - '.github/workflows/paxeer-docker-build.yml'
+  merge_group:
+    branches:
+      - main
+      - release/**
+  push:
+    branches:
+      - main
+      - release/**
+    paths:
+      - 'go.mod'
+      - 'go.sum'
+      - 'chain.mk'
+      - 'docker/layerx/Dockerfile'
+      - 'docker/layerx/Dockerfile.dockerignore'
+      - 'foundry.paxeer.toml'
+      - 'buf.gen.yaml'
+      - 'buf.lock'
+      - 'buf.yaml'
+      - 'codecov.yml'
+      - 'config.yml'
+      - '.golangci.yml'
+      - 'gen.go'
+      - 'link_directives_test.go'
+      - 'mod_test.go'
+      - 'run_blocktests.sh'
+      - 'version.json'
+      - 'admin/**'
+      - 'api/**'
+      - 'assets/**'
+      - 'benchmark/**'
+      - 'consensus/**'
+      - 'custodyproof/**'
+      - 'daemon/**'
+      - 'docker/**'
+      - 'engine/**'
+      - 'example/**'
+      - 'hpx/**'
+      - 'integration_test/**'
+      - 'interchain/**'
+      - 'loadtest/**'
+      - 'modules/**'
+      - 'node/**'
+      - 'occ_tests/**'
+      - 'parallelization/**'
+      - 'precompiles/**'
+      - 'ratelimiter/**'
+      - 'rpc/**'
+      - 'sdk/**'
+      - 'storage/**'
+      - 'store/**'
+      - 'sync/**'
+      - 'testutil/**'
+      - 'types/**'
+      - 'utils/**'
+      - 'wasm/**'
+      - 'wasm-runtime/**'
+      - 'wasmbinding/**'
+      - 'contracts/src/**'
+      - 'contracts/test/**'
+      - 'contracts/scripts/**'
+      - 'contracts/wasm/**'
+      - 'docs/swagger/**'
+      - 'docs/swagger-ui/**'
+      - 'tests/chain/**'
+      - 'tools/chain/**'
+      - 'tools/tx-scanner/**'
+      - 'tools/utils/**'
+      - 'contracts/config/client.toml'
+      - 'contracts/hardhat.config.js'
+      - 'contracts/package.json'
+      - 'contracts/package-lock.json'
+      - 'contracts/tsconfig.json'
+      - 'docs/evm_jsonrpc_unsupported.md'
+      - 'docs/paxeer-network.md'
+      - 'docs/paxeer-chain-docs.md'
+      - 'scripts/**'
+      - '!scripts/PaxeerBetaDeploy.s.sol'
+      - '!scripts/qualify-mirror-live.sh'
+      - '!scripts/qualify-mirror-verification-live.sh'
+      - '.github/workflows/paxeer-docker-build.yml'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    working-directory: .
+
+jobs:
+  pax-images:
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+      contents: read
+    steps:
+      -
+        name: Check out the repo
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      -
+        name: Set up QEMU
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+      - name: Login to Docker Hub
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        if: env.DOCKERHUB_USERNAME != ''
+        env:
+            DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      -
+        name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      -
+        name: Login Container Registry
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Validate Docker build (amd64)
+        run: docker build --platform=linux/amd64 -f docker/layerx/Dockerfile --build-arg PAX_CHAIN_REF="${{ github.sha }}" .

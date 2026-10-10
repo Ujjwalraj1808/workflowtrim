@@ -1,0 +1,92 @@
+name: Semgrep
+permissions: {}
+on:
+  pull_request: {}
+  push:
+    branches: [master, v3.dev]
+  schedule:
+    - cron: '33 19 * * 1'
+  workflow_dispatch: {}
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  semgrep:
+    name: Scan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read # Needed for uploading security scan results
+      security-events: write # Needed for uploading security scan results
+    container:
+      # Incompatible with Harden Runner
+      image: semgrep/semgrep
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: semgrep scan --sarif --output=results.sarif
+        env:
+          SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
+          SEMGREP_RULES: >-
+            p/ci
+            p/command-injection
+            p/cwe-top-25
+            p/default
+            p/findsecbugs
+            p/github-actions
+            p/insecure-transport
+            p/java
+            p/jwt
+            p/lockfiles
+            p/mschwager.java-security-rules
+            p/owasp-top-ten
+            p/pawayf.semgrep-java-sec-rules
+            p/r2c-best-practices
+            p/r2c-ci
+            p/r2c-security-audit
+            p/secrets
+            p/security-audit
+            p/semgrep-misconfigurations
+            p/semgrep-rule-ci
+            p/semgrep-rule-lints
+            p/sql-injection
+            p/supply-chain
+            p/trailofbits
+            p/xss
+      - name: Fix non-numeric security-severity values in SARIF
+        if: always()
+        run: |
+          if [ -f results.sarif ]; then
+            jq '
+              def fix_severity:
+                {"CRITICAL":"9.0","Critical":"9.0","HIGH":"7.0","High":"7.0",
+                 "MEDIUM":"5.0","Medium":"5.0","LOW":"3.0","Low":"3.0",
+                 "INFO":"1.0","Info":"1.0"};
+              .runs[].tool.driver.rules |= [.[] |
+                if .properties."security-severity" then
+                  .properties."security-severity" |= (fix_severity[.] // .)
+                else . end |
+                if (.id | length) > 255 then .id |= .[:255] else . end]
+            ' results.sarif > results.tmp && mv results.tmp results.sarif
+          fi
+      - name: Check file existence
+        id: check_files
+        uses: andstor/file-existence-action@558493d6c74bf472d87c84eab196434afc2fa029 # v3.1.0
+        with:
+          files: results.sarif
+      - name: Upload artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: steps.check_files.outputs.files_exists == 'true'
+        with:
+          name: SARIF file
+          path: results.sarif
+          retention-days: 1
+      - name: Upload SARIF file for GitHub Advanced Security Dashboard
+        uses: github/codeql-action/upload-sarif@1c5b675653bb5c22dbe9b12b556ec555138e09fd # v4.38.1
+        if: steps.check_files.outputs.files_exists == 'true'
+        continue-on-error: true
+        with:
+          sarif_file: results.sarif

@@ -1,0 +1,110 @@
+name: JavaScript Scoped Taint
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ubs
+      - modules/ubs-js.sh
+      - modules/lib/ubs-common.sh
+      - modules/helpers/ubs_core/**
+      - test-suite/js/test_taint_scopes.py
+      - test-suite/js/test_taint_domains.py
+      - test-suite/quality/*js*.py
+      - .github/workflows/javascript-taint-scopes.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate-scopes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+      UBS_NO_AUTO_UPDATE: '1'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      # The scoped analyzer is production code; old-failure proofs and patch
+      # installation would reject or replace the implementation being tested.
+      - name: Record the production revision under test
+        run: echo "JS_SCOPES_REVISION $(git rev-parse HEAD)"
+      - name: Run scoped and existing domain regressions
+        run: |
+          python3 test-suite/js/test_taint_scopes.py
+          python3 test-suite/js/test_taint_domains.py
+      - name: Install scanner dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq ripgrep rsync shellcheck
+          npm install --global @ast-grep/cli
+      - name: Run existing JavaScript quality tests
+        run: python3 -m unittest discover -s test-suite/quality -p '*js*.py' -v
+      - name: Verify real scanner interprocedural detections and clean controls
+        run: |
+          python3 - <<'PY'
+          import json
+          import subprocess
+          import tempfile
+          from pathlib import Path
+          root = Path.cwd()
+          artifacts = root / 'test-suite' / 'artifacts' / 'javascript-taint-scopes'
+          artifacts.mkdir(parents=True, exist_ok=True)
+          cases = [
+              ('helper-source', 'function read() { return req.query.code; }\neval(read());', {'js.taint.eval'}, set()),
+              ('helper-sink', 'function run(value) { shell.exec(value); }\nrun(req.query.command);', {'js.taint.command'}, set()),
+              ('recursive-effect', 'function a(x) { if (flag) return b(x); eval(x); }\nfunction b(y) { a(y); }\nb(req.query.code);', {'js.taint.eval'}, set()),
+              ('default-source', 'function read(value = req.query.html) { return value; }\nres.send(read());', {'js.taint.xss'}, set()),
+              ('scope-clean', 'function a(req) { const html = req.query.html; }\nfunction b() { const html = "hello"; res.send(html); }', set(), {'js.taint.xss'}),
+              ('constant-clean', 'function clean(value) { return "hello"; }\nres.send(clean(req.query.html));', set(), {'js.taint.xss'}),
+              ('wrapped-sanitizer', 'function escape(x) { return DOMPurify.sanitize(x); }\nres.send(escape(req.query.html));', set(), {'js.taint.xss'}),
+              ('call-isolation', 'function id(x) { return x; }\nconst raw = id(req.query.html);\nconst clean = id("hello");\nres.send(clean);', set(), {'js.taint.xss'}),
+          ]
+          for name, source, expected, forbidden in cases:
+              with tempfile.TemporaryDirectory(prefix='ubs-js-scopes-') as tmp:
+                  target = Path(tmp) / 'app.js'
+                  target.write_text(source + '\n', encoding='utf-8')
+                  result = subprocess.run([str(root / 'ubs'), str(target), '--only=js', '--format=json', '--ci'],
+                                          cwd=tmp, capture_output=True, text=True, timeout=120)
+                  (artifacts / f'{name}.json').write_text(result.stdout)
+                  (artifacts / f'{name}.stderr.log').write_text(result.stderr)
+                  print(name, 'exit', result.returncode, result.stderr, flush=True)
+                  assert result.returncode in (0, 1), result.stdout
+                  data = json.loads(result.stdout)
+                  rules = set()
+                  def visit(value):
+                      if isinstance(value, dict):
+                          for key in ('rule', 'rule_id', 'ruleId'):
+                              if isinstance(value.get(key), str):
+                                  rules.add(value[key].replace('javascript.', 'js.'))
+                          for child in value.values():
+                              visit(child)
+                      elif isinstance(value, list):
+                          for child in value:
+                              visit(child)
+                  visit(data)
+                  assert expected <= rules, (name, expected, rules, data)
+                  assert not forbidden & rules, (name, forbidden, rules, data)
+                  print('JS_SCOPES_E2E_PASS', name, sorted(rules), flush=True)
+          PY
+      - name: Verify the production integrity chain and deterministic regeneration
+        run: |
+          ./scripts/verify_checksums.sh
+          ./scripts/verify_sha256sums.sh
+          git diff --check
+          git diff > "$RUNNER_TEMP/javascript-taint-tested.diff"
+          python3 scripts/update_checksums.py
+          ./scripts/update_sha256sums.sh
+          git diff > "$RUNNER_TEMP/javascript-taint-idempotent.diff"
+          cmp "$RUNNER_TEMP/javascript-taint-tested.diff" "$RUNNER_TEMP/javascript-taint-idempotent.diff"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: javascript-taint-scopes
+          path: |
+            ${{ runner.temp }}/javascript-taint-*.diff
+            test-suite/artifacts/javascript-taint-scopes/
+          retention-days: 3

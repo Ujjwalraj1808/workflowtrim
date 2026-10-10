@@ -1,0 +1,151 @@
+name: Orchestrator Maintenance
+
+on:
+  workflow_dispatch:
+    inputs:
+      task:
+        description: "Maintenance Task"
+        required: true
+        type: choice
+        default: "cleanup"
+        options:
+          - cleanup
+          - retract
+          - support-toggle
+      App:
+        description: "App Slug (for retract/support-toggle)"
+        required: false
+        type: string
+      state:
+        description: "Target State (for support-toggle)"
+        required: false
+        type: choice
+        options:
+          - supported
+          - unsupported
+      version:
+        description: "Version to Retract (for retract)"
+        required: false
+        type: string
+  schedule:
+    - cron: "0 0 * * 0" # Weekly Cleanup
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+permissions:
+  contents: write
+  packages: write
+  actions: write
+  # Note: packages: write includes delete permission for package versions
+
+jobs:
+  # --------------------------------------------------------------------------------
+  # CLEANUP: Delete old runs & Stale items
+  # --------------------------------------------------------------------------------
+  cleanup:
+    name: 🧹 System Cleanup
+    if: |
+      github.event_name == 'schedule' ||
+      (github.event_name == 'workflow_dispatch' && (github.event.inputs.task == 'cleanup' || github.event.inputs.task == ''))
+    runs-on: ubuntu-latest
+    steps:
+      - name: 🗑️ Delete Old Workflow Runs
+        uses: Mattraks/delete-workflow-runs@v2
+        with:
+          token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          retain_days: 30
+          keep_minimum_runs: 5
+
+      - name: ⤵️ Check out code
+        uses: actions/checkout@v7
+      - name: 🐍 Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+
+      - name: 📦 Install Python Dependencies
+        run: pip install requests pyyaml --quiet
+
+      - name: 🗑️ Prune Docker Registry
+        run: python3 .scripts/prune_registry.py
+        env:
+          GITHUB_TOKEN: ${{ secrets.PAT || secrets.GITHUB_TOKEN }} # Needs delete:packages scope
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+
+  # --------------------------------------------------------------------------------
+  # RETRACT: Remove specific version
+  # --------------------------------------------------------------------------------
+  retract:
+    name: ↩️ Retract Release
+    if: github.event.inputs.task == 'retract'
+    runs-on: ubuntu-latest
+    steps:
+      - name: ⤵️ Check out code
+        uses: actions/checkout@v7
+      - name: 🚫 Retract Logic
+        run: |
+          echo "Retracting ${{ github.event.inputs.App }} version ${{ github.event.inputs.version }}"
+          # We assume python dependencies are installed or we use standard lib
+          pip install requests
+          python3 .scripts/retract_version.py "${{ github.event.inputs.App }}" "${{ github.event.inputs.version }}"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+
+  # --------------------------------------------------------------------------------
+  # UNSUPPORTED: Scan & Move
+  # --------------------------------------------------------------------------------
+  unsupported-check:
+    name: 🏚️ Check Unsupported
+    if: github.event.inputs.task == 'cleanup' || github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - name: ⤵️ Check out code
+        uses: actions/checkout@v7
+      - name: 🏃 Run Move Script
+        run: |
+          python3 .scripts/move_unsupported.py
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 🔄 Pull latest changes (Handle non-fast-forward)
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git pull --rebase --autostash origin master
+
+      - name: 🚀 Commit Changes
+        uses: stefanzweifel/git-auto-commit-action@v7
+        with:
+          commit_message: "chore: move unsupported Apps [skip ci]"
+          file_pattern: "unsupported/* README.md"
+
+  # --------------------------------------------------------------------------------
+  # TOGGLE SUPPORT: Move, Prune, Update Docs
+  # --------------------------------------------------------------------------------
+  toggle-support:
+    name: 🔄 Toggle Support State
+    if: github.event.inputs.task == 'support-toggle'
+    runs-on: ubuntu-latest
+    steps:
+      - name: ⤵️ Check out code
+        uses: actions/checkout@v7
+      - name: 🏃 Run Toggle Script
+        run: |
+          python3 .scripts/toggle_support.py "${{ github.event.inputs.App }}" "${{ github.event.inputs.state }}"
+        env:
+          GITHUB_TOKEN: ${{ secrets.PAT || secrets.GITHUB_TOKEN }} # Needs delete:packages scope
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+
+      - name: 🔄 Pull latest changes (Handle non-fast-forward)
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git pull --rebase --autostash origin master
+
+      - name: 🚀 Commit Changes
+        uses: stefanzweifel/git-auto-commit-action@v7
+        with:
+          commit_message: "chore: mark ${{ github.event.inputs.App }} as ${{ github.event.inputs.state }} [skip ci]"

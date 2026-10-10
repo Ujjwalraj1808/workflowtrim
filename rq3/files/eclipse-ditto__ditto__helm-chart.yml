@@ -1,0 +1,166 @@
+# Copyright (c) 2023 Contributors to the Eclipse Foundation
+#
+# See the NOTICE file(s) distributed with this work for additional
+# information regarding copyright ownership.
+#
+# This program and the accompanying materials are made available under the
+# terms of the Eclipse Public License 2.0 which is available at
+# http://www.eclipse.org/legal/epl-2.0
+#
+# SPDX-License-Identifier: EPL-2.0
+name: Lint and test Helm chart
+
+env:
+  CONFIG_OPTION_CHART_TESTING: "--config .github/ct.yml"
+  VERSION_CHART_TESTING: "v3.11.0"
+  VERSION_HELM: "v3.13.3"
+  VERSION_PYTHON: "3.10"
+on:
+  pull_request:
+    paths:
+      - 'deployment/helm/**'
+      - '!deployment/helm/**/CHANGELOG.md'
+      - '!deployment/helm/**/README.md'
+      - '.github/workflows/helm-chart.yml'
+      - '.github/ct.yml'
+      - '.github/kubeval.sh'
+
+permissions:
+  contents: read
+
+jobs:
+  lint-chart:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Set up Helm
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: ${{ env.VERSION_HELM }}
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ env.VERSION_PYTHON }}
+          check-latest: true
+      - name: Set up chart-testing
+        uses: helm/chart-testing-action@6ec842c01de15ebb84c8627d2744a0c2f2755c9f # v2.8.0
+        with:
+          version: ${{ env.VERSION_CHART_TESTING }}
+      - name: Run chart-testing (list-changed)
+        id: list-changed
+        env:
+          CT_CONFIG: ${{ env.CONFIG_OPTION_CHART_TESTING }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          changed=$(ct list-changed $CT_CONFIG --target-branch "$DEFAULT_BRANCH")
+          if [[ -n "$changed" ]]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Run chart-testing (lint)
+        if: steps.list-changed.outputs.changed == 'true'
+        env:
+          CT_CONFIG: ${{ env.CONFIG_OPTION_CHART_TESTING }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: ct lint $CT_CONFIG --target-branch "$DEFAULT_BRANCH"
+
+  kubeval-chart:
+    runs-on: ubuntu-latest
+    needs: lint-chart
+    strategy:
+      matrix:
+        # the versions supported by kubeval are the ones for
+        # which a folder exists at
+        # https://github.com/yannh/kubernetes-json-schema/
+        k8s:
+          - v1.33.7
+          - v1.34.3
+          - v1.35.1
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Fetch history for chart testing
+        run: git fetch --prune --unshallow
+      - name: Set up Helm
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: ${{ env.VERSION_HELM }}
+      - name: Run kubeval
+        env:
+          KUBERNETES_VERSION: ${{ matrix.k8s }}
+        run: .github/kubeval.sh
+
+  install-chart:
+    name: install-chart
+    runs-on: ubuntu-latest
+    needs:
+      - lint-chart
+      - kubeval-chart
+    strategy:
+      matrix:
+        # the versions supported by chart-testing are the tags
+        # available for the docker.io/kindest/node image
+        # https://hub.docker.com/r/kindest/node/tags
+        k8s:
+          - v1.33.7
+          - v1.34.3
+          - v1.35.1
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Fetch history for chart testing
+        run: git fetch --prune --unshallow
+      - name: Set up Helm
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: ${{ env.VERSION_HELM }}
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ env.VERSION_PYTHON }}
+          check-latest: true
+      - name: Set up chart-testing
+        uses: helm/chart-testing-action@6ec842c01de15ebb84c8627d2744a0c2f2755c9f # v2.8.0
+        with:
+          version: ${{ env.VERSION_CHART_TESTING }}
+      - name: Run chart-testing (list-changed)
+        id: list-changed
+        env:
+          CT_CONFIG: ${{ env.CONFIG_OPTION_CHART_TESTING }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          changed=$(ct list-changed $CT_CONFIG --target-branch "$DEFAULT_BRANCH")
+          if [[ -n "$changed" ]]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Create kind ${{ matrix.k8s }} cluster
+        if: steps.list-changed.outputs.changed == 'true'
+        uses: helm/kind-action@06c1ae10762d3b9c1644e7fe69596ae519e015a2 # v1.15.0
+        with:
+          node_image: kindest/node:${{ matrix.k8s }}
+      - name: Run chart-testing (install)
+        if: steps.list-changed.outputs.changed == 'true'
+        env:
+          CT_CONFIG: ${{ env.CONFIG_OPTION_CHART_TESTING }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: ct install $CT_CONFIG --target-branch "$DEFAULT_BRANCH"

@@ -1,0 +1,36 @@
+# SPDX-FileCopyrightText: 2026 Edward Kmett
+# SPDX-License-Identifier: UPL-1.0 AND BSD-3-Clause
+
+name: Build
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      expected_sha:
+        description: Expected source commit (empty uses this run's commit)
+        type: string
+        required: false
+permissions:
+  contents: read
+  actions: read
+jobs:
+  automation:
+    uses: ./.github/workflows/checks.yml
+    with:
+      cadence: commit
+      expected_sha: ${{ inputs.expected_sha || github.sha }}
+  jvm-linux:
+    name: Linux ordinary tests
+    uses: ./.github/workflows/test-common.yml
+    with:
+      os: ubuntu-latest
+      expected_sha: ${{ inputs.expected_sha || github.sha }}
+      cadence: commit
+  jvm-macos:
+    name: macOS ordinary tests
+    uses: ./.github/workflows/test-common.yml
+    with:
+      os: macos-26
+      expected_sha: ${{ inputs.expected_sha || github.sha }}
+      cadence: commit

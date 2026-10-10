@@ -1,0 +1,84 @@
+name: "FUSE Integration Tests"
+
+on:
+  push:
+    branches: [ master, main ]
+    paths:
+      - 'weed/**'
+      - 'test/fuse_integration/**'
+      - '.github/workflows/fuse-integration.yml'
+      - '.github/actions/fix-fusermount-setuid/**'
+  pull_request:
+    branches: [ master, main ]
+    paths:
+      - 'weed/**'
+      - 'test/fuse_integration/**'
+      - '.github/workflows/fuse-integration.yml'
+      - '.github/actions/fix-fusermount-setuid/**'
+
+concurrency:
+  group: ${{ github.head_ref }}/fuse-integration
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  fuse-integration:
+    name: FUSE Integration Testing
+    runs-on: ubuntu-22.04
+    timeout-minutes: 50
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v7
+
+    - name: Set up Go
+      uses: actions/setup-go@v7
+      with:
+        go-version-file: 'go.mod'
+
+    - name: Configure FUSE
+      run: |
+        # Nothing to install: fuse3 ships fusermount3 and is pre-installed, and
+        # go-fuse is pure Go, so the libfuse headers were never linked against.
+        # Allow non-root FUSE mounts with allow_other
+        echo 'user_allow_other' | sudo tee -a /etc/fuse.conf
+        sudo chmod 644 /etc/fuse.conf
+        # Verify FUSE installation
+        fusermount3 --version || fusermount --version || true
+        ls -la /dev/fuse
+
+    - name: Repair the fusermount3 setuid bit
+      uses: ./.github/actions/fix-fusermount-setuid
+
+    - name: Build SeaweedFS
+      run: |
+        cd weed
+        go build -tags "elastic gocdk sqlite ydb tarantool tikv rclone" -o weed .
+        chmod +x weed
+        ./weed version
+        # Make weed binary available in PATH for the test framework
+        sudo cp weed /usr/local/bin/weed
+
+    - name: Install test dependencies
+      run: |
+        cd test/fuse_integration
+        go mod download
+
+    - name: Run FUSE Integration Tests
+      run: |
+        set -o pipefail
+        cd test/fuse_integration
+        echo "Running full FUSE integration test suite..."
+        go test -v -count=1 -timeout=45m ./... 2>&1 | tee /tmp/fuse-test-output.log
+
+    - name: Upload Test Logs
+      if: always()
+      uses: actions/upload-artifact@v7
+      with:
+        name: fuse-integration-test-results
+        path: |
+          /tmp/fuse-test-output.log
+          /tmp/seaweedfs-fuse-logs/
+        retention-days: 7

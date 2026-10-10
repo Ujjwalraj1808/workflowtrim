@@ -1,0 +1,107 @@
+# Copyright 2023 The Atlas Operator Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: CD - Operator Release
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - 'charts/atlas-operator/Chart.yaml'
+  workflow_dispatch:
+concurrency:
+  group: operator-release
+  cancel-in-progress: false
+jobs:
+  detect-version:
+    name: Detect Version Change
+    runs-on: ubuntu-slim
+    outputs:
+      semver: ${{ steps.check.outputs.semver }}
+      should_release: ${{ steps.check.outputs.should_release }}
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+      - name: Check if tag already exists
+        id: check
+        run: |
+          VERSION=$(yq '.appVersion' charts/atlas-operator/Chart.yaml)
+          TAG="v${VERSION}"
+          echo "semver=${VERSION}" >> $GITHUB_OUTPUT
+          echo "version=${TAG}" >> $GITHUB_OUTPUT
+          echo "Detected version: ${TAG}"
+          if git rev-parse "refs/tags/${TAG}" >/dev/null 2>&1; then
+            echo "Tag ${TAG} already exists, skipping release"
+            echo "should_release=false" >> $GITHUB_OUTPUT
+          else
+            echo "Tag ${TAG} does not exist, proceeding with release"
+            echo "should_release=true" >> $GITHUB_OUTPUT
+          fi
+  image:
+    name: Build and Push Image
+    needs: [detect-version]
+    if: needs.detect-version.outputs.should_release == 'true'
+    # Granted here, not only in the called workflow: permissions can be
+    # maintained or reduced down a workflow_call chain, never elevated.
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      security-events: write
+    uses: ./.github/workflows/cd-image.yaml
+    with:
+      version: ${{ needs.detect-version.outputs.version }}
+    secrets: inherit
+  release:
+    name: Create Release
+    needs: [detect-version, image]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+    defaults:
+      run:
+        working-directory: charts/
+    env:
+      SEMVER: ${{ needs.detect-version.outputs.semver }}
+      VERSION: ${{ needs.detect-version.outputs.version }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Setup Helm
+        uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4
+      - name: Login to ghcr.io using helm
+        run: |
+          echo ${{ secrets.GITHUB_TOKEN }} | helm registry login ghcr.io --username ${{ github.repository_owner }} --password-stdin
+      - name: Package & push Helm chart
+        run: |
+          helm package atlas-operator
+          helm push atlas-operator-${SEMVER}.tgz oci://ghcr.io/ariga/charts
+      - name: Create and push tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "$VERSION" -m "Release $VERSION"
+          git push origin "$VERSION"
+          echo "Created and pushed tag: $VERSION"
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$VERSION" \
+            --title "$VERSION" \
+            --verify-tag \
+            --generate-notes

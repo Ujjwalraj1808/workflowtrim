@@ -1,0 +1,96 @@
+name: dead-code-scan
+
+# Unused-export / unused-file detection (knip), reported to the PR job summary.
+# The gap this fills: eslint's `no-unused-vars` only sees WITHIN a file, and the
+# duplication scan only sees copy/paste — neither catches an export nobody imports
+# or a helper whose last caller was removed (exactly the class of orphan a refactor
+# leaves behind when it deletes the only call site in another module).
+#
+# Gates on UNUSED FILES; everything else it finds is reported without failing.
+#
+# This was reports-only, on two conditions it set for itself: that the config be tuned enough
+# to be trustworthy, and that a full-inventory report (knip has no base-branch diffing) not be
+# read as this PR's delta. Both are now met — the inventory is EMPTY, so "the whole inventory"
+# and "your delta" are the same list, and `ignoreDependencies` has gone from `.*` to four named
+# entries with reasons.
+#
+# What tipped it: an orphaned file is invisible to everything else in CI. #1124 replaced a
+# 311-line module with a directory and left the old file behind; typecheck, the full test suite
+# and the build all stayed green, and only jscpd noticed (because the two copies happened to be
+# similar — a less similar orphan would have shipped unnoticed).
+#
+# Unused EXPORTS stay reporting-only: they are the finding knip is most likely to get wrong,
+# since it cannot infer every entry point (CLI subcommands spawned via tsx, codegen). Promote
+# them the same way if that stops being true.
+#
+# Config lives in `knip.jsonc`; run it locally with `yarn knip`.
+
+on:
+  pull_request:
+    branches: [main]
+    # Dead exports can only change when an analyzed input changes. Keep in sync with
+    # knip.jsonc's entry/project globs and tsconfig (module resolution). package.json
+    # and yarn.lock are included too: knip auto-detects entry points from package.json
+    # (bin/scripts/main) and resolves imports through the installed dependency graph,
+    # so a PR touching only those can still orphan code.
+    paths:
+      - "**/*.ts"
+      - "**/*.vue"
+      - "**/*.js"
+      - "**/tsconfig*.json"
+      - "knip.jsonc"
+      - "package.json"
+      - "yarn.lock"
+      - ".github/workflows/dead-code-scan.yaml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A pull request supersedes its own earlier pushes. A manual dispatch is not cancelled:
+# somebody is waiting to read its summary.
+concurrency:
+  group: dead-code-scan-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  dead-code-scan:
+    name: Dead Code Scan (knip)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      # `cache: yarn` costs this step ~18s (the yarn download folder is a 1.6 GB tarball) and
+      # takes ~38s off the install below — net ~20s. It shares ci.yml's entry rather than adding
+      # one: setup-node keys on platform-arch-manager-lockfilehash with no workflow or node
+      # version in it, so this hits what ci.yml already saves on main.
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: yarn
+
+      # knip resolves imports through the real dependency graph, so node_modules has
+      # to be installed. `--frozen-lockfile` keeps CI honest against yarn.lock.
+      - run: yarn install --frozen-lockfile --network-timeout 120000
+
+      # knip's exit code is captured rather than swallowed, and rather than left to decide the
+      # step on its own: the summary has to be written EITHER WAY (a failing job is exactly when
+      # someone wants to read what it found), and a `{ ... } >> $GITHUB_STEP_SUMMARY` block ends
+      # with printf's status, so the knip result would be lost even without a `|| true`.
+      - name: Run knip
+        run: |
+          set -uo pipefail
+          knip_status=0
+          output=$(yarn --silent knip --reporter compact 2>&1) || knip_status=$?
+          {
+            printf '## Dead code scan (knip)\n\n'
+            printf 'An unused FILE fails this job. Everything else below is reported for a human\n'
+            printf 'to judge. See .github/workflows/dead-code-scan.yaml.\n\n'
+            printf '```\n'
+            printf '%s\n' "$output"
+            printf '```\n'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$knip_status"

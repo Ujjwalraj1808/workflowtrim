@@ -1,0 +1,253 @@
+name: release
+
+# Builds a self-contained "bundled" release tarball and attaches it to a GitHub
+# Release. The tarball ships the source tree + prebuilt web UI + optional
+# vendor/*.tgz packages for unpublished/private deps. Public dependencies are
+# installed on the target machine so native optional deps match that OS.
+#
+# Trigger: push a version tag (v1.2.3) or run manually from the Actions tab.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to publish (e.g. v0.1.0). Defaults to a dev build."
+        required: false
+
+permissions:
+  contents: write # create releases + upload assets
+  id-token: write # npm provenance attestation for the published packages
+  issues: write # file an issue when a release run fails
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      # `secrets` is not allowed in step `if:` — surface them as env first.
+      NPM_REGISTRY: ${{ secrets.NPM_REGISTRY }}
+      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+      # Publishing to npmjs is a different credential from NPM_TOKEN, which
+      # authenticates *reads* against the private provider registry. Keeping
+      # them separate means a read token can never publish, and the publish
+      # token is never written into the default registry config.
+      NPM_PUBLISH_TOKEN: ${{ secrets.NPM_PUBLISH_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      # Auth for the private registry that hosts the "vibes" AI-SDK provider.
+      # Set repo secrets NPM_REGISTRY (e.g. https://npm.your-registry.dev/) and
+      # NPM_TOKEN. If absent, this is a no-op and a public install is attempted.
+      - name: Configure private registry
+        if: ${{ env.NPM_TOKEN != '' }}
+        run: |
+          REG="${NPM_REGISTRY:-https://registry.npmjs.org/}"
+          HOST="${REG#*://}"; HOST="${HOST%%/*}"
+          {
+            echo "[install]"
+            echo "registry = \"$REG\""
+          } > "$HOME/.bunfig.toml"
+          # bun also reads npm-style token lines from .npmrc
+          echo "//$HOST/:_authToken=${NPM_TOKEN}" > "$HOME/.npmrc"
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Build public packages
+        run: bun run build:packages
+
+      # The @omg-dev/app embed smoke. It is not in the default `bun run test`
+      # set because the dist-lib build it needs peaks at 1.7 GB resident and
+      # is marked stale by any web/src edit, which made every local test run
+      # rebuild it. build:packages above has just produced that bundle, so
+      # this is the cheap place to prove it actually mounts before it ships.
+      - name: Smoke the prebuilt embed bundle
+        run: bun run test:embed
+
+      - name: Build the web UI
+        run: bun run --cwd web build
+
+      - name: Stage + pack the bundle
+        # Reuse the same staging/prune logic as local releases (single source of
+        # truth). Deps + web are already built above, so skip reinstalling.
+        run: SKIP_INSTALL=1 bash scripts/release.sh
+
+      # Publish the four public packages to npm under @omg-dev.
+      #
+      # --registry is explicit and NOT taken from NPM_REGISTRY. That secret
+      # points at the private registry hosting the "vibes" provider, and the
+      # step above writes it into ~/.npmrc as the default registry — so an
+      # unqualified `npm publish` here would push the public packages to a
+      # private registry and silently succeed. Naming the registry per command,
+      # with its own token, keeps consuming and publishing separate.
+      #
+      # Only runs for a real tag: a workflow_dispatch dev build has no version
+      # to publish, and burning a version number is not undoable. The condition
+      # resolves the tag exactly the way the GitHub release step below does — a
+      # manual dispatch that passes `tag` is a real release and must publish,
+      # and testing only github.ref would silently skip it.
+      #
+      # A missing token warns instead of skipping silently. Gating the whole
+      # step on the secret would mean a release that quietly ships no packages
+      # and a green checkmark saying it worked — the release log has to say why
+      # nothing was published.
+      - name: Publish packages to npm
+        if: ${{ startsWith(inputs.tag || github.ref_name, 'v') }}
+        run: |
+          set -euo pipefail
+          if [ -z "${NPM_PUBLISH_TOKEN:-}" ]; then
+            echo "::warning title=npm publish skipped::NPM_PUBLISH_TOKEN is not set, so @omg-dev/* was NOT published for this tag. Add the secret and re-run this workflow to publish."
+            exit 0
+          fi
+          REG="https://registry.npmjs.org/"
+          # Job-local userconfig, never the shared ~/.npmrc: the private-registry
+          # step above owns that file, and this token must not end up as the
+          # default credential for every later command.
+          #
+          # This repository now publishes @omg-dev/cli 0.5.0+ (the control-plane
+          # bootstrapper). BennyKok/vibes used to publish 0.4.x — the retired
+          # prompt-to-app CLI — into the same name. Do not publish 0.4.x again.
+          NPMRC="$RUNNER_TEMP/.npmrc.publish"
+          printf '//registry.npmjs.org/:_authToken=%s\n' "$NPM_PUBLISH_TOKEN" > "$NPMRC"
+          chmod 600 "$NPMRC"
+          # Fail fast and legibly on a bad or expired token, rather than
+          # discovering it as an opaque 401 partway through the loop.
+          npm whoami --userconfig "$NPMRC" --registry "$REG"
+
+          # Dependency order, not glob order. `dist/omg-dev-*.tgz` expands
+          # alphabetically to app, client, protocol, react — publishing app
+          # first, whose pinned dependency on protocol does not exist on the
+          # registry yet. npm does not validate that at publish time, so the
+          # result is a window where a published package cannot be installed.
+          for pkg in protocol client cloud react app cli; do
+            # "./" is load-bearing. `npm publish dist/omg-dev-protocol-1.0.0.tgz`
+            # parses as the GitHub shorthand <owner>/<repo> — npm resolves it to
+            # ssh://git@github.com/dist/omg-dev-protocol-1.0.0.tgz.git and fails
+            # with a public-key error that reads nothing like a bad path. An
+            # explicit relative prefix forces the file-path interpretation.
+            tgz="./$(ls dist/omg-dev-${pkg}-*.tgz)"
+            name="$(tar -xzOf "$tgz" package/package.json | jq -r .name)"
+            version="$(tar -xzOf "$tgz" package/package.json | jq -r .version)"
+            echo "▸ $name@$version"
+            # Idempotency is decided by the publish result, not a prior `npm
+            # view`: a pre-check races anything else publishing the same version
+            # and turns a transient registry read failure into a wrong decision.
+            # Only a genuine conflict is tolerated — auth, validation and network
+            # errors must still fail the release.
+            if ! out=$(npm publish "$tgz" \
+                --userconfig "$NPMRC" \
+                --registry "$REG" \
+                --access public \
+                --provenance 2>&1); then
+              if echo "$out" | grep -qE 'EPUBLISHCONFLICT|cannot publish over|already published|409'; then
+                echo "  already published, skipping"
+              else
+                echo "$out" >&2
+                exit 1
+              fi
+            else
+              echo "$out"
+            fi
+          done
+          rm -f "$NPMRC"
+
+      - name: Publish release
+        id: publish
+        uses: softprops/action-gh-release@v2
+        with:
+          # Stable asset name: /releases/latest/download/omg-bundle.tar.gz.
+          # lfg-bundle.tar.gz is the same tarball under its pre-rename name —
+          # every setup.sh already on a machine asks for it by name, so dropping
+          # it would break `latest` for every existing installer.
+          #
+          # The package tarballs stay attached even though they are on npm now:
+          # they are what the bundle's own pruned manifest can fall back to, and
+          # an attached artifact is the record of exactly what a tag shipped.
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          #
+          # The omg-<os>-<arch> bundles are what setup.sh asks for first: they
+          # carry node_modules already installed and pruned for that target, so
+          # an install resolves nothing locally. Matched by glob rather than
+          # listed one per line on purpose — release.sh skips a platform whose
+          # cross-install fails instead of failing the whole build, and naming
+          # them individually would turn that survivable skip into a release
+          # that cannot publish. The glob needs two dashes, so it cannot pick up
+          # omg-bundle.tar.gz.
+          files: |
+            dist/omg-bundle.tar.gz
+            dist/omg-bundle.tar.gz.sha256
+            dist/lfg-bundle.tar.gz
+            dist/lfg-bundle.tar.gz.sha256
+            dist/omg-*-*.tar.gz
+            dist/omg-*-*.tar.gz.sha256
+            dist/omg-dev-protocol-*.tgz
+            dist/omg-dev-client-*.tgz
+            dist/omg-dev-react-*.tgz
+            dist/omg-dev-app-*.tgz
+            dist/omg-dev-cli-*.tgz
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+
+      # A release is not published when the upload step exits — it is
+      # published when every staged asset is on the release. v0.1.360 died
+      # mid-upload during a GitHub 500s window: 3 of 16 assets never arrived,
+      # the log just stopped, and the red run was the only signal.
+      # fail_on_unmatched_files only proves each glob matched a local file;
+      # this step proves the uploads landed. It re-uploads whatever is
+      # missing (transient flakiness is the common case) and then fails the
+      # job if the release is still incomplete — a retried-and-still-partial
+      # release must go red, not ship quietly.
+      #
+      # Runs even when the publish step failed: that is exactly the case
+      # where assets may be missing, and repairing them here turns a red
+      # build into a red build whose release is at least whole.
+      - name: Verify release assets
+        if: ${{ !cancelled() && steps.publish.outcome != 'skipped' && startsWith(inputs.tag || github.ref_name, 'v') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: bash scripts/verify-release-assets.sh "$RELEASE_TAG"
+
+      # A failed tag build emails only the pusher, and v0.1.360 showed that
+      # is not enough — it sat broken until someone read `gh run list` for
+      # an unrelated reason. File one issue per tag so the failure is
+      # durable and visible to everyone watching the repo. Re-runs of the
+      # same tag comment on the existing issue instead of opening new ones.
+      - name: File an issue on failure
+        if: ${{ failure() && startsWith(inputs.tag || github.ref_name, 'v') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          title="Release ${RELEASE_TAG} failed"
+          existing="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
+            --search "\"${title}\" in:title" --json number --jq '.[0].number // empty')"
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" \
+              --body "Failed again: ${run_url}"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$(cat <<EOF
+          The release workflow run for \`${RELEASE_TAG}\` failed: ${run_url}
+
+          If the publish step died mid-upload, the GitHub Release may exist
+          with assets missing — check it before tagging the next release:
+
+          \`\`\`
+          gh release view ${RELEASE_TAG} --json assets --jq '.assets[].name'
+          bash scripts/verify-release-assets.sh ${RELEASE_TAG} dist
+          \`\`\`
+
+          A \`latest\` release with missing assets silently breaks
+          \`omg update\` for every user on the affected platform.
+          EOF
+          )"
+          fi

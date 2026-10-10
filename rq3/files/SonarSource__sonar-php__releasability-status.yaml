@@ -1,0 +1,25 @@
+name: Releasability Status
+on:
+  workflow_dispatch:
+  workflow_run:
+    workflows: [Build]  # Name must match the build workflow
+    types:
+      - completed
+    branches:
+      - master
+      - branch-*
+
+jobs:
+  releasability-status:
+    name: Releasability status
+    runs-on: sonar-s-public
+    permissions:
+      id-token: write
+      statuses: write
+      contents: read
+    steps:
+      - uses: SonarSource/gh-action_releasability/releasability-status@v3
+        with:
+          optional_checks: 'Jira'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}

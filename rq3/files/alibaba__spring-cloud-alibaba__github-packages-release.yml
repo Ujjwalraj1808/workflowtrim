@@ -1,0 +1,59 @@
+name: GitHub Packages Release
+on:
+  push:
+    branches:
+      - 2023.x
+      - 2025.0.x
+      - 2025.1.x
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  release:
+    name: Release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v5
+      - name: Set up JDK 21
+        uses: actions/setup-java@v5
+        with:
+          java-version: '21'
+          distribution: 'adopt'
+          # https://github.com/actions/setup-java/releases/tag/v5.5.0 MAVEN_ARGS
+          # https://github.com/actions/setup-java/pull/1053
+          show-download-progress: true
+      - name: Dependencies Cache
+        uses: actions/cache@v5
+        with:
+          path: ~/.m2/repository
+          key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
+          restore-keys: |
+            ${{ runner.os }}-maven-
+      - name: install dependencies
+        run: mvn clean -B install -U package -pl '!spring-cloud-alibaba-coverage'  -DskipTests
+      - name: cat ~/.m2/settings.xml
+        run: |
+          cat ~/.m2/settings.xml
+      - name: Deploy to GitHub Package Maven
+        run: |
+          VERSION=$(mvn help:evaluate -Dexpression=project.version -q -DforceStdout)
+          echo "Project version: $VERSION"
+          if [[ "$VERSION" != *"-SNAPSHOT" ]]; then
+            echo "Not a snapshot version. Skipping deployment."
+            exit 0
+          fi
+          mvn clean -B deploy -pl . -DskipTests
+          cd $GITHUB_WORKSPACE/spring-cloud-alibaba-dependencies
+          mvn clean -B deploy -DskipTests
+          cd $GITHUB_WORKSPACE/spring-cloud-alibaba-starters
+          mvn clean -B deploy -DskipTests
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+      - name: Delete snapshots from the Maven local repository
+        run: find ~/.m2/repository -type d -name '*-SNAPSHOT' -print -exec rm -r {} +

@@ -1,0 +1,114 @@
+name: Ingest GHSA Malware
+
+on:
+  schedule:
+  - cron: '15 * * * *' # Every hour, at quarter past. To limit conflicts.
+  workflow_dispatch:
+
+permissions: read-all
+
+jobs:
+  ingest-ghsa:
+    name: Ingest GHSA
+    continue-on-error: false
+    runs-on: ubuntu-latest
+
+    permissions:
+      actions: read
+      contents: write
+
+    steps:
+    - name: Checkout self
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        token: ${{ secrets.GH_TOKEN }}
+    - name: Checkout ossf/osv-schema
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        token: ${{ secrets.GH_TOKEN }}
+        repository: ossf/osv-schema
+        ref: 423306dd97fb345252590f8d86d7d9d1b2ecf92c
+        path: osv-schema
+    - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      with:
+        go-version-file: 'go.mod'
+    - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      with:
+        python-version: "3.13"
+        cache: pipenv
+        cache-dependency-path: osv-schema/tools/ghsa/Pipfile.lock
+
+    - name: Install pipenv
+      run: |
+        pip install pipenv==2025.0.4
+
+    - name: Install dependencies
+      run: |
+        cd osv-schema/tools/ghsa
+        pipenv sync
+
+    - name: Output GitHub quotas pre dump
+      run: |
+        gh api graphql -f query='
+          query {
+            rateLimit {
+              limit
+              cost
+              remaining
+              resetAt
+            }
+          }
+        '
+        gh api -i --silent "/advisories?type=malware&per_page=1&sort=updated&direction=desc"
+      env:
+        GH_TOKEN: ${{ github.token }}
+
+    - name: Dump GHSA Malware
+      run: |
+        cd osv-schema/tools/ghsa
+        mkdir OUT
+        TIMESINCE=`python3 -c 'import datetime; dt=datetime.datetime.now(datetime.UTC)-datetime.timedelta(hours=24); print(dt.isoformat())'`
+        pipenv run python dump_ghsa.py --token "${{ github.token }}" --query "classifications: [MALWARE] updatedSince: \"$TIMESINCE\" orderBy: { direction: ASC field: UPDATED_AT }" OUT
+
+    - name: Output GitHub quotas post dump
+      run: |
+        gh api graphql -f query='
+          query {
+            rateLimit {
+              limit
+              cost
+              remaining
+              resetAt
+            }
+          }
+        '
+      env:
+        GH_TOKEN: ${{ github.token }}
+
+    - name: Convert GHSA to OSV
+      run: |
+        cd osv-schema/tools/ghsa
+        mkdir OSV
+        pipenv run python convert_ghsa.py -o OSV OUT/*.json
+
+    - name: Ingest OSV
+      run: |
+        go run ./cmd/ingest -config config/config.yaml -dir osv-schema/tools/ghsa/OSV -source ghsa-malware
+
+    - name: Prepare commit
+      run: |
+        git config user.name github-actions
+        git config user.email github-actions@github.com
+        git add osv
+    - name: Commit report changes
+      run: git diff --cached --quiet || git commit -m 'Ingest OSV - GHSA Malware'
+    - name: Push commit
+      if: ${{ github.ref == 'refs/heads/main' }}
+      run: git push
+
+    - name: Save OSV for debugging
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      with:
+        name: ghsa-osv
+        path: osv-schema/tools/ghsa/OSV/*.json
+        retention-days: 14

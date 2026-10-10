@@ -1,0 +1,198 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+      - '**/LICENSE'
+      - '**/.gitignore'
+  pull_request:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+      - '**/LICENSE'
+      - '**/.gitignore'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: self-hosted
+    timeout-minutes: 15
+    container:
+      image: golang:1.26.9
+      options: --cpus=2
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Trust workspace
+        run: git config --global --replace-all safe.directory '*'
+
+      - name: Verify generated provider presets
+        run: go run ./internal/llm/gen -check -output extensions/frontend/src/shared/providers.generated.ts -kotlin-output extensions/idea/src/main/kotlin/com/alibaba/opencodereview/idea/services/ProviderNames.generated.kt
+
+      - name: Verify license headers
+        run: bash scripts/verify-license.sh
+
+      - name: Verify action pins
+        run: bash scripts/verify-action-pins.sh
+
+      - name: Verify sources contain no unapproved non-English text
+        run: go run scripts/verify-english-only.go
+
+      - name: Check formatting
+        run: |
+          unformatted="$(gofmt -s -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "::error::Not gofmt-clean. Run 'gofmt -s -w .' and commit:"
+            echo "$unformatted"
+            gofmt -s -d .
+            exit 1
+          fi
+      
+      - name: Check line endings
+        run: |
+          git add --renormalize .
+          if ! git diff --cached --quiet; then
+            echo "::error::Line endings must be LF. Run 'git add --renormalize .' and commit the diff below."
+            git diff --cached --stat
+            exit 1
+          fi
+        
+      - name: Check go.mod is tidy
+        run: |
+          go mod tidy
+          if ! git diff --exit-code -- go.mod go.sum; then
+            echo "::error::go.mod/go.sum are not tidy. Run 'go mod tidy' and commit the diff above."
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@v1.6.0
+          govulncheck ./...
+
+      - name: Test with coverage
+        env:
+          OCR_DELEGATE_REQUIRE_PTY: '1'
+        run: |
+          go test -v -race -count=1 -coverprofile=coverage.out ./...
+          go tool cover -func=coverage.out | grep total: | awk '{print $3}'
+
+      - name: Check coverage threshold
+        run: |
+          COVERAGE=$(go tool cover -func=coverage.out | grep total: | awk '{print $3}' | sed 's/%//')
+          echo "Total coverage: ${COVERAGE}%"
+          if awk "BEGIN {exit !($COVERAGE < 90)}"; then
+            echo "FAIL: Coverage ${COVERAGE}% is below 90% threshold"
+            exit 1
+          fi
+          echo "PASS: Coverage ${COVERAGE}% meets 90% threshold"
+
+      - name: Build
+        run: go build -o ./opencodereview ./cmd/opencodereview
+
+      - name: Smoke test
+        run: |
+          ./opencodereview --version
+          ./opencodereview --version | grep -q "open-code-review"
+          HELP=$(./opencodereview --help)
+          echo "$HELP" | grep -q "Commands:"
+          echo "$HELP" | grep -q "review"
+          echo "$HELP" | grep -q "scan"
+          echo "$HELP" | grep -q "delegate"
+          echo "$HELP" | grep -q "config"
+          echo "$HELP" | grep -q "llm"
+          echo "$HELP" | grep -q "viewer"
+          echo "$HELP" | grep -q "session"
+          echo "$HELP" | grep -q "rules"
+          rm -f ./opencodereview
+
+  # Runs the suite natively on Windows, which the cross-compile job below cannot
+  # do: it only proves the windows arms of the build-tag splits compile. GitHub
+  # does not support `container:` on Windows runners
+  # (actions/runner#904), so this job installs Go directly instead of reusing the
+  # golang:1.26.9 image the other jobs share.
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.26.9'
+          cache: true
+
+      - name: Vet
+        run: go vet ./...
+
+      # No -race here: the race detector needs a working C toolchain on Windows,
+      # and races are OS-independent, so the Linux job above already covers them.
+      # This job is here for the OS-specific behavior instead. No coverage gate
+      # either -- the //go:build !windows test files legitimately drop the total
+      # below the 80% the Linux job enforces.
+      - name: Test
+        run: go test -count=1 ./...
+
+      - name: Test Node launcher
+        run: npm run test:launcher
+
+      - name: Build
+        run: go build -o opencodereview.exe ./cmd/opencodereview
+
+      # Same assertions as the Linux smoke test, under git-bash so the script is
+      # shared verbatim rather than reimplemented in PowerShell.
+      - name: Smoke test
+        shell: bash
+        run: |
+          ./opencodereview.exe --version
+          ./opencodereview.exe --version | grep -q "open-code-review"
+          HELP=$(./opencodereview.exe --help)
+          echo "$HELP" | grep -q "Commands:"
+          echo "$HELP" | grep -q "review"
+          echo "$HELP" | grep -q "scan"
+          echo "$HELP" | grep -q "delegate"
+          echo "$HELP" | grep -q "config"
+          echo "$HELP" | grep -q "llm"
+          echo "$HELP" | grep -q "viewer"
+          echo "$HELP" | grep -q "session"
+          echo "$HELP" | grep -q "rules"
+          rm -f ./opencodereview.exe
+
+  cross-compile:
+    runs-on: self-hosted
+    timeout-minutes: 10
+    container:
+      image: golang:1.26.9
+      options: --cpus=2
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {goos: linux,   goarch: arm64}
+          - {goos: darwin,  goarch: amd64}
+          - {goos: darwin,  goarch: arm64}
+          - {goos: windows, goarch: amd64}
+          - {goos: windows, goarch: arm64}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Trust workspace
+        run: git config --global --replace-all safe.directory '*'
+
+      - name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: '0'
+        run: go build -o /dev/null ./...

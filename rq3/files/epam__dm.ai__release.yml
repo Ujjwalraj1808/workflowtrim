@@ -1,0 +1,708 @@
+name: Release DMTools
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Custom version (e.g., 1.7.54). Leave empty to auto-increment patch version.'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  checks: write
+  packages: write
+
+jobs:
+  version-and-tag:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      checks: write
+    outputs:
+      version: ${{ steps.new_version.outputs.version }}
+      current_version: ${{ steps.current_version.outputs.current }}
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          token: ${{ secrets.PAT_TOKEN }}
+          fetch-depth: 0
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      # Unit tests are intentionally NOT re-run here: main is protected by the
+      # "Java unit tests" required status check, so any commit reachable from
+      # main has already passed them. Re-running the full suite here just adds
+      # ~5-7 minutes during which main can move forward (e.g. another PR merges),
+      # causing the final "Push changes and tag" step to be rejected as
+      # non-fast-forward.
+
+      - name: Read current version
+        id: current_version
+        run: |
+          CURRENT_VERSION=$(grep '^version=' gradle.properties | cut -d'=' -f2)
+          echo "current=$CURRENT_VERSION" >> $GITHUB_OUTPUT
+          echo "Current version: $CURRENT_VERSION"
+      
+      - name: Determine new version
+        id: new_version
+        run: |
+          CURRENT_VERSION="${{ steps.current_version.outputs.current }}"
+          CUSTOM_VERSION="${{ github.event.inputs.version }}"
+          
+          if [ -n "$CUSTOM_VERSION" ]; then
+            NEW_VERSION="$CUSTOM_VERSION"
+            echo "Using custom version: $NEW_VERSION"
+          else
+            # Auto-increment patch version
+            IFS='.' read -ra VERSION_PARTS <<< "$CURRENT_VERSION"
+            MAJOR="${VERSION_PARTS[0]}"
+            MINOR="${VERSION_PARTS[1]}"
+            PATCH="${VERSION_PARTS[2]}"
+            PATCH=$((PATCH + 1))
+            NEW_VERSION="$MAJOR.$MINOR.$PATCH"
+            echo "Auto-incremented version: $NEW_VERSION"
+          fi
+          
+          echo "version=$NEW_VERSION" >> $GITHUB_OUTPUT
+      
+      - name: Update gradle.properties
+        run: |
+          NEW_VERSION="${{ steps.new_version.outputs.version }}"
+          sed -i "s/^version=.*/version=$NEW_VERSION/" gradle.properties
+          cat gradle.properties
+      
+      - name: Commit version change
+        run: |
+          NEW_VERSION="${{ steps.new_version.outputs.version }}"
+          git add gradle.properties
+          git commit -m "version increased to $NEW_VERSION"
+      
+      - name: Create tag
+        run: |
+          NEW_VERSION="${{ steps.new_version.outputs.version }}"
+          git tag "v$NEW_VERSION"
+          echo "Created tag: v$NEW_VERSION"
+      
+      - name: Generate changelog
+        id: changelog
+        run: |
+          CURRENT_VERSION="${{ steps.current_version.outputs.current }}"
+          NEW_VERSION="${{ steps.new_version.outputs.version }}"
+          PREV_TAG="v$CURRENT_VERSION"
+          NEW_TAG="v$NEW_VERSION"
+
+          if git rev-parse "$PREV_TAG" >/dev/null 2>&1; then
+            .github/scripts/generate-release-changelog.sh "$PREV_TAG" "$NEW_TAG" changelog.md
+          else
+            echo "## 📝 What's Changed" > changelog.md
+            echo "" >> changelog.md
+            echo "Previous tag $PREV_TAG not found. See [commits since last release](https://github.com/${{ github.repository }}/commits/v$NEW_VERSION)." >> changelog.md
+            echo "" >> changelog.md
+          fi
+
+          echo "--- Generated changelog ---"
+          cat changelog.md
+          echo "--- End changelog ---"
+
+      - name: Upload changelog artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-changelog
+          path: changelog.md
+          retention-days: 7
+
+      - name: Push changes and tag
+        run: |
+          NEW_VERSION="${{ steps.new_version.outputs.version }}"
+          git remote add epam https://x-access-token:${{ secrets.PAT_TOKEN }}@github.com/epam/dm.ai.git
+
+          # Push to temp branch first so the commit SHA exists on GitHub
+          git push epam HEAD:refs/heads/release-temp-v$NEW_VERSION
+
+          # Create "Java unit tests" check run via API for this commit
+          # This satisfies the branch protection required status check
+          # Uses github.token (GitHub Actions app) which has checks:write permission
+          COMMIT_SHA=$(git rev-parse HEAD)
+          curl -s -X POST \
+            -H "Authorization: Bearer ${{ github.token }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            https://api.github.com/repos/epam/dm.ai/check-runs \
+            -d "{
+              \"name\": \"Java unit tests\",
+              \"head_sha\": \"$COMMIT_SHA\",
+              \"status\": \"completed\",
+              \"conclusion\": \"success\",
+              \"output\": {
+                \"title\": \"Tests passed\",
+                \"summary\": \"All unit tests passed in release workflow\"
+              }
+            }"
+
+          # Push to main (branch protection now satisfied).
+          # Retry with rebase in case main advanced (e.g. another PR merged)
+          # between checkout and this step.
+          for attempt in 1 2 3; do
+            if git push epam main; then
+              break
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              echo "::error::Failed to push to main after $attempt attempts"
+              exit 1
+            fi
+            echo "Push rejected (main moved), rebasing and retrying ($attempt)..."
+            git fetch epam main
+            git rebase epam/main
+          done
+          git push epam --tags
+
+          # Clean up temp branch
+          git push epam --delete refs/heads/release-temp-v$NEW_VERSION || true
+      
+      - name: Summary
+        run: |
+          echo "✅ Version and tag created successfully!"
+          echo "📦 Old version: ${{ steps.current_version.outputs.current }}"
+          echo "🚀 New version: ${{ steps.new_version.outputs.version }}"
+          echo "🏷️  Tag: v${{ steps.new_version.outputs.version }}"
+  
+  # Single build job - compiles and tests once
+  build-and-test:
+    needs: version-and-tag
+    uses: ./.github/workflows/build-and-test.yml
+    secrets: inherit
+    with:
+      version: ${{ needs.version-and-tag.outputs.version }}
+  
+  # Parallel packaging jobs - no compilation, just packaging
+  package-cli:
+    needs: [version-and-tag, build-and-test]
+    uses: ./.github/workflows/package-cli.yml
+    secrets: inherit
+    with:
+      version: ${{ needs.version-and-tag.outputs.version }}
+
+  # package-standalone:
+  #   needs: [version-and-tag, build-and-test]
+  #   uses: ./.github/workflows/package-standalone.yml
+  #   secrets: inherit
+  #   with:
+  #     version: ${{ needs.version-and-tag.outputs.version }}
+  #     flutter_release_tag: latest
+
+  # Package AI skill
+  package-skill:
+    needs: [version-and-tag, build-and-test]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Update version in skill metadata
+        run: |
+          VERSION="${{ needs.version-and-tag.outputs.version }}"
+
+          # Update version in SKILL.md metadata
+          if [ -f "dmtools-ai-docs/SKILL.md" ]; then
+            sed -i "s/version: .*/version: $VERSION/" dmtools-ai-docs/SKILL.md
+          fi
+
+      - name: Create skill package
+        run: |
+          VERSION="${{ needs.version-and-tag.outputs.version }}"
+          DIST_DIR="dist"
+          mkdir -p "$DIST_DIR" "$DIST_DIR/staging"
+
+          copy_skill_doc() {
+            local source_file="$1"
+            local target_root="$2"
+            mkdir -p "$target_root/$(dirname "$source_file")"
+            cp "dmtools-ai-docs/$source_file" "$target_root/$source_file"
+          }
+
+          create_skill_manifest() {
+            local target_root="$1"
+            local skill_name="$2"
+            local title="$3"
+            local description="$4"
+            cat > "$target_root/SKILL.md" <<EOF
+          ---
+          name: $skill_name
+          description: $description
+          license: Apache-2.0
+          compatibility:
+            - Java 17+
+            - macOS, Linux, Windows (WSL)
+          metadata:
+            version: skill-v$VERSION
+            author: DMtools Team
+            repository: https://github.com/epam/dm.ai
+            documentation: https://github.com/epam/dm.ai/tree/main/dmtools-ai-docs
+          ---
+
+          # $title
+
+          Install instructions: [references/installation/README.md#install-only-the-skills-you-need](references/installation/README.md#install-only-the-skills-you-need)
+
+          Use the focused configuration and MCP reference pages included in this package:
+          EOF
+          }
+
+          package_directory() {
+            local source_dir="$1"
+            local base_name="$2"
+            local output_dir="$PWD/$DIST_DIR"
+            (
+              cd "$source_dir"
+              zip -rq "$output_dir/${base_name}-v${VERSION}.zip" .
+              tar -czf "$output_dir/${base_name}-v${VERSION}.tar.gz" .
+            )
+            cp "$DIST_DIR/${base_name}-v${VERSION}.zip" "$DIST_DIR/${base_name}.zip"
+            cp "$DIST_DIR/${base_name}-v${VERSION}.tar.gz" "$DIST_DIR/${base_name}.tar.gz"
+          }
+
+          echo "📦 Creating DMtools Agent Skill packages..."
+
+          package_directory "dmtools-ai-docs" "dmtools-skill"
+
+          mkdir -p "$DIST_DIR/staging/jira"
+          create_skill_manifest "$DIST_DIR/staging/jira" "dmtools-jira" "DMtools Jira Skill" "Focused DMtools skill for Jira setup, Jira MCP tools, and Xray-backed workflows."
+          cat >> "$DIST_DIR/staging/jira/SKILL.md" <<'EOF'
+          - [Jira configuration](references/configuration/integrations/jira.md)
+          - [Jira MCP tools](references/mcp-tools/jira-tools.md)
+          - [Xray manual generation](references/test-generation/xray-manual.md)
+          EOF
+          copy_skill_doc "references/installation/README.md" "$DIST_DIR/staging/jira"
+          copy_skill_doc "references/configuration/integrations/jira.md" "$DIST_DIR/staging/jira"
+          copy_skill_doc "references/mcp-tools/jira-tools.md" "$DIST_DIR/staging/jira"
+          copy_skill_doc "references/test-generation/xray-manual.md" "$DIST_DIR/staging/jira"
+          package_directory "$DIST_DIR/staging/jira" "dmtools-jira-skill"
+
+          mkdir -p "$DIST_DIR/staging/github"
+          create_skill_manifest "$DIST_DIR/staging/github" "dmtools-github" "DMtools GitHub Skill" "Focused DMtools skill for GitHub configuration and pull request tooling."
+          cat >> "$DIST_DIR/staging/github/SKILL.md" <<'EOF'
+          - [GitHub configuration](references/configuration/integrations/github.md)
+          - [GitHub MCP tools](references/mcp-tools/github-tools.md)
+          EOF
+          copy_skill_doc "references/installation/README.md" "$DIST_DIR/staging/github"
+          copy_skill_doc "references/configuration/integrations/github.md" "$DIST_DIR/staging/github"
+          copy_skill_doc "references/mcp-tools/github-tools.md" "$DIST_DIR/staging/github"
+          package_directory "$DIST_DIR/staging/github" "dmtools-github-skill"
+
+          mkdir -p "$DIST_DIR/staging/ado"
+          create_skill_manifest "$DIST_DIR/staging/ado" "dmtools-ado" "DMtools Azure DevOps Skill" "Focused DMtools skill for Azure DevOps configuration, work item automation, and PR tooling."
+          cat >> "$DIST_DIR/staging/ado/SKILL.md" <<'EOF'
+          - [ADO configuration](references/configuration/integrations/ado.md)
+          - [ADO MCP tools](references/mcp-tools/ado-tools.md)
+          EOF
+          copy_skill_doc "references/installation/README.md" "$DIST_DIR/staging/ado"
+          copy_skill_doc "references/configuration/integrations/ado.md" "$DIST_DIR/staging/ado"
+          copy_skill_doc "references/mcp-tools/ado-tools.md" "$DIST_DIR/staging/ado"
+          package_directory "$DIST_DIR/staging/ado" "dmtools-ado-skill"
+
+          mkdir -p "$DIST_DIR/staging/testrail"
+          create_skill_manifest "$DIST_DIR/staging/testrail" "dmtools-testrail" "DMtools TestRail Skill" "Focused DMtools skill for TestRail configuration and generated test case workflows."
+          cat >> "$DIST_DIR/staging/testrail/SKILL.md" <<'EOF'
+          - [TestRail configuration](references/configuration/integrations/testrail.md)
+          - [TestRail MCP tools](references/mcp-tools/testrail-tools.md)
+          - [TestRail manual generation](references/test-generation/testrail-manual.md)
+          EOF
+          copy_skill_doc "references/installation/README.md" "$DIST_DIR/staging/testrail"
+          copy_skill_doc "references/configuration/integrations/testrail.md" "$DIST_DIR/staging/testrail"
+          copy_skill_doc "references/mcp-tools/testrail-tools.md" "$DIST_DIR/staging/testrail"
+          copy_skill_doc "references/test-generation/testrail-manual.md" "$DIST_DIR/staging/testrail"
+          package_directory "$DIST_DIR/staging/testrail" "dmtools-testrail-skill"
+
+          # Focused packs for the remaining integrations the installer advertises (dm.ai#675).
+          # Docs: MCP tool reference (always) + configuration guide / manual (when it exists).
+          make_focused_pack() {
+            local key="$1" title="$2" description="$3"; shift 3
+            local name="dmtools-$key"
+            mkdir -p "$DIST_DIR/staging/$key"
+            create_skill_manifest "$DIST_DIR/staging/$key" "$name" "$title" "$description"
+            copy_skill_doc "references/installation/README.md" "$DIST_DIR/staging/$key"
+            local doc
+            for doc in "$@"; do
+              if [ -f "dmtools-ai-docs/$doc" ]; then
+                copy_skill_doc "$doc" "$DIST_DIR/staging/$key"
+                echo "- [$doc]($doc)" >> "$DIST_DIR/staging/$key/SKILL.md"
+              fi
+            done
+            package_directory "$DIST_DIR/staging/$key" "$name-skill"
+          }
+          make_focused_pack confluence "DMtools Confluence Skill" "Focused DMtools skill for Confluence page reading, Markdown conversion and publishing." references/configuration/integrations/confluence.md references/mcp-tools/confluence-tools.md
+          make_focused_pack gitlab "DMtools GitLab Skill" "Focused DMtools skill for GitLab merge-request review and repository tooling." references/configuration/integrations/gitlab.md references/mcp-tools/gitlab-tools.md
+          make_focused_pack figma "DMtools Figma Skill" "Focused DMtools skill for Figma design reading and asset export." references/configuration/integrations/figma.md references/mcp-tools/figma-tools.md
+          make_focused_pack teams "DMtools Teams Skill" "Focused DMtools skill for Microsoft Teams messages and transcripts." references/configuration/integrations/teams.md references/mcp-tools/teams-tools.md references/mcp-tools/teams_auth-tools.md
+          make_focused_pack sharepoint "DMtools SharePoint Skill" "Focused DMtools skill for SharePoint file access." references/configuration/integrations/sharepoint.md references/mcp-tools/sharepoint-tools.md references/mcp-tools/teams_auth-tools.md
+          make_focused_pack xray "DMtools Xray Skill" "Focused DMtools skill for Jira Xray test management." references/configuration/integrations/jira.md references/mcp-tools/jira_xray-tools.md references/test-generation/xray-manual.md
+
+          # Copy install scripts (bash + PowerShell)
+          cp dmtools-ai-docs/install.sh $DIST_DIR/skill-install.sh
+          chmod +x $DIST_DIR/skill-install.sh
+          cp dmtools-ai-docs/skill-install.ps1 $DIST_DIR/skill-install.ps1
+
+          echo "✅ Skill package created:"
+          ls -lh $DIST_DIR/
+
+      - name: Generate checksums
+        run: |
+          cd dist
+          sha256sum *.zip *.tar.gz > skill-checksums.sha256
+          cat skill-checksums.sha256
+
+      - name: Upload skill artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: skill-package
+          path: |
+            dist/dmtools-skill*.zip
+            dist/dmtools-skill*.tar.gz
+            dist/dmtools-jira-skill*.zip
+            dist/dmtools-jira-skill*.tar.gz
+            dist/dmtools-github-skill*.zip
+            dist/dmtools-github-skill*.tar.gz
+            dist/dmtools-ado-skill*.zip
+            dist/dmtools-ado-skill*.tar.gz
+            dist/dmtools-testrail-skill*.zip
+            dist/dmtools-testrail-skill*.tar.gz
+            dist/dmtools-confluence-skill*.zip
+            dist/dmtools-confluence-skill*.tar.gz
+            dist/dmtools-gitlab-skill*.zip
+            dist/dmtools-gitlab-skill*.tar.gz
+            dist/dmtools-figma-skill*.zip
+            dist/dmtools-figma-skill*.tar.gz
+            dist/dmtools-teams-skill*.zip
+            dist/dmtools-teams-skill*.tar.gz
+            dist/dmtools-sharepoint-skill*.zip
+            dist/dmtools-sharepoint-skill*.tar.gz
+            dist/dmtools-xray-skill*.zip
+            dist/dmtools-xray-skill*.tar.gz
+            dist/skill-install.sh
+            dist/skill-install.ps1
+            dist/skill-checksums.sha256
+          retention-days: 7
+
+  # Create unified release with all artifacts
+  create-unified-release:
+    needs: [version-and-tag, package-cli, package-skill]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: write
+
+    steps:
+      - name: Download CLI Package
+        uses: actions/download-artifact@v8
+        with:
+          name: cli-package
+          path: cli/
+
+      - name: Download Skill Package
+        uses: actions/download-artifact@v8
+        with:
+          name: skill-package
+          path: skill/
+
+      - name: Download changelog
+        uses: actions/download-artifact@v8
+        with:
+          name: release-changelog
+          path: changelog/
+      
+      # - name: Download Standalone Package
+      #   uses: actions/download-artifact@v8
+      #   with:
+      #     name: standalone-package
+      #     path: standalone/
+
+      - name: List Downloaded Artifacts
+        run: |
+          echo "CLI artifacts:"
+          ls -lhR cli/
+          echo ""
+          echo "Skill artifacts:"
+          ls -lhR skill/
+          # echo ""
+          # echo "Standalone artifacts:"
+          # ls -lhR standalone/
+      
+      - name: Generate Release Notes
+        run: |
+          VERSION="${{ needs.version-and-tag.outputs.version }}"
+
+          # Get CLI JAR size
+          CLI_JAR_SIZE=$(du -h cli/dmtools-v${VERSION}-all.jar | cut -f1)
+
+          # Get Skill package sizes
+          SKILL_ZIP_SIZE=$(du -h skill/dmtools-skill-v${VERSION}.zip | cut -f1)
+          SKILL_TAR_SIZE=$(du -h skill/dmtools-skill-v${VERSION}.tar.gz | cut -f1)
+
+          # Standalone artifacts disabled
+          # STANDALONE_JAR_SIZE=$(du -h standalone/dmtools-standalone.jar | cut -f1)
+          # STANDALONE_WAR_SIZE=$(du -h standalone/dmtools-standalone.war | cut -f1)
+          # MACOS_ARM_SIZE=$(du -h standalone/bundles/dmtools-standalone-macos-aarch64.zip | cut -f1)
+          # MACOS_X64_SIZE=$(du -h standalone/bundles/dmtools-standalone-macos-x64.zip | cut -f1)
+          # WINDOWS_X64_SIZE=$(du -h standalone/bundles/dmtools-standalone-windows-x64.zip | cut -f1)
+          # API_MACOS_ARM_SIZE=$(du -h standalone/api-bundles/dmtools-server-api-macos-aarch64.zip | cut -f1)
+          # API_MACOS_X64_SIZE=$(du -h standalone/api-bundles/dmtools-server-api-macos-x64.zip | cut -f1)
+          # API_WINDOWS_X64_SIZE=$(du -h standalone/api-bundles/dmtools-server-api-windows-x64.zip | cut -f1)
+
+          CHANGELOG_FILE="changelog/changelog.md"
+          if [ -f "$CHANGELOG_FILE" ]; then
+            CHANGELOG_CONTENT=$(cat "$CHANGELOG_FILE")
+          else
+            CHANGELOG_CONTENT="## 📝 What's Changed\n\nNo changelog available for this release."
+          fi
+
+          cat > release_notes.md << EOF
+          # 🚀 DMTools Release v${VERSION}
+
+          ${CHANGELOG_CONTENT}
+
+          ---
+
+          This release includes the **DMTools CLI** and **Agent Skill** for enterprise dark-factory orchestration across MCP tools, AI agents, and delivery workflows.
+
+          ## 📦 What's Included
+
+          ### 🖥️ DMTools CLI
+          - **Command-line interface** for DMTools operations
+          - **Java-based** automation and integration tools
+          - **Cross-platform install scripts** for easy setup (\`install\`, \`install.sh\`, \`install.bat\`, \`install.ps1\`)
+          - **Wrapper script** (\`dmtools.sh\`)
+
+          ### 🤖 DMTools Agent Skill
+          - **AI assistant skill** for MCP, AI agents, and generative-ai-friendly DMTools workflows in Cursor, Claude, Codex, and other Agent Skills compatible systems
+          - **Complete DMtools documentation** (67+ MCP tools, JavaScript agent development, and configuration guides)
+          - **Cross-platform support** (works with all major AI coding assistants)
+          
+          ## 🎯 Quick Start
+
+          ### Install DMTools CLI
+
+          **macOS / Linux / Git Bash:**
+          \`\`\`bash
+          curl -fsSL https://github.com/${{ github.repository }}/releases/latest/download/install.sh | bash
+          \`\`\`
+
+          **Windows (PowerShell):**
+          \`\`\`powershell
+          irm https://github.com/${{ github.repository }}/releases/latest/download/install.ps1 | iex
+          \`\`\`
+
+          ### Install DMTools Agent Skill
+
+          **macOS / Linux / Git Bash:**
+          \`\`\`bash
+          curl -fsSL https://github.com/${{ github.repository }}/releases/download/v${VERSION}/skill-install.sh | bash
+          \`\`\`
+
+          **Windows (PowerShell):**
+          \`\`\`powershell
+          irm https://github.com/${{ github.repository }}/releases/download/v${VERSION}/skill-install.ps1 | iex
+          \`\`\`
+
+          **Focused skill install:**
+          \`\`\`bash
+          curl -fsSL https://github.com/${{ github.repository }}/releases/download/v${VERSION}/skill-install.sh | bash -s -- --skills jira,github
+          \`\`\`
+
+          **Focused packages:**
+          - \`dmtools-jira-skill.zip\` → \`/dmtools-jira\`
+          - \`dmtools-github-skill.zip\` → \`/dmtools-github\`
+          - \`dmtools-ado-skill.zip\` → \`/dmtools-ado\`
+          - \`dmtools-testrail-skill.zip\` → \`/dmtools-testrail\`
+          - \`dmtools-confluence-skill.zip\` → \`/dmtools-confluence\`
+          - \`dmtools-gitlab-skill.zip\` → \`/dmtools-gitlab\`
+          - \`dmtools-figma-skill.zip\` → \`/dmtools-figma\`
+          - \`dmtools-teams-skill.zip\` → \`/dmtools-teams\`
+          - \`dmtools-sharepoint-skill.zip\` → \`/dmtools-sharepoint\`
+          - \`dmtools-xray-skill.zip\` → \`/dmtools-xray\`
+
+          **Manual Installation:**
+          1. Download \`dmtools-skill.zip\` or a focused package such as \`dmtools-jira-skill.zip\`
+          2. Extract to one of these directories:
+             - \`.cursor/skills/\` (project-level Cursor)
+             - \`.claude/skills/\` (project-level Claude)
+             - \`~/.claude/skills/\` (global Claude)
+             - \`.codex/skills/\` (project-level Codex)
+
+          ### Install Specific Version (v${VERSION})
+
+          **DMTools CLI - macOS / Linux / Git Bash:**
+          \`\`\`bash
+          curl -fsSL https://github.com/${{ github.repository }}/releases/download/v${VERSION}/install.sh | bash -s -- v${VERSION}
+          \`\`\`
+
+          **DMTools CLI - Windows (cmd.exe):**
+          \`\`\`cmd
+          set DMTOOLS_VERSION=v${VERSION} && curl -fsSL https://github.com/${{ github.repository }}/releases/download/v${VERSION}/install.bat -o "%TEMP%\dmtools-install.bat" && "%TEMP%\dmtools-install.bat"
+          \`\`\`
+
+          **DMTools CLI - Windows (PowerShell):**
+          \`\`\`powershell
+          \$env:DMTOOLS_VERSION = "v${VERSION}"
+          irm https://github.com/${{ github.repository }}/releases/download/v${VERSION}/install.ps1 | iex
+          \`\`\`
+          
+          ## 📋 System Requirements
+          
+          - **Java 17+** (required)
+          - **2GB RAM** minimum, 4GB recommended
+          - **1GB disk space** for application and data
+          
+          ## 📊 Build Information
+
+          - **Version:** v${VERSION}
+          - **Build Date:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')
+          - **CLI JAR Size:** ${CLI_JAR_SIZE}
+          - **Skill ZIP Size:** ${SKILL_ZIP_SIZE}
+          - **Skill TAR Size:** ${SKILL_TAR_SIZE}
+          - **Git Commit:** \`${GITHUB_SHA:0:8}\`
+          
+          ## 🐛 Troubleshooting
+          
+          ### Common Issues
+          
+          1. **Java version:** Ensure Java 17+ is installed (\`java -version\`)
+          2. **Memory issues:** Increase heap size with \`-Xmx4g\`
+          
+          ### Getting Help
+          
+          - **Issues:** [GitHub Issues](https://github.com/${{ github.repository }}/issues)
+          - **Documentation:** [Main Repository](https://github.com/${{ github.repository }})
+          EOF
+          
+          echo "Release notes generated"
+      
+      - name: Generate CLI Checksums
+        run: |
+          VERSION="${{ needs.version-and-tag.outputs.version }}"
+          cd cli
+          sha256sum \
+            "dmtools-v${VERSION}-all.jar" \
+            install.sh \
+            install \
+            install.bat \
+            install.ps1 \
+            dmtools.sh \
+            > dmtools-checksums.sha256
+          echo "CLI checksums generated:"
+          cat dmtools-checksums.sha256
+
+      - name: Create Unified Release
+        uses: softprops/action-gh-release@v3
+        env:
+          # Use PAT_TOKEN so the release:published event fires and triggers
+          # the Update Release Site Data workflow (events from GITHUB_TOKEN
+          # do not trigger downstream workflows).
+          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
+        with:
+          tag_name: v${{ needs.version-and-tag.outputs.version }}
+          name: "DMTools v${{ needs.version-and-tag.outputs.version }}"
+          body_path: release_notes.md
+          draft: false
+          prerelease: false
+          files: |
+            cli/dmtools-v${{ needs.version-and-tag.outputs.version }}-all.jar
+            cli/install.sh
+            cli/install
+            cli/install.bat
+            cli/install.ps1
+            cli/dmtools.sh
+            cli/dmtools-checksums.sha256
+            skill/dmtools-skill-v${{ needs.version-and-tag.outputs.version }}.zip
+            skill/dmtools-skill-v${{ needs.version-and-tag.outputs.version }}.tar.gz
+            skill/dmtools-skill.zip
+            skill/dmtools-skill.tar.gz
+            skill/dmtools-jira-skill-v${{ needs.version-and-tag.outputs.version }}.zip
+            skill/dmtools-jira-skill-v${{ needs.version-and-tag.outputs.version }}.tar.gz
+            skill/dmtools-jira-skill.zip
+            skill/dmtools-jira-skill.tar.gz
+            skill/dmtools-github-skill-v${{ needs.version-and-tag.outputs.version }}.zip
+            skill/dmtools-github-skill-v${{ needs.version-and-tag.outputs.version }}.tar.gz
+            skill/dmtools-github-skill.zip
+            skill/dmtools-github-skill.tar.gz
+            skill/dmtools-ado-skill-v${{ needs.version-and-tag.outputs.version }}.zip
+            skill/dmtools-ado-skill-v${{ needs.version-and-tag.outputs.version }}.tar.gz
+            skill/dmtools-ado-skill.zip
+            skill/dmtools-ado-skill.tar.gz
+            skill/dmtools-testrail-skill-v${{ needs.version-and-tag.outputs.version }}.zip
+            skill/dmtools-testrail-skill-v${{ needs.version-and-tag.outputs.version }}.tar.gz
+            skill/dmtools-testrail-skill.zip
+            skill/dmtools-testrail-skill.tar.gz
+            skill/dmtools-confluence-skill-v${{ needs.version-and-tag.outputs.version }}.zip
+            skill/dmtools-confluence-skill-v${{ needs.version-and-tag.outputs.version }}.tar.gz
+            skill/dmtools-confluence-skill.zip
+            skill/dmtools-confluence-skill.tar.gz
+            skill/dmtools-gitlab-skill-v${{ needs.version-and-tag.outputs.version }}.zip
+            skill/dmtools-gitlab-skill-v${{ needs.version-and-tag.outputs.version }}.tar.gz
+            skill/dmtools-gitlab-skill.zip
+            skill/dmtools-gitlab-skill.tar.gz
+            skill/dmtools-figma-skill-v${{ needs.version-and-tag.outputs.version }}.zip
+            skill/dmtools-figma-skill-v${{ needs.version-and-tag.outputs.version }}.tar.gz
+            skill/dmtools-figma-skill.zip
+            skill/dmtools-figma-skill.tar.gz
+            skill/dmtools-teams-skill-v${{ needs.version-and-tag.outputs.version }}.zip
+            skill/dmtools-teams-skill-v${{ needs.version-and-tag.outputs.version }}.tar.gz
+            skill/dmtools-teams-skill.zip
+            skill/dmtools-teams-skill.tar.gz
+            skill/dmtools-sharepoint-skill-v${{ needs.version-and-tag.outputs.version }}.zip
+            skill/dmtools-sharepoint-skill-v${{ needs.version-and-tag.outputs.version }}.tar.gz
+            skill/dmtools-sharepoint-skill.zip
+            skill/dmtools-sharepoint-skill.tar.gz
+            skill/dmtools-xray-skill-v${{ needs.version-and-tag.outputs.version }}.zip
+            skill/dmtools-xray-skill-v${{ needs.version-and-tag.outputs.version }}.tar.gz
+            skill/dmtools-xray-skill.zip
+            skill/dmtools-xray-skill.tar.gz
+            skill/skill-install.sh
+            skill/skill-install.ps1
+            skill/skill-checksums.sha256
+
+      - name: Trigger release site data update
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Explicitly dispatch update-release-site.yml instead of relying on
+          # the "release: published" event to cascade: GitHub does not run
+          # downstream workflows for events produced by a token whose identity
+          # collapses to the default GITHUB_TOKEN (github-actions[bot]), which
+          # is what happens here even when GITHUB_TOKEN is overridden with
+          # PAT_TOKEN above. A direct `gh workflow run` call is a normal API
+          # request and always works with actions: write permission.
+          gh workflow run update-release-site.yml \
+            --repo "${{ github.repository }}" \
+            -f version="v${{ needs.version-and-tag.outputs.version }}"
+
+      - name: Summary
+        run: |
+          echo "## 🎉 Unified Release Created Successfully!" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Version:** v${{ needs.version-and-tag.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Previous Version:** ${{ needs.version-and-tag.outputs.current_version }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Install DMTools CLI" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "curl -fsSL https://github.com/${{ github.repository }}/releases/latest/download/install.sh | bash" >> $GITHUB_STEP_SUMMARY
+          echo "irm https://github.com/${{ github.repository }}/releases/latest/download/install.ps1 | iex" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Install DMTools Agent Skill" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "curl -fsSL https://github.com/${{ github.repository }}/releases/download/v${{ needs.version-and-tag.outputs.version }}/skill-install.sh | bash" >> $GITHUB_STEP_SUMMARY
+          echo "irm https://github.com/${{ github.repository }}/releases/download/v${{ needs.version-and-tag.outputs.version }}/skill-install.ps1 | iex" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📦 Included Artifacts" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**CLI Tools:** CLI JAR, install wrapper, install.sh, install.bat, install.ps1, dmtools.sh" >> $GITHUB_STEP_SUMMARY
+          echo "**Agent Skill:** Skill ZIP, Skill TAR, focused skill packages, skill-install.sh, skill-install.ps1, skill-checksums.sha256" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "✅ All artifacts compiled, tested, and packaged successfully!" >> $GITHUB_STEP_SUMMARY

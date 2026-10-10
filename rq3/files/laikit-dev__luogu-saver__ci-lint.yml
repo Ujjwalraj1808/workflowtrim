@@ -1,0 +1,34 @@
+name: CI Lint
+
+permissions:
+    contents: read
+
+on:
+    pull_request:
+        branches:
+            - master
+    push:
+        branches:
+            - master
+
+jobs:
+    lint:
+        runs-on: ubuntu-latest
+        steps:
+            - name: Checkout
+              uses: actions/checkout@v6.0.1
+
+            - name: Setup Node
+              uses: actions/setup-node@v6.1.0
+              with:
+                  node-version: 22
+                  cache: npm
+
+            - name: Install Dependencies
+              run: npm ci
+
+            - name: Run ESLint
+              run: npm run lint:eslint
+
+            - name: Check Prettier Formatting
+              run: npm run lint:prettier

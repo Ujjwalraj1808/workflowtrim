@@ -1,0 +1,113 @@
+name: AllFilings Backfill
+
+# allFilings 과거 커버리지 심화 전용 자동화.
+#
+# Original SSOT Sync 는 최신/current 데이터 전진과 search source catalog 갱신을 빠르게 끝내고
+# Search Index Build 를 바로 붙여야 한다. 과거 백필은 네트워크·DART 지연이 길 수 있으므로
+# 별도 workflow 로 분리한다. 이 workflow 가 성공해 과거 slab/catalog 를 갱신하면 Search Index
+# Build 의 workflow_run trigger 가 이어 받아 current search index 를 다시 갱신한다.
+
+on:
+  schedule:
+    - cron: '30 5 * * *'  # UTC 05:30 = KST 14:30, Original SSOT Sync 이후 독립 심화
+  workflow_dispatch:
+    inputs:
+      months:
+        description: '백필 월 수'
+        default: '2'
+        type: string
+      floor:
+        description: '백필 하한 YYYYMM'
+        default: '201501'
+        type: string
+      search_catalog_bootstrap:
+        description: '초기 allFilings search source catalog 생성 허용'
+        default: 'false'
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  allfilings-backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    # job 레벨 concurrency 를 쓴다. 워크플로 레벨은 run 생성 즉시 큐를 점유하고, GitHub 은 그룹당
+    # pending 을 1 개만 유지해 새 트리거가 오면 기존 pending 을 취소한다(cancel-in-progress 무관).
+    # 2026-08 사고: hf-dart-push 대기 중이던 run 8 건이 job 0 개인 채 취소됐다. job 레벨이면
+    # if 로 skip 되는 job 은 큐에 진입조차 하지 않는다.
+    concurrency:
+      group: hf-dart-push
+      cancel-in-progress: false
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Smoke import
+        run: uv run python -c "import dartlab"
+
+      - name: allFilings 과거 백필
+        id: backfill
+        timeout-minutes: 65
+        env:
+          DART_API_KEYS: ${{ secrets.DART_API_KEYS }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          DART_ALLFILINGS_BACKFILL_MONTHS: ${{ github.event.inputs.months || '2' }}
+          DART_ALLFILINGS_BACKFILL_FLOOR: ${{ github.event.inputs.floor || '201501' }}
+          DARTLAB_HF_RETRY_ATTEMPTS: '3'
+          DARTLAB_HF_RETRY_MAX_SINGLE_WAIT_SECONDS: '120'
+        run: uv run python -X utf8 -m dartlab.pipeline allFilingsBackfill
+
+      # floor 에 닿아 백필이 할 일이 없다고 선언(skipped)하면 버킷과 카탈로그를 건너뛴다. 수집 장애로
+      # 0일을 모은 날은 skipped 가 아니라서 버킷 단계가 빈 입력으로 실패하고 장애가 드러난다.
+      - name: 비정기공시 코드 버킷 증분 갱신 + HF 원자 push
+        if: steps.backfill.outputs.skipped != 'true'
+        timeout-minutes: 30
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          DARTLAB_HF_RETRY_ATTEMPTS: '3'
+          DARTLAB_HF_RETRY_MAX_SINGLE_WAIT_SECONDS: '120'
+        run: uv run python -X utf8 .github/scripts/sync/buildAllFilingsRecent.py
+
+      - name: allFilings search source manifest + catalog
+        if: steps.backfill.outputs.skipped != 'true'
+        timeout-minutes: 20
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          SEARCH_CATALOG_BOOTSTRAP: ${{ github.event.inputs.search_catalog_bootstrap == 'true' && '1' || '0' }}
+          DARTLAB_HF_RETRY_ATTEMPTS: '3'
+          DARTLAB_HF_RETRY_MAX_SINGLE_WAIT_SECONDS: '120'
+        run: |
+          extra=()
+          if [ "${SEARCH_CATALOG_BOOTSTRAP:-0}" != "1" ]; then
+            extra+=(--require-previous-manifest)
+          fi
+          uv run python -X utf8 .github/scripts/search/buildSearchCatalog.py \
+            --source allFilings \
+            --input 'data/dart/allFilings/**/*.parquet' \
+            --out-dir data/dart/searchCatalog/allFilings \
+            --producer allFilingsBackfill.allfilings-backfill \
+            --compare-remote-manifest \
+            --merge-previous-catalog \
+            --min-files 300 \
+            --min-rows 150000 \
+            --min-catalog-rows 150000 \
+            "${extra[@]}" \
+            --upload
+
+      - name: Upload allFilings search catalog evidence
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: search-catalog-allFilings-backfill-${{ github.run_id }}
+          path: data/dart/searchCatalog/allFilings/**
+          if-no-files-found: ignore

@@ -1,0 +1,44 @@
+name: Web Platform Tests
+on:
+  workflow_dispatch:
+  pull_request:
+    paths-ignore:
+      - 'docs/**'
+      - 'release notes/**'
+
+defaults:
+  run:
+    shell: bash
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Resolve Go versions
+        id: go_versions
+        uses: grafana/k6-ci/.github/actions/go-versions@bc53c239916ae45b50a0bdea2a37698589219c84 # v0.5.3
+      - name: Install Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: ${{ steps.go_versions.outputs.current }}
+          check-latest: true
+      # TODO: combine WebPlatform tests checkout & patch into the single step
+      - name: Run Streams Tests
+        run: |
+          set -x
+          cd internal/js/modules/k6/experimental/streams/tests
+          sh checkout.sh
+          go test -race ../...
+      - name: Run Webcrypto Tests
+        run: |
+          set -x
+          cd internal/js/modules/k6/webcrypto/tests
+          sh checkout.sh
+          go test -race ./...

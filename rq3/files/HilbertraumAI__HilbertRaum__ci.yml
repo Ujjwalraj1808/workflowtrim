@@ -1,0 +1,180 @@
+# CI — offline build + test gate (fixes audit finding TEST-N1).
+#
+# Runs the exact pre-release command chain (npm ci -> typecheck -> build -> test) on every
+# pull request and on pushes to master, on Ubuntu and Windows. The unit+integration suite is
+# fully OFFLINE: it uses the mock runtime + mock embedder and mocks `electron`, so it needs no
+# weights, no sidecar binaries, and no network — nothing here launches Electron.
+#
+# This is dev infrastructure only. It ships nothing to users, adds no telemetry/analytics, and
+# performs no network egress beyond the npm registry install. It does NOT replace the
+# HILBERTRAUM_* manual smoke matrix — that real-binary / real-model pre-release gate is a
+# SEPARATE human step (see docs/packaging.md — the "Continuous integration (CI)" section and the
+# "HILBERTRAUM_* manual harness matrix", audit M-A5); those smokes are env-gated and skip here.
+
+name: CI
+
+# Every PR is validated against its merge result; pushes to master give post-merge green +
+# catch direct pushes. A branch pushed WITHOUT an open PR intentionally gets no CI — the PR is
+# the gate (open a draft PR to run CI on a WIP branch).
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+# One in-flight run per ref. A new push to a branch/PR cancels the previous, still-running CI.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least privilege: these jobs only read the repo and run npm — nothing else. This matters most
+# for fork PRs, where an unset (default) GITHUB_TOKEN scope would be handed to whatever code runs
+# during npm ci / build / test. Grant more narrowly at the job level if a future step needs it.
+permissions:
+  contents: read
+
+# Keep CI fast and free of network flakiness: nothing here launches Electron, so the ~100 MB
+# platform binary is never needed. Since wave DEP-4 (Electron 43) that costs nothing to arrange:
+# Electron >= 42 REMOVED the postinstall download entirely — the binary now arrives lazily on the
+# first invocation of the electron bin, which CI never performs. ELECTRON_SKIP_BINARY_DOWNLOAD
+# was dropped from this block because electron >= 42 no longer reads it; keeping it would leave a
+# knob advertising an effect it no longer has.
+#
+# HILBERTRAUM_SKIP_ELECTRON_CHECK short-circuits the repo's own verify-electron postinstall
+# (scripts/verify-electron.mjs). It is now belt-and-braces rather than load-bearing: that script
+# understands the lazy-download model and already exits 0 when the binary is simply not present
+# yet. It stays because it also skips the check on a genuinely half-extracted tree, which CI can
+# neither repair nor usefully diagnose. See packaging.md.
+env:
+  HILBERTRAUM_SKIP_ELECTRON_CHECK: '1'
+
+jobs:
+  build-and-test:
+    # Explicit per-leg name, because the legs are no longer a plain OS x node cross-product
+    # (see the matrix below) and the auto-generated names would read
+    # "(windows-latest, 22.x, --shard=1/2)".
+    name: build-and-test (${{ matrix.label }})
+    runs-on: ${{ matrix.os }}
+    # A hang must fail the leg, not hold it for GitHub's 6 h default. Vitest 4 removed the 60 s
+    # worker-side RPC timeout that used to end a run whose main process stopped answering (wave
+    # DEP-6), so this cap is now the only bound. The slowest leg takes ~9 min.
+    timeout-minutes: 30
+    strategy:
+      # Report every leg even if one fails — the ci-success gate below aggregates them
+      # (a matrix job's `result` is success only when ALL legs succeeded).
+      fail-fast: false
+      matrix:
+        # Spelled out with `include` only, because the legs are deliberately ASYMMETRIC: the
+        # windows legs are SHARDED, the ubuntu ones are not (#458 step 2).
+        #
+        # BOTH ends of the supported range are gated on both platforms, because both were
+        # previously untested claims (AUD-26): 22.x is the `engines.node >=22.12` floor the app
+        # promises to run on (raised from 22.5 by Electron 43, wave DEP-4), 24.x is what every
+        # release leg builds AND runs the full suite under. CI gating only one of them leaves
+        # the other a declaration nothing exercises.
+        #
+        # WHY THE WINDOWS LEGS ARE SPLIT (#458). The `npm test` step was 483–542 s of a 10–14
+        # min windows leg while the ubuntu legs finished in ~5 min with room to spare, so the
+        # windows legs ran AT their time budget: the same suite on one tree measured 486 s green
+        # and 694/802 s on the runs that failed, and whichever file was unlucky on a starved
+        # worker failed a run no code change could have broken (five flakes in two days, each
+        # costing a full re-run). Two shards halve the wall clock, and with it the window in
+        # which a noisy neighbour can hit. Runner minutes are free on a public repo, so the
+        # extra jobs cost nothing but queue time. See docs/packaging.md, the CI section.
+        #
+        # MEASURED, once the shard flag actually reached vitest (run 34662589439): the windows
+        # Test step fell from 483–542 s to 221–239 s and the job from 10–13 min to 5.3–5.7 min,
+        # so windows is no longer the critical path (ubuntu: 4.9–5.3 min). The gain BEATS a
+        # halving because per-file overheads drop too: per-file test cost went 2.22 s → 1.65/
+        # 1.99 s, and both shards together cost LESS total test time than the one unsharded run
+        # (816 s vs 997 s). So sharding does not only halve exposure — pressure per runner
+        # genuinely eases (plausibly the #460 handle/temp-root accumulation, halved per runner;
+        # correlation, not proven cause). Widening the vitest budgets (step 1, `hookTimeout` /
+        # `testTimeout`) is still what buys TOLERANCE against a starved fork. Since the #458
+        # residual fix each windows shard runs TWO forks, not vitest's default three
+        # (`vitest.config.ts` `maxWorkers`, keyed on CI + win32 — nothing to pass here); the
+        # Test step prints "[vitest.config] windows CI leg: forks capped at 2" as evidence.
+        #
+        # WHY UBUNTU STAYS WHOLE — not just cost. One leg per node version still runs all 449
+        # files in a SINGLE vitest process, so cross-file interference (shared module state, a
+        # leaked global, an ordering dependency) keeps a leg that can see it. A fully sharded
+        # matrix would partition that surface away on every leg at once.
+        #
+        # Adding or renaming a leg is safe: `ci-success` below is the only required check and
+        # aggregates whatever legs exist. NEVER mark a leg's own name required.
+        include:
+          - { label: 'ubuntu 22.x',           os: ubuntu-latest,  node: '22.x' }
+          - { label: 'ubuntu 24.x',           os: ubuntu-latest,  node: '24.x' }
+          - { label: 'windows 22.x, 1 of 2',  os: windows-latest, node: '22.x', shard: '--shard=1/2' }
+          - { label: 'windows 22.x, 2 of 2',  os: windows-latest, node: '22.x', shard: '--shard=2/2' }
+          - { label: 'windows 24.x, 1 of 2',  os: windows-latest, node: '24.x', shard: '--shard=1/2' }
+          - { label: 'windows 24.x, 2 of 2',  os: windows-latest, node: '24.x', shard: '--shard=2/2' }
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Set up Node.js ${{ matrix.node }}
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      # `engines.npm >= 11` + the `packageManager: npm@11.6.2` pin are only real policy if
+      # the pinned npm is what actually installs. Node 22 bundles npm 10.9 and Node 24 bundles
+      # a different 11.x — neither is the pinned version, and the 22 one is BELOW the repo's own
+      # floor — so without this the pin was never exercised on any leg. `corepack enable` was
+      # tried and does NOT override npm here (its npm shim did not take precedence — the bundled
+      # npm ran on every leg: 10.9.8 on Node 22, 11.16.0 on Node 24), so install the pin
+      # explicitly instead. Node 22's bundled npm 10 can install npm 11 globally; the printed
+      # version is the run-log evidence that 11.6.2 is what the install/test steps below run.
+      - name: Install the pinned npm (engines.npm >= 11; the bundled npm is not the pin)
+        run: |
+          npm install -g npm@11.6.2
+          node -v
+          npm -v
+
+      - name: Install (lockfile-pinned, offline-capable)
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Build
+        run: npm run build
+
+      # `matrix.shard` is `--shard=i/2` on the windows legs and UNSET (empty) on the ubuntu
+      # ones, which run the whole suite. An empty expansion contributes NO argv element, so one
+      # step serves both shapes — verified, because an empty string WOULD have read as a path
+      # filter and silently switched the collection guard off on the ubuntu legs.
+      #
+      # This must stay `npm test`, and the root `test` script must keep its trailing `--`.
+      # THE FIRST SHARDED RUN SILENTLY DID NOTHING because of that: the root script forwards to
+      # the workspace (`npm run test --workspace apps/desktop`), and without a `--` the inner
+      # `npm run` ate `--shard=1/2` as an npm config ("npm warn Unknown cli config"), so all six
+      # legs ran the whole 449-file suite and merely looked slow. A POSITIONAL survives two npm
+      # layers; a FLAG does not. Run 34660709148 is the evidence — every leg reported "(449)".
+      #
+      # The suite's anti-false-green reporter is shard-aware (tests/full-suite-guard.ts): it
+      # narrows to the shard's expected subset by reproducing vitest's own split, so a dropped
+      # file still hard-fails whichever shard owned it. Do NOT "shard" by passing a path
+      # (`npm test -- tests/unit`) — a positional reads as a filter and switches that guard
+      # off silently, which is the one failure mode it exists to prevent.
+      - name: Test
+        run: npm test -- ${{ matrix.shard }}
+
+  # Single stable gate to mark as the branch-protection required status check. The matrix legs
+  # publish as "build-and-test (ubuntu 22.x)" / "(windows 24.x, 1 of 2)" / … — names that shift
+  # whenever the OS labels, the Node list or the SHARD COUNT change (#458 step 2 renamed all six
+  # of them); "ci-success" does not, so it stays matched in branch protection. Never add a leg's
+  # own name as a required check.
+  ci-success:
+    name: ci-success
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    if: always()
+    steps:
+      - name: Require every build-and-test leg to have succeeded
+        run: |
+          result='${{ needs.build-and-test.result }}'
+          echo "build-and-test aggregate result: $result"
+          test "$result" = "success"

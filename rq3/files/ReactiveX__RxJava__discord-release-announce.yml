@@ -1,0 +1,23 @@
+name: Announce Release to Discord
+
+on:
+  release:
+    types: [published]           # triggers when you publish a release (not draft)
+
+permissions:
+  contents: read          # Allows reading release notes, tag, assets, etc.
+
+jobs:
+  notify-discord:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send release to Discord
+        uses: SethCohen/github-releases-to-discord@24d166886aee4646d448c8a389ff9e1ebcab3682 # v1
+        with:
+          webhook_url: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          # optional customizations below - most have good defaults
+          username: "Release Changelog"
+          avatar_url: "https://cdn.discordapp.com/avatars/487431320314576937/bd64361e4ba6313d561d54e78c9e7171.png"
+          content: "||@everyone||"
+          embed_color: 3447003     # hex color without # (e.g. Discord blue)
+          include_assets: true     # list download links if you have binaries

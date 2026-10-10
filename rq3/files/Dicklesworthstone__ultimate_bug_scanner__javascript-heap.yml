@@ -1,0 +1,103 @@
+name: JavaScript Heap Taint
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ubs
+      - modules/ubs-js.sh
+      - modules/lib/ubs-common.sh
+      - modules/helpers/ubs_core/**
+      - test-suite/quality/*js*.py
+      - test-suite/js/test_taint_domains.py
+      - test-suite/js/test_taint_scopes.py
+      - test-suite/js/test_taint_effects.py
+      - .github/workflows/javascript-heap.yml
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: Supported runner pool for the unchanged validation gates
+        type: choice
+        options: [ubuntu-latest, macos-15]
+        default: ubuntu-latest
+
+permissions:
+  contents: read
+
+jobs:
+  heap-regressions:
+    runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
+    timeout-minutes: 20
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+      UBS_NO_AUTO_UPDATE: '1'
+      HOMEBREW_NO_AUTO_UPDATE: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Retain exact production source for independent reproduction
+        run: |
+          git rev-parse HEAD > "$RUNNER_TEMP/js-heap-source-head.txt"
+          git ls-files --stage > "$RUNNER_TEMP/js-heap-source-index.txt"
+          git archive --format=tar.gz HEAD > "$RUNNER_TEMP/js-heap-source.tar.gz"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: js-heap-source
+          path: ${{ runner.temp }}/js-heap-source*
+          retention-days: 3
+      - name: Install actual scanner dependencies before Bash integrity gates
+        run: |
+          if [ "$RUNNER_OS" = macOS ]; then
+            brew install bash jq ripgrep shellcheck
+            echo "$(brew --prefix)/bin" >> "$GITHUB_PATH"
+          else
+            sudo apt-get update
+            sudo apt-get install -y bash jq ripgrep rsync shellcheck
+          fi
+          npm install --global @ast-grep/cli
+      - name: Verify the committed production integrity chain
+        run: |
+          bash -c 'test "$BASH_VERSINFO" -ge 5'
+          ./scripts/verify_checksums.sh
+          ./scripts/verify_sha256sums.sh
+          git diff --check
+      - name: Run 119 heap tests including 16 real scanner and 21 Node scenarios
+        run: |
+          command -v ast-grep
+          command -v node
+          python3 - <<'PY'
+          import importlib.util
+          import unittest
+          path = 'test-suite/quality/test_taint_js_heap.py'
+          spec = importlib.util.spec_from_file_location('heap_regressions', path)
+          module = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(module)
+          result = unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromModule(module))
+          assert result.testsRun == 119, result.testsRun
+          assert result.wasSuccessful() and not result.skipped, (result.failures, result.errors, result.skipped)
+          print('JS_HEAP_TESTS_PASS', result.testsRun, flush=True)
+          PY
+      - name: Run existing production taint and JavaScript quality suites
+        run: |
+          python3 test-suite/js/test_taint_domains.py
+          python3 test-suite/js/test_taint_scopes.py
+          python3 test-suite/js/test_taint_effects.py
+          python3 -m unittest discover -s test-suite/quality -p '*js*.py' -v
+          shellcheck -S warning ubs modules/ubs-*.sh scripts/new-module.sh
+          for file in ubs modules/ubs-*.sh modules/lib/ubs-common.sh scripts/new-module.sh; do bash -n "$file"; done
+      - name: Verify byte-identical production checksum regeneration
+        run: |
+          ./scripts/verify_checksums.sh
+          ./scripts/verify_sha256sums.sh
+          python3 scripts/update_checksums.py
+          git diff --exit-code
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: javascript-heap-validation
+          path: test-suite/artifacts/javascript-heap/
+          retention-days: 3

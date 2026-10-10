@@ -1,0 +1,38 @@
+#
+# SPDX-FileCopyrightText: Copyright The ThingsBoard Authors
+# SPDX-FileCopyrightText: Modifications Copyright ThingsBoard, Inc.
+# SPDX-License-Identifier: Apache-2.0 AND BUSL-1.1
+#
+
+name: Check configuration files
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+    paths:
+      - 'application/src/main/resources/thingsboard.yml'
+      - 'transport/http/src/main/resources/tb-http-transport.yml'
+      - 'transport/mqtt/src/main/resources/tb-mqtt-transport.yml'
+      - 'transport/coap/src/main/resources/tb-coap-transport.yml'
+      - 'transport/lwm2m/src/main/resources/tb-lwm2m-transport.yml'
+      - 'transport/snmp/src/main/resources/tb-snmp-transport.yml'
+      - 'msa/vc-executor/src/main/resources/tb-vc-executor.yml'
+      - 'integration/executor/src/main/resources/tb-integration-executor.yml'
+
+jobs:
+  build:
+    name: Check thingsboard.yml file
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v3
+        with:
+          python-version: "3.13.2"
+          architecture: "x64"
+        env:
+          AGENT_TOOLSDIRECTORY: /opt/hostedtoolcache
+      - name: Run Verification Script
+        run: python3 tools/src/main/python/check_yml_file.py

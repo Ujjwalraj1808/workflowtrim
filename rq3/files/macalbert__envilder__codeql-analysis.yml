@@ -1,0 +1,48 @@
+name: 🏰 Fortress Scan (CodeQL)
+
+on:
+  workflow_dispatch:
+
+  pull_request:
+    branches: [main]
+
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/codeql-analysis.yml"
+      - "src/**"
+      - "tests/**"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  codeql-fortress:
+    strategy:
+      fail-fast: false
+      matrix:
+        language: ["javascript-typescript"]
+
+    permissions:
+      security-events: write
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 🧱 Enter the Fortress (Checkout Repository)
+        uses: actions/checkout@v7
+        with:
+          lfs: true
+
+      - name: 🏰 Initialize CodeQL (Unlock the Gate)
+        uses: github/codeql-action/init@v4.38.2
+        with:
+          languages: ${{ matrix.language }}
+          config-file: .github/codeql-config.yml
+
+      - name: 🏗️ Autobuild (Build the Bridge)
+        uses: github/codeql-action/autobuild@v4.38.2
+
+      - name: 🔎 Perform CodeQL Analysis (Find the Secret Door)
+        uses: github/codeql-action/analyze@v4.38.2

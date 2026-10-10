@@ -1,0 +1,48 @@
+name: Preview release
+
+env:
+  # install playwright binary manually (because pnpm only runs install script once)
+  PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
+
+permissions:
+  pull-requests: write
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    types: [opened, synchronize, labeled]
+
+jobs:
+  preview:
+    if: >
+      github.repository == 'vitejs/vite' &&
+      (github.event_name == 'push' ||
+      (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'trigger: preview')))
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Disallow installation scripts
+        run: yq '.allowBuilds[]=false' -i pnpm-workspace.yaml
+
+      - name: Install pnpm and node 24
+        uses: pnpm/setup@fbda4c85fc2e1e08721cd8763afea8f48d60f024 # v3.0.0
+        with:
+          runtime: node@24
+
+      - name: Build Vite core
+        working-directory: ./packages/vite
+        run: pnpm build
+
+      - name: Build plugin-legacy
+        working-directory: ./packages/plugin-legacy
+        run: pnpm build
+
+      - name: Publish preview release
+        # zizmor: ignore[use-trusted-publishing]
+        run: pnpm dlx pkg-pr-new@0.0 publish --pnpm './packages/vite' './packages/plugin-legacy' --packageManager=pnpm,npm,yarn --commentWithDev

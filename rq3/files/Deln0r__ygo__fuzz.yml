@@ -1,0 +1,110 @@
+name: fuzz
+
+# Continuous fuzzing of the untrusted-input decode paths (update apply,
+# state vector, delete set, Any values, awareness presence, sync frames,
+# lib0 primitives). The committed seed corpus already runs as regression
+# tests in the main `test` job; this workflow does NEW exploration.
+#
+# A `discover` job enumerates every FuzzXxx target and emits a matrix, so
+# the target list never has to be maintained by hand. The `fuzz` job then
+# runs one matrix leg per target IN PARALLEL: a long burst on the nightly
+# schedule, a short smoke burst on any change to a decode path. Running
+# legs in parallel (rather than one serial loop) lets each target get a
+# much longer nightly budget at a sane wall-clock, isolates a crasher to
+# its own leg (fail-fast is off), and uploads a per-target crasher corpus.
+on:
+  schedule:
+    - cron: "0 6 * * *" # daily 06:00 UTC
+  push:
+    branches: [main]
+    paths:
+      - "internal/lib0/**"
+      - "internal/encoding/**"
+      - "internal/awareness/**"
+      - "internal/sync/**"
+      - "internal/block/**"
+      - "internal/types/**"
+      - "internal/undo/**"
+      - ".github/workflows/fuzz.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "internal/lib0/**"
+      - "internal/encoding/**"
+      - "internal/awareness/**"
+      - "internal/sync/**"
+      - "internal/block/**"
+      - "internal/types/**"
+      - "internal/undo/**"
+  workflow_dispatch:
+
+jobs:
+  discover:
+    name: discover targets
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.list.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: list
+        name: enumerate fuzz targets
+        run: |
+          set -euo pipefail
+          entries=$(grep -rl '^func Fuzz' --include='*_test.go' . | while IFS= read -r f; do
+            dir=$(dirname "$f")
+            grep -oE '^func (Fuzz[A-Za-z0-9_]+)' "$f" \
+              | awk -v d="${dir#./}" '{printf "{\"pkg\":\"%s\",\"func\":\"%s\"}\n", d, $2}'
+          done | paste -sd, -)
+          echo "matrix={\"include\":[$entries]}" >> "$GITHUB_OUTPUT"
+
+  fuzz:
+    name: fuzz ${{ matrix.func }}
+    needs: discover
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.discover.outputs.matrix) }}
+    env:
+      # Long continuous run on the nightly schedule; a quick burst on
+      # push / PR. Legs run in parallel, so the nightly budget is per
+      # target, not summed across them.
+      FUZZTIME: ${{ github.event_name == 'schedule' && '600s' || '40s' }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          # Fuzz on the current Go release: the runtime and the fuzzing engine
+          # are part of what is under test here, so an old toolchain fuzzes
+          # code paths users no longer run. `stable` rather than a number,
+          # because the number was 1.26 for weeks after 1.27 shipped.
+          go-version: stable
+      - name: go mod download
+        run: go mod download
+      - name: fuzz ${{ matrix.func }} (${{ env.FUZZTIME }})
+        # Retried once, but ONLY when no crasher was written. The Go fuzz
+        # coordinator occasionally fails with a bare "context deadline
+        # exceeded" exactly at the -fuzztime boundary after a full, clean run
+        # (observed 2026-08-20/25/28 on three unrelated targets, tens of
+        # millions of execs, no failing input). A genuine finding always
+        # writes a NEW file under testdata/fuzz/<target>/ and would also
+        # re-fail deterministically, so a retry cannot mask it: we fail
+        # immediately if the corpus gained a file, and otherwise re-run.
+        run: |
+          run_fuzz() {
+            go test -run='^$' -fuzz="^${{ matrix.func }}$" -fuzztime="${FUZZTIME}" "./${{ matrix.pkg }}"
+          }
+          if run_fuzz; then exit 0; fi
+          if [ -n "$(git status --porcelain -- "${{ matrix.pkg }}/testdata/fuzz/")" ]; then
+            echo "::error::fuzz wrote a new crasher - genuine finding, not retrying"
+            git status --porcelain -- "${{ matrix.pkg }}/testdata/fuzz/"
+            exit 1
+          fi
+          echo "::warning::no crasher written - retrying once (coordinator deadline flake)"
+          run_fuzz
+      - name: upload crashers
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-crashers-${{ matrix.func }}
+          path: "${{ matrix.pkg }}/testdata/fuzz/**"
+          if-no-files-found: ignore

@@ -1,0 +1,43 @@
+---
+name: lint-jsonnet
+on:
+  pull_request:
+    paths:
+      - "**/*.jsonnet"
+      - "**/*.libsonnet"
+      - "**/jsonnetfile.json"
+      - "**/jsonnetfile.lock.json"
+      - "production/loki-mixin/**" # the mixin imports raw .json dashboards as source
+      - "production/loki-mixin-compiled/**"
+      - ".github/workflows/lint-jsonnet.yml" # validate changes to the workflow itself
+
+permissions:
+  contents: read
+
+jobs:
+  check-mixin:
+    name: Check mixin jsonnet files
+    runs-on: ubuntu-x64
+    permissions:
+      contents: "read"
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: setup go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.27.1"
+      - name: setup jsonnet
+        run: |
+          go install github.com/google/go-jsonnet/cmd/jsonnet@v0.20.0
+          go install github.com/google/go-jsonnet/cmd/jsonnetfmt@v0.20.0
+          go install github.com/google/go-jsonnet/cmd/jsonnet-lint@v0.20.0
+          go install github.com/monitoring-mixins/mixtool/cmd/mixtool@16dc166166d91e93475b86b9355a4faed2400c18
+          go install github.com/jsonnet-bundler/jsonnet-bundler/cmd/jb@v0.5.1
+      - name: run linting
+        run: make BUILD_IN_CONTAINER=false lint-jsonnet
+      - name: check compiled mixin has been updated
+        run: |
+          make BUILD_IN_CONTAINER=false loki-mixin-check

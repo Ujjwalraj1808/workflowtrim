@@ -1,0 +1,125 @@
+name: Nightly change proposals
+
+on:
+  schedule:
+    - cron: "23 3 * * *" # daily 03:23 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write # labels
+
+concurrency:
+  group: proposals
+  cancel-in-progress: false
+
+# Two outputs a night, from one decision (scripts/lib/proposals-ema.ts):
+#
+#   1. Auto branch (bot/proposals-auto). EU rows the register decides on its own: scripts/apply-proposals.ts reads each
+#      EMA medicine page (status field and dated facts, cached for the day), attributes it by exact INN, brand or alias,
+#      maps Authorised, Withdrawn, Application withdrawn and Refused to the helpers in src/data/regional-approvals.ts,
+#      drops what is already on main, and writes the rest through the round-trip-tested io helper. The run then
+#      validates, typechecks and tests (including a re-read of every written row's source page), and squash-merges the
+#      pull request, as the weekly maintenance does. The bot commit deploys like any other push to main.
+#
+#   2. Review branch (bot/proposals, label needs-review). Everything a person must look at, each line with the reason:
+#      EMA candidates with no page, no status field, no exact match or several, biosimilars and generics, Revoked,
+#      Expired, Lapsed, pending CHMP opinions, and hand-written rows that disagree with the register. The other feeds are
+#      review-only by design because their sources have no status field to quote: FDA notices are prose titles that land
+#      in hand-written regulatoryEvents lists; ClinicalTrials.gov's overall status is only a floor under OnCo's editorial
+#      trial statuses (positive, negative, mixed); HTA verdicts (NICE, G-BA, PBAC) come from HTML tables and PDFs.
+#      This pull request is never merged automatically.
+jobs:
+  propose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - id: date
+        run: echo "today=$(date -u +%F)" >> "$GITHUB_OUTPUT"
+      - name: Cache the EMA register pages read today (one fetch per page per day)
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/onco-cache
+          key: ema-pages-${{ steps.date.outputs.today }}
+          restore-keys: ema-pages-
+
+      # ---- 1. Auto branch: rows the register decides ----
+      - name: Write the EU rows that pass every check
+        run: npx tsx scripts/apply-proposals.ts --apply
+        env:
+          ONCO_CACHE_DIR: ${{ runner.temp }}/onco-cache
+      # The merge below is unattended, so the rows it lands must pass what a person's branch passes. The gates never
+      # fail the job: when one does the pull request is still opened, the merge is skipped and the last step of this
+      # branch labels it for review, so a red run waits for a person rather than landing on main.
+      - id: gates
+        continue-on-error: true
+        env:
+          ONCO_CACHE_DIR: ${{ runner.temp }}/onco-cache
+          ONCO_VERIFY_APPLIED: "1"
+        # --testTimeout matches scripts/ship.sh and .github/actions/gates; a bare `npx vitest run` uses the
+        # 30 second default, which the first render in src/app/heavy-pages.test.ts cannot meet on a runner.
+        run: npm run validate && npm run typecheck && npm run lint && npx vitest run --testTimeout=600000 --hookTimeout=600000
+      - uses: peter-evans/create-pull-request@v7
+        id: auto
+        with:
+          branch: bot/proposals-auto
+          title: "EMA register: EU rows read from the medicine pages"
+          commit-message: "chore: EU regional rows read from the EMA register pages"
+          body: |
+            Rows written by `scripts/apply-proposals.ts` from the EMA medicine pages: status read from the page's
+            status field, product matched by exact INN, brand or alias, helper chosen by status (A/C, W, R), nothing
+            that was already on main. Each note quotes the page's status line; `public/proposals/applied.json` lists
+            the rows and their source URLs. Validated, typechecked and tested in this run, including a re-read of
+            every source page. Merged by the workflow, as the weekly maintenance is.
+          labels: automated, pipeline, regional-approval
+          delete-branch: true
+      - name: Merge the auto rows (only when this run's gates passed)
+        if: steps.auto.outputs.pull-request-number != '' && steps.gates.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh pr merge --squash --delete-branch "${{ steps.auto.outputs.pull-request-number }}" || echo "merge deferred, the pull request stays open for a person"
+      - name: Leave the auto rows for review (a gate failed in this run)
+        if: steps.auto.outputs.pull-request-number != '' && steps.gates.outcome != 'success'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh label create needs-review --color D93F0B --description "A person must check this before it lands" --force || true
+          gh pr edit "${{ steps.auto.outputs.pull-request-number }}" --add-label needs-review
+          gh pr comment "${{ steps.auto.outputs.pull-request-number }}" --body "Not merged: a gate failed in [this run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}). The rows are on this branch for a person to read."
+
+      # ---- 2. Review branch: the residue, each row with its reason ----
+      - name: Reset the working tree for the review pass
+        run: |
+          git reset --hard "${{ github.sha }}"
+          git clean -qfd
+      - name: Draft the review residue
+        run: npx tsx scripts/propose-updates.ts --corrections
+        env:
+          ONCO_CACHE_DIR: ${{ runner.temp }}/onco-cache
+      - run: npm run validate
+      - name: Ensure the needs-review label exists
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh label create needs-review --color D93F0B --description "A person must check each row before it is applied" --force || true
+      - uses: peter-evans/create-pull-request@v7
+        with:
+          branch: bot/proposals
+          title: "Bot proposals: rows that need a person"
+          commit-message: "chore: draft change proposals that need review"
+          body: |
+            Drafted by `scripts/propose-updates.ts` from `public/factcheck.json`, `public/trials/changes.json`, `public/fda/recent.json` and `public/regional/candidates.json`, regenerated against today's main.
+
+            Review `docs/proposals/latest.md`: each line names the entity, the file and field, the current and proposed values, the source URL and, for EMA rows, why a person is needed (no exact product match, biosimilar or generic, a register status with no helper, a pending opinion, or a hand-written row that disagrees). EU rows the register decided on its own were merged by the auto branch of the same run and are listed at the end of the file, not proposed.
+
+            Apply the ones that check out by editing the data files (or push commits to this branch), then merge; close the rest. `CORRECTIONS.md` carries one line for this run under "Proposed by the update bot"; move confirmed corrections into the dated tables above it.
+
+            This pull request is never merged automatically.
+          labels: bot-proposal, needs-review, automated
+          delete-branch: true

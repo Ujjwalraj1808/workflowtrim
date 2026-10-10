@@ -1,0 +1,262 @@
+name: Data Sync
+
+# ──────────────────────────────────────────────────────────────
+# DART 메인 데이터 수집 (2026-04-16 정리)
+#
+# 자동 cron (recent 모드):
+#   1. DART list.json 으로 최근 N일 정기공시 조회
+#   2. 카테고리별 독립 누락 검사 (finance reprt_code + report rcept_no)
+#   3. 누락된 종목·분기만 수집 — 88분기 차집합 X
+#   4. 이전 실행 pending.txt (API 한도 잘림) 우선 회수
+#   5. 변경 파일만 HF push
+#
+# 수동 (workflow_dispatch):
+#   - mode=recent (기본): list.json 기반 경량 수집 (~30분)
+#   - mode=full: 88분기 차집합 수집 (~5시간, 이전 dataPipeline full 모드 대체)
+#
+# 파이프라인 상세: engines.data
+# ──────────────────────────────────────────────────────────────
+
+on:
+  schedule:
+    - cron: '0 18 * * *'  # UTC 18:00 = KST 03:00 (야간 공시 캡처)
+    - cron: '0 6 * * *'   # UTC 06:00 = KST 15:00 (당일 오전 공시 빠른 반영)
+  workflow_dispatch:
+    inputs:
+      lookback_days:
+        description: '신규 공시 조회 기간 (일)'
+        default: '85'
+        type: string
+      mode:
+        description: 'recent (list.json 기반) / full (88분기 차집합, 무거움)'
+        default: 'recent'
+        type: choice
+        options: [recent, full]
+      category:
+        description: '(full 모드용) finance/report/all'
+        default: 'all'
+        type: choice
+        options: [all, finance, report]
+
+permissions:
+  contents: read  # HF push 는 HF_TOKEN 사용 — git commit/push/release 없음(checkout+cache 만). 최소권한.
+
+# DART 경로 (dart/*) 에 push 하는 워크플로우만 hf-dart-push 로 직렬화한다 (HF 412 회피).
+# 직렬화는 job 레벨에 건다. 아래 각 job 의 concurrency 주석 참고.
+# 다른 경로 (edgar/*, kindlist/*, search/*) 는 별도 group 이라 이 큐와 경쟁하지 않는다.
+jobs:
+  # ── Job 1: finance + report (list.json 기반, ~30분) ──
+  sync-finance-report:
+    if: ${{ github.event.inputs.mode != 'full' }}
+    runs-on: ubuntu-latest
+    # 90 -> 180. 정기보고서 마감 주에는 report 대상이 2700 종목대로 뛴다(2026-08-19 실측 2717).
+    # 엔드포인트 복구 전에는 전량 실패라 저장이 없어 85 분에 잘렸고, 복구 후에는 실제 수집과
+    # 저장을 하므로 종목당 시간이 늘어난다. checkpoint 업로드를 배치 단위로 바꾼 뒤 추정
+    # 소요는 100 종목당 약 4 분, 2700 종목 기준 약 110 분이다. 계절 피크를 정상 작업량으로
+    # 보고 상한을 맞춘다. checkpoint 가 100 종목마다 저장·업로드하므로 잘려도 진전은 남는다.
+    timeout-minutes: 180
+    # job 레벨 concurrency 를 쓴다. 워크플로 레벨은 run 생성 즉시 큐를 점유하고, GitHub 은 그룹당
+    # pending 을 1 개만 유지해 새 트리거가 오면 기존 pending 을 취소한다(cancel-in-progress 무관).
+    # 2026-08 사고: hf-dart-push 대기 중이던 run 8 건이 job 0 개인 채 취소됐다. job 레벨이면
+    # if 로 skip 되는 job 은 큐에 진입조차 하지 않는다.
+    concurrency:
+      group: hf-dart-push
+      cancel-in-progress: false
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Smoke import (fail fast on src regression)
+        run: uv run python -c "import dartlab; print('dartlab', getattr(dartlab, '__version__', 'dev'))"
+
+      - name: Restore finance cache
+        uses: actions/cache/restore@v5
+        with:
+          path: data/dart/finance
+          key: dartlab-data-finance-${{ github.run_id }}
+          restore-keys: dartlab-data-finance-
+
+      - name: Restore report cache
+        uses: actions/cache/restore@v5
+        with:
+          path: data/dart/report
+          key: dartlab-data-report-${{ github.run_id }}
+          restore-keys: dartlab-data-report-
+
+      - name: Restore collect state (pending.txt) — fr scope
+        uses: actions/cache/restore@v5
+        with:
+          path: data/dart/_collect_state/fr
+          key: dartlab-collect-state-fr-${{ github.run_id }}
+          restore-keys: dartlab-collect-state-fr-
+
+      # HF seed: GHA cache 가 cold/stale 해도 부족 parquet 을 HF 에서 채움 (idempotent).
+      # cold start death spiral 차단 — HF 가 source of truth, GHA cache 는 속도 부스터.
+      - name: Seed missing parquet from HF
+        run: uv run python -X utf8 .github/scripts/sync/seedFromHf.py --category finance,report
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+
+      - name: Sync recent (finance + report)
+        # 통합 진입점(dartlab.pipeline) — dart stage 가 syncRecent 를 SYNC_CATEGORIES env
+        # (finance,report)로 동형 호출. --no-upload: 업로드는 아래 per-category uploadData
+        # 스텝이 담당(syncRecent 내부 checkpoint 업로드는 보존). PYTHONUNBUFFERED=1 로 버퍼링 차단.
+        run: uv run python -X utf8 -m dartlab.pipeline finance --no-upload
+        env:
+          DART_API_KEYS: ${{ secrets.DART_API_KEYS }}
+          DARTLAB_DART_CONNECT_RETRY_ATTEMPTS: "6"  # OpenDART TCP 연결 불통(수 분) 대비, 약 4분 긴 백오프 재시도
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}  # checkpoint subprocess (uploadData.py) 가 필요
+          SYNC_LOOKBACK_DAYS: ${{ github.event.inputs.lookback_days || '85' }}
+          SYNC_CATEGORIES: finance,report
+          SYNC_STATE_SCOPE: fr  # 병렬 Job pending.txt 경쟁 회피
+          PYTHONUNBUFFERED: "1"
+
+      # Phase A — parquet → .arrow IPC mirror 빌드. Phase D 의 read_ipc(memory_map=True)
+      # 진입점이 사용. mtime 비교로 변경된 parquet 만 재변환 (idempotent).
+      - name: Build IPC mirror (finance + report)
+        run: uv run python -X utf8 .github/scripts/sync/buildIpcMirror.py
+        env:
+          SYNC_CATEGORIES: finance,report
+
+      - name: Upload to HuggingFace (finance)
+        if: hashFiles('dist/changed_finance.txt') != ''
+        run: |
+          if [ -s dist/changed_finance.txt ]; then
+            cp dist/changed_finance.txt dist/changed.txt
+            uv run python .github/scripts/sync/uploadData.py --target hf
+          fi
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          SYNC_CATEGORY: finance
+
+      # 접수 원장: 이번 run 에 바뀐 종목 parquet 의 공시별 내용 해시와 관측 시각을 불변 파일로 쌓는다.
+      # finance 는 제자리 덮어쓰기라 과거 시점 내용을 증명할 수 없고, 이 시각은 소급해서 만들 수 없다.
+      # HF dart/financeReceipts/ 에 run 마다 새 파일만 올리며 같은 경로가 있으면 실패한다.
+      # 원장 실패가 수집, 업로드, 캐시 저장을 막지 않도록 격리한다.
+      - name: Build and upload finance receipt ledger
+        if: hashFiles('dist/changed_finance.txt') != ''
+        continue-on-error: true
+        run: uv run python -X utf8 -m dartlab.pipeline.financeReceipts --out-dir dist/financeReceipts --upload
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+
+      - name: Upload to HuggingFace (report)
+        if: hashFiles('dist/changed_report.txt') != ''
+        run: |
+          if [ -s dist/changed_report.txt ]; then
+            cp dist/changed_report.txt dist/changed.txt
+            uv run python .github/scripts/sync/uploadData.py --target hf
+          fi
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          SYNC_CATEGORY: report
+
+      # GitHub Releases 업로드 폐지 (2026-04-08): HF만 유지.
+      # data-finance/data-report 태그는 정리됨. uploadData.py --target gh 호출 금지.
+
+      - name: Save finance cache
+        if: always()
+        uses: actions/cache/save@v5
+        with:
+          path: data/dart/finance
+          key: dartlab-data-finance-${{ github.run_id }}
+
+      - name: Save report cache
+        if: always()
+        uses: actions/cache/save@v5
+        with:
+          path: data/dart/report
+          key: dartlab-data-report-${{ github.run_id }}
+
+      - name: Save collect state — fr scope
+        if: always()
+        uses: actions/cache/save@v5
+        with:
+          path: data/dart/_collect_state/fr
+          key: dartlab-collect-state-fr-${{ github.run_id }}
+
+  # ── Job 2 (workflow_dispatch full 전용): 88분기 차집합 (heavy) ──
+  full-collect:
+    if: ${{ github.event.inputs.mode == 'full' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    concurrency:
+      group: hf-dart-push
+      cancel-in-progress: false
+
+    strategy:
+      fail-fast: false
+      # matrix 팬아웃(finance·report)이 같은 hf-dart-push 를 동시에 요청하면 서로를 큐에서
+      # 밀어낸다. originalSync 의 needs 직렬과 같은 목적으로, 한 번에 한 job 만 그룹을
+      # 요청하도록 직렬화한다. HF 동시 커밋(412) 회피도 겸한다.
+      max-parallel: 1
+      matrix:
+        category: ${{ github.event_name == 'workflow_dispatch' && fromJSON(format('["{0}"]', inputs.category == 'all' && 'finance","report' || inputs.category)) || fromJSON('["finance","report"]') }}
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Smoke import (fail fast on src regression)
+        run: uv run python -c "import dartlab; print('dartlab', getattr(dartlab, '__version__', 'dev'))"
+
+      - name: Restore data cache
+        uses: actions/cache/restore@v5
+        with:
+          path: data/dart/${{ matrix.category }}
+          key: dartlab-data-${{ matrix.category }}-${{ github.run_id }}
+          restore-keys: dartlab-data-${{ matrix.category }}-
+
+      - name: Full collect (88-quarter diff)
+        run: uv run python .github/scripts/sync/syncData.py
+        env:
+          DART_API_KEYS: ${{ secrets.DART_API_KEYS }}
+          DARTLAB_DART_CONNECT_RETRY_ATTEMPTS: "6"  # OpenDART TCP 연결 불통(수 분) 대비, 약 4분 긴 백오프 재시도
+          SYNC_CATEGORY: ${{ matrix.category }}
+          SYNC_MODE: all
+
+      - name: Save data cache
+        uses: actions/cache/save@v5
+        with:
+          path: data/dart/${{ matrix.category }}
+          key: dartlab-data-${{ matrix.category }}-${{ github.run_id }}
+
+      # Phase A — IPC mirror 빌드
+      - name: Build IPC mirror
+        run: uv run python -X utf8 .github/scripts/sync/buildIpcMirror.py
+        env:
+          SYNC_CATEGORY: ${{ matrix.category }}
+
+      - name: Upload to HuggingFace
+        run: uv run python .github/scripts/sync/uploadData.py --target hf
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          SYNC_CATEGORY: ${{ matrix.category }}
+
+      # 접수 원장: full 재빌드는 카테고리 없는 dist/changed.txt 에 변경 목록을 쓴다. finance 일 때만
+      # 같은 원장을 만들고, 실패해도 수집과 업로드를 막지 않는다.
+      - name: Build and upload finance receipt ledger
+        if: ${{ matrix.category == 'finance' && hashFiles('dist/changed.txt') != '' }}
+        continue-on-error: true
+        run: uv run python -X utf8 -m dartlab.pipeline.financeReceipts --changed-file dist/changed.txt --out-dir dist/financeReceipts --upload
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+
+      # GitHub Releases 업로드 폐지 (2026-04-08): HF만 유지.

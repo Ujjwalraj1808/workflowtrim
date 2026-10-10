@@ -1,0 +1,65 @@
+name: e2e-dsh-plugin-lane
+
+# #2170 measure 3: the dsh plugin lane (anthropic wire, x-bili-plugin:dsh
+# headers, fork/title-gen side traffic) is the surface where the #2156/#2157/
+# #2164 regression chain lived. This lane runs every dsh/fork/side-shaped
+# suite in one named place so a lane regression is visible on the PR as its
+# own red check, not buried in the general test matrix. Zero tokens: all
+# upstreams are in-process mocks.
+on:
+  pull_request:
+    paths:
+      - "src/server.ts"
+      - "src/server/**"
+      - "src/session.ts"
+      - "src/plugin.ts"
+      - "tests/*fork*.test.ts"
+      - "tests/*side*.test.ts"
+      - "tests/*dsh*.test.ts"
+      - ".github/workflows/ci-e2e-dsh.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: e2e-dsh-plugin-lane-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  e2e-dsh-plugin-lane:
+    name: dsh plugin lane (fork adoption + side-request isolation + lane truth tables)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install deps
+        run: npm ci
+
+      # tsx resolves `acp-kernel` to its built dist (kernel/ is a workspace
+      # package) — same prerequisite as the main test matrix.
+      - name: Build kernel
+        run: npm --prefix kernel run build
+
+      - name: Run dsh plugin lane suites (sequential — concurrent runs flake on shared XDG dirs)
+        run: |
+          set -euo pipefail
+          for f in \
+            side-lane-truth-table \
+            side-lane-invariants \
+            fork-side-request-lane \
+            side-request-isolation \
+            fix-1075-side-request \
+            dsh-persona-fingerprint \
+            plugin-fork \
+            fork-adoption \
+            fork-ccr-adoption \
+            fork-nudge-trigger \
+            truncation-fork \
+            preflight-fork-estimate; do
+            echo "=== tests/$f.test.ts ==="
+            node --import tsx --test "tests/$f.test.ts"
+          done

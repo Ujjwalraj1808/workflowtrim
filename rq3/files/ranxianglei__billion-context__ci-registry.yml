@@ -1,0 +1,61 @@
+name: e2e-local-registry
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: e2e-registry-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  e2e-registry:
+    name: hermetic registry e2e (local verdaccio; loopback only, zero secrets)
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        # Windows is where real installs live (npm -g shims, NTFS junctions,
+        # Program Files paths) — validated on a real win10 VM before adding.
+        os: [ubuntu-latest, windows-latest]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install deps
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      # #1628: the real-baseline phase downloads ONE real published tarball
+      # (the live old updater is the object under test — a self-built fake
+      # cannot stand in for it). Resolved here so a pinned PR head stays
+      # byte-stable across the matrix.
+      - name: Resolve real published baseline (single upstream read)
+        run: echo "BILI_E2E_REAL_BASELINE=$(npm view billion-context version)" >> "$GITHUB_ENV"
+
+      - name: Run hermetic registry E2E
+        run: ACP_TEST_REGISTRY=1 node --import tsx --test tests/e2e/e2e-registry.test.ts tests/e2e/e2e-advisory-rollback.test.ts
+
+      - name: Collect E2E artifacts
+        if: failure()
+        run: |
+          mkdir -p tmp/e2e-artifacts
+          for d in tmp/e2e-registry-* tmp/e2e-advisory-* tmp/e2e-npm-global-*; do [ -d "$d" ] && cp -r "$d" tmp/e2e-artifacts/ || true; done
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        name: e2e-registry-artifacts (with os suffix)
+        with:
+          name: e2e-registry-artifacts-${{ matrix.os }}
+          path: tmp/e2e-artifacts
+          if-no-files-found: ignore

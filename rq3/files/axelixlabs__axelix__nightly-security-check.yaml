@@ -1,0 +1,22 @@
+name: Nightly Security Check
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 1 * * *'
+
+jobs:
+  run-security-check:
+    # Scheduled runs must only execute in the main Axelix repository, not in forks.
+    if: github.event_name != 'schedule' || github.repository == 'axelixlabs/axelix'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+      security-events: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Running Security Check
+        uses: ./.github/actions/security-check

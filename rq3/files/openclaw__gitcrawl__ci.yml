@@ -1,0 +1,136 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Go / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-15
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Download modules
+        run: go mod download
+
+      - name: Check module tidiness
+        if: ${{ matrix.os == 'ubuntu-latest' }}
+        run: |
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum
+
+      - name: Check formatting
+        if: ${{ matrix.os == 'ubuntu-latest' }}
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Vulnerability scan
+        run: GOWORK=off go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...
+
+      - name: Deadcode
+        run: |
+          output_file=$(mktemp)
+          go run golang.org/x/tools/cmd/deadcode@v0.50.0 -test ./... > "$output_file"
+          if [ -s "$output_file" ]; then
+            cat "$output_file"
+            exit 1
+          fi
+
+      - name: Test with coverage
+        run: |
+          go test ./... -covermode=atomic -coverprofile=coverage.out
+          total="$(go tool cover -func=coverage.out | awk '/^total:/ { sub(/%/, "", $3); print $3 }')"
+          echo "total coverage: ${total}%"
+          awk -v total="$total" 'BEGIN { if (total + 0 < 85.0) { printf("coverage %.1f%% is below 85.0%%\n", total); exit 1 } }'
+
+      - name: Test portable SIMD and scalar fallback
+        if: ${{ matrix.os == 'ubuntu-latest' }}
+        run: |
+          # Release binaries are built with this experiment, so test everything they ship.
+          GOEXPERIMENT=simd go test ./...
+          GOEXPERIMENT=simd GODEBUG=simd=0 go test ./internal/vector ./internal/cli
+
+      - name: Build
+        run: go build -ldflags "-X github.com/openclaw/gitcrawl/internal/cli.version=${GITHUB_SHA:0:7}" -o bin/gitcrawl ./cmd/gitcrawl
+
+      - name: Smoke test TUI help
+        run: |
+          set -euo pipefail
+          test -n "$(./bin/gitcrawl --version)"
+          ./bin/gitcrawl metadata --json | grep -q '"schema_version"'
+          ./bin/gitcrawl status --json | grep -q '"databases"'
+          output="$(./bin/gitcrawl help tui)"
+          printf '%s\n' "$output"
+          printf '%s' "$output" | grep -q "gitcrawl tui"
+
+      - name: Test release scripts
+        run: ./scripts/test-release.sh
+
+      - name: Snapshot release build
+        if: ${{ matrix.os == 'ubuntu-latest' }}
+        uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
+        with:
+          distribution: goreleaser
+          version: "v2.18.2"
+          args: release --snapshot --clean --skip=publish
+
+  portable-windows:
+    name: Portable filesystem / windows
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: Test exclusive publication and long paths
+        run: go test ./internal/cli -run '^TestPortableExclusiveRename' -count=1
+      - name: Build and smoke test CLI
+        run: |
+          go build -o gitcrawl.exe ./cmd/gitcrawl
+          ./gitcrawl.exe --version
+
+  docs:
+    name: Docs
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .node-version
+      - name: Build documentation and validate links
+        run: make docs

@@ -1,0 +1,83 @@
+name: Real-compile tests
+
+# End-to-end tests under ``tests/real_compile/`` that spawn an
+# actual ``esphome compile`` subprocess (PlatformIO → downloads
+# + compiles a tiny ESP8266 firmware), so a single test easily
+# runs minutes. The default ``test`` workflow excludes this tree
+# via ``--ignore=tests/real_compile``; this workflow runs it on
+# its own — but only when the diff actually touches the surfaces
+# these tests pin (the materialiser, the receiver-side packer,
+# the storage-path resolver, or the tests themselves). Ordinary
+# bugfix / docs / catalog PRs don't trigger it.
+#
+# If you add a new test under ``tests/real_compile/`` that
+# depends on additional surfaces, extend the ``paths:`` filter
+# below so the gate stays meaningful.
+#
+# YAML anchors (``&trigger-paths`` / ``*trigger-paths``) keep
+# the push and pull_request path filters in lockstep — GitHub
+# Actions resolves anchors at YAML parse time, so the two
+# triggers see one shared list.
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches: [main]
+    paths: &trigger-paths
+      - "esphome_device_builder/helpers/remote_artifacts_materialise.py"
+      - "esphome_device_builder/controllers/remote_build/artifacts_tarball.py"
+      - "esphome_device_builder/helpers/storage_path.py"
+      - "esphome_device_builder/controllers/editor.py"
+      - "esphome_device_builder/helpers/device_yaml/_parsing.py"
+      - "esphome_device_builder/controllers/devices/importable.py"
+      - "esphome_device_builder/controllers/devices/mutations_yaml.py"
+      - "tests/real_compile/**"
+      - ".github/workflows/real-compile-tests.yml"
+  pull_request:
+    branches: [main]
+    paths: *trigger-paths
+
+jobs:
+  real_compile:
+    name: Real esphome compile (round-trip pins)
+    runs-on: ubuntu-latest
+    # PlatformIO toolchain download + cold ESP8266 compile lands
+    # around 4-5 minutes on a fresh runner; the second compile in
+    # the pin-test is incremental (~5 s). 15 minutes is generous
+    # headroom against a flaky toolchain mirror.
+    timeout-minutes: 15
+    steps:
+      - name: Check out code from GitHub
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Set up Python 3.14 + cached venv
+        uses: ./.github/actions/restore-or-build-venv
+        with:
+          python-version: "3.14"
+          install-args: -c esphome-constraints.txt -e .[esphome,test]
+
+      - name: Put the venv on PATH
+        run: echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
+
+      - name: Cache PlatformIO core + per-platform toolchains
+        # ``~/.platformio`` holds PIO's wheel cache, downloaded
+        # toolchains, and per-platform package state. The cache
+        # key includes the test tree's hash so a deliberate change
+        # to the YAML in a test (different platform, different
+        # board) invalidates without manual bumps.
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: ~/.platformio
+          key: pio-real-compile-${{ runner.os }}-${{ hashFiles('tests/real_compile/**') }}
+          restore-keys: |
+            pio-real-compile-${{ runner.os }}-
+
+      - name: Run real-compile tests
+        # ``--timeout=600`` overrides the 10s default in
+        # ``pyproject.toml`` (real compiles run minutes). The
+        # per-test ``@pytest.mark.timeout(...)`` decorator wins
+        # over both, so individual tests can opt for tighter or
+        # looser caps.
+        run: pytest -v tests/real_compile --timeout=600 --no-cov

@@ -1,0 +1,79 @@
+name: Quant Audit
+
+# ──────────────────────────────────────────────────────────────
+# verdict 카테고리 라벨 drift 감지 — 12년 OHLCV 로 audit 재실행.
+# 데이터 fetch 필요 (naver finance) 하므로 nightly + manual.
+# ──────────────────────────────────────────────────────────────
+
+on:
+  schedule:
+    - cron: "0 4 * * 1"  # 매주 월요일 04:00 UTC (한국 13:00)
+  workflow_dispatch:
+
+concurrency:
+  group: quant-audit
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  audit-verdict:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Run verdict category audit (5종목 12년)
+        run: |
+          uv run python -X utf8 -c "
+          import logging; logging.basicConfig(level=logging.WARNING)
+          import warnings; warnings.filterwarnings('ignore')
+          from dartlab.quant.signal.analyzer import _categoryEdgeAudit
+
+          codes = ['005930','000660','005380','035720','068270']
+          results = {}
+          for cat in ('trend','momentum','volatility'):
+              results[cat] = _categoryEdgeAudit(codes, cat, horizons=(5,10,20))
+
+          # 결과 → markdown
+          lines = ['# Verdict Category Audit', '', '| category | label | n | 5d | 10d | 20d | pass |', '|---|---|---|---|---|---|---|']
+          for cat, labels in results.items():
+              for lbl, d in labels.items():
+                  det = d.get('horizon_details', {})
+                  d5 = det.get(5, {})
+                  d10 = det.get(10, {})
+                  d20 = det.get(20, {})
+                  p = '✅' if d.get('pass') else '❌'
+                  lines.append(f'| {cat} | {lbl} | {d.get(\"n_signals\",0)} | t={d5.get(\"t_stat\",0):+.2f} | t={d10.get(\"t_stat\",0):+.2f} | t={d20.get(\"t_stat\",0):+.2f} | {p} |')
+
+          report = '\n'.join(lines)
+          from pathlib import Path
+          Path('data/dart/auditQuant').mkdir(parents=True, exist_ok=True)
+          with open('data/dart/auditQuant/verdict_categories.md', 'w', encoding='utf-8') as f:
+              f.write(report)
+          print(report)
+
+          # fail 검출
+          fail_count = sum(1 for cat in results.values() for d in cat.values() if not d.get('pass'))
+          print(f'\nFail labels: {fail_count}')
+          if fail_count > 0:
+              print('⚠ 라벨 drift 감지 — verdict 카테고리 재검토 필요')
+          "
+
+      - name: Upload audit result
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: verdict-audit
+          path: data/dart/auditQuant/verdict_categories.md

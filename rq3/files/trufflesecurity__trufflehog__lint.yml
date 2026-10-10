@@ -1,0 +1,69 @@
+name: Lint
+
+on:
+  push:
+    tags:
+      - v*
+  pull_request:
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  golangci-lint:
+    name: golangci-lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version: "1.27"
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9
+        with:
+          # NOTE: Version and args must match scripts/lint.sh
+          version: v2.14.0
+          args: --enable bodyclose,copyloopvar,misspell --timeout 10m
+  man-page-staleness:
+    name: man-page-staleness
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version: "1.27"
+      - name: Regenerate man page
+        run: make man
+      - name: Check for staleness
+        run: |
+          if ! git diff --exit-code docs/man/trufflehog.1; then
+            echo "::error::docs/man/trufflehog.1 is stale. Run 'make man' and commit the result."
+            exit 1
+          fi
+  semgrep:
+    name: semgrep
+    runs-on: ubuntu-latest
+    container:
+      image: returntocorp/semgrep
+    if: (github.actor != 'dependabot[bot]')
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - run: semgrep --config=hack/semgrep-rules/detectors.yaml pkg/detectors/
+  checksecretparts:
+    # Reports detector packages that construct detectors.Result without
+    # populating SecretParts. See hack/checksecretparts/README.md.
+    name: checksecretparts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version: "1.27"
+          # hack/checksecretparts only needs the standard library, so this job
+          # finishes before any other and would otherwise claim the shared
+          # go.sum-keyed cache with an empty module cache. Cache keys are
+          # write-once, so that starves every later job on the branch.
+          cache: false
+      - name: Run checksecretparts
+        run: go run ./hack/checksecretparts -fail ./pkg/detectors

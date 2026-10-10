@@ -1,0 +1,188 @@
+name: 'Release: Framework CLI'
+
+permissions:
+  id-token: write
+  contents: write
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'packages/sf-core/**'
+      - 'packages/serverless/**'
+      - 'packages/engine/**'
+      - 'packages/mcp/**'
+
+defaults:
+  run:
+    working-directory: ./packages/sf-core
+
+jobs:
+  test-engine:
+    name: 'Test: Engine'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./packages/engine
+    steps:
+      - name: 'Checkout Code'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: 'Setup: Node.js'
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24.x
+          check-latest: true
+          cache: npm
+      - name: 'Setup: Enable Corepack'
+        run: corepack enable npm
+      - name: 'Install: Dependencies'
+        run: |
+          cd ../../
+          npm ci
+      - name: 'Test: Engine Unit'
+        run: npm test
+
+  tests:
+    uses: ./.github/workflows/test-framework.yml
+    permissions:
+      id-token: write
+      contents: read
+    secrets:
+      SERVERLESS_LICENSE_KEY_DEV: ${{ secrets.SERVERLESS_LICENSE_KEY_DEV }}
+      SERVERLESS_ACCESS_KEY_DEV: ${{ secrets.SERVERLESS_ACCESS_KEY_DEV }}
+    with:
+      platforms: '["ubuntu-latest","ubuntu-24.04-arm","windows-latest"]'
+      stage-prefix: mr-${{ github.actor }}
+      # The default SDK path, which users run; pull request CI covers v3.
+      aws-sdk: ''
+
+  release-canary:
+    name: 'Release: Canary & Tag'
+    # Every test job, on every platform, must pass first.
+    needs: [test-engine, tests]
+    runs-on: ubuntu-latest
+    env:
+      IS_CANARY: true
+    outputs:
+      new_version: ${{ steps.tag_if_new_version.outputs.new_version }}
+    steps:
+      - name: 'Checkout Code'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 50
+      - name: 'Setup: Node.js'
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24.x
+          check-latest: true
+          cache: npm
+      - name: 'Setup: Enable Corepack'
+        run: corepack enable npm
+      - name: 'Install: Dependencies'
+        run: |
+          cd ../../
+          npm ci
+      - name: 'Build: Minify Shim'
+        run: |
+          cd ../serverless/lib/plugins/aws/dev
+          ../../../../../../node_modules/.bin/esbuild ./shim.js --bundle --platform=node --minify --outfile=./shim.min.js
+      - name: 'Build: MCP Entry'
+        working-directory: ./packages/serverless
+        run: npm run build:mcp:entry
+      - name: 'Build: Framework'
+        run: npm run build
+      - name: 'Setup: AWS Credentials'
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: arn:aws:iam::377024778620:role/GithubActionsPublicServerlessRepoAccessRole
+          aws-region: us-east-1
+      - name: 'Release: Upload Tarballs'
+        run: bash prepareReleaseTars.sh
+      - name: 'Release: Invalidate Cache'
+        run: |
+          aws cloudfront create-invalidation --distribution-id E1USPSJN28WQ8U --paths "/*"
+      - name: 'Release: Tag Version'
+        id: tag_if_new_version
+        continue-on-error: true
+        run: |
+          NEW_VERSION=`git diff -U0 ${{ github.event.before }} package.json | grep '"version": "' | tail -n 1 | grep -oE "[0-9]+\.[0-9]+\.[0-9]+"` || :
+          if [ -n "$NEW_VERSION" ] && [ $NEW_VERSION != "0.0.0" ];
+          then
+            git tag sf-core@$NEW_VERSION
+            git push --tags
+            echo "Tagged new version: $NEW_VERSION"
+            echo "new_version=${NEW_VERSION}" >> $GITHUB_OUTPUT
+          fi
+  release-stable:
+    name: 'Release: Dist Tarball'
+    needs: release-canary
+    if: needs.release-canary.outputs.new_version
+    runs-on: ubuntu-latest
+    steps:
+      - name: 'Checkout Code'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: 'Setup: Node.js'
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24.x
+          check-latest: true
+          cache: npm
+      - name: 'Setup: Enable Corepack'
+        run: corepack enable npm
+      - name: 'Setup: AWS Credentials'
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: arn:aws:iam::802587217904:role/GithubActionsPublicServerlessRepoAccessRole
+          aws-region: us-east-1
+      - name: 'Install: Dependencies'
+        run: |
+          cd ../../
+          npm ci
+      - name: 'Build: Minify Shim'
+        run: |
+          cd ../serverless/lib/plugins/aws/dev
+          ../../../../../../node_modules/.bin/esbuild ./shim.js --bundle --platform=node --minify --outfile=./shim.min.js
+      - name: 'Build: MCP Entry'
+        working-directory: ./packages/serverless
+        run: npm run build:mcp:entry
+      - name: 'Build: Framework'
+        run: npm run build
+      - name: 'Release: Upload Tarballs'
+        run: bash prepareReleaseTars.sh
+        env:
+          RELEASES_MONGO_URI: ${{ secrets.RELEASES_MONGO_URI }}
+      - name: 'Release: Invalidate Cache'
+        run: |
+          aws cloudfront create-invalidation --distribution-id E3OEL4OJF1G5FG --paths "/releases.json"
+          aws cloudfront create-invalidation --distribution-id E3OEL4OJF1G5FG --paths "/versions.json"
+  release-npm:
+    name: 'Release: NPM Installer'
+    needs: release-stable
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./packages/sf-core-installer
+    steps:
+      - name: 'Checkout Code'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: 'Setup: Node.js'
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24.x
+          check-latest: true
+          cache: npm
+          scope: '@serverless'
+          registry-url: https://registry.npmjs.org
+      - name: 'Setup: Enable Corepack'
+        run: corepack enable npm
+      - name: 'Release: Copy Readme'
+        run: |
+          cp ../../README.md ./README.md
+      - name: 'Install: Dependencies'
+        run: |
+          cd ../../
+          npm ci
+      - name: 'Release: NPM Publish'
+        run: |
+          npm publish

@@ -1,0 +1,394 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build-test:
+    name: Node ${{ matrix.node-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: [20.19.0, 24.16.0]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # Full history: the concept gate range-walks the PR's constituent
+          # commits (a shallow synthetic-merge checkout would hide them, and
+          # the gate fails loudly on unreachable parents rather than skip).
+          fetch-depth: 0
+
+      # Secret scan runs FIRST — before any toolchain/lifecycle step can read
+      # or echo repository contents. The patterns cannot self-match their own
+      # literals (each embeds a `[` that breaks the class), so workflow files
+      # are scanned too; verified empirically.
+      - name: Secret scan
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git grep -InE '(\bsk-[A-Za-z0-9_-]{20,}|\bsk-ant-[A-Za-z0-9_-]{20,}|\bsk-or-[A-Za-z0-9_-]{20,}|\bghp_[A-Za-z0-9_]{20,}|\bgithub_pat_[A-Za-z0-9_]{20,}|xox[baeprs]-[A-Za-z0-9-]{10,}|\bnpm_[A-Za-z0-9]{30,}|-----BEGIN [A-Z ]*PRIVATE KEY-----)' -- . ':!pnpm-lock.yaml'; then
+            echo "::error::Potential token-like secret found in tracked files."
+            exit 1
+          fi
+
+      # No `version:` here — pnpm/action-setup reads the `packageManager` field in package.json
+      # (the Node-20-compatible pinned pnpm version). Specifying both causes
+      # ERR_PNPM_BAD_PM_VERSION.
+      - name: Install pnpm
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+
+      - name: Setup Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build
+        run: pnpm build
+
+      - name: Build Linux engine resources without platform helper substitutes
+        if: matrix.node-version == '24.16.0'
+        shell: bash
+        env:
+          CLAUDEXOR_BUILD_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          resources="$RUNNER_TEMP/linux-engine-resources"
+          bash scripts/build-engine-resources.sh "$resources"
+          test ! -e "$resources/native"
+          node "$resources/claudexord.bundle.cjs" --probe
+          node "$resources/claudexor.bundle.cjs" help --json
+
+          # Exercise the archive's materialized layout, not only deploy links.
+          browser="$RUNNER_TEMP/linux-materialized-browser"
+          node --input-type=module -e 'import { copyTreeMaterialized } from "./scripts/lib/remote-runtime-archive.mjs"; copyTreeMaterialized(process.argv[1], process.argv[2]);' "$resources/browser-mcp-runtime" "$browser"
+          node "$browser/dist/browser-mcp-launcher.js" --help
+
+      - name: Typecheck (packages + tests + scripts)
+        run: pnpm typecheck && pnpm typecheck:tests
+
+      - name: Test
+        run: pnpm test
+
+      - name: Verify generated JSON Schema is up to date
+        run: |
+          pnpm schema:gen
+          git diff --exit-code packages/schema/generated || (echo "::error::JSON Schema is stale; run 'pnpm schema:gen' and commit." && exit 1)
+          if [ -n "$(git ls-files --others --exclude-standard packages/schema/generated)" ]; then
+            echo "::error::Untracked generated schema files exist; commit them."
+            exit 1
+          fi
+
+      - name: Validate generated JSON Schema dialect (ajv)
+        run: node scripts/validate-generated-schemas.mjs
+
+      - name: Docs truth (endpoints, mode ids, CLI flags)
+        run: node scripts/docs-truth-check.mjs
+
+      - name: Concept gate (Bible edits need CONCEPT-CHANGE markers)
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          # Checkout is fetch-depth: 0, so ranges walk real constituent
+          # commits (synthetic PR merges are exempt unless they change the
+          # Bible beyond their parents; the gate handles that itself).
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            git check-ref-format --branch "$BASE_REF" >/dev/null
+            git fetch --no-tags origin "$BASE_REF"
+            node scripts/concept-gate.mjs --range "origin/$BASE_REF..HEAD"
+          elif [[ "$BEFORE_SHA" =~ ^[0-9a-f]{40}$ ]] && [ "$BEFORE_SHA" != "0000000000000000000000000000000000000000" ]; then
+            node scripts/concept-gate.mjs --range "$BEFORE_SHA..HEAD"
+          else
+            node scripts/concept-gate.mjs --since-last-tag
+          fi
+
+      - name: Staged-field gate (schema fields need producer+consumer)
+        run: pnpm staged:check
+
+      - name: Retired-key gate (persisted-config removals need a registry entry)
+        run: pnpm retired:check
+
+      - name: "INV→verify link gate (every Bible verify: target exists and runs)"
+        run: pnpm inv:check
+
+      - name: Swift fixtures freshness (TS↔Swift round-trip fixtures in sync)
+        run: pnpm fixtures:swift:check
+
+      - name: Sensitive-resource ownership gate
+        run: pnpm sensitive:check
+
+      - name: Dead exports (knip)
+        run: pnpm knip
+
+      - name: Complexity ratchet (readability only goes up)
+        run: node scripts/complexity-ratchet.mjs
+
+      - name: Model-hints freshness (manifest known_models vs installed CLIs)
+        run: node scripts/model-hints-freshness.mjs
+
+      - name: MCP-CLI capability parity (tool args vs run-control flags)
+        run: node scripts/mcp-cli-parity-check.mjs
+
+      - name: Artifact text-extension parity (server SEMANTIC_TEXT_EXTENSIONS vs Swift)
+        run: node scripts/artifact-text-parity-check.mjs
+
+      - name: Fixture provenance (manifest coverage; freshness warns locally)
+        run: node scripts/fixture-freshness-check.mjs
+
+      - name: Runtime-update fixtures freshness (signed-manifest test vectors)
+        run: pnpm fixtures:runtime-update:check
+
+      - name: Canary golden stories (fake-harness E2E)
+        run: pnpm canary
+
+      - name: Release workflow supply-chain contract
+        run: pnpm release:workflow:check
+
+      - name: Format
+        run: pnpm format:check
+
+      - name: Linux CLI smoke (bins, machine surfaces, doctor honesty)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The bare-package wrapper bins must run on Linux.
+          node packages/claudexor/bin/claudexor.js --version
+          node packages/claudexor/bin/claudexor.js help --json | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const j=JSON.parse(s);if(!j.ok||!Array.isArray(j.commands))process.exit(1);});'
+          node packages/cli/dist/cli.js capabilities --json | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const j=JSON.parse(s);if(j.ok!==true)process.exit(1);});'
+          # No vendor CLIs on the runner: doctor must report them honestly
+          # (unavailable/degraded) as VALID JSON — a crash or empty output
+          # fails this step loudly (no || true escape hatch).
+          node packages/cli/dist/cli.js doctor --json > /tmp/doctor.json
+          node -e 'const j=JSON.parse(require("node:fs").readFileSync("/tmp/doctor.json","utf8")); if(!Array.isArray(j.harnesses)) { console.error("doctor --json did not produce a harnesses array"); process.exit(1); }'
+
+  # Branch protection on main requires a check context literally named
+  # `build-test`. The job above never publishes one: a matrix job's check runs
+  # are named from its `name:` template, so it reports as "Node 20.19.0" and
+  # "Node 24.16.0" and the required context stays pending forever (every PR
+  # sits at BLOCKED). This aggregate exists only to publish that name.
+  # `if: always()` is load-bearing — without it the job is skipped when the
+  # matrix fails or is cancelled, and a skipped required check never reports.
+  build-test-gate:
+    name: build-test
+    needs: [build-test, windows-test, swift]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every Node matrix leg to succeed
+        # `needs.<job>.result` collapses the whole matrix: it is `success` only
+        # when every leg succeeded (fail-fast: false means all of them ran).
+        env:
+          MATRIX_RESULT: ${{ needs.build-test.result }}
+          WINDOWS_RESULT: ${{ needs.windows-test.result }}
+          MACOS_RESULT: ${{ needs.swift.result }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$MATRIX_RESULT" != "success" ]; then
+            echo "::error::Node matrix result is '$MATRIX_RESULT' (expected 'success')."
+            exit 1
+          fi
+          if [ "$WINDOWS_RESULT" != "success" ]; then
+            echo "::error::Windows lane result is '$WINDOWS_RESULT' (expected 'success')."
+            exit 1
+          fi
+          if [ "$MACOS_RESULT" != "success" ]; then
+            echo "::error::macOS lane result is '$MACOS_RESULT' (expected 'success')."
+            exit 1
+          fi
+
+  windows-test:
+    name: Windows ${{ matrix.runner }} (Node ${{ matrix.node-version }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-2022
+            node-version: 20.19.0
+          - runner: windows-latest
+            node-version: 24.16.0
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+
+      - name: Setup Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: pnpm
+
+      - name: Initialize pinned x64 MSVC environment
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (-not (Test-Path -LiteralPath $vswhere -PathType Leaf)) {
+            throw "vswhere.exe is unavailable on the hosted Windows image"
+          }
+          $installation = (& $vswhere -latest -products * `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            -property installationPath | Select-Object -First 1).Trim()
+          if (-not $installation) { throw "x64 MSVC build tools are unavailable" }
+          $devCmd = Join-Path $installation "Common7\Tools\VsDevCmd.bat"
+          if (-not (Test-Path -LiteralPath $devCmd -PathType Leaf)) {
+            throw "VsDevCmd.bat is unavailable at $devCmd"
+          }
+          $setup = Join-Path $env:RUNNER_TEMP "claudexor-msvc-env.cmd"
+          "@call `"$devCmd`" -no_logo -arch=x64 -host_arch=x64`r`n@set`r`n" |
+            Set-Content -LiteralPath $setup -Encoding ascii
+          $developer = @{}
+          & $env:ComSpec /d /s /c "`"$setup`"" | ForEach-Object {
+            $separator = $_.IndexOf("=")
+            if ($separator -gt 0) {
+              $developer[$_.Substring(0, $separator)] = $_.Substring($separator + 1)
+            }
+          }
+          foreach ($name in @("Path", "INCLUDE", "LIB", "LIBPATH", "VCToolsInstallDir", "WindowsSdkDir", "WindowsSDKVersion", "UCRTVersion")) {
+            if ($developer.ContainsKey($name)) {
+              Add-Content -LiteralPath $env:GITHUB_ENV -Value "$name=$($developer[$name])" -Encoding utf8
+            }
+          }
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build
+        run: pnpm build
+
+      - name: Build native ConPTY fixture
+        run: pnpm --filter @claudexor/core build:win32-fixtures
+
+      # The Windows-shaped surfaces, and only suites whose fixtures are
+      # portable: the absolute-path contract, win32 process identity and
+      # termination, and the journal walker whose separator bug reproduces
+      # ONLY here. Suites built on POSIX mode bits, symlinks or `#!/bin/sh`
+      # fixtures stay on the Linux/macOS legs; their win32 branches are
+      # proven by injected-platform unit tests instead. The CLI exit tail runs
+      # here because only Windows libuv aborts a forced exit after fetch().
+      - name: Test (platform auth, agy print, ConPTY, setup transport, journal, CLI exit)
+        run: >
+          pnpm vitest run packages/schema/src/schema.test.ts
+          packages/schema/src/platform-auth-policy.test.ts
+          packages/core/src/process-identity.test.ts
+          packages/core/src/process-tree.test.ts
+          packages/core/src/proc-windows-hide.test.ts
+          packages/core/src/capabilities.test.ts
+          packages/core/src/win32-conpty-helper.test.ts
+          packages/harness-agy/src/conformance.test.ts
+          packages/harness-agy/src/win32-print-acceptance.test.ts
+          packages/cli/src/setup-login-capability.test.ts
+          packages/cli/src/setup-login-pty.test.ts
+          packages/cli/src/setup-login-runner-transport.test.ts
+          packages/cli/src/profile-login-win32.integration.test.ts
+          packages/cli/src/setup-login-recovery.test.ts
+          packages/cli/src/setup-recovery-command.test.ts
+          packages/cli/src/live-auth-status.test.ts
+          packages/core/src/credential-mutation-window.test.ts
+          packages/core/src/proc-exit.test.ts
+          packages/harness-cursor/src/auth-timeout.test.ts
+          packages/harness-cursor/src/status-cache.test.ts
+          packages/harness-cursor/src/status-cache-clock.test.ts
+          packages/cli/src/cli-io.test.ts
+          packages/journal/src/index.test.ts
+          packages/journal/src/background-compaction.test.ts
+          packages/journal/src/background-capacity.test.ts
+          packages/daemon/src/journal-maintenance.test.ts
+          packages/control-api/src/journal-background.test.ts
+          packages/harness-codex/src/model-auth.test.ts
+          packages/harness-codex/src/model.test.ts
+          packages/harness-codex/src/responses.test.ts
+          packages/daemon/src/model-operations.test.ts
+          packages/control-api/src/files-result.test.ts
+          packages/workspace/src/directory-portable.test.ts
+          packages/daemon/src/resource-store.model.test.ts
+          packages/daemon/src/command-retention.test.ts
+          packages/control-api/src/model-routes.test.ts
+
+      # The local Codex installer on Windows, proven against the REAL pinned
+      # package: the exact embedded Node toolchain (the official zip's
+      # `node.exe` beside its own `node_modules/npm/bin/npm-cli.js`, SHA-256
+      # pinned below for the `.node-version` release), no node/npm on PATH,
+      # an isolated profile/config root, and the package-native `codex.exe`
+      # the shared harness PATH resolves for doctor/login/run. Auth is a
+      # separate lane; this proves install, receipt, version and doctor
+      # readiness only. `scripts/windows-local-install-smoke.mjs` is the proof.
+      - name: Stage the exact embedded Node toolchain (node.exe + its own npm-cli.js)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $version = (Get-Content .node-version -Raw).Trim()
+          $expected = "edaca9bd58ec8e92037dac4e877d52f6b8f430b81c18b57e264b4e2fb111cd56"
+          $archive = "node-v$version-win-x64.zip"
+          $stage = Join-Path $env:RUNNER_TEMP "claudexor-embedded-node"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          $zip = Join-Path $stage $archive
+          Invoke-WebRequest -Uri "https://nodejs.org/dist/v$version/$archive" -OutFile $zip
+          $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $zip).Hash.ToLowerInvariant()
+          if ($actual -ne $expected) {
+            throw "$archive SHA-256 $actual does not match the pinned $expected (nodejs.org SHASUMS256.txt for v$version)"
+          }
+          Expand-Archive -LiteralPath $zip -DestinationPath $stage -Force
+          $node = Join-Path $stage "node-v$version-win-x64\node.exe"
+          $npm = Join-Path (Split-Path -Parent $node) "node_modules\npm\bin\npm-cli.js"
+          if (-not (Test-Path -LiteralPath $node -PathType Leaf)) { throw "embedded node.exe missing at $node" }
+          if (-not (Test-Path -LiteralPath $npm -PathType Leaf)) { throw "embedded npm-cli.js missing at $npm" }
+          & $node --version
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "CLAUDEXOR_EMBEDDED_NODE=$node" -Encoding utf8
+
+      - name: Local Codex install proof (exact npm pin, embedded npm, no ambient node/npm, isolated profile)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          & $env:CLAUDEXOR_EMBEDDED_NODE scripts/windows-local-install-smoke.mjs
+          if ($LASTEXITCODE -ne 0) { throw "windows-local-install-smoke exited $LASTEXITCODE" }
+
+  swift:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .node-version
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+
+      - name: Build and probe engine resources independently of the app
+        shell: bash
+        env:
+          CLAUDEXOR_BUILD_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          resources="$RUNNER_TEMP/engine-resources"
+          bash scripts/build-engine-resources.sh "$resources"
+          node "$resources/claudexord.bundle.cjs" --probe
+          node "$resources/claudexor.bundle.cjs" help --json
+          pnpm vitest run packages/core/src/process-identity.test.ts packages/schema/src/platform-auth-policy.test.ts
+
+      - name: Swift tests (ClaudexorKit)
+        working-directory: apps/macos/ClaudexorKit
+        run: swift test
+
+      - name: Swift tests and build (ClaudexorApp)
+        working-directory: apps/macos/ClaudexorApp
+        run: swift test && swift build

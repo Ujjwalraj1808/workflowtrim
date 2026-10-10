@@ -1,0 +1,18 @@
+name: Conformance test harness
+
+on:
+  schedule:
+    - cron: '23 5 * * *'
+  workflow_dispatch:
+
+jobs:
+  conformance:
+    strategy:
+      fail-fast: false
+      matrix:
+        branch:
+          - main
+          - versions/next-major
+    uses: ./.github/workflows/cth-test.yml
+    with:
+      branch: ${{ matrix.branch }}

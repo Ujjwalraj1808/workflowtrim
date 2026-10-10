@@ -1,0 +1,43 @@
+name: yamory
+
+on:
+  push:
+    branches:
+      - main
+      - yamory-*
+jobs:
+  check:
+    name: Node.js ubuntu-latest 18.x
+    runs-on: ubuntu-latest
+    steps:
+      - uses: Kesin11/actions-timeline@da70beff098ff89b15d279e8bf2f60519a8dadd7 # v2
+
+      - uses: actions/checkout@v7
+
+      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: "pnpm"
+        # To avoid setup-node cache failure.
+        # ref. https://github.com/actions/setup-node/issues/1137
+      - name: create pnpm cache directory
+        run: mkdir -vp $(pnpm store path --silent)
+
+      - name: download and validate Yamory script
+        working-directory: /tmp
+        run: |
+          curl -sSf -L -o ./yamory-pnpm.sh https://localscanner.yamory.io/script/pnpm
+          curl -sSf -L -o ./yamory-pnpm-sha512sum.txt \
+            https://cli.yamory.io/yamory-app-library-scan-scripts/yamory-pnpm-sha512sum.txt
+          sha512sum --check yamory-pnpm-sha512sum.txt
+          chmod +x ./yamory-pnpm.sh
+      - name: run Yamory
+        run: |
+          ls -d packages/*/ | xargs -I {} /tmp/yamory-pnpm.sh --manifest {}/package.json
+          ls -d examples/*/ | xargs -I {} /tmp/yamory-pnpm.sh --manifest {}/package.json
+        env:
+          CI: true
+          PROJECT_GROUP_KEY: js-sdk
+          YAMORY_API_KEY: ${{ secrets.YAMORY_API_KEY }}

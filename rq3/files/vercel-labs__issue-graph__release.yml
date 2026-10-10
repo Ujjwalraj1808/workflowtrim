@@ -1,0 +1,229 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      expected_sha:
+        description: Full main commit SHA approved for release
+        required: true
+        type: string
+      expected_version:
+        description: Exact package.json version approved for release
+        required: true
+        type: string
+      publish:
+        description: Publish after verification
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: issue-graph-npm-release
+  cancel-in-progress: false
+
+env:
+  EXPECTED_SHA: ${{ inputs.expected_sha || github.sha }}
+  EXPECTED_VERSION: ${{ inputs.expected_version }}
+
+jobs:
+  plan:
+    if: github.repository == 'vercel-labs/issue-graph' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    outputs:
+      needed: ${{ steps.plan.outputs.needed }}
+      version: ${{ steps.plan.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - name: Check whether the main version needs publication
+        id: plan
+        run: node scripts/release.ts plan
+
+  build:
+    needs: plan
+    if: needs.plan.outputs.needed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      EXPECTED_VERSION: ${{ needs.plan.outputs.version }}
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+      filename: ${{ steps.record.outputs.filename }}
+      sha256: ${{ steps.record.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - name: Validate release identity and registry state
+        run: node scripts/release.ts preflight
+      - name: Validate release notes before publication
+        run: node scripts/release-notes.ts "$EXPECTED_VERSION" "$RUNNER_TEMP/release-notes.md"
+      - uses: pnpm/action-setup@v4
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm lint && pnpm typecheck && pnpm test
+      - name: Build and pack once
+        run: |
+          mkdir "$RUNNER_TEMP/release"
+          pnpm pack --pack-destination "$RUNNER_TEMP/release"
+      - name: Record exact archive and source identity
+        id: record
+        run: node scripts/release.ts record "$RUNNER_TEMP/release"
+      - uses: actions/upload-artifact@v4
+        id: upload
+        with:
+          name: issue-graph-release-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/release/
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+          overwrite: false
+
+  consumers:
+    needs: [plan, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [20, 22, 24]
+    env:
+      EXPECTED_VERSION: ${{ needs.plan.outputs.version }}
+      EXPECTED_TARBALL_SHA256: ${{ needs.build.outputs.sha256 }}
+      TARBALL_FILENAME: ${{ needs.build.outputs.filename }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ matrix.node }}
+          package-manager-cache: false
+      - uses: pnpm/action-setup@v4
+      - run: pnpm install --frozen-lockfile
+      - uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ needs.build.outputs.artifact-id }}
+          path: ${{ runner.temp }}/release
+          merge-multiple: true
+      - name: Verify retained archive identity
+        run: pnpm exec tsx scripts/release.ts verify "$RUNNER_TEMP/release"
+      - name: Exercise the supplied archive without rebuilding
+        run: pnpm test:package --tarball "$RUNNER_TEMP/release/$TARBALL_FILENAME" --sha256 "$EXPECTED_TARBALL_SHA256"
+      - name: Verify archive was not changed
+        run: pnpm exec tsx scripts/release.ts verify "$RUNNER_TEMP/release"
+
+  publish:
+    needs: [plan, build, consumers]
+    if: (github.event_name == 'push' || inputs.publish == true) && github.repository == 'vercel-labs/issue-graph' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: Release
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+    env:
+      EXPECTED_VERSION: ${{ needs.plan.outputs.version }}
+      EXPECTED_TARBALL_SHA256: ${{ needs.build.outputs.sha256 }}
+      TARBALL_FILENAME: ${{ needs.build.outputs.filename }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+      - uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ needs.build.outputs.artifact-id }}
+          path: ${{ runner.temp }}/release
+          merge-multiple: true
+      - name: Recheck archive and registry, or verify an already published archive
+        id: preflight
+        run: node scripts/release.ts prepare-publish "$RUNNER_TEMP/release"
+      - name: Publish the tested archive through OIDC without hooks
+        if: steps.preflight.outputs.publish == 'true'
+        env:
+          NODE_AUTH_TOKEN: ""
+          NPM_TOKEN: ""
+        run: |
+          NPM_VERSION=$(npm --version)
+          NPM_VERSION="$NPM_VERSION" node --input-type=module -e '
+            import assert from "node:assert/strict";
+            const [major, minor, patch] = process.env.NPM_VERSION.split(".").map(Number);
+            assert.ok(major > 11 || (major === 11 && (minor > 5 || (minor === 5 && patch >= 1))), "npm >=11.5.1 is required for OIDC");
+            assert.ok(!process.env.NODE_AUTH_TOKEN && !process.env.NPM_TOKEN, "publish must use OIDC, not a stored token");
+          '
+          (
+            cd "$RUNNER_TEMP/release"
+            npm publish "./$TARBALL_FILENAME" --ignore-scripts --access public --registry=https://registry.npmjs.org/ --tag latest
+          )
+          node scripts/release.ts verify "$RUNNER_TEMP/release"
+      - name: Verify published registry identity and exact archive bytes
+        run: node scripts/release.ts verify-published "$RUNNER_TEMP/release"
+
+  github-release:
+    name: Create GitHub Release
+    needs: [plan, publish]
+    if: (github.event_name == 'push' || inputs.publish == true) && github.repository == 'vercel-labs/issue-graph' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    env:
+      EXPECTED_VERSION: ${{ needs.plan.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - name: Extract approved changelog entry
+        run: node scripts/release-notes.ts "$EXPECTED_VERSION" "$RUNNER_TEMP/release-notes.md"
+      - name: Create release at the published commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="v$EXPECTED_VERSION"
+          TAG_REF=$(gh api --paginate "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/$TAG" \
+            --jq ".[] | select(.ref == \"refs/tags/$TAG\") | .ref")
+          if [ -z "$TAG_REF" ]; then
+            gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" \
+              -f ref="refs/tags/$TAG" -f sha="$EXPECTED_SHA" >/dev/null
+          fi
+          RELEASE_SHA=$(gh api "repos/$GITHUB_REPOSITORY/commits/refs/tags/$TAG" --jq '.sha')
+          test "$RELEASE_SHA" = "$EXPECTED_SHA"
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $TAG already exists at the approved commit"
+          else
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --title "$TAG" --verify-tag \
+              --notes-file "$RUNNER_TEMP/release-notes.md"
+          fi

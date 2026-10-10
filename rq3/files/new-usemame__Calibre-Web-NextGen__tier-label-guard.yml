@@ -1,0 +1,112 @@
+name: tier-label-guard
+
+# Restrict who can apply safe-tier-1 / safe-tier-2 to a PR.
+#
+# These labels are the contract that auto-merge.yml respects: a label
+# present + green CI → the PR can be merged without human eyes. The
+# *act* of applying the label is therefore a signed-by-a-trusted-author
+# decision. If a maintainer misclicks, or a future collaborator without
+# context applies one, this workflow strips it immediately and comments
+# on the PR with why.
+#
+# Why pull_request_target rather than pull_request:
+#   - We need pull-requests: write to strip a label from a fork PR; the
+#     base repo's permissions block applies under pull_request_target.
+#   - The workflow file itself is read from main (the base ref), so a
+#     malicious PR can't widen the trusted-labelers list by editing this
+#     file in their branch — the gate value comes from main's copy of
+#     .github/policy/tier-policy.config.
+#   - We do NOT actions/checkout the PR head. We only inspect event
+#     metadata (label name, sender login) and call gh against the API.
+#     No attacker-controlled code is executed; pull_request_target is
+#     safe in this shape.
+
+on:
+  pull_request_target:
+    types: [labeled]
+
+permissions:
+  pull-requests: write
+  contents: read
+
+concurrency:
+  group: tier-label-guard-${{ github.event.pull_request.number }}-${{ github.event.label.name }}
+  cancel-in-progress: false
+
+jobs:
+  guard:
+    # Only run for the two tier labels. Other labels (needs-review,
+    # backport-from-upstream, etc.) are unrestricted.
+    if: |
+      github.event.label.name == 'safe-tier-1' ||
+      github.event.label.name == 'safe-tier-2'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main (for tier-policy.config)
+        # Critical: ref must be main, NOT the PR head. The policy file
+        # used to evaluate trust must be the one currently on main; a
+        # malicious PR cannot widen its own trusted-labelers list by
+        # editing the config in its own branch.
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 1
+
+      - name: Resolve trusted-labelers + check sender
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          LABEL_NAME: ${{ github.event.label.name }}
+          SENDER: ${{ github.event.sender.login }}
+        run: |
+          set -euo pipefail
+
+          if [ ! -f .github/policy/tier-policy.config ]; then
+            echo "::error::missing .github/policy/tier-policy.config — cannot evaluate trust"
+            exit 1
+          fi
+          # shellcheck disable=SC1091
+          source .github/policy/tier-policy.config
+
+          if [ -z "${TIER_LABEL_TRUSTED_LABELERS:-}" ]; then
+            echo "::error::TIER_LABEL_TRUSTED_LABELERS missing from tier-policy.config"
+            exit 1
+          fi
+
+          echo "Label applied: $LABEL_NAME by $SENDER on PR #$PR_NUMBER"
+          echo "Trusted set:   $TIER_LABEL_TRUSTED_LABELERS"
+
+          # Comma-separated allow-list. Wrap with commas so we can do a
+          # substring match without partial-word matches (e.g. 'new-use'
+          # must NOT match 'new-usemame').
+          trusted=",$TIER_LABEL_TRUSTED_LABELERS,"
+          probe=",$SENDER,"
+          if [[ "$trusted" == *"$probe"* ]]; then
+            echo "labeler is trusted; leaving label in place."
+            exit 0
+          fi
+
+          echo "labeler '$SENDER' is NOT in the trusted set; stripping label."
+
+          gh pr edit "$PR_NUMBER" --repo "$REPO" --remove-label "$LABEL_NAME"
+
+          # Use a heredoc-via---body-file to avoid quoting issues with the
+          # rendered comment body (PR titles can contain backticks etc.).
+          body_file=$(mktemp)
+          cat > "$body_file" <<COMMENT
+          🤖 tier-label-guard: stripped \`$LABEL_NAME\`.
+
+          The \`safe-tier-1\` and \`safe-tier-2\` labels gate auto-merge —
+          the act of applying one is a signed-by-a-trusted-author decision.
+          This label was applied by \`$SENDER\`, who is not in the trusted
+          labelers list configured in \`.github/policy/tier-policy.config\`
+          (\`TIER_LABEL_TRUSTED_LABELERS\`).
+
+          If this PR really should auto-merge, an operator from the trusted
+          list needs to apply the label after review. If you're the operator
+          and meant to apply it under your trusted account, switch accounts
+          (\`gh auth switch\`) and re-apply.
+          COMMENT
+          gh pr comment "$PR_NUMBER" --repo "$REPO" --body-file "$body_file"
+          rm -f "$body_file"

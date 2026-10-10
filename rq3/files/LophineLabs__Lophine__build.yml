@@ -1,0 +1,245 @@
+name: Lophine CI
+
+on:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      force-release:
+        description: "Force disable release if you enter false, force release if you enter true, default release if not released else skip release"
+        required: false
+        default: ""
+      force-push:
+        description: "Force disable push to repo if you enter false, force push to repo if you enter true, default push if not released else skip push repo"
+        required: false
+        default: ""
+      comments:
+        description: "Add comments to release"
+        required: false
+        default: ""
+
+permissions: write-all
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    environment: default
+    env:
+      BUILD_NUMBER: ${{ github.run_number }}
+    steps:
+      - name: Checkout Git Repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Sync to CNB
+        if: github.event_name != 'pull_request'
+        continue-on-error: true
+        env:
+          CNB_TOKEN: ${{ secrets.CNB_TOKEN }}
+          CNB_TARGET_URL: https://cnb.cool/LophineLabs/Lophine.git
+        run: |
+          git fetch --all --tags --force
+
+          docker run --rm \
+            -v "${{ github.workspace }}:${{ github.workspace }}" \
+            -w "${{ github.workspace }}" \
+            -e PLUGIN_TARGET_URL="$CNB_TARGET_URL" \
+            -e PLUGIN_AUTH_TYPE="https" \
+            -e PLUGIN_USERNAME="cnb" \
+            -e PLUGIN_PASSWORD="$CNB_TOKEN" \
+            -e PLUGIN_FORCE="true" \
+            -e PLUGIN_PUSH_TAGS="true" \
+            tencentcom/git-sync
+
+      - name: Set Up JDK
+        uses: actions/setup-java@v6
+        with:
+          distribution: zulu
+          java-version: 25
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
+
+      - name: Configure Git User Details
+        run: git config --global user.email "ci@lophinelabs.com" && git config --global user.name "LophinelabsCI"
+
+      - name: Apply All Patches
+        run: ./gradlew applyAllPatches
+
+      - name: Build Paperclip Jar
+        run: ./gradlew createPaperclipJar
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.project_id_b }} CI Artifacts
+          path: lophine-server/build/libs/*-paperclip-*.jar
+
+      - name: Set Environment
+        if: github.event_name != 'pull_request'
+        run: sh scripts/SetENV.sh
+
+      - name: Check If Release Exists
+        if: github.event_name != 'pull_request' && env.flag_release == 'true'
+        run: |
+          git fetch --tags
+          if [ -n "$(git tag -l "${{ env.tag }}")" ]; then
+            echo "Release already exists"
+            release_exists=true
+          else
+            echo "Release does not exist"
+            release_exists=false
+          fi
+          if [ "$release_exists" == "true" ]; then
+            counter=1
+            while [ -n "$(git tag -l "${{ env.tag }}-${counter}")" ]; do
+              counter=$((counter + 1))
+            done
+            echo "tag=${{ env.tag }}-${counter}" >> $GITHUB_ENV
+            echo "release_count= - ${counter}" >> $GITHUB_ENV
+            release_exists=false
+          fi
+          echo "release_exists=${release_exists}" >> $GITHUB_ENV
+
+      - name: Check If Branch In Expectations
+        if: github.event_name != 'pull_request' && env.flag_release == 'true'
+        run: |
+          if [[ "$GITHUB_REF_NAME" == ver/* ]] || [[ "$GITHUB_REF_NAME" == exp/* ]] || [[ "$GITHUB_REF_NAME" == dev/* ]]; then
+            echo "Branch is in expected prefixes"
+            echo "unexpect=false" >> $GITHUB_ENV
+          else
+            echo "Branch is NOT in expected prefixes"
+            echo "unexpect=true" >> $GITHUB_ENV
+          fi
+
+      - name: Publish To Repo
+        if: ( github.event_name != 'pull_request' && !( env.unexpect == 'true' ) && env.flag_push_repo == 'true' && !( inputs.force-push == 'false' )) || inputs.force-push == 'true'
+        continue-on-error: true
+        run: ./gradlew generateDevelopmentBundle publish -PpublishDevBundle=true
+        env:
+          PRIVATE_MAVEN_REPO_PASSWORD: ${{ secrets.PRIVATE_MAVEN_REPO_PASSWORD }}
+          PRIVATE_MAVEN_REPO_USERNAME: ${{ secrets.PRIVATE_MAVEN_REPO_USERNAME }}
+
+      - name: Create Release - Pre Process
+        if: ( github.event_name != 'pull_request' && env.from_pr_merge != 'true' && !( env.unexpect == 'true' ) && env.flag_release == 'true' && env.release_exists != 'true' && !(inputs.force-release == 'false')) || inputs.force-release == 'true'
+        run: |
+          if [ "${{ inputs.comments }}" == "" ]; then
+            echo "No comments provided"
+            echo "flag_comment=false" >> $GITHUB_ENV
+          else
+            echo "Comments provided: ${{ inputs.comments }}"
+            echo "flag_comment=true" >> $GITHUB_ENV
+          fi
+
+      - name: Create Release - No Comment
+        id: release_no_comment
+        if: env.flag_comment == 'false'
+        uses: ncipollo/release-action@v1
+        with:
+          tag: ${{ env.tag }}
+          name: ${{ env.project_id_b }} ${{ env.mcversion }} - ${{ env.commit_id }}${{ env.release_count }}
+          body: |
+            📦Version: `${{ env.mcversion }}` | Commit ${{ env.commit_id }} [![download](https://img.shields.io/github/downloads/LophineLabs/${{ env.project_id }}/${{ env.tag }}/total?color=red&style=flat-square)](https://github.com/LophineLabs/${{ env.project_id }}/releases/download/${{ env.tag }}/${{ env.jar }})
+            This release is automatically compiled by GitHub Actions
+            ### Branch Info
+            > ${{ github.ref_name }}
+            ### Commit Message
+            ${{ env.commit_msg }}
+          artifacts: ${{ env.jar_dir }}
+          generateReleaseNotes: true
+          prerelease: ${{ env.pre }}
+          makeLatest: ${{ env.make_latest }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create Release - With Comment
+        id: release_with_comment
+        if: env.flag_comment == 'true'
+        uses: ncipollo/release-action@v1
+        with:
+          tag: ${{ env.tag }}
+          name: ${{ env.project_id_b }} ${{ env.mcversion }} - ${{ env.commit_id }}${{ env.release_count }}
+          body: |
+            📦Version: `${{ env.mcversion }}` | Commit ${{ env.commit_id }} [![download](https://img.shields.io/github/downloads/LophineLabs/${{ env.project_id }}/${{ env.tag }}/total?color=red&style=flat-square)](https://github.com/LophineLabs/${{ env.project_id }}/releases/download/${{ env.tag }}/${{ env.jar }})
+            This release is automatically compiled by GitHub Actions
+            ### Comments
+            > ${{ inputs.comments }}
+            ### Branch Info
+            > ${{ github.ref_name }}
+            ### Commit Message
+            ${{ env.commit_msg }}
+          artifacts: ${{ env.jar_dir }}
+          generateReleaseNotes: true
+          prerelease: ${{ env.pre }}
+          makeLatest: ${{ env.make_latest }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Sync Release Tag to CNB
+        if: ${{ !cancelled() && (steps.release_no_comment.conclusion == 'success' || steps.release_with_comment.conclusion == 'success') }}
+        continue-on-error: true
+        env:
+          CNB_TOKEN: ${{ secrets.CNB_TOKEN }}
+          CNB_TARGET_URL: https://cnb.cool/LophineLabs/Lophine.git
+        run: |
+          set -euo pipefail
+
+          echo "Sync release tag to CNB: ${{ env.tag }}"
+
+          git fetch origin \
+            "refs/tags/${{ env.tag }}:refs/tags/${{ env.tag }}" \
+            --force
+
+          git remote remove target 2>/dev/null || true
+
+          docker run --rm \
+            -v "${{ github.workspace }}:${{ github.workspace }}" \
+            -w "${{ github.workspace }}" \
+            -e PLUGIN_TARGET_URL="$CNB_TARGET_URL" \
+            -e PLUGIN_AUTH_TYPE="https" \
+            -e PLUGIN_USERNAME="cnb" \
+            -e PLUGIN_PASSWORD="$CNB_TOKEN" \
+            -e PLUGIN_FORCE="true" \
+            -e PLUGIN_PUSH_TAGS="true" \
+            tencentcom/git-sync
+
+          echo "Tag synced. Triggering CNB release pipeline..."
+
+          REQUEST_BODY="$(jq -nc \
+            --arg tag "${{ env.tag }}" \
+            --arg branch "${{ github.ref_name }}" \
+            '{
+              branch: $branch,
+              event: "api_trigger_release_sync",
+              env: {
+                RELEASE_TAG: $tag
+              }
+            }'
+          )"
+
+          echo "CNB branch: ${{ github.ref_name }}"
+          echo "CNB release tag: ${{ env.tag }}"
+
+          HTTP_CODE="$(
+            curl --silent \
+              --show-error \
+              --output /tmp/cnb-response.json \
+              --write-out "%{http_code}" \
+              --request POST \
+              --url "https://api.cnb.cool/LophineLabs/Lophine/-/build/start" \
+              --header "Authorization: ${CNB_TOKEN}" \
+              --header "Accept: application/json" \
+              --header "Content-Type: application/json" \
+              --data "${REQUEST_BODY}"
+          )"
+
+          echo "CNB HTTP Status: ${HTTP_CODE}"
+          echo "CNB API Response:"
+          cat /tmp/cnb-response.json
+          echo
+
+          if [ "${HTTP_CODE}" -lt 200 ] || [ "${HTTP_CODE}" -ge 300 ]; then
+            echo "ERROR: Failed to trigger CNB pipeline"
+            exit 1
+          fi

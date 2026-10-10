@@ -1,0 +1,154 @@
+name: Fuzz
+
+# Long-running libFuzzer campaigns for the parser workspace, moved off local
+# machines onto Actions runners (QA6). Each target
+# (see fuzz/fuzz_targets/) gets its own matrix job so a hang or
+# crash in one target never blocks the others.
+#
+# Seed corpus lives only in fuzz/corpus/ and is generated from tracked public
+# demo fixtures (never private samples).
+on:
+  schedule:
+    # 03:00 UTC daily — off-peak, well clear of any interactive CI traffic.
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'Fuzz target to run (or "all" for every target)'
+        required: true
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - fuzz_docx_parse
+          - fuzz_pptx_parse
+          - fuzz_xlsx_parse
+          - fuzz_zip_handle
+          - fuzz_rels
+          - fuzz_docx_part
+          - fuzz_xlsx_part
+          - fuzz_pptx_part
+          - fuzz_chart_part
+          - fuzz_legacy_direct_doc
+          - fuzz_legacy_direct_xls
+          - fuzz_legacy_direct_ppt
+          - fuzz_legacy_ppt_alternative
+      duration_minutes:
+        description: 'Fuzz duration per target, in minutes'
+        required: true
+        default: '330'
+
+permissions:
+  contents: read
+
+# One campaign at a time per target set — a still-running scheduled run
+# should not be cancelled by a manual dispatch (or vice versa) racing it.
+concurrency:
+  group: fuzz-${{ github.event.inputs.target || 'all' }}
+  cancel-in-progress: false
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    # Actions caps a single job at 6h; stay comfortably under that so the
+    # libFuzzer time budget below always has room to flush its summary and
+    # for the artifact upload step to run even if the target itself hangs
+    # right up to its own budget.
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - fuzz_docx_parse
+          - fuzz_pptx_parse
+          - fuzz_xlsx_parse
+          - fuzz_zip_handle
+          - fuzz_rels
+          - fuzz_docx_part
+          - fuzz_xlsx_part
+          - fuzz_pptx_part
+          - fuzz_chart_part
+          - fuzz_legacy_direct_doc
+          - fuzz_legacy_direct_xls
+          - fuzz_legacy_direct_ppt
+          - fuzz_legacy_ppt_alternative
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Skip non-matching manual target
+        id: gate
+        run: |
+          selected="${{ github.event.inputs.target || 'all' }}"
+          if [ "$selected" = "all" ] || [ "$selected" = "${{ matrix.target }}" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install Rust nightly
+        if: steps.gate.outputs.run == 'true'
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Cache cargo build
+        if: steps.gate.outputs.run == 'true'
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            fuzz
+
+      - name: Install cargo-fuzz
+        if: steps.gate.outputs.run == 'true'
+        run: cargo install cargo-fuzz --locked
+
+      - name: Seed corpus
+        if: steps.gate.outputs.run == 'true'
+        # Corpus dirs are gitignored. Generate part seeds from tracked public
+        # demos and retain the existing whole-package seeds for legacy targets.
+        run: |
+          mkdir -p "fuzz/corpus/${{ matrix.target }}"
+          case "${{ matrix.target }}" in
+            fuzz_docx_parse) cp packages/docx/public/demo/sample-1.docx "fuzz/corpus/${{ matrix.target }}/" || true ;;
+            fuzz_pptx_parse) cp packages/pptx/public/demo/sample-1.pptx "fuzz/corpus/${{ matrix.target }}/" || true ;;
+            fuzz_xlsx_parse) cp packages/xlsx/public/demo/sample-1.xlsx "fuzz/corpus/${{ matrix.target }}/" || true ;;
+            fuzz_zip_handle) cp packages/xlsx/public/demo/sample-1.xlsx "fuzz/corpus/${{ matrix.target }}/" || true ;;
+          esac
+          python3 fuzz/generate-part-corpus.py
+
+      - name: Compute time budget
+        if: steps.gate.outputs.run == 'true'
+        id: budget
+        run: |
+          minutes="${{ github.event.inputs.duration_minutes || '330' }}"
+          echo "seconds=$((minutes * 60))" >> "$GITHUB_OUTPUT"
+
+      - name: Run ${{ matrix.target }}
+        if: steps.gate.outputs.run == 'true'
+        working-directory: fuzz
+        # `set -o pipefail` is required here: without it, `... | tee log`
+        # always exits with tee's status (0), so a crashing fuzz target would
+        # never fail the step (or the job) despite a real finding.
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p logs
+          cargo fuzz run "${{ matrix.target }}" -- \
+            -dict=dicts/ooxml.dict \
+            -max_total_time=${{ steps.budget.outputs.seconds }} \
+            -rss_limit_mb=4096 \
+            -workers=1 \
+            2>&1 | tee "logs/${{ matrix.target }}.log"
+
+      # `cargo fuzz run` exits non-zero on a detected crash/OOM/timeout,
+      # failing the step (and the job) above — this upload runs regardless so
+      # the reproducer bytes and the log are always retrievable from a failed
+      # run, not just a successful one.
+      - name: Upload crash artifacts
+        if: always() && steps.gate.outputs.run == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: |
+            fuzz/artifacts/${{ matrix.target }}/**
+            fuzz/logs/${{ matrix.target }}.log
+          if-no-files-found: ignore
+          retention-days: 30

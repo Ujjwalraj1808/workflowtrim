@@ -1,0 +1,43 @@
+---
+name: 'docs'
+
+# yamllint disable-line rule:truthy
+on:
+  push:
+    branches:
+      - master
+
+concurrency:
+  group: docs-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Cloning repo
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: "Setup python 3.10"
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.10'
+
+      - name: Generate documentation
+        env:
+          BOT_GITHUB_USERNAME: ${{ secrets.HOMEBREW_GITHUB_USERNAME }}
+          BOT_GITHUB_API_TOKEN: ${{ secrets.HOMEBREW_GITHUB_API_TOKEN }}
+        run: |
+          git config --global user.name 'Dokku Bot'
+          git config --global user.email no-reply@dokku.com
+
+          curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+          sudo chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+          sudo apt update
+          sudo apt install gh -y
+
+          gh auth login --with-token <<<"$BOT_GITHUB_API_TOKEN"
+          contrib/build-docs

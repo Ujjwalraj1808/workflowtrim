@@ -1,0 +1,171 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+# 同一分支的新提交取消还在运行的旧检查。
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # CI 每次重新执行测试，测试结果缓存留给本地开发。
+  GOFLAGS: -count=1
+
+jobs:
+  go-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # PR 检查源提交；完整历史用于计算格式检查的基准。
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+      - id: go
+        uses: ./.github/actions/setup-go
+        with:
+          group: lint
+      - id: golangci
+        run: echo "version=$(cat .golangci-version)" >> "$GITHUB_OUTPUT"
+      - uses: golangci/golangci-lint-action@v9
+        with:
+          version: ${{ steps.golangci.outputs.version }}
+          install-only: true
+          skip-cache: true
+      - run: make lint-go
+      - run: make test-tools
+      - name: Check formatting of changed Go files
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PUSH_BASE: ${{ github.event.before }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          if [ "$EVENT_NAME" = pull_request ]; then
+            BASE=$(git merge-base "$PR_BASE" HEAD)
+          elif [ -n "$PUSH_BASE" ] && [ "$PUSH_BASE" != 0000000000000000000000000000000000000000 ]; then
+            # 强制推送后旧提交可能不在当前分支历史中，缺失时单独获取。
+            git cat-file -e "$PUSH_BASE^{commit}" 2>/dev/null || git fetch origin "$PUSH_BASE"
+            BASE=$PUSH_BASE
+          elif [ "$GITHUB_REF_NAME" != "$DEFAULT_BRANCH" ]; then
+            BASE=$(git merge-base "origin/$DEFAULT_BRANCH" HEAD)
+          else
+            # 首次推送默认分支没有旧提交，以空树为基准。
+            BASE=$(git hash-object -t tree --stdin < /dev/null)
+          fi
+          make fmt-check BASE="$BASE"
+      - if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/cache/save@v5
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+            ~/.cache/golangci-lint
+          key: ${{ steps.go.outputs.cache-key }}
+
+  go-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - id: go
+        uses: ./.github/actions/setup-go
+        with:
+          group: test
+      - run: make test-go
+      - if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/cache/save@v5
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+            ~/.cache/golangci-lint
+          key: ${{ steps.go.outputs.cache-key }}
+
+  go-integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      # 与 go-test 共用编译缓存，由 go-test 负责保存。
+      - uses: ./.github/actions/setup-go
+        with:
+          group: test
+      - name: Install PostgreSQL 18 client
+        run: |
+          # 恢复夹具使用 PostgreSQL 18；pg_dump 不能备份高于自身主版本的服务端。
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl --fail --silent --show-error --location https://www.postgresql.org/media/keys/ACCC4CF8.asc -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc
+          . /etc/os-release
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt ${VERSION_CODENAME}-pgdg main" | sudo tee /etc/apt/sources.list.d/tokenrouter-pgdg.list
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends postgresql-client-18
+          echo "/usr/lib/postgresql/18/bin" >> "$GITHUB_PATH"
+      - run: make test-integration
+
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: pnpm/action-setup@v6
+        with:
+          package_json_file: frontend/package.json
+      - uses: actions/setup-node@v6
+        with:
+          node-version-file: .node-version
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+      - run: pnpm --dir frontend install --frozen-lockfile
+      - run: make lint-frontend
+      - run: make test-frontend
+
+  # 生产前端资源和嵌入资源的发布形态后端。
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - id: go
+        uses: ./.github/actions/setup-go
+        with:
+          group: build
+      - id: golangci
+        run: echo "version=$(cat .golangci-version)" >> "$GITHUB_OUTPUT"
+      - uses: golangci/golangci-lint-action@v9
+        with:
+          version: ${{ steps.golangci.outputs.version }}
+          install-only: true
+          skip-cache: true
+      - uses: pnpm/action-setup@v6
+        with:
+          package_json_file: frontend/package.json
+      - uses: actions/setup-node@v6
+        with:
+          node-version-file: .node-version
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+      - run: pnpm --dir frontend install --frozen-lockfile
+      - run: make build
+      - run: make test-embed
+      - if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/cache/save@v5
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+            ~/.cache/golangci-lint
+          key: ${{ steps.go.outputs.cache-key }}
+
+  scripts:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v6
+      - run: make test-scripts
+
+  installer:
+    # Linux 安装器依赖 Bash 4+ 和 sha256sum；macOS 系统 Bash 仅支持 3.2。
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - run: make test-installer

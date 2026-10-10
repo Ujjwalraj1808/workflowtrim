@@ -1,0 +1,43 @@
+name: k6packager
+on:
+  # Enable manually triggering this workflow via the API or web UI
+  workflow_dispatch:
+  schedule:
+    - cron: '0 0 * * 0' # weekly (Sundays at 00:00)
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  publish-packager:
+    runs-on: ubuntu-latest
+    env:
+      VERSION: 0.0.4
+      DOCKER_IMAGE_ID: ghcr.io/grafana/k6packager
+      GITHUB_ACTOR: ${{ github.actor }}
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    permissions:
+      contents: read
+      id-token: write
+      packages: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Build
+        run: |
+          cd packaging
+          docker compose build packager
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ env.GITHUB_ACTOR }}
+          password: ${{ env.GITHUB_TOKEN }}
+      - name: Publish
+        run: |
+          docker push "${DOCKER_IMAGE_ID}:latest"
+          docker tag "${DOCKER_IMAGE_ID}" "${DOCKER_IMAGE_ID}:${VERSION}"
+          docker push "${DOCKER_IMAGE_ID}:${VERSION}"

@@ -1,0 +1,64 @@
+name: Validate Skill
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Read-only token: nothing here writes to the repository.
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Install skills-ref
+        run: pip install skills-ref==0.1.1
+
+      - name: Validate SKILL.md against the Agent Skills spec
+        run: python -m skills_ref.cli validate skills/keep-the-why
+
+      - name: Validate evals.json is well-formed
+        run: python -m json.tool tools/evals/evals.json >/dev/null
+
+      # agent-skill-manager labels a package High Risk at install time on the
+      # word bash (or `sh -c`) anywhere in it; shell fences in the package are
+      # ```sh (context/release-and-distribution.md, "Shell fences inside the
+      # skill package are ```sh"). One slipped back in with 0.18.0 — this
+      # mirrors asm's pattern so it cannot again.
+      - name: No asm shell-command match in the skill package
+        run: |
+          if grep -rnwE 'bash|sh[[:space:]]+-c' skills/keep-the-why; then
+            echo "::error::the skill package matches asm's shell-command pattern (bash, sh -c): fence shell snippets as sh — see context/release-and-distribution.md"
+            exit 1
+          fi
+
+      - name: Check version consistency across the repo
+        run: |
+          V=$(grep -oP '(?<=version: ")[0-9]+\.[0-9]+\.[0-9]+' skills/keep-the-why/SKILL.md | head -1)
+          echo "Reference version (SKILL.md): $V"
+          fail=0
+          check() {
+            v=$(grep -oP "$2" "$1" | head -1)
+            if [ "$v" != "$V" ]; then
+              echo "::error file=$1::version mismatch: found '$v', expected '$V'"
+              fail=1
+            fi
+          }
+          check plugin.json '(?<="version": ")[0-9]+\.[0-9]+\.[0-9]+'
+          check .claude-plugin/plugin.json '(?<="version": ")[0-9]+\.[0-9]+\.[0-9]+'
+          check .codex-plugin/plugin.json '(?<="version": ")[0-9]+\.[0-9]+\.[0-9]+'
+          check package.json '(?<="version": ")[0-9]+\.[0-9]+\.[0-9]+'
+          check llms.txt '(?<=^Version: )[0-9]+\.[0-9]+\.[0-9]+'
+          check .keep-the-why '(?<=context-schema: )[0-9]+\.[0-9]+\.[0-9]+'
+          check skills/keep-the-why/references/setup.md '(?<=context-schema: )[0-9]+\.[0-9]+\.[0-9]+'
+          check skills/keep-the-why/references/specification.md '(?<=context-schema: )[0-9]+\.[0-9]+\.[0-9]+'
+          check skills/keep-the-why/examples/first-time-setup.md '(?<=context-schema: )[0-9]+\.[0-9]+\.[0-9]+'
+          exit $fail

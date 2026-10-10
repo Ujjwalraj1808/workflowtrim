@@ -1,0 +1,135 @@
+# ---------------------------------------------------------------------------
+# SonarCloud analysis — runs on every push to main and on trusted same-repository PRs.
+# Requires SONAR_TOKEN repository secret; Dependabot/fork PRs cannot receive it.
+# ---------------------------------------------------------------------------
+name: SonarCloud
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read      # checkout
+  pull-requests: read # PR decoration
+
+concurrency:
+  group: sonarcloud-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  classify:
+    runs-on: ubuntu-24.04
+    outputs:
+      release_metadata_only: ${{ steps.release-classifier.outputs.release_metadata_only }}
+      docs_only: ${{ steps.release-classifier.outputs.docs_only }}
+      run_analysis: ${{ steps.sonar-mode.outputs.run_analysis }}
+      no_op_reason: ${{ steps.sonar-mode.outputs.no_op_reason }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Detect release metadata-only change set
+        id: release-classifier
+        shell: bash
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_EVENT_NAME" == 'pull_request' ]]; then
+            base_sha="$(git rev-parse HEAD^1)"
+            head_sha="$(git rev-parse HEAD^2)"
+          else
+            base_sha="$BEFORE_SHA"
+            head_sha="$(git rev-parse HEAD)"
+            if [[ -z "$base_sha" || "$base_sha" =~ ^0+$ ]]; then
+              base_sha="$(git rev-parse HEAD^)"
+            fi
+          fi
+          git diff --name-only "$base_sha" "$head_sha" > "${RUNNER_TEMP}/changed-paths.txt"
+          if python scripts/check_release_please_metadata_only.py \
+            --paths-file "${RUNNER_TEMP}/changed-paths.txt"; then
+            echo 'release_metadata_only=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'release_metadata_only=false' >> "$GITHUB_OUTPUT"
+          fi
+          # Preserve source-to-doc rename deletions; Git -z avoids path quoting
+          # ambiguities. Empty/malformed or mixed diffs always run full analysis.
+          git diff --no-renames --name-only -z "$base_sha" "$head_sha" > "${RUNNER_TEMP}/changed-paths-nul.bin"
+          if python scripts/check_sonar_docs_only.py \
+            --paths-file "${RUNNER_TEMP}/changed-paths-nul.bin"; then
+            echo 'docs_only=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'docs_only=false' >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Determine Sonar execution mode
+        id: sonar-mode
+        shell: bash
+        env:
+          RELEASE_METADATA_ONLY: ${{ steps.release-classifier.outputs.release_metadata_only }}
+          DOCS_ONLY: ${{ steps.release-classifier.outputs.docs_only }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          run_analysis=true
+          no_op_reason=''
+          if [[ "$RELEASE_METADATA_ONLY" == 'true' ]]; then
+            run_analysis=false
+            no_op_reason='release-metadata-only change set'
+          elif [[ "$EVENT_NAME" == 'pull_request' && "$PR_HEAD_REPO" != "$REPOSITORY" ]]; then
+            run_analysis=false
+            no_op_reason='fork pull request'
+          elif [[ "$EVENT_NAME" == 'pull_request' && "$PR_AUTHOR" == 'dependabot[bot]' ]]; then
+            run_analysis=false
+            no_op_reason='Dependabot pull request cannot receive SONAR_TOKEN'
+          elif [[ "$DOCS_ONLY" == 'true' ]]; then
+            run_analysis=false
+            no_op_reason='docs-only change set outside Sonar analysis scope'
+          fi
+          echo "run_analysis=$run_analysis" >> "$GITHUB_OUTPUT"
+          echo "no_op_reason=$no_op_reason" >> "$GITHUB_OUTPUT"
+
+  sonarcloud:
+    name: SonarCloud Scan
+    needs: classify
+    if: >
+      always() &&
+      needs.classify.result == 'success' &&
+      (github.repository_owner == 'oaslananka' || github.repository_owner == 'oaslananka-ops')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Record intentional Sonar no-op
+        if: needs.classify.outputs.run_analysis != 'true'
+        shell: bash
+        env:
+          NO_OP_REASON: ${{ needs.classify.outputs.no_op_reason }}
+        run: |
+          set -euo pipefail
+          echo "SonarCloud analysis intentionally not run: ${NO_OP_REASON:-not applicable}"
+
+      - name: Checkout code
+        if: needs.classify.outputs.run_analysis == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0  # full history for accurate blame / new-code detection
+          persist-credentials: false
+
+      # Keep an independent full-suite coverage run: cross-workflow artifact reuse must
+      # preserve exact-SHA integrity and the existing PR/fork trust boundary.
+      - name: Run tests with coverage
+        if: needs.classify.outputs.run_analysis == 'true'
+        uses: ./.github/actions/python-full-suite
+
+      - name: SonarCloud Scan
+        if: needs.classify.outputs.run_analysis == 'true'
+        uses: SonarSource/sonarqube-scan-action@d209202bc7d53ff1cc128f7f907dac145c9d6ae9 # v8.3.0
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

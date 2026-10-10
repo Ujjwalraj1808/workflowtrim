@@ -1,0 +1,581 @@
+name: Orchestrator CI
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+    branches:
+      - master
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+
+  # --------------------------------------------------------------------------------
+  # FILTER: Detect which Apps have changed
+  # --------------------------------------------------------------------------------
+  generate-config:
+    name: Generate Config
+    if: github.event_name == 'pull_request' || !contains((github.event.head_commit.message || ''), '[skip-tests]')
+    runs-on: ubuntu-latest
+    outputs:
+      filters: ${{ steps.generator.outputs.filters }}
+    steps:
+      - name: ⤵️ Check out code
+        uses: actions/checkout@v7
+      - name: 🐍 Generate Dynamic Filters
+        id: generator
+        run: |
+          import os
+          import json
+          import uuid
+
+          filters = {}
+          # Apps excluded from CI builds/tests (only built during release)
+          # These Apps are too large or resource-intensive for CI
+          CI_EXCLUDED_APPS = set()
+
+          # Scan for config.yaml to identify Apps
+          for root, dirs, files in os.walk("."):
+              if "config.yaml" in files:
+                  App_name = os.path.relpath(root, ".")
+                  if App_name == ".": continue
+
+                  # Standardize path separators
+                  App_name = App_name.replace(os.path.sep, "/")
+
+                  # Skip hidden directories (including .unsupported - these are built locally from unsupported branch)
+                  # If the path starts with . (including .unsupported), skip
+                  # If the path is inside a hidden dir (like .git/foo), skip
+                  parts = App_name.split("/")
+                  if parts[0].startswith("."):
+                      continue
+                  if len(parts) > 1 and any(p.startswith(".") for p in parts):
+                       # Skip any path containing hidden directories
+                       continue
+
+                  # Skip CI-excluded Apps (heavy/long-running, only built on release)
+                  if App_name in CI_EXCLUDED_APPS:
+                      print(f"Skipping CI-excluded App: {App_name}")
+                      continue
+
+                  filters[App_name] = [f"{App_name}/**"]
+
+          # Dump as JSON (valid YAML)
+          json_content = json.dumps(filters)
+
+          delimiter = str(uuid.uuid4())
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write(f"filters<<{delimiter}\n")
+              f.write(json_content)
+              f.write(f"\n{delimiter}\n")
+
+        shell: python
+
+  # --------------------------------------------------------------------------------
+  # FILTER: Detect which Apps have changed
+  # --------------------------------------------------------------------------------
+  filter:
+    name: 🔍 Detect Changes
+    needs: generate-config
+    runs-on: ubuntu-latest
+    outputs:
+      Apps: ${{ steps.filter.outputs.changes }}
+      docs_only: ${{ steps.change-type.outputs.docs_only }}
+      needs_build: ${{ steps.change-type.outputs.needs_build }}
+      force_supervisor: ${{ steps.change-type.outputs.force_supervisor }}
+      skip_supervisor: ${{ steps.change-type.outputs.skip_supervisor }}
+      is_stale: ${{ steps.check-stale.outputs.is_stale }}
+    steps:
+      - name: 🔍 Check for newer commits
+        id: check-stale
+        if: github.event_name == 'pull_request'
+        run: |
+          # Use API to get current head SHA to avoid git dependency before checkout
+          LATEST_SHA=$(gh api repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }} --jq '.head.sha' 2>/dev/null || echo "")
+          CURRENT_SHA="${{ github.event.pull_request.head.sha }}"
+
+          if [ -n "$LATEST_SHA" ] && [ "$LATEST_SHA" != "$CURRENT_SHA" ]; then
+            echo "::warning title=Stale Build::Skipping build for $CURRENT_SHA because a newer commit ($LATEST_SHA) is available."
+            echo "is_stale=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_stale=false" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: ⤵️ Check out code
+        uses: actions/checkout@v7
+        if: steps.check-stale.outputs.is_stale != 'true'
+        with:
+          fetch-depth: 0
+
+      - name: 📂 Run Paths Filter
+        id: filter
+        if: steps.check-stale.outputs.is_stale != 'true'
+        uses: dorny/paths-filter@v4
+        with:
+          token: ''  # Force use of local git instead of GitHub API to avoid timeouts
+          filters: ${{ needs.generate-config.outputs.filters }}
+
+      - name: 🔎 Analyze Change Types
+        id: change-type
+        if: steps.check-stale.outputs.is_stale != 'true'
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          # Get all changed files in this push/PR
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            CHANGED_FILES=$({ git diff --name-only "${{ github.event.pull_request.base.sha }}" "${{ github.sha }}" 2>/dev/null || git diff --name-only HEAD~1 2>/dev/null || git ls-tree -r HEAD --name-only; })
+          else
+            CHANGED_FILES=$({ git diff --name-only HEAD~1 2>/dev/null || git ls-tree -r HEAD --name-only; })
+          fi
+
+          echo "Changed files:"
+          echo "$CHANGED_FILES"
+
+          # Categorize changes
+          docs_only="true"
+          needs_build="false"
+
+          for file in $CHANGED_FILES; do
+            # Check if file requires build (Dockerfile, config, scripts, etc.)
+            if [[ "$file" == */Dockerfile ]] || \
+               [[ "$file" == */build.yaml ]] || \
+               [[ "$file" == */build.json ]] || \
+               [[ "$file" == */config.yaml ]] || \
+               [[ "$file" == */config.json ]] || \
+               [[ "$file" == *run.sh ]] || \
+               [[ "$file" == *.py ]] || \
+               [[ "$file" == */rootfs/* ]] || \
+               [[ "$file" == */root/* ]]; then
+              needs_build="true"
+              docs_only="false"
+            # Check if it's NOT a documentation/workflow file
+            elif [[ "$file" != *.md ]] && \
+                 [[ "$file" != *.MD ]] && \
+                 [[ "$file" != .github/workflows/* ]] && \
+                 [[ "$file" != .github/*.md ]] && \
+                 [[ "$file" != LICENSE* ]] && \
+                 [[ "$file" != */CHANGELOG* ]] && \
+                 [[ "$file" != .gitignore ]] && \
+                 [[ "$file" != .editorconfig ]]; then
+              docs_only="false"
+            fi
+          done
+
+          # Check for Manual Triggers in Commit Message or PR Title
+          COMMIT_MSG=$(git log -1 --pretty=format:"%s")
+          # PR_TITLE is passed via env
+          SEARCH_TEXT="$COMMIT_MSG $PR_TITLE"
+          echo "Run Trigger Check on: $SEARCH_TEXT"
+
+          force_supervisor="false"
+          if [[ "$SEARCH_TEXT" == *"[supervisor]"* ]] || [[ "$SEARCH_TEXT" == *"[test-supervisor]"* ]]; then
+             echo "✅ Found [supervisor] trigger!"
+             force_supervisor="true"
+             needs_build="true"
+             # If we force supervisor test, we treat it as if code changed so build runs
+          fi
+
+          if [[ "$SEARCH_TEXT" == *"[build]"* ]] || [[ "$SEARCH_TEXT" == *"[force build]"* ]]; then
+             echo "✅ Found [build] trigger!"
+             needs_build="true"
+          fi
+
+          # Determine if we should skip heavy supervisor tests based on change volume vs complexity
+          # Threshold: more than 5 Apps, and all changes are minor (doc/changelog/formatting)
+          App_COUNT=$(echo "${{ steps.filter.outputs.changes }}" | jq '. | length' 2>/dev/null || echo "0")
+          skip_supervisor="false"
+          if [ "$App_COUNT" -gt 5 ] && [ "$docs_only" == "true" ]; then
+             echo "🚀 Large docs-only PR detected ($App_COUNT Apps). Skipping heavy tests."
+             skip_supervisor="true"
+          fi
+
+          {
+            echo "docs_only=$docs_only"
+            echo "needs_build=$needs_build"
+            echo "force_supervisor=$force_supervisor"
+            echo "skip_supervisor=$skip_supervisor"
+          } >> "$GITHUB_OUTPUT"
+          echo "Results: docs_only=$docs_only, needs_build=$needs_build, skip_supervisor=$skip_supervisor"
+
+  # --------------------------------------------------------------------------------
+  # LINT: Static Analysis (Fail Fast)
+  # --------------------------------------------------------------------------------
+  # ROOT LINT: Lint root level & non-app files (package.json, workflows, root scripts)
+  # --------------------------------------------------------------------------------
+  root-lint:
+    name: 🧹 Root Lint & Validate
+    needs: filter
+    if: |
+      (needs.filter.outputs.Apps == '[]' || needs.filter.outputs.Apps == '') &&
+      needs.filter.outputs.docs_only != 'true' &&
+      needs.filter.outputs.is_stale != 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: ⤵️ Check out code
+        uses: actions/checkout@v7
+
+      - name: 📦 Validate Root package.json
+        run: |
+          if [ -f package.json ]; then
+            node -e "JSON.parse(require('fs').readFileSync('package.json'))"
+            echo "✅ Root package.json is valid JSON"
+          fi
+          if [ -f package-lock.json ]; then
+            node -e "JSON.parse(require('fs').readFileSync('package-lock.json'))"
+            echo "✅ Root package-lock.json is valid JSON"
+          fi
+
+      - name: 🧪 Run Repository & AGENTS Tests
+        run: |
+          if [ -d tests ]; then
+            python3 -m pip install --upgrade pip
+            pip install pytest
+            pytest tests/
+          fi
+
+  # --------------------------------------------------------------------------------
+  lint:
+    name: 🧹 Lint & Validate
+    needs: filter
+    if: |
+      needs.filter.outputs.Apps != '[]' &&
+      needs.filter.outputs.Apps != '' &&
+      needs.filter.outputs.is_stale != 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        App: ${{ fromJSON(needs.filter.outputs.Apps) }}
+
+    steps:
+      - name: ⤵️ Check out code
+        uses: actions/checkout@v7
+      # 1. ShellCheck
+      - name: 🐚 ShellCheck
+        uses: ludeeus/action-shellcheck@2.0.0
+        with:
+          scandir: "./${{ matrix.App }}"
+          format: gcc
+        env:
+          SHELLCHECK_OPTS: -s bash -e SC2086 -e SC1091 -e SC2155
+
+      # 2. Hadolint
+      - name: 🐳 Hadolint
+        uses: hadolint/hadolint-action@v3.5.0
+        with:
+          dockerfile: "./${{ matrix.App }}/Dockerfile"
+          config: .hadolint.yaml
+
+      # 3. Common Linters (Markdown/YAML/JSON/Prettier)
+      # ADVISORY CHECKS: These use continue-on-error: true intentionally.
+      # Rationale: Formatting issues are auto-fixed by orchestrator-autofix.yaml,
+      # so we don't block PRs for style violations. Failures still appear in logs.
+      - name: 📝 MarkdownLint
+        continue-on-error: true # Advisory - auto-fixed by orchestrator-autofix
+        uses: actionshub/markdownlint@v3.1.4
+        with:
+          args: "-c .markdownlint.yaml ${{ matrix.App }}"
+
+      - name: 📄 YAMLLint
+        continue-on-error: true # Advisory - formatting issues are non-blocking
+        uses: frenck/action-yamllint@v1
+        with:
+          args: "./${{ matrix.App }}"
+
+      - name: 💅 Prettier
+        continue-on-error: true # Advisory - auto-fixed by orchestrator-autofix
+        run: |
+          npm install -g prettier
+          prettier --check "${{ matrix.App }}/**/*.{json,js,md,yaml}" --ignore-path .prettierignore
+
+      - name: 🧩 ESLint & Tests
+        run: |
+          # Find directory with package.json (root or app/)
+          LINT_DIR=""
+          if [ -f "./${{ matrix.App }}/package.json" ]; then
+            LINT_DIR="./${{ matrix.App }}"
+          elif [ -f "./${{ matrix.App }}/app/package.json" ]; then
+            LINT_DIR="./${{ matrix.App }}/app"
+          fi
+
+          if [ -n "$LINT_DIR" ]; then
+            echo "🔍 Processing Node.js project in $LINT_DIR"
+            cd "$LINT_DIR"
+            npm ci --prefer-offline || npm install
+
+            if npm run | grep -q "lint"; then
+              echo "::group::🔍 Running ESLint"
+              npm run lint -- --format stylish
+              echo "::endgroup::"
+            else
+              echo "⏭️ No lint script found in package.json, skipping."
+            fi
+
+            if npm run | grep -q "test"; then
+              echo "::group::🧪 Running Tests"
+              npm test
+              echo "::endgroup::"
+            fi
+          else
+            echo "⏭️ No package.json found, skipping ESLint."
+          fi
+
+      # 3b. Node.js ES Module & Import Syntax Validation (Catches missing exports & syntax errors)
+      - name: ⚡ Node.js Module Verification
+        env:
+          CI: "true"
+        run: |
+          LINT_DIR=""
+          if [ -f "./${{ matrix.App }}/package.json" ]; then
+            LINT_DIR="./${{ matrix.App }}"
+          elif [ -f "./${{ matrix.App }}/app/package.json" ]; then
+            LINT_DIR="./${{ matrix.App }}/app"
+          fi
+
+          if [ -n "$LINT_DIR" ]; then
+            echo "🔍 Validating Node.js module imports and syntax in $LINT_DIR"
+            cd "$LINT_DIR"
+            if [ -d "node_modules" ] || npm install --no-audit --no-fund; then
+              # Test loading entrypoints / index.js syntax and ESM resolution without running top-level code
+              if [ -f "./index.js" ]; then
+                node --check ./index.js
+                echo "✅ Verified ESM syntax: ./index.js"
+              fi
+              if [ -f "./src/index.js" ]; then
+                node --check ./src/index.js
+                echo "✅ Verified ESM syntax: ./src/index.js"
+              fi
+            fi
+          fi
+
+      # 4. apps linter (Frenck's) - Validates config.yaml/json
+      - name: 🕵️ app linter
+        uses: frenck/action-addon-linter@v2
+        with:
+          path: "./${{ matrix.App }}"
+        continue-on-error: ${{ matrix.App == 'netboot-xyz' }}
+
+      # 5. Platinum Compliance (S6, Healthcheck, OCI, Translations, Images)
+      - name: 🐍 Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+          cache: "pip"
+
+      - name: 📦 Install Compliance Deps
+        run: pip install pyyaml pillow
+
+      - name: 🏆 Platinum Compliance Check
+        id: compliance
+        continue-on-error: true
+        run: |
+          set +e
+          # Add App name as header for report aggregation
+          echo "App: ${{ matrix.App }}" > compliance_report.txt
+          python3 .scripts/check_compliance.py "./${{ matrix.App }}" >> compliance_report.txt 2>&1
+          exit_code=$?
+          set -e
+
+          echo "::group::Compliance Report"
+          cat compliance_report.txt
+          echo "::endgroup::"
+
+          if [ "$exit_code" -ne 0 ]; then
+            echo "status=failure" >> "$GITHUB_OUTPUT"
+          else
+            echo "status=success" >> "$GITHUB_OUTPUT"
+          fi
+
+          # Sanitize App name for artifact naming (replace / with -)
+          App_SAFE=$(echo "${{ matrix.App }}" | tr '/' '-')
+          echo "App_safe=$App_SAFE" >> "$GITHUB_OUTPUT"
+
+      - name: 📤 Upload Compliance Report
+        if: steps.compliance.outputs.status == 'failure'
+        uses: actions/upload-artifact@v7
+        with:
+          name: compliance-${{ github.run_id }}-${{ steps.compliance.outputs.App_safe }}
+          path: compliance_report.txt
+          retention-days: 1
+
+      - name: 🛑 Fail if Compliance Error
+        if: steps.compliance.outputs.status == 'failure'
+        run: |
+          echo "::error::Compliance checks failed! See 'Platinum Compliance Check' step for details."
+          cat compliance_report.txt
+          exit 1
+
+      # 7. Translation Check (EN/DE)
+      - name: 🌐 Translation Check
+        run: |
+          python3 .scripts/check_translations.py "./${{ matrix.App }}"
+
+      # 6. Security Scan (Trivy)
+      # Scanning the directory for vulnerabilities (fs mode)
+      # Note: Scanning the built image is better, but this scans deps/conf before build.
+      - name: 🛡️ Trivy Security Scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: "fs"
+          scan-ref: "./${{ matrix.App }}"
+          ignore-unfixed: true
+          severity: "CRITICAL,HIGH"
+
+  # --------------------------------------------------------------------------------
+  # BUILD: Test Build (No Push)
+  # --------------------------------------------------------------------------------
+  build:
+    name: 🏗️ Test Build (${{ matrix.App }})
+    needs: [filter, lint]
+    # Skip build if only docs/workflows changed (no Dockerfile, config, scripts)
+    if: |
+      always() &&
+      needs.filter.outputs.Apps != '[]' &&
+      needs.filter.outputs.Apps != '' &&
+      needs.filter.outputs.needs_build == 'true' &&
+      needs.filter.outputs.is_stale != 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      # Only matrix on Apps, build all arches sequentially on same runner
+      matrix:
+        App: ${{ fromJSON(needs.filter.outputs.Apps) }}
+
+    steps:
+      - name: ⚡ Check Apache2 Resource Optimization
+        id: check_opt
+        run: |
+          ALL_APPS='${{ needs.filter.outputs.Apps }}'
+          APP='${{ matrix.App }}'
+          if [[ "$APP" == "apache2-minimal" || "$APP" == "apache2-minimal-mariadb" ]] && echo "$ALL_APPS" | grep -q '"apache2"'; then
+            echo "::notice title=Resource Optimization::Skipping Docker build for $APP because full 'apache2' add-on is included in this CI run."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 🧹 Free Disk Space
+        if: steps.check_opt.outputs.skip != 'true'
+        run: |
+          echo "Freeing up disk space on Mono, Android, and .NET in background..."
+          (sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" >/dev/null 2>&1 &)
+
+      - name: ⤵️ Check out code
+        if: steps.check_opt.outputs.skip != 'true'
+        uses: actions/checkout@v7
+      - name: 🐳 Set up Docker Buildx
+        if: steps.check_opt.outputs.skip != 'true'
+        uses: docker/setup-buildx-action@v4
+      - name: 🔑 Login to GitHub Container Registry
+        if: steps.check_opt.outputs.skip != 'true'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 💾 Cache Docker layers (optimized for shared base image)
+        if: steps.check_opt.outputs.skip != 'true'
+        uses: actions/cache@v6
+        with:
+          path: /tmp/.buildx-cache
+          # Primary key: App-specific for precise cache hits
+          key: ${{ runner.os }}-buildx-${{ matrix.App }}-${{ github.sha }}
+          restore-keys: |
+            # Try App-specific cache first
+            ${{ runner.os }}-buildx-${{ matrix.App }}-
+            # Fallback to shared base image cache (all Apps share base:19.0.0)
+            ${{ runner.os }}-buildx-base-image-19.0.0-
+            # Last resort: any buildx cache
+            ${{ runner.os }}-buildx-
+
+      - name: ⚙️ Prepare Image Info
+        if: steps.check_opt.outputs.skip != 'true'
+        id: prep
+        run: |
+          VERSION=$(yq -r '.version' "${{ matrix.App }}/config.yaml")
+          SLUG=$(yq -r '.slug' "${{ matrix.App }}/config.yaml")
+          if [ -z "$SLUG" ] || [ "$SLUG" == "null" ]; then
+            SLUG=$(echo "${{ matrix.App }}" | tr '[:upper:]' '[:lower:]')
+          fi
+          # Docker/GHCR requires lowercase repository names
+          IMAGE=$(echo "ghcr.io/${{ github.repository_owner }}/amd64-hassio-addons-$SLUG" | tr '[:upper:]' '[:lower:]')
+
+          # Extract build_from from build.yaml (legacy format)
+          BUILD_FROM=$(yq -r '.build_from.amd64' "${{ matrix.App }}/build.yaml")
+          if [ "$BUILD_FROM" == "null" ] || [ -z "$BUILD_FROM" ]; then
+            BUILD_FROM=$(yq -r '.build_from' "${{ matrix.App }}/build.yaml")
+          fi
+          if [ "$BUILD_FROM" == "null" ] || [ -z "$BUILD_FROM" ]; then
+            BUILD_FROM=""
+          fi
+
+          {
+            echo "slug=$SLUG"
+            echo "version=$VERSION"
+            echo "image=$IMAGE"
+            echo "build_from=$BUILD_FROM"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: 🏗️ Test Build amd64 (CI optimized)
+        if: steps.check_opt.outputs.skip != 'true'
+        uses: docker/build-push-action@v7
+        with:
+          context: ./${{ matrix.App }}
+          file: ./${{ matrix.App }}/Dockerfile
+          platforms: linux/amd64
+          push: false
+          build-args: |
+            BUILD_ARCH=amd64
+            BUILD_FROM=${{ steps.prep.outputs.build_from }}
+          cache-from: type=gha,scope=${{ matrix.App }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.App }},ignore-error=true
+
+      - name: ✅ Build Success
+        if: steps.check_opt.outputs.skip != 'true'
+        run: echo "✅ amd64 build successful"
+
+  # --------------------------------------------------------------------------------
+  # SUPERVISOR TEST: Real Supervisor Integration (Only on PRs with code changes)
+  # --------------------------------------------------------------------------------
+  supervisor-test:
+    name: 🏠 Supervisor Integration Test
+    needs: [filter, lint, build]
+    # Only run on PRs with actual code changes (not docs-only), and only if build succeeded
+    if: |
+      always() &&
+      github.event_name == 'pull_request' &&
+      (needs.build.result == 'success' || (needs.build.result == 'skipped' && needs.filter.outputs.force_supervisor == 'true')) &&
+      (
+        (
+          needs.filter.outputs.Apps != '[]' &&
+          needs.filter.outputs.Apps != '' &&
+          needs.filter.outputs.docs_only != 'true' &&
+          needs.filter.outputs.skip_supervisor != 'true'
+        ) ||
+        needs.filter.outputs.force_supervisor == 'true'
+      ) &&
+      needs.filter.outputs.is_stale != 'true'
+    uses: ./.github/workflows/orchestrator-supervisor-test.yaml
+    with:
+      Apps: ${{ needs.filter.outputs.Apps }}
+      timeout: "15"

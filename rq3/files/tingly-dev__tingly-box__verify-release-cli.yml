@@ -1,0 +1,150 @@
+name: Verify Release CLI
+
+run-name: >-
+  🔍 Verify CLI release ${{ inputs.tag || github.event.release.tag_name }}
+
+# Post-release verification of what a tag ships as the CLI. Two independent
+# jobs:
+#   - verify-release-assets: checks the already-built CLI release assets
+#     (zip integrity, checksums, binary formats) — no rebuild.
+#   - verify-npx-shim: runs build/npx/test-shim.sh against the release.
+# The desktop GUI is a separate pipeline (release-gui.yml) with its own
+# verification in verify-release-gui.yml; nothing GUI-related runs here.
+# Called by release-cli.yml right after it publishes a release (non-blocking, in
+# parallel with the NPX publish workflow) — that release is created with
+# GITHUB_TOKEN, so the `release: published` trigger below only catches
+# releases published by hand. Can also be triggered manually against any tag.
+# PR-time compile checks live in verify-compile.yml.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to verify (e.g., v1.0.0)'
+        required: true
+        type: string
+  workflow_call:
+    inputs:
+      tag:
+        description: 'Release tag to verify'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  verify-release-assets:
+    name: Verify Release Binaries
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Resolve release tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "release" ]; then
+            TAG="${{ github.event.release.tag_name }}"
+          else
+            TAG="${{ inputs.tag }}"
+          fi
+          if [ -z "$TAG" ]; then
+            echo "Error: no release tag provided"
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Verifying release: $TAG"
+
+      - name: Download release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p assets
+          gh release download "${{ steps.tag.outputs.tag }}" \
+            --repo "${{ github.repository }}" \
+            --pattern 'tingly-box-linux-*.zip' \
+            --pattern 'tingly-box-macos-*.zip' \
+            --pattern 'tingly-box-windows-*.zip' \
+            --pattern 'checksums.txt' \
+            --dir assets
+          ls -lh assets/
+
+      - name: Verify checksums
+        working-directory: assets
+        run: |
+          if [ -f checksums.txt ]; then
+            sha256sum -c checksums.txt --ignore-missing
+          else
+            echo "⚠️ checksums.txt not present in release, skipping"
+          fi
+
+      - name: Verify binary formats
+        run: |
+          .github/scripts/verify-binary.sh assets \
+            linux-amd64 linux-arm64 \
+            macos-amd64 macos-arm64 \
+            windows-amd64 windows-arm64
+
+      - name: Write summary
+        if: always()
+        run: |
+          {
+            echo "## 🔍 Verify Release Assets — ${{ steps.tag.outputs.tag }}"
+            echo ""
+            echo "Checked release assets: zip integrity, sha256 checksums, and"
+            echo "binary format/architecture per platform."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  verify-npx-shim:
+    name: Verify NPX Shim
+    runs-on: ubuntu-latest
+    env:
+      NODE_VERSION: '24'
+    steps:
+      - name: Resolve release tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "release" ]; then
+            TAG="${{ github.event.release.tag_name }}"
+          else
+            TAG="${{ inputs.tag }}"
+          fi
+          if [ -z "$TAG" ]; then
+            echo "Error: no release tag provided"
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Testing npx shim against release: $TAG"
+
+      # The tag's shim source — the same the publish workflow packages.
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ steps.tag.outputs.tag }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Run shim test harness
+        run: |
+          if [ ! -f build/npx/test-shim.sh ]; then
+            echo "⏭️ build/npx/test-shim.sh not present at this tag, skipping"
+            exit 0
+          fi
+          bash build/npx/test-shim.sh "${{ steps.tag.outputs.tag }}"
+
+      - name: Write summary
+        if: always()
+        run: |
+          {
+            echo "## 📦 Verify NPX Shim — ${{ steps.tag.outputs.tag }}"
+            echo ""
+            echo "Bundled the cli shim like the publish workflow (esbuild,"
+            echo "single dependency-free file) and ran the test matrix:"
+            echo "retired-dir sweep guards and an end-to-end download +"
+            echo "\`version\` run of the release binary."
+          } >> "$GITHUB_STEP_SUMMARY"

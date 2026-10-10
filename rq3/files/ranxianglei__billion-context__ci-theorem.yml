@@ -1,0 +1,66 @@
+name: Theorem Lane
+
+# Machine-checked cache-stability theorems (#2149). Runs Z3 over proof/spec
+# plus the grounding tests in tests/cache-theorem.test.ts. Ubuntu-only: the
+# pinned z3-solver wheel targets linux x86_64; windows legs of ci.yml run the
+# same test file with solver subtests skipped by design.
+on:
+  pull_request:
+    branches: [master]
+    paths:
+      - "proof/**"
+      - "tests/cache-theorem.test.ts"
+      - "src/loop/**"
+      - "src/wire-body.ts"
+      - "src/system-anchor.ts"
+      - "src/chain-checkpoint.ts"
+      - "src/image-note.ts"
+      - "src/server.ts"
+      - "src/session.ts"
+      - "src/fake-completion.ts"
+      - "src/degenerate-retry.ts"
+      - "kernel/src/rebuild.ts"
+      - "kernel/src/render-refs.ts"
+      - "kernel/src/refs.ts"
+      - "kernel/src/segment.ts"
+      - "kernel/src/block-map.ts"
+      - "kernel/src/ccr.ts"
+      - ".github/workflows/ci-theorem.yml"
+  push:
+    branches: [master]
+    paths:
+      - "proof/**"
+      - "tests/cache-theorem.test.ts"
+      - "src/loop/**"
+      - "src/wire-body.ts"
+      - "src/system-anchor.ts"
+      - "src/chain-checkpoint.ts"
+      - "src/image-note.ts"
+      - "src/server.ts"
+      - "src/session.ts"
+      - "src/fake-completion.ts"
+      - "src/degenerate-retry.ts"
+      - "kernel/src/rebuild.ts"
+      - "kernel/src/render-refs.ts"
+      - "kernel/src/refs.ts"
+      - "kernel/src/segment.ts"
+      - "kernel/src/block-map.ts"
+      - "kernel/src/ccr.ts"
+      - ".github/workflows/ci-theorem.yml"
+
+jobs:
+  theorem:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      # pin the solver so local iteration and CI verdicts match
+      - name: Install pinned z3
+        run: python3 -m pip install --quiet "z3-solver==4.9.1.0"
+      - name: Install dependencies
+        run: npm install --ignore-scripts --no-fund --no-audit
+      - name: Run theorem lane
+        run: node --import tsx --test tests/cache-theorem.test.ts

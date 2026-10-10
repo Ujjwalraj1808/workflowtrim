@@ -1,0 +1,94 @@
+name: Data Audit
+
+# ──────────────────────────────────────────────────────────────
+# 데이터 파이프라인 정기 및 완료 이벤트 감사. 모든 실패 Issue 자동 알림(단발은 auto-rerun 병행).
+# 추가로 DART panel 신선도(공시목록의 정기 rcept 가 HF panel 에 들어왔는가)를 매번 재서, run 이
+# 전부 초록이어도 데이터가 멈춘 경우를 잡는다(2026-08 사고 재발 방지).
+#
+# 감사 대상 = scheduled(cron) 데이터/자동화 파이프라인 전체 (목록 SSOT = monitorPipeline.py
+#          MONITORED_WORKFLOWS): Original SSOT Sync · Data Sync · DART New Stocks · Data Prebuild ·
+#          EDGAR(bulk/filings/content/proxy/prices) · Gov(가격/지수) · Macro · News Archive · Brokerage ·
+#          Valuation Snapshot · Search Index · Quant Audit · Update KindList · Notify(watch/earnings) ·
+#          Expectation Cycle · Lens Product Build. 새 scheduled 워크플로우 추가 시 그 목록에도 등록.
+#
+# 수동 (workflow_dispatch):
+#   - 즉시 감사 실행 (실패 Issue 갱신 포함)
+#
+# full 모드 수집은 dataSync.yml workflow_dispatch (mode=full) 로 이전.
+# ──────────────────────────────────────────────────────────────
+
+on:
+  schedule:
+    - cron: '0 20 * * *'  # UTC 20:00 = KST 05:00, 일일 감사
+  workflow_run:
+    workflows:
+      - Original SSOT Sync
+      - AllFilings Backfill
+      - Data Sync
+      - DART New Stocks Sync
+      - Data Prebuild (DART)
+      - EDGAR Data Sync (Bulk)
+      - Gov Price Sync (Bulk)
+      - Gov Index Sync (Bulk)
+      - Macro Data Sync (Bulk)
+      - News Archive Sync
+      - GDELT Sync
+      - Naver News Sync
+      - Valuation Snapshot
+      - Search Index Build
+      - Quant Audit
+      - Update KindList
+      - Intent Model Pipeline
+      - Notify Watch
+      - Brokerage Research Sync
+      - EDGAR Filings Sync (submissions bulk)
+      - EDGAR Filings Content Sync (allFilings content_raw)
+      - EDGAR Proxy Sync (governance 3-table)
+      - EDGAR Prices Daily (Polygon increment)
+      - Notify Watch Earnings
+      - Expectation Cycle
+      - Lens Product Build
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+  actions: write  # transient 단발 실패 자동 재실행(gh run rerun) 용
+
+concurrency:
+  group: data-audit
+  # false: 신선도 감사(약 5 분)가 도는 동안 다른 workflow_run 완료가 들어와도 진행 중 run 을 끊지 않는다.
+  # 뒤따르는 트리거는 pending 1 개로 접히므로 중복 실행은 어차피 생기지 않는다.
+  cancel-in-progress: false
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    # 10 -> 30. 신선도 감사(공시목록 1회 + 종목당 HF rceptNo range read 수천 건, 8 스레드)가 보통 5 분,
+    # HF 가 느린 날엔 예산(15 분)까지 쓴다. 2026-08-22 실측: 연결 끊김 재시도가 겹쳐 20 분에 잘렸다.
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Pipeline health check
+        # run 결론 감시 + DART panel 신선도 감사(공시목록 vs HF panel rceptNo). 후자는 DART_API_KEYS 가 필요하고,
+        # 없으면 건너뛰고 그 사실을 로그에 남긴다.
+        run: uv run python -X utf8 .github/scripts/ops/monitorPipeline.py
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DART_API_KEYS: ${{ secrets.DART_API_KEYS }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          # 신선도 감사는 일일 cron·수동·panel 생산자(Original SSOT Sync) 완료 때만. 그 밖의 workflow_run 은 run 감시만.
+          DARTLAB_FRESHNESS_AUDIT: ${{ (github.event_name != 'workflow_run' || github.event.workflow_run.name == 'Original SSOT Sync') && '1' || '0' }}
+          DARTLAB_FRESHNESS_BUDGET_SECONDS: '900'  # HF rceptNo 조회 예산. 넘기면 표본으로 판정(절반 미만이면 유보).

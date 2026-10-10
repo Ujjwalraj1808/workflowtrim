@@ -1,0 +1,21 @@
+name: Update Wiki
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'docs/**'
+    branches:
+      - 'main'
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+    - name: Updating Wiki
+      uses: Andrew-Chen-Wang/github-wiki-action@v4
+      with:
+        path: docs
+        ignore: README.md
+        commit-message: '${{ github.event.commits[0].message }}'

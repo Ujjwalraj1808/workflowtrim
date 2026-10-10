@@ -1,0 +1,123 @@
+name: "test s3 over https using aws-cli"
+
+on:
+  push:
+    branches: [master, test-https-s3-awscli]
+    paths:
+      - 'weed/s3api/**'
+      - 'weed/server/**'
+      - 'go.mod'
+      - 'go.sum'
+      - '.github/workflows/test-s3-over-https-using-awscli.yml'
+  pull_request:
+    branches: [master, test-https-s3-awscli]
+    paths:
+      - 'weed/s3api/**'
+      - 'weed/server/**'
+      - 'go.mod'
+      - 'go.sum'
+      - '.github/workflows/test-s3-over-https-using-awscli.yml'
+
+env:
+  AWS_ACCESS_KEY_ID: some_access_key1
+  AWS_SECRET_ACCESS_KEY: some_secret_key1
+  AWS_ENDPOINT_URL: https://localhost:8443
+
+defaults:
+  run:
+    working-directory: weed
+
+jobs:
+  awscli-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: ^1.26
+
+      - name: Build SeaweedFS
+        run: |
+          go build
+
+      - name: Start SeaweedFS
+        run: |
+          set -e
+          mkdir -p /tmp/data
+          ./weed -v=3 server -s3 -dir=/tmp/data -s3.config=../docker/compose/s3.json -master.peers=none > weed.log 2>&1 &
+          until curl -s http://localhost:8333/healthz > /dev/null; do sleep 1; done
+
+      - name: Setup Caddy
+        run: |
+          curl -fsSL "https://caddyserver.com/api/download?os=linux&arch=amd64" -o caddy
+          chmod +x caddy
+          ./caddy version
+          echo "{
+            auto_https disable_redirects
+            local_certs
+          }
+          localhost:8443 {
+            tls internal
+            reverse_proxy localhost:8333
+          }" > Caddyfile
+
+      - name: Start Caddy
+        run: |
+          ./caddy start
+          until curl -fsS --insecure https://localhost:8443/healthz > /dev/null; do sleep 1; done
+
+      - name: Create Bucket
+        run: |
+          aws --no-verify-ssl s3api create-bucket --bucket bucket
+
+      - name: Test PutObject
+        run: |
+          set -e
+          dd if=/dev/urandom of=generated bs=1M count=2
+          aws --no-verify-ssl s3api put-object --bucket bucket --key test-putobject --body generated
+          aws --no-verify-ssl s3api get-object --bucket bucket --key test-putobject downloaded
+          diff -q generated downloaded
+          rm -f generated downloaded
+
+      - name: Test Multi-part Upload
+        run: |
+          set -e
+          dd if=/dev/urandom of=generated bs=1M count=32
+          aws --no-verify-ssl s3 cp --no-progress generated s3://bucket/test-multipart
+          aws --no-verify-ssl s3 cp --no-progress s3://bucket/test-multipart downloaded
+          diff -q generated downloaded
+          rm -f generated downloaded
+
+      - name: Test GetObject with If-Match
+        run: |
+          set -e
+          dd if=/dev/urandom of=generated bs=1M count=32
+          ETAG=$(aws --no-verify-ssl s3api put-object --bucket bucket --key test-get-obj --body generated | jq -r .ETag)
+          # jq -r already removes quotes, so use ETAG directly (handles both simple and multipart ETags)
+          aws --no-verify-ssl s3api get-object --bucket bucket --key test-get-obj --if-match "$ETAG" downloaded
+          diff -q generated downloaded
+          rm -f generated downloaded
+
+      - name: Show server logs on failure
+        if: failure()
+        run: |
+          echo "========================================="
+          echo "SeaweedFS Server Logs"
+          echo "========================================="
+          # Note: weed.log is relative to working-directory (weed/)
+          if [ -f weed.log ]; then
+            cat weed.log
+          else
+            echo "No weed.log file found"
+          fi
+
+      - name: Upload server logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: seaweedfs-logs
+          # Note: actions don't use defaults.run.working-directory, so path is relative to workspace root
+          path: weed/weed.log
+          retention-days: 3

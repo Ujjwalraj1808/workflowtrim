@@ -1,0 +1,175 @@
+---
+name: "release"
+
+# yamllint disable-line rule:truthy
+on:
+  workflow_dispatch:
+    inputs:
+      release_type:
+        description: "Release type"
+        default: "patch"
+        required: true
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+          - build
+          - betafish
+jobs:
+  release:
+    name: release
+    runs-on: ubuntu-24.04
+    env:
+      PACKAGECLOUD_TOKEN: ${{ secrets.PACKAGECLOUD_TOKEN }}
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: 2.7
+
+      - name: login to docker hub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: set up qemu
+        uses: docker/setup-qemu-action@v4
+
+      - name: set up docker buildx
+        id: buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: inspect builder
+        run: |
+          echo "Name:      ${{ steps.buildx.outputs.name }}"
+          echo "Endpoint:  ${{ steps.buildx.outputs.endpoint }}"
+          echo "Status:    ${{ steps.buildx.outputs.status }}"
+          echo "Flags:     ${{ steps.buildx.outputs.flags }}"
+          echo "Platforms: ${{ steps.buildx.outputs.platforms }}"
+
+      - name: install package_cloud
+        run: gem install package_cloud
+
+      - name: configure git
+        run: |
+          git config --global user.name 'Dokku Bot'
+          git config --global user.email no-reply@dokku.com
+
+      - name: build package
+        env:
+          RELEASE_GITHUB_USERNAME: ${{ secrets.HOMEBREW_GITHUB_USERNAME }}
+          RELEASE_GITHUB_API_TOKEN: ${{ secrets.HOMEBREW_GITHUB_API_TOKEN }}
+        run: contrib/release-dokku ${{ github.event.inputs.release_type }}
+
+      - name: output version
+        id: version
+        run: echo "version=$(cat build/next-version)" >> $GITHUB_OUTPUT
+
+      - name: upload packages
+        uses: actions/upload-artifact@v7
+        with:
+          name: build
+          path: build
+
+  build-digitalocean:
+    name: build-digitalocean
+    runs-on: ubuntu-24.04
+    needs: release
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Setup packer
+        uses: hashicorp/setup-packer@main
+        with:
+          version: latest
+
+      - name: Run packer init
+        run: "make image/init/digitalocean"
+
+      - name: Run `packer validate`
+        env:
+          DIGITALOCEAN_TOKEN: ${{ secrets.DIGITALOCEAN_TOKEN }}
+        run: |
+          VERSION=${{ needs.release.outputs.version }}
+          PKR_VAR_dokku_version="${VERSION:1}" make image/validate/digitalocean
+
+      - name: Bump Digitalocean Image
+        env:
+          DIGITALOCEAN_TOKEN: ${{ secrets.DIGITALOCEAN_TOKEN }}
+        run: |
+          VERSION=${{ needs.release.outputs.version }}
+          PKR_VAR_dokku_version="${VERSION:1}" make image/build/digitalocean
+
+      - name: upload packages
+        uses: actions/upload-artifact@v7
+        with:
+          name: digitalocean-manifest.json
+          path: digitalocean-manifest.json
+
+  bump-azure:
+    name: bump-azure
+    runs-on: ubuntu-24.04
+    needs: release
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+      - name: Bump Azure Template
+        env:
+          BOT_GITHUB_USERNAME: ${{ secrets.HOMEBREW_GITHUB_USERNAME }}
+          BOT_GITHUB_API_TOKEN: ${{ secrets.HOMEBREW_GITHUB_API_TOKEN }}
+        run: |
+          VERSION=${{ needs.release.outputs.version }}
+          git config --global user.name 'Dokku Bot'
+          git config --global user.email no-reply@dokku.com
+          .github/commands/bump-azure "${VERSION:1}" "$BOT_GITHUB_USERNAME" "$BOT_GITHUB_API_TOKEN"
+
+  bump-formula:
+    name: bump-formula
+    runs-on: macos-latest
+    needs: release
+    steps:
+      - name: Brew doctor
+        run: |
+          brew doctor || true
+      - name: Brew cleanup
+        run: |
+          echo "====> Running brew cleanup"
+          brew cleanup || true
+          echo "====> Untapping homebrew/core"
+          brew untap homebrew/core || true
+          echo "====> Untapping homebrew/cask"
+          brew untap homebrew/cask || true
+          echo "====> Untapping aws/tap"
+          brew untap aws/tap || true
+          echo "====> Untapping hashicorp/tap"
+          brew untap hashicorp/tap || true
+          echo "====> Uninstalling openssl@1.1"
+          brew uninstall openssl@1.1 || true
+          echo "====> Uninstalling ruby@3.0"
+          brew uninstall ruby@3.0 || true
+          echo "====> Running brew cleanup"
+          brew cleanup || true
+      - name: Brew doctor
+        run: brew doctor || true
+      - name: Brew config
+        run: brew config
+      - name: Bump Homebrew Formula
+        env:
+          HOMEBREW_GITHUB_USERNAME: ${{ secrets.HOMEBREW_GITHUB_USERNAME }}
+          HOMEBREW_GITHUB_API_TOKEN: ${{ secrets.HOMEBREW_GITHUB_API_TOKEN }}
+        run: |
+          git config --global user.name 'Dokku Bot'
+          git config --global user.email no-reply@dokku.com
+          curl -sSL https://github.com/dokku/netrc/releases/download/v0.4.1/netrc_0.4.1_darwin_x86_64.tgz | tar xvf -
+          mv netrc /usr/local/bin/netrc
+          netrc set github.com "$HOMEBREW_GITHUB_USERNAME" "$HOMEBREW_GITHUB_API_TOKEN"
+          brew tap dokku/repo
+          brew bump-formula-pr -f --no-browse --no-audit --no-fork --debug --verbose --url "https://github.com/dokku/dokku/archive/${{ needs.release.outputs.version }}.tar.gz" dokku/repo/dokku

@@ -1,0 +1,446 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: write
+    env:
+      DOCKERHUB_IMAGE: ${{ vars.DOCKERHUB_IMAGE || 'kjlion/kejilion-panel' }}
+      DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME || 'kjlion' }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Validate release inputs
+        id: release
+        shell: bash
+        env:
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          stable_pattern='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+          preview_pattern='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-rc\.([1-9][0-9]*)$'
+          if [[ "$version" =~ $stable_pattern ]]; then
+            stable=true
+            channel=stable
+            release_train="$version"
+          elif [[ "$version" =~ $preview_pattern ]]; then
+            stable=false
+            channel=preview
+            release_train="${version%%-rc.*}"
+          else
+            echo "Release tag must be vX.Y.Z or vX.Y.Z-rc.N" >&2
+            exit 1
+          fi
+          IFS=. read -r major minor patch <<< "$release_train"
+          for number in "$major" "$minor" "$patch"; do
+            (( 10#$number <= 999999 )) || {
+              echo "Release version components must not exceed 999999" >&2
+              exit 1
+            }
+          done
+          if [ "$channel" = preview ]; then
+            rc_number="${version##*-rc.}"
+            (( 10#$rc_number <= 999999 )) || {
+              echo "Release candidate number must not exceed 999999" >&2
+              exit 1
+            }
+          fi
+          test "$version" = "$(tr -d '\r\n' < VERSION)" || {
+            echo "Tag version does not match VERSION" >&2
+            exit 1
+          }
+          [[ "${DOCKERHUB_IMAGE:-}" =~ ^[a-z0-9]+([._-][a-z0-9]+)*/[a-z0-9]+([._-][a-z0-9]+)*$ ]] || {
+            echo "Repository variable DOCKERHUB_IMAGE must be owner/repository" >&2
+            exit 1
+          }
+          test -n "${DOCKERHUB_USERNAME:-}" || {
+            echo "Repository variable DOCKERHUB_USERNAME is required" >&2
+            exit 1
+          }
+          test -n "${DOCKERHUB_TOKEN:-}" || {
+            echo "Repository secret DOCKERHUB_TOKEN is required" >&2
+            exit 1
+          }
+          {
+            echo "version=$version"
+            echo "image=docker.io/$DOCKERHUB_IMAGE"
+            echo "stable=$stable"
+            echo "channel=$channel"
+            echo "release_train=$release_train"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.27.2"
+          cache: true
+
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24.21.0"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Validate release notes
+        shell: bash
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          bash scripts/check-release-notes.sh \
+            "$VERSION" \
+            "${{ steps.release.outputs.image }}" \
+            "IMAGE_PUBLICATION_PENDING" \
+            release/DRAFT_NOTES.md
+
+      - name: Verify source
+        shell: bash
+        run: |
+          node scripts/run-source-checks.mjs
+
+      - name: Scan Go call paths for known vulnerabilities
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
+
+      - name: Audit Node dependencies
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            if npm audit --prefix web --audit-level=high; then
+              exit 0
+            fi
+            if [[ "$attempt" -lt 3 ]]; then
+              sleep $((attempt * 10))
+            fi
+          done
+          exit 1
+
+      - name: Scan source, dependencies, secrets, and configuration
+        env:
+          TRIVY_CACHE_DIR: ${{ runner.temp }}/trivy-cache
+        run: bash scripts/security-scan.sh source
+
+      - name: Verify kejilion.sh application lifecycle
+        run: |
+          docker run --rm \
+            -e KPANEL_APP_CONF_TEST_ROOTFS=1 \
+            -v "$PWD:/src:ro" \
+            bash:5.2.37-alpine3.22@sha256:3bee76a96d86d5d2d5efc7c1c570e5a7c95db22348a26944e0e546fa174e3324 \
+            bash /src/packaging/tests/app-conf-lifecycle.sh /src
+
+      - name: Build Agent and lightweight node release binaries
+        shell: bash
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          node scripts/run-repo-bash.mjs scripts/build-mcp-clients.sh release
+          ldflags="-s -w -X github.com/kejilion/kejilion-panel/internal/version.Version=$VERSION"
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+            go build -trimpath -ldflags "$ldflags" \
+            -o release/kejilion-agent-linux-amd64 ./cmd/kejilion-agent
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 \
+            go build -trimpath -ldflags "$ldflags" \
+            -o release/kejilion-agent-linux-arm64 ./cmd/kejilion-agent
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+            go build -trimpath -ldflags "$ldflags" \
+            -o release/kejilion-node-linux-amd64 ./cmd/kejilion-node
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 \
+            go build -trimpath -ldflags "$ldflags" \
+            -o release/kejilion-node-linux-arm64 ./cmd/kejilion-node
+          git archive --format=tar HEAD \
+            deploy docs README.md CHANGELOG.md VERSION \
+            LICENSE NOTICE LICENSES THIRD_PARTY_NOTICES.md TRADEMARKS.md |
+            gzip -n > "release/kejilion-panel-meta-$VERSION.tar.gz"
+          (
+            cd release
+            sha256sum \
+              kejilion-agent-linux-amd64 \
+              kejilion-agent-linux-arm64 \
+              kejilion-node-linux-amd64 \
+              kejilion-node-linux-arm64 \
+              kpanel-mcp-* \
+              "kejilion-panel-meta-$VERSION.tar.gz" > SHA256SUMS
+          )
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          version: v0.34.1
+          driver-opts: image=moby/buildkit:v0.30.0@sha256:0168606be2315b7c807a03b3d8aa79beefdb31c98740cebdffdfeebf31190c9f
+
+      - name: Build native image for runtime validation
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          tags: kejilion-panel:release-check
+          build-args: |
+            VERSION=${{ steps.release.outputs.version }}
+            REVISION=${{ github.sha }}
+          provenance: false
+          sbom: false
+          cache-from: type=gha
+
+      - name: Scan native release image
+        env:
+          TRIVY_CACHE_DIR: ${{ runner.temp }}/trivy-cache
+        run: bash scripts/security-scan.sh image kejilion-panel:release-check
+
+      - name: Verify runtime image contract
+        shell: bash
+        env:
+          REVISION: ${{ github.sha }}
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          test "$(docker image inspect --format '{{.Config.User}}' kejilion-panel:release-check)" = "65532:65532"
+          test "$(docker image inspect --format '{{join .Config.Healthcheck.Test " "}}' kejilion-panel:release-check)" = "CMD /paneld healthcheck"
+          test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}' kejilion-panel:release-check)" = "$VERSION"
+          test "$(docker image inspect --format '{{index .Config.Labels "io.kejilion.kpanel.update-freeze"}}' kejilion-panel:release-check)" = "1"
+          test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' kejilion-panel:release-check)" = "$REVISION"
+          test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.source"}}' kejilion-panel:release-check)" = "https://github.com/kejilion/KPanel"
+          test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.licenses"}}' kejilion-panel:release-check)" = "AGPL-3.0-only"
+          bash scripts/check-managed-script-contract.sh kejilion-panel:release-check
+          release_container="$(docker create kejilion-panel:release-check)"
+          docker cp "$release_container:/release/kejilion.sh" release/kejilion.sh
+          docker cp "$release_container:/release/kpanel.conf" release/kpanel.conf
+          docker cp "$release_container:/licenses/LICENSE" release/IMAGE_LICENSE
+          docker cp "$release_container:/licenses/NOTICE" release/IMAGE_NOTICE
+          docker cp "$release_container:/licenses/THIRD_PARTY_NOTICES.md" release/IMAGE_THIRD_PARTY_NOTICES.md
+          docker cp "$release_container:/licenses/third-party/Apache-2.0.txt" release/IMAGE_APACHE_LICENSE
+          docker rm "$release_container" >/dev/null
+          test "$(sha256sum release/kejilion.sh | awk '{print $1}')" = "$(docker image inspect --format '{{index .Config.Labels "io.kejilion.script.sha256"}}' kejilion-panel:release-check)"
+          cmp packaging/kejilion-app/kpanel.conf release/kpanel.conf
+          cmp LICENSE release/IMAGE_LICENSE
+          cmp NOTICE release/IMAGE_NOTICE
+          cmp THIRD_PARTY_NOTICES.md release/IMAGE_THIRD_PARTY_NOTICES.md
+          cmp LICENSES/Apache-2.0.txt release/IMAGE_APACHE_LICENSE
+          container_id="$(
+            docker run --detach --rm \
+              --network none \
+              --read-only \
+              --memory 256m \
+              --cpus 1 \
+              --pids-limit 128 \
+              --cap-drop ALL \
+              --security-opt no-new-privileges \
+              --tmpfs /tmp:rw,noexec,nosuid,size=16m,mode=1777 \
+              --tmpfs /var/lib/kejilion-panel:rw,noexec,nosuid,size=16m,uid=65532,gid=65532,mode=0700 \
+              kejilion-panel:release-check
+          )"
+          test "$(docker inspect --format '{{.HostConfig.Memory}}' "$container_id")" = "268435456"
+          test "$(docker inspect --format '{{.HostConfig.NanoCpus}}' "$container_id")" = "1000000000"
+          test "$(docker inspect --format '{{.HostConfig.PidsLimit}}' "$container_id")" = "128"
+          cleanup() {
+            docker container rm --force "$container_id" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+          healthy=false
+          for _ in {1..20}; do
+            if docker exec "$container_id" /paneld healthcheck >/dev/null 2>&1; then
+              healthy=true
+              break
+            fi
+            sleep 1
+          done
+          test "$healthy" = true
+
+      - name: Prepare draft GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.release.outputs.version }}
+          STABLE: ${{ steps.release.outputs.stable }}
+        run: |
+          set -euo pipefail
+          create_flags=(--latest=false)
+          prerelease_value=false
+          if [ "$STABLE" = false ]; then
+            create_flags+=(--prerelease)
+            prerelease_value=true
+          fi
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            draft="$(
+              gh release view "$GITHUB_REF_NAME" \
+                --json isDraft \
+                --jq '.isDraft'
+            )"
+            test "$draft" = true || {
+              echo "Refusing to replace an already-published release" >&2
+              exit 1
+            }
+            gh release edit "$GITHUB_REF_NAME" \
+              --latest=false \
+              --prerelease="$prerelease_value" \
+              --title "KPanel $VERSION" \
+              --notes-file release/DRAFT_NOTES.md
+            gh release upload "$GITHUB_REF_NAME" --clobber \
+              release/kpanel-mcp-* \
+              release/kejilion-agent-linux-amd64 \
+              release/kejilion-agent-linux-arm64 \
+              release/kejilion-node-linux-amd64 \
+              release/kejilion-node-linux-arm64 \
+              "release/kejilion-panel-meta-$VERSION.tar.gz" \
+              release/SHA256SUMS \
+              LICENSE \
+              THIRD_PARTY_NOTICES.md
+          else
+            gh release create "$GITHUB_REF_NAME" \
+              release/kpanel-mcp-* \
+              --verify-tag \
+              --draft \
+              "${create_flags[@]}" \
+              --title "KPanel $VERSION" \
+              --notes-file release/DRAFT_NOTES.md \
+              release/kejilion-agent-linux-amd64 \
+              release/kejilion-agent-linux-arm64 \
+              release/kejilion-node-linux-amd64 \
+              release/kejilion-node-linux-arm64 \
+              "release/kejilion-panel-meta-$VERSION.tar.gz" \
+              release/SHA256SUMS \
+              LICENSE \
+              THIRD_PARTY_NOTICES.md
+          fi
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          username: ${{ env.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push multi-architecture image
+        id: image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.release.outputs.image }}:${{ steps.release.outputs.version }}
+          build-args: |
+            VERSION=${{ steps.release.outputs.version }}
+            REVISION=${{ github.sha }}
+          provenance: mode=max
+          sbom: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Validate final release notes
+        shell: bash
+        env:
+          IMAGE: ${{ steps.release.outputs.image }}
+          IMAGE_DIGEST: ${{ steps.image.outputs.digest }}
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          bash scripts/check-release-notes.sh \
+            "$VERSION" \
+            "$IMAGE" \
+            "$IMAGE_DIGEST" \
+            release/RELEASE_NOTES.md
+
+      - name: Promote image to its release channel
+        shell: bash
+        env:
+          CHANNEL: ${{ steps.release.outputs.channel }}
+          IMAGE: ${{ steps.release.outputs.image }}
+          IMAGE_DIGEST: ${{ steps.image.outputs.digest }}
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          channel_tag=preview
+          if [ "$CHANNEL" = stable ]; then
+            channel_tag=latest
+          fi
+          manifest_digest() {
+            docker buildx imagetools inspect "$1" \
+              --format '{{json .Manifest}}' | jq -r '.digest'
+          }
+          retry() {
+            local attempt
+            for attempt in {1..5}; do
+              if "$@"; then
+                return 0
+              fi
+              if (( attempt == 5 )); then
+                return 1
+              fi
+              sleep $((attempt * 5))
+            done
+          }
+          retry_capture() {
+            local result_var="$1"
+            local attempt output
+            shift
+            for attempt in {1..5}; do
+              if output="$("$@")"; then
+                printf -v "$result_var" '%s' "$output"
+                return 0
+              fi
+              if (( attempt == 5 )); then
+                return 1
+              fi
+              sleep $((attempt * 5))
+            done
+          }
+          retry_capture version_digest manifest_digest "$IMAGE:$VERSION"
+          test "$version_digest" = "$IMAGE_DIGEST"
+          retry docker buildx imagetools inspect "$IMAGE@$IMAGE_DIGEST" >/dev/null
+          retry docker buildx imagetools create \
+            --tag "$IMAGE:$channel_tag" \
+            "$IMAGE@$IMAGE_DIGEST"
+          retry_capture channel_digest manifest_digest "$IMAGE:$channel_tag"
+          test "$channel_digest" = "$IMAGE_DIGEST"
+
+      - name: Publish GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IMAGE: ${{ steps.release.outputs.image }}
+          IMAGE_DIGEST: ${{ steps.image.outputs.digest }}
+          STABLE: ${{ steps.release.outputs.stable }}
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          if [ "$STABLE" = true ]; then
+            gh release edit "$GITHUB_REF_NAME" \
+              --draft=false \
+              --prerelease=false \
+              --latest \
+              --title "KPanel $VERSION" \
+              --notes-file release/RELEASE_NOTES.md
+          else
+            gh release edit "$GITHUB_REF_NAME" \
+              --draft=false \
+              --prerelease \
+              --latest=false \
+              --title "KPanel $VERSION" \
+              --notes-file release/RELEASE_NOTES.md
+          fi
+
+      - name: Archive published candidate branch
+        if: steps.release.outputs.stable == 'true'
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          node scripts/archive-release-candidate.mjs \
+            --tag "$GITHUB_REF_NAME" --release-sha "$GITHUB_SHA" --apply

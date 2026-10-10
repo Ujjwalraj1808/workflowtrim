@@ -1,0 +1,43 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - '*'
+
+jobs:
+  build:
+    name: Publish release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          submodules: true
+      - uses: gradle/actions/wrapper-validation@v6.4.0
+      - name: Find Tag
+        id: tagger
+        uses: jimschubert/query-tag-action@v2.3
+        with:
+          skip-unshallow: 'true'
+          abbrev: false
+          commit-ish: HEAD
+      - name: Install JDK ${{ matrix.java_version }}
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: 17
+      - name: Install Android SDK
+        uses: hannesa2/action-android/install-sdk@0.18.1
+      - name: Build project
+        run: ./gradlew assembleRelease
+      - name: Create Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{steps.tagger.outputs.tag}}
+          name: ${{steps.tagger.outputs.tag}}
+          generate_release_notes: true
+          files: ./library/build/outputs/aar/lib*-release.aar
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

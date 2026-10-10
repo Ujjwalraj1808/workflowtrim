@@ -1,0 +1,57 @@
+name: Generate and Upload SBOM to Dependency-Track
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  generate-and-upload-sbom:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6.1.0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+
+      - name: Generate SBOM
+        run: |
+          pnpm dlx @cyclonedx/cdxgen -r -o sbom.json
+
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@v7
+        id: upload-artifact
+        with:
+          name: sbom
+          path: sbom.json
+
+      - name: Get artifact download URL
+        id: artifact-url
+        run: |
+          sleep 5
+
+          URL=$(curl -s -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts")
+
+          ARTIFACT_ID=$(echo "$URL" | jq -r '.artifacts[] | select(.name=="sbom") | .id')
+
+          echo "artifact_id=${ARTIFACT_ID}" >> $GITHUB_OUTPUT
+          echo "Artifact ID: ${ARTIFACT_ID}"
+
+      - name: Trigger GitLab Pipeline # https://git.reservix.io/design-system-team/marigold-sboms
+        run: |
+          curl -X POST \
+            -F token=${{ secrets.GITLAB_TRIGGER_TOKEN }} \
+            -F ref=main \
+            -F "variables[OWNER]=${{ github.repository_owner }}" \
+            -F "variables[REPO]=${{ github.event.repository.name }}" \
+            -F "variables[ARTIFACT_ID]=${{ steps.artifact-url.outputs.artifact_id }}" \
+            -F "variables[ARCHIVE_FORMAT]=zip" \
+            "https://git.reservix.io/api/v4/projects/1956/trigger/pipeline"

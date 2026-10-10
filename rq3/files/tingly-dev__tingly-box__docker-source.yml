@@ -1,0 +1,67 @@
+name: Docker Source Image Build and Push
+
+# Builds the image from the checked-out source via
+# build/docker/docker.build.Dockerfile, rather than repackaging a published
+# npm release the way npm.yml's build-docker-npm job does. Dispatch this
+# against the ref you want built, so a branch's own changes actually reach
+# the image.
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Tag for the image (e.g. patched, v1.2.3-rc1)'
+        required: false
+        default: 'source'
+        type: string
+      platforms:
+        description: 'Target platforms (e.g. linux/amd64, linux/arm64)'
+        required: false
+        default: 'linux/amd64'
+        type: string
+      dockerfile:
+        description: 'Dockerfile to build from'
+        required: false
+        default: './build/docker/docker.build.Dockerfile'
+        type: string
+
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          # The SDK forks are submodules wired in through local `replace`
+          # directives. Without them the Dockerfile's fallback clones each
+          # fork's branch HEAD instead of the pinned commit, so the image
+          # would be built against SDK code this ref was never tested on.
+          submodules: recursive
+
+      # image_tag reaches a run: block through the composite action's step
+      # summary. Dispatch is limited to write-access users, but npm.yml
+      # validates its tag for the same reason and this one should too.
+      - name: Validate image tag
+        env:
+          IMAGE_TAG: ${{ github.event.inputs.image_tag }}
+        run: |
+          if ! printf '%s' "$IMAGE_TAG" | grep -qE '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$'; then
+            echo "Invalid image tag: must match ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$" >&2
+            exit 1
+          fi
+
+      # Source builds are ad-hoc: only the requested tag is applied, never a
+      # moving alias such as `latest` or `rc` (those follow npm publishes).
+      - name: Build and push Docker image
+        uses: ./.github/actions/docker-build-push
+        with:
+          image_name: tingly-box
+          version: ${{ github.event.inputs.image_tag }}
+          dockerfile: ${{ github.event.inputs.dockerfile }}
+          platforms: ${{ github.event.inputs.platforms }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}

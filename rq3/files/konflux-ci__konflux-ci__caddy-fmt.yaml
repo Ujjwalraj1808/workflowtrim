@@ -1,0 +1,38 @@
+name: Verify Caddyfile formatting
+
+on:
+  pull_request:
+    paths:
+      - operator/upstream-kustomizations/ui/core/proxy/Caddyfile
+      - .github/workflows/caddy-fmt.yaml
+  merge_group:
+    types: [checks_requested]
+
+permissions:
+  contents: read
+
+jobs:
+  caddy-fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+
+      - name: Extract Caddy image reference
+        id: image
+        run: |
+          set -euo pipefail
+          ref=$(yq '.images[] | select(.name == "quay.io/konflux-ci/reverse-proxy") | .newName + "@" + .digest' \
+            operator/upstream-kustomizations/ui/core/proxy/kustomization.yaml)
+          echo "ref=${ref}" >> "$GITHUB_OUTPUT"
+
+      - name: Verify Caddyfile is formatted
+        run: |
+          set -euo pipefail
+          caddyfile="operator/upstream-kustomizations/ui/core/proxy/Caddyfile"
+          formatted=$(docker run --rm -i "${{ steps.image.outputs.ref }}" fmt - < "$caddyfile")
+          if ! diff -u "$caddyfile" <(echo "$formatted"); then
+            echo "ERROR: Caddyfile is not formatted. Run the following to fix:" >&2
+            echo "  docker run --rm -i <caddy-image> fmt - < $caddyfile > /tmp/Caddyfile && mv /tmp/Caddyfile $caddyfile" >&2
+            exit 1
+          fi
+          echo "Caddyfile formatting is correct"

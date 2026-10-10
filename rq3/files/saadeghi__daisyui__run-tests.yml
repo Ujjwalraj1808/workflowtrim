@@ -1,0 +1,76 @@
+name: "🧪 Tests"
+
+on:
+  workflow_dispatch:
+    inputs:
+      filter:
+        type: string
+        description: Filter tests
+        default: ""
+  workflow_call:
+    inputs:
+      filter:
+        type: string
+        default: ""
+  pull_request:
+    paths:
+      - "packages/daisyui/**"
+      - "packages/docs/**"
+      - "package.json"
+      - "bun.lock"
+      - ".github/workflows/run-tests.yml"
+  push:
+    branches:
+      - master
+    paths:
+      - "packages/daisyui/**"
+      - "packages/docs/**"
+      - "package.json"
+      - "bun.lock"
+      - ".github/workflows/run-tests.yml"
+jobs:
+  tests:
+    timeout-minutes: 10
+    env:
+      TEST_FILTER: ${{ inputs.filter }}
+    name: "Tests"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: Setup bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.0"
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: build package
+        run: bun run --bun build
+
+      - name: Run tests
+        run: |
+          if [ -z "$TEST_FILTER" ]; then
+            bun test
+          else
+            bun test -t "$TEST_FILTER"
+          fi
+
+      - name: Validate docs translations
+        if: env.TEST_FILTER == ''
+        working-directory: packages/docs
+        run: bun run lang:validate
+
+      - name: Build docs
+        if: env.TEST_FILTER == ''
+        working-directory: packages/docs
+        run: bun run --bun build
+
+      - name: Verify docs build
+        if: env.TEST_FILTER == ''
+        working-directory: packages/docs
+        run: bun run verify:build

@@ -1,0 +1,1445 @@
+name: Orchestrator Release
+
+# Unified release workflow combining:
+# - Manual releases (workflow_dispatch)
+# - Auto-releases after Renovate PRs merge (pull_request.closed)
+# - Repository dispatch from other workflows
+
+on:
+  workflow_dispatch:
+    inputs:
+      App:
+        description: "App slug (folder name) or list (comma-separated), 'all' for all Apps, or 'detect' for auto"
+        required: true
+        type: string
+      version:
+        description: "Version increment (major, minor, patch)"
+        required: true
+        default: "patch"
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+      custom_version:
+        description: "Specific target version (e.g. 1.2.3). Overrides 'version' input."
+        required: false
+        type: string
+      skip_verification:
+        description: "Skip lint/build verification"
+        required: false
+        default: false
+        type: boolean
+      changelog_only:
+        description: "Only update changelog, don't bump version (versions already correct)"
+        required: false
+        default: false
+        type: boolean
+      changelog_message:
+        description: "Custom changelog message (optional)"
+        required: false
+        type: string
+
+  pull_request:
+    types: [closed]
+    branches:
+      - master
+
+  repository_dispatch:
+    types: [dependency-update, base-image-update, auto-release]
+
+  push:
+    branches:
+      - master
+    paths:
+      - "**/config.yaml"
+      - ".github/workflows/orchestrator-release.yaml"
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  # Apps to ignore for auto-releases (Blacklist)
+  AUTO_RELEASE_IGNORE: |
+    sap-abap-cloud-dev
+    aegisbot
+    AegisBot
+    solumati
+    alivro
+    Alivro
+    antigravity
+    entramirror
+    EntraMirror
+    wiki.js3
+    switchcraft
+
+  # Labels that indicate safe auto-release
+  SAFE_LABELS: dependencies automerge
+
+  # Labels that block auto-release
+  BLOCK_LABELS: breaking-change major no-release needs-review
+
+permissions:
+  contents: write
+  packages: write
+  actions: write
+  pull-requests: read
+
+jobs:
+  # ================================================================================
+  # DETECT: Determine which Apps need release
+  # ================================================================================
+  detect:
+    name: 🔍 Detect Release Targets
+    if: |
+      github.event_name == 'pull_request' ||
+      github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'repository_dispatch' ||
+      (github.event_name == 'push' && contains(github.event.head_commit.message, 'release(all)'))
+    runs-on: ubuntu-latest
+    outputs:
+      Apps: ${{ steps.detect.outputs.Apps }}
+      should_release: ${{ steps.detect.outputs.should_release }}
+      is_auto: ${{ steps.detect.outputs.is_auto }}
+      version_type: ${{ steps.detect.outputs.version_type }}
+      is_manual_bump: ${{ steps.detect.outputs.is_manual_bump }}
+      is_all: ${{ steps.detect.outputs.is_all }}
+      target_version: ${{ steps.detect.outputs.target_version }}
+    steps:
+      - name: ⤵️ Checkout code
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: 🔍 Detect release targets
+        id: detect
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_MERGED: ${{ github.event.pull_request.merged }}
+          PR_LABELS: ${{ toJson(github.event.pull_request.labels.*.name) }}
+          INPUT_App: ${{ github.event.inputs.App }}
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+          INPUT_CUSTOM_VERSION: ${{ github.event.inputs.custom_version }}
+          DISPATCH_App: ${{ github.event.client_payload.App }}
+          DISPATCH_VERSION: ${{ github.event.client_payload.version }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          EVENT_NAME: ${{ github.event_name }}
+          HEAD_COMMIT_MSG: ${{ github.event.head_commit.message }}
+        run: |
+          set -e
+          AppS=""
+          SHOULD_RELEASE="false"
+          IS_AUTO="false"
+          VERSION_TYPE="patch"
+          TARGET_VERSION=""
+          IS_ALL="false"
+
+          # ----------------------------------------------------------------
+          # MANUAL DISPATCH
+          # ----------------------------------------------------------------
+          if [ "$EVENT_NAME" == "workflow_dispatch" ]; then
+            IS_AUTO="false"
+            VERSION_TYPE="${INPUT_VERSION:-patch}"
+            TARGET_VERSION="${INPUT_CUSTOM_VERSION}"
+
+            if [ -n "$TARGET_VERSION" ]; then
+                echo "🔍 Custom target version provided: $TARGET_VERSION"
+                VERSION_TYPE="patch" # Dummy value for increment arg
+            fi
+
+            echo "🔍 Manual dispatch detected"
+            echo "  INPUT_App: '$INPUT_App'"
+            echo "  INPUT_VERSION: '$INPUT_VERSION'"
+
+            if [ "$INPUT_App" == "all" ]; then
+              IS_ALL="true"
+              # Find all Apps (matching Python script logic)
+              echo "🔍 Finding all Apps..."
+              SKIP_AppS="homeassistant-test-instance"
+
+              # Regular Apps (top-level directories with config.yaml)
+              # NOTE: .unsupported Apps are excluded - they are built locally from unsupported branch
+              for item in */; do
+                item_name="${item%/}"
+                if [ -f "${item}config.yaml" ] && [ ! "${item_name#.}" != "$item_name" ] && [ ! "${item_name#_}" != "$item_name" ]; then
+                  # Skip test Apps
+                  skip=false
+                  for skip_item in $SKIP_AppS; do
+                    if [ "$item_name" == "$skip_item" ]; then
+                      skip=true
+                      break
+                    fi
+                  done
+                  if [ "$skip" == "false" ]; then
+                    [ -z "$AppS" ] && AppS="$item_name" || AppS="$AppS,$item_name"
+                  fi
+                fi
+              done
+
+              # .unsupported Apps are NOT included - they are built locally from unsupported branch
+              echo "ℹ️ Skipping .unsupported Apps (built locally from unsupported branch)"
+
+              SHOULD_RELEASE="true"
+              echo "📦 Found Apps: $AppS"
+              echo "Count: $(echo "$AppS" | tr ',' '\n' | wc -l)"
+            elif [ -n "$INPUT_App" ] && [ "$INPUT_App" != "detect" ]; then
+              IS_ALL="false"
+              # Handle comma-separated list
+              IFS=',' read -ra INPUT_AppS_ARRAY <<< "$INPUT_App"
+              VALID_AppS=""
+
+              for App in "${INPUT_AppS_ARRAY[@]}"; do
+                  App=$(echo "$App" | xargs) # trim whitespace
+
+                  # Resolve directory name case-insensitively if exact match doesn't exist
+                  if [ ! -d "$App" ]; then
+                      REAL_DIR=$(find . -maxdepth 1 -mindepth 1 -type d -iname "$App" -exec basename {} \; | head -n 1)
+                      if [ -n "$REAL_DIR" ]; then
+                          echo "ℹ️ Resolved '$App' to actual directory '$REAL_DIR'"
+                          App="$REAL_DIR"
+                      fi
+                  fi
+
+                  # Check if it exists (basic check, though dynamic check happens later too)
+                  if [ ! -d "$App" ]; then
+                      echo "⚠️ Warning: App directory '$App' does not exist. Skipping."
+                      continue
+                  fi
+
+                  # Check unsupported and in-development
+                  if [[ "$App" == .unsupported/* ]] || [[ "$App" == .unsupported* ]] || [[ "$App" == .dev/* ]] || [[ "$App" == .dev* ]]; then
+                    echo "❌ Error: .unsupported and .dev Apps cannot be released as pre-built stable images"
+                    echo "   They are built locally from their respective branches (unsupported/dev/edge)"
+                    echo "   Skipping $App"
+                    continue
+                  fi
+
+                  [ -z "$VALID_AppS" ] && VALID_AppS="$App" || VALID_AppS="$VALID_AppS,$App"
+              done
+
+              if [ -n "$VALID_AppS" ]; then
+                  AppS="$VALID_AppS"
+                  SHOULD_RELEASE="true"
+                  echo "📦 Apps to release: $AppS"
+              else
+                  echo "❌ No valid Apps found to release from input: '$INPUT_App'"
+                  SHOULD_RELEASE="false"
+              fi
+            elif [ "$INPUT_App" == "detect" ]; then
+              IS_ALL="false"
+              echo "🔍 Auto-detection triggered manually (checking HEAD^ vs HEAD)"
+
+              # Get list of changed files
+              CHANGED_FILES=$(git diff --name-only HEAD^ HEAD)
+
+              for file in $CHANGED_FILES; do
+                # Skip .unsupported and .dev Apps
+                if [[ "$file" == .unsupported/* ]] || [[ "$file" == .dev/* ]]; then
+                  echo "⏭️ Skipping .unsupported/.dev App: $file"
+                  continue
+                fi
+
+                if [[ "$file" == *"/config.yaml" ]]; then
+                  App_dir=$(dirname "$file")
+                  App_name=$(basename "$App_dir")
+
+                  # Check if version changed
+                  # Get old version (handle new file case)
+                  if git rev-parse --verify HEAD^:"$file" >/dev/null 2>&1; then
+                      OLD_VERSION=$(git show HEAD^:"$file" | grep "^version:" | head -n 1 | awk '{print $2}' | tr -d '"' | tr -d "'")
+                  else
+                      OLD_VERSION=""
+                      echo "  ℹ️ New file detected (no old version)"
+                  fi
+                  # Get new version
+                  NEW_VERSION=$(grep "^version:" "$file" | head -n 1 | awk '{print $2}' | tr -d '"' | tr -d "'")
+
+                  if [ "$OLD_VERSION" != "$NEW_VERSION" ] && [ -n "$NEW_VERSION" ]; then
+                     echo "🚀 Detected version bump in $App_name: $OLD_VERSION -> $NEW_VERSION"
+                     [ -z "$AppS" ] && AppS="$App_name" || AppS="$AppS,$App_name"
+                     SHOULD_RELEASE="true"
+                     IS_MANUAL_BUMP="true"
+                     SHOULD_RELEASE="true"
+                     IS_MANUAL_BUMP="true"
+                     TARGET_VERSION="$NEW_VERSION"
+                     VERSION_TYPE="patch" # Dummy value
+                  fi
+                fi
+              done
+
+              if [ -z "$AppS" ]; then
+                echo "ℹ️ No version bumps detected in last commit."
+              fi
+            else
+              IS_ALL="false"
+              echo "⚠️ Invalid or missing App input: '$INPUT_App'"
+              SHOULD_RELEASE="false"
+            fi
+
+          # ----------------------------------------------------------------
+          # REPOSITORY DISPATCH
+          # ----------------------------------------------------------------
+          elif [ "$EVENT_NAME" == "repository_dispatch" ]; then
+            IS_AUTO="true"
+            VERSION_TYPE="${DISPATCH_VERSION:-patch}"
+
+            if [ -n "$DISPATCH_App" ]; then
+              AppS="$DISPATCH_App"
+              SHOULD_RELEASE="true"
+            fi
+
+          # ----------------------------------------------------------------
+          # MERGED PR (Auto-release)
+          # ----------------------------------------------------------------
+          elif [ "$EVENT_NAME" == "pull_request" ]; then
+            IS_AUTO="true"
+
+            # Check if PR was merged
+            if [ "$PR_MERGED" != "true" ]; then
+              echo "PR was not merged, skipping."
+              {
+                echo "should_release=false"
+                echo "Apps=[]"
+                echo "is_auto=false"
+                echo "version_type=patch"
+              } >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+
+            # Check for blocking labels
+            CLEAN_BLOCK_LABELS=$(echo "$BLOCK_LABELS" | tr '\n' ' ')
+            for label in $CLEAN_BLOCK_LABELS; do
+              if echo "$PR_LABELS" | grep -qi "\"$label\""; then
+                echo "⛔ Found blocking label: $label"
+                {
+                  echo "should_release=false"
+                  echo "Apps=[]"
+                  echo "is_auto=true"
+                  echo "version_type=patch"
+                } >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+            done
+
+            # Get PR Title for safe check
+            PR_TITLE=$(gh pr view "$PR_NUMBER" --json title --jq '.title' || echo "")
+
+            # Check for safe labels
+            HAS_SAFE="false"
+            CLEAN_SAFE_LABELS=$(echo "$SAFE_LABELS" | tr '\n' ' ')
+            for label in $CLEAN_SAFE_LABELS; do
+              if echo "$PR_LABELS" | grep -qi "\"$label\""; then
+                HAS_SAFE="true"
+                break
+              fi
+            done
+
+            if [ "$HAS_SAFE" != "true" ]; then
+              # Check PR Title for safe patterns (Renovate)
+              echo "DEBUG: Checking PR Title: '$PR_TITLE'"
+              REGEX_DEP="^⬆️ Update dependency"
+              REGEX_TAG="^⬆️ Update .* Docker tag"
+
+              if [[ "$PR_TITLE" =~ $REGEX_DEP ]] || [[ "$PR_TITLE" =~ $REGEX_TAG ]]; then
+                echo "✅ Safe PR Title detected (Renovate): $PR_TITLE"
+                HAS_SAFE="true"
+              else
+                echo "No safe labels or safe title patterns found"
+                {
+                  echo "should_release=false"
+                  echo "Apps=[]"
+                  echo "is_auto=true"
+                  echo "is_auto=true"
+                  echo "version_type=patch"
+                  echo "target_version="
+                } >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+            fi
+
+            # Get changed files using PR API as primary source
+            echo "🔍 Fetching changed files via GitHub API..."
+            if CHANGED=$(gh pr view "$PR_NUMBER" --json files --jq '.files[].path' 2>/dev/null); then
+              echo "✅ Successfully fetched changed files from PR API"
+            else
+              echo "⚠️ Failed to fetch changed files from PR API (Branch might be deleted). Using git diff fallback..."
+              # HEAD is the merge commit. HEAD^ is the state before the PR merge.
+              CHANGED=$(git diff --name-only HEAD^ HEAD)
+            fi
+
+            if [ -z "$CHANGED" ]; then
+              echo "❌ Error: Could not detect any changed files for verification."
+              {
+                echo "should_release=false"
+                echo "Apps=[]"
+                echo "is_auto=true"
+                echo "version_type=patch"
+              } >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+
+            # Check if this is a base image update by checking PR title/description
+            IS_BASE_IMAGE_UPDATE="false"
+            # PR_TITLE is already fetched above
+            PR_BODY=$(gh pr view "$PR_NUMBER" --json body --jq '.body' || echo "")
+            if echo "$PR_TITLE $PR_BODY" | grep -qiE "(base.*image|hassio-addons/(base|debian-base|base-python)|App base images|Bailys|Homeassistant App Base|Important Update)"; then
+              IS_BASE_IMAGE_UPDATE="true"
+              echo "🔍 Base image update detected from PR title/description"
+            fi
+
+            # ----------------------------------------------------------------
+            # Identify affected Apps
+            # ----------------------------------------------------------------
+            # If base image update, release ALL affected Apps (not just AUTO_RELEASE_AppS)
+            # NOTE: .unsupported Apps are excluded - they are built locally from unsupported branch
+            if [ "$IS_BASE_IMAGE_UPDATE" == "true" ]; then
+              echo "🔍 Base image update - releasing all affected Apps (excluding .unsupported)"
+              # Find all Apps with changed Dockerfile or build.yaml
+              for file in $CHANGED; do
+                # Skip .unsupported and .dev Apps
+                if [[ "$file" =~ ^\.unsupported/ ]] || [[ "$file" =~ ^\.dev/ ]]; then
+                  echo "  ⏭️ Skipping .unsupported/.dev App: $file"
+                  continue
+                fi
+
+                # Extract App directory from file path (only regular Apps)
+                if [[ "$file" =~ ^([^/]+)/ ]]; then
+                  App_dir="${BASH_REMATCH[1]}"
+                else
+                  continue
+                fi
+
+                # Check if Dockerfile or build.yaml in this App was changed
+                if echo "$CHANGED" | grep -qE "^${App_dir}/(Dockerfile|build\.yaml)$"; then
+                  # Skip if already added
+                  if [[ ! ",$AppS," =~ ,"$App_dir", ]]; then
+                    [ -z "$AppS" ] && AppS="$App_dir" || AppS="$AppS,$App_dir"
+                    echo "  ✅ Added $App_dir (Dockerfile/build.yaml changed)"
+                  fi
+                fi
+              done
+            else
+              # ----------------------------------------------------------------
+              # Detect NEW Apps (config.yaml added)
+              # ----------------------------------------------------------------
+              echo "🔍 Checking for newly or modified Apps..."
+              CLEAN_IGNORE_AppS="$(echo "$AUTO_RELEASE_IGNORE" | tr '\n' ' ')"
+
+              # Loop through changed files to detect affected Apps
+              for file in $CHANGED; do
+                 # Skip .unsupported and .dev
+                 if [[ "$file" == .unsupported/* ]] || [[ "$file" == .dev/* ]]; then
+                    continue
+                 fi
+
+                 # Extract App slug (first directory level)
+                 if [[ "$file" =~ ^([^/]+)/ ]]; then
+                    App_dir="${BASH_REMATCH[1]}"
+
+                    # Skip hidden directories (like .github, .scripts), internal folders (_images), or docs
+                    if [[ "$App_dir" == .* ]] || [[ "$App_dir" == _* ]] || [[ "$App_dir" == "docs" ]]; then
+                       continue
+                    fi
+
+                    # Skip if already identified as target
+                    if [[ ",$AppS," =~ ,"$App_dir", ]]; then
+                       continue
+                    fi
+
+                    # IMPORTANT: Verify it's actually an App directory by checking for config.yaml
+                    if [ ! -f "${App_dir}/config.yaml" ]; then
+                       continue
+                    fi
+
+                    # 1. Detect NEW Apps (config.yaml added)
+                    if [[ "$file" == "${App_dir}/config.yaml" ]] && git diff --name-status HEAD^ HEAD | grep -qE "^A.*${file}"; then
+                        echo "  🚀 Detected NEW App: $App_dir"
+                        [ -z "$AppS" ] && AppS="$App_dir" || AppS="$AppS,$App_dir"
+                        continue
+                    fi
+
+                    # 2. Detect updates for ALL Apps (except ignored)
+                    if [[ " $CLEAN_IGNORE_AppS " != *" $App_dir "* ]]; then
+                       # Special rule for whatsapp: only auto-release on base image, version bump, or baileys updates
+                       if [ "$App_dir" == "whatsapp" ]; then
+                         IS_BAILEYS_UPDATE="false"
+                         if echo "$PR_TITLE" | grep -qiE "baileys"; then
+                           IS_BAILEYS_UPDATE="true"
+                         fi
+                         IS_VERSION_BUMP="false"
+                         if git diff HEAD^ HEAD -U0 "${App_dir}/config.yaml" 2>/dev/null | grep -q '^+version:'; then
+                           IS_VERSION_BUMP="true"
+                         fi
+                         if [ "$IS_BASE_IMAGE_UPDATE" != "true" ] && [ "$IS_BAILEYS_UPDATE" != "true" ] && [ "$IS_VERSION_BUMP" != "true" ]; then
+                           echo "  ⏭️ Skipping whatsapp auto-release (not a base image, version bump, or baileys update)"
+                           continue
+                         fi
+                       fi
+
+                       echo "  ✅ Added $App_dir (Changed file: $file)"
+                       [ -z "$AppS" ] && AppS="$App_dir" || AppS="$AppS,$App_dir"
+                    else
+                       echo "  ⏭️ Skipping ignored App: $App_dir"
+                    fi
+                 fi
+              done
+            fi
+
+            # ----------------------------------------------------------------
+            # Check for Manual Version Bumps in PR (Manifest Version Change)
+            # ----------------------------------------------------------------
+            echo "🔍 Checking for explicit version bumps in config.yaml..."
+            # Check for version changes in any config.yaml
+            for file in $CHANGED; do
+              if [[ "$file" == *"/config.yaml" ]]; then
+                App_dir=$(dirname "$file")
+                App_slug=$(basename "$App_dir")
+
+                # Skip .unsupported
+                if [[ "$App_dir" == .unsupported/* ]]; then continue; fi
+
+                # Check if version field actually changed
+                if git rev-parse --verify HEAD^:"$file" >/dev/null 2>&1; then
+                    OLD_VERSION=$(git show HEAD^:"$file" | grep "^version:" | head -n 1 | awk '{print $2}' | tr -d '"' | tr -d "'")
+                else
+                    OLD_VERSION=""
+                fi
+                NEW_VERSION=$(grep "^version:" "$file" | head -n 1 | awk '{print $2}' | tr -d '"' | tr -d "'")
+
+                if [ "$OLD_VERSION" != "$NEW_VERSION" ] && [ -n "$NEW_VERSION" ]; then
+                   echo "🚀 Detected explicit version bump in $App_slug: $OLD_VERSION -> $NEW_VERSION"
+                   # Add to AppS if not already there
+                   if [[ ! ",$AppS," =~ ,"$App_slug", ]]; then
+                     [ -z "$AppS" ] && AppS="$App_slug" || AppS="$AppS,$App_slug"
+                   fi
+                   # Use this version instead of patch bump
+                   TARGET_VERSION="$NEW_VERSION"
+                   VERSION_TYPE="patch" # Dummy value
+                   IS_MANUAL_BUMP="true"
+                fi
+              fi
+            done
+
+            [ -n "$AppS" ] && SHOULD_RELEASE="true"
+          # ----------------------------------------------------------------
+          # PUSH TO MASTER (Manual Version Bump Detection or release(all) trigger)
+          # ----------------------------------------------------------------
+          elif [ "$EVENT_NAME" == "push" ]; then
+             IS_AUTO="false"
+
+             # Check for "release(all)" in commit message
+             COMMIT_MSG="$HEAD_COMMIT_MSG"
+             if echo "$COMMIT_MSG" | grep -qi "release(all)"; then
+               echo "🚀 Detected 'release(all)' in commit message - releasing all Apps"
+               SKIP_AppS="homeassistant-test-instance sap-abap-cloud-dev"
+
+               # Regular Apps (top-level directories with config.yaml)
+               # NOTE: .unsupported Apps are excluded - they are built locally from unsupported branch
+               for item in */; do
+                 item_name="${item%/}"
+                 if [ -f "${item}config.yaml" ] && [ ! "${item_name#.}" != "$item_name" ] && [ ! "${item_name#_}" != "$item_name" ]; then
+                   # Skip test Apps
+                   skip=false
+                   for skip_item in $SKIP_AppS; do
+                     if [ "$item_name" == "$skip_item" ]; then
+                       skip=true
+                       break
+                     fi
+                   done
+                   if [ "$skip" == "false" ]; then
+                     [ -z "$AppS" ] && AppS="$item_name" || AppS="$AppS,$item_name"
+                   fi
+                 fi
+               done
+
+               # .unsupported Apps are NOT included - they are built locally from unsupported branch
+               echo "ℹ️ Skipping .unsupported Apps (built locally from unsupported branch)"
+
+               SHOULD_RELEASE="true"
+               VERSION_TYPE="patch" # Default for release(all)
+               echo "📦 Found Apps: $AppS"
+             else
+               IS_ALL="false"
+               # Original logic: Detect manual version bumps
+               # NOTE: .unsupported Apps are excluded - they are built locally from unsupported branch
+               # Get list of changed files
+               CHANGED_FILES=$(git diff --name-only HEAD^ HEAD)
+
+               for file in $CHANGED_FILES; do
+                 # Skip .unsupported Apps - they are built locally from unsupported branch
+                 if [[ "$file" == .unsupported/* ]]; then
+                   echo "⏭️ Skipping .unsupported App: $file (built locally from unsupported branch)"
+                   continue
+                 fi
+
+                 if [[ "$file" == *"/config.yaml" ]]; then
+                   App_dir=$(dirname "$file")
+                   App_name=$(basename "$App_dir")
+
+                   # Check if version changed
+                   # Get old version (handle new file case)
+                   if git rev-parse --verify HEAD^:"$file" >/dev/null 2>&1; then
+                       OLD_VERSION=$(git show HEAD^:"$file" | grep "^version:" | head -n 1 | awk '{print $2}' | tr -d '"' | tr -d "'")
+                   else
+                       OLD_VERSION=""
+                       echo "  ℹ️ New file detected (no old version)"
+                   fi
+                   # Get new version
+                   NEW_VERSION=$(grep "^version:" "$file" | head -n 1 | awk '{print $2}' | tr -d '"' | tr -d "'")
+
+                   if [ "$OLD_VERSION" != "$NEW_VERSION" ] && [ -n "$NEW_VERSION" ]; then
+                      echo "🚀 Detected version bump in $App_name: $OLD_VERSION -> $NEW_VERSION"
+                      [ -z "$AppS" ] && AppS="$App_name" || AppS="$AppS,$App_name"
+                      SHOULD_RELEASE="true"
+                      IS_MANUAL_BUMP="true"
+                      TARGET_VERSION="$NEW_VERSION"
+                      VERSION_TYPE="patch" # Dummy value
+                   fi
+                 fi
+               done
+             fi
+
+          fi
+
+          # Sort Apps by priority (only if multiple Apps are affected)
+          if [ -n "$AppS" ]; then
+            App_COUNT=$(echo "$AppS" | tr ',' '\n' | wc -l | tr -d ' ')
+            if [ "$App_COUNT" -gt 1 ]; then
+              echo "📋 Sorting Apps by priority (multiple Apps detected)..."
+
+              # Split into categories
+              NORMAL_AppS=""
+              SWITCH_LAN_PLAY_AppS=""
+              PTERODACTYL_WINGS_AppS=""
+              PTERODACTYL_PANEL_AppS=""
+              ANTIGRAVITY_App=""
+              SAP_App=""
+              UNSUPPORTED_AppS=""
+
+              # Process each App
+              IFS=','
+              for App in $AppS; do
+                App=$(echo "$App" | xargs)  # trim whitespace
+
+              # Check category
+              if [[ "$App" == .unsupported/* ]]; then
+                # Unsupported Apps go last
+                [ -z "$UNSUPPORTED_AppS" ] && UNSUPPORTED_AppS="$App" || UNSUPPORTED_AppS="$UNSUPPORTED_AppS,$App"
+              elif [[ "$App" == "sap-abap-cloud-dev" ]]; then
+                 # SAP goes second-to-last (after antigravity, before unsupported)
+                SAP_App="$App"
+              elif [[ "$App" == "antigravity-server" ]]; then
+                # antigravity-server goes third-to-last
+                ANTIGRAVITY_App="$App"
+              elif [[ "$App" == pterodactyl-panel* ]]; then
+                 # pterodactyl panel goes fourth-to-last
+                 [ -z "$PTERODACTYL_PANEL_AppS" ] && PTERODACTYL_PANEL_AppS="$App" || PTERODACTYL_PANEL_AppS="$PTERODACTYL_PANEL_AppS,$App"
+              elif [[ "$App" == pterodactyl-wings* ]]; then
+                 # pterodactyl wings goes fifth-to-last
+                 [ -z "$PTERODACTYL_WINGS_AppS" ] && PTERODACTYL_WINGS_AppS="$App" || PTERODACTYL_WINGS_AppS="$PTERODACTYL_WINGS_AppS,$App"
+              elif [[ "$App" == switch_lan_play* ]]; then
+                # switch_lan_play Apps go sixth-to-last
+                [ -z "$SWITCH_LAN_PLAY_AppS" ] && SWITCH_LAN_PLAY_AppS="$App" || SWITCH_LAN_PLAY_AppS="$SWITCH_LAN_PLAY_AppS,$App"
+              else
+                # Normal Apps go first
+                [ -z "$NORMAL_AppS" ] && NORMAL_AppS="$App" || NORMAL_AppS="$NORMAL_AppS,$App"
+              fi
+            done
+            unset IFS
+
+            # Rebuild in correct order
+            SORTED_AppS=""
+            [ -n "$NORMAL_AppS" ] && SORTED_AppS="$NORMAL_AppS"
+            [ -n "$SWITCH_LAN_PLAY_AppS" ] && {
+              [ -n "$SORTED_AppS" ] && SORTED_AppS="$SORTED_AppS,$SWITCH_LAN_PLAY_AppS" || SORTED_AppS="$SWITCH_LAN_PLAY_AppS"
+            }
+            [ -n "$PTERODACTYL_WINGS_AppS" ] && {
+                [ -n "$SORTED_AppS" ] && SORTED_AppS="$SORTED_AppS,$PTERODACTYL_WINGS_AppS" || SORTED_AppS="$PTERODACTYL_WINGS_AppS"
+            }
+            [ -n "$PTERODACTYL_PANEL_AppS" ] && {
+                [ -n "$SORTED_AppS" ] && SORTED_AppS="$SORTED_AppS,$PTERODACTYL_PANEL_AppS" || SORTED_AppS="$PTERODACTYL_PANEL_AppS"
+            }
+            [ -n "$ANTIGRAVITY_App" ] && {
+              [ -n "$SORTED_AppS" ] && SORTED_AppS="$SORTED_AppS,$ANTIGRAVITY_App" || SORTED_AppS="$ANTIGRAVITY_App"
+            }
+            [ -n "$SAP_App" ] && {
+              [ -n "$SORTED_AppS" ] && SORTED_AppS="$SORTED_AppS,$SAP_App" || SORTED_AppS="$SAP_App"
+            }
+            [ -n "$UNSUPPORTED_AppS" ] && {
+              [ -n "$SORTED_AppS" ] && SORTED_AppS="$SORTED_AppS,$UNSUPPORTED_AppS" || SORTED_AppS="$UNSUPPORTED_AppS"
+            }
+
+            AppS="$SORTED_AppS"
+            echo "✅ Sorted Apps: $AppS"
+            fi
+          fi
+
+          # Convert to JSON array (compact format for GitHub Actions output)
+          if [ -n "$AppS" ]; then
+            JSON="$(echo "$AppS" | tr ',' '\n' | jq -R . | jq -s -c .)"
+          else
+            JSON="[]"
+          fi
+
+          echo "Apps: $AppS"
+          echo "Should release: $SHOULD_RELEASE"
+          echo "Is auto: $IS_AUTO"
+          echo "Version type: $VERSION_TYPE"
+          echo "Is manual bump: ${IS_MANUAL_BUMP:-false}"
+          echo "Is all: ${IS_ALL:-false}"
+
+          # Output as compact JSON (single line) to avoid formatting issues
+          # shellcheck disable=SC2129
+          printf "Apps=%s\n" "$JSON" >> "$GITHUB_OUTPUT"
+          printf "should_release=%s\n" "$SHOULD_RELEASE" >> "$GITHUB_OUTPUT"
+          printf "is_auto=%s\n" "$IS_AUTO" >> "$GITHUB_OUTPUT"
+          printf "version_type=%s\n" "$VERSION_TYPE" >> "$GITHUB_OUTPUT"
+          # shellcheck disable=SC2154
+          printf "target_version=%s\n" "$TARGET_VERSION" >> "$GITHUB_OUTPUT"
+          # shellcheck disable=SC2154
+          printf "is_manual_bump=%s\n" "${IS_MANUAL_BUMP:-false}" >> "$GITHUB_OUTPUT"
+          printf "is_all=%s\n" "${IS_ALL:-false}" >> "$GITHUB_OUTPUT"
+
+  # ================================================================================
+  # VERIFY: Lint and test build before release
+  # ================================================================================
+  verify:
+    name: ✅ Verify ${{ matrix.App }}
+    needs: detect
+    if: needs.detect.outputs.should_release == 'true' && github.event.inputs.skip_verification != 'true'
+    concurrency:
+      group: release-verify-${{ matrix.App }}
+      cancel-in-progress: true
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        App: ${{ fromJson(needs.detect.outputs.Apps) }}
+    steps:
+      - name: 🧹 Free Disk Space
+        run: |
+          echo "Freeing up disk space on Mono, Android, and .NET..."
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf "/usr/local/share/boost"
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+
+      - name: ⤵️ Check out code
+        uses: actions/checkout@v7
+      - name: 🔑 Login to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: 🐳 Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+      - name: 🕵️ App Linter
+        uses: frenck/action-addon-linter@v2
+        with:
+          path: "./${{ matrix.App }}"
+
+      - name: ℹ️ Get App Info
+        id: info
+        shell: bash
+        run: |
+          SLUG=$(yq -r '.slug' "${{ matrix.App }}/config.yaml")
+          if [ -z "$SLUG" ] || [ "$SLUG" == "null" ]; then
+            SLUG=$(echo "${{ matrix.App }}" | tr '[:upper:]' '[:lower:]')
+          fi
+          # Docker/GHCR requires lowercase repository names
+          IMAGE=$(echo "ghcr.io/${{ github.repository_owner }}/amd64-hassio-addons-$SLUG" | tr '[:upper:]' '[:lower:]')
+          echo "slug=$SLUG" >> "$GITHUB_OUTPUT"
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: 🔧 Inject Version Warning
+        run: |
+          pip install pyyaml --quiet
+          python3 .scripts/inject_version_warning.py "${{ matrix.App }}"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 🏗️ Test Build
+        if: matrix.App != 'sap-abap-cloud-dev'
+        uses: docker/build-push-action@v7
+        with:
+          context: ./${{ matrix.App }}
+          file: ./${{ matrix.App }}/Dockerfile
+          platforms: linux/amd64
+          push: false
+          build-args: |
+            BUILD_ARCH=amd64
+          cache-from: type=gha,scope=${{ matrix.App }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.App }},ignore-error=true
+
+  # ================================================================================
+  # RELEASE: Build & Push
+  # ================================================================================
+  release:
+    name: 🚀 Release ${{ matrix.App }}
+    needs: [detect, verify]
+    if: |
+      !cancelled() &&
+      needs.detect.outputs.should_release == 'true' &&
+      (needs.verify.result == 'success' || needs.verify.result == 'skipped' || github.event.inputs.skip_verification == 'true')
+    concurrency:
+      group: release-${{ matrix.App }}
+      cancel-in-progress: true
+    runs-on: ubuntu-latest
+    continue-on-error: ${{ matrix.App == 'solumati' }}
+    strategy:
+      fail-fast: false
+      # Use max-parallel: 5 to allow concurrent releases
+      # Retry logic handles potential git race conditions
+      max-parallel: 5
+      matrix:
+        App: ${{ fromJson(needs.detect.outputs.Apps) }}
+    steps:
+      - name: 🧹 Free Disk Space
+        run: |
+          echo "Freeing up disk space on Mono, Android, and .NET..."
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf "/usr/local/share/boost"
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+
+      - name: ⤵️ Check out code
+        uses: actions/checkout@v7
+        with:
+          token: ${{ secrets.PAT || secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: 🏷️ Detect if unsupported
+        id: status
+        run: |
+          # shellcheck disable=SC2193
+          if [[ "${{ matrix.App }}" == .unsupported/* ]]; then
+            echo "is_unsupported=true" >> "$GITHUB_OUTPUT"
+            echo "📦 App is UNSUPPORTED"
+          else
+            echo "is_unsupported=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 🔧 Inject Version Warning
+        run: |
+          pip install pyyaml --quiet
+          python3 .scripts/inject_version_warning.py "${{ matrix.App }}"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 🧹 Cleanup Temporary Migration Helpers
+        run: |
+          python3 .scripts/cleanup_migration_helpers.py --app "${{ matrix.App }}" || true
+
+      - name: 🔧 Fix Image Field Format (if needed)
+        if: matrix.App != 'sap-abap-cloud-dev'
+        run: |
+          # Ensure image field uses correct format: ghcr.io/faserf/hassio-addons-{slug}-{arch}
+          SLUG=$(grep "^slug:" "${{ matrix.App }}/config.yaml" | head -n 1 | awk '{print $2}' | tr -d '"' | tr -d "'")
+          CORRECT_IMAGE="ghcr.io/faserf/hassio-addons-${SLUG}-{arch}"
+
+          if grep -q "^image:" "${{ matrix.App }}/config.yaml"; then
+            CURRENT_IMAGE=$(grep "^image:" "${{ matrix.App }}/config.yaml" | head -n 1 | awk '{print $2}' | tr -d '"' | tr -d "'")
+            if [ "$CURRENT_IMAGE" != "$CORRECT_IMAGE" ]; then
+              sed -i "s|^image:.*|image: ${CORRECT_IMAGE}|g" "${{ matrix.App }}/config.yaml"
+              echo "✅ Updated image field from '$CURRENT_IMAGE' to '$CORRECT_IMAGE'"
+            else
+              echo "ℹ️ Image field already correct: $CORRECT_IMAGE"
+            fi
+          else
+            # Add image field if missing
+            sed -i "/^slug:.*/a image: ${CORRECT_IMAGE}" "${{ matrix.App }}/config.yaml"
+            echo "✅ Added image field: $CORRECT_IMAGE"
+          fi
+
+      - name: ℹ️ Get App Info
+        id: info
+        shell: bash
+        run: |
+          VERSION=$(yq -r '.version' "${{ matrix.App }}/config.yaml")
+          SLUG=$(yq -r '.slug' "${{ matrix.App }}/config.yaml")
+          if [ -z "$SLUG" ] || [ "$SLUG" == "null" ]; then
+            SLUG=$(echo "${{ matrix.App }}" | tr '[:upper:]' '[:lower:]')
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "slug=$SLUG" >> "$GITHUB_OUTPUT"
+
+      - name: 🐋 Login to GitHub Container Registry
+        if: matrix.App != 'sap-abap-cloud-dev'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 🐳 Set up QEMU
+        if: matrix.App != 'sap-abap-cloud-dev'
+        uses: docker/setup-qemu-action@v4
+
+      - name: 🐳 Set up Docker Buildx
+        if: matrix.App != 'sap-abap-cloud-dev'
+        uses: docker/setup-buildx-action@v4
+
+
+      - name: 📝 Bump Version & Changelog
+        run: |
+          VERSION_TYPE="${{ needs.detect.outputs.version_type }}"
+          TARGET_VERSION="${{ needs.detect.outputs.target_version }}"
+          IS_AUTO="${{ needs.detect.outputs.is_auto }}"
+          IS_MANUAL_BUMP="${{ needs.detect.outputs.is_manual_bump }}"
+          CHANGELOG_ONLY="${{ github.event.inputs.changelog_only || 'false' }}"
+
+          if [ "$IS_AUTO" == "true" ]; then
+            MSG="Automatic release after dependency update"
+          else
+            # Use custom message if provided, otherwise default
+            if [ -n "${{ github.event.inputs.changelog_message }}" ]; then
+              MSG="${{ github.event.inputs.changelog_message }}"
+            else
+              MSG="Manual release via Orchestrator"
+            fi
+          fi
+
+          if [ "$IS_MANUAL_BUMP" == "true" ] || [ "$CHANGELOG_ONLY" == "true" ]; then
+             echo "ℹ️ Changelog-only mode: Updating Changelog without version bump."
+             # Get current version from config.yaml
+             CURRENT_VERSION=$(grep "^version:" "${{ matrix.App }}/config.yaml" | head -n 1 | awk '{print $2}' | tr -d '"' | tr -d "'")
+             python3 .scripts/bump_version.py "${{ matrix.App }}" patch --target-version "$CURRENT_VERSION" --changelog-only --message "$MSG"
+          else
+             PYTHON_CMD="python3 .scripts/bump_version.py \"${{ matrix.App }}\" \"$VERSION_TYPE\" --message \"$MSG\""
+
+             if [ -n "$TARGET_VERSION" ] && [ "$TARGET_VERSION" != "null" ]; then
+                PYTHON_CMD="python3 .scripts/bump_version.py \"${{ matrix.App }}\" patch --target-version \"$TARGET_VERSION\" --message \"$MSG\""
+             fi
+
+             eval "$PYTHON_CMD"
+          fi
+
+          # Re-inject updated version into Dockerfile after version bump
+          python3 .scripts/inject_version_warning.py "${{ matrix.App }}"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 🔍 Debug Git Status (Post-Bump)
+        run: |
+          echo "Current directory: $(pwd)"
+          ls -la "${{ matrix.App }}"
+          git status
+          git diff
+          grep "version:" "${{ matrix.App }}/config.yaml"
+
+      - name: 🔄 Pull latest changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Store local changes for this App
+          App_FILES="."
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "📦 Stashing local changes for ${{ matrix.App }}..."
+            git stash push -u -m "temp-stash-${{ matrix.App }}" || echo "No changes to stash"
+          fi
+
+          # Fetch and update to latest master
+          git fetch origin master
+          git reset --hard origin/master
+
+          # Restore and reapply local changes
+          if git stash list | grep -q "temp-stash-${{ matrix.App }}"; then
+            STASH_ENTRY=$(git stash list | grep "temp-stash-${{ matrix.App }}" | head -n1 | cut -d: -f1)
+            if [ -n "$STASH_ENTRY" ]; then
+              # Apply stash (don't pop, in case of conflicts)
+              git stash apply "$STASH_ENTRY" || {
+                echo "⚠️ Merge conflict detected, resolving..."
+                # If there's a conflict, resolve by taking our version (the App files)
+                git checkout --ours -- "$App_FILES" 2>/dev/null || true
+                git add "$App_FILES"
+                # Clean up the stash
+                git stash drop "$STASH_ENTRY" 2>/dev/null || true
+              }
+            fi
+          fi
+
+          # Ensure we're on the latest master (handle any merge state)
+          git merge --abort 2>/dev/null || true
+          git rebase --abort 2>/dev/null || true
+          git rebase --abort 2>/dev/null || true
+
+          # Reapply changes one more time if needed
+          if [ -n "$(git status --porcelain "$App_FILES")" ]; then
+            echo "✅ Local changes preserved for ${{ matrix.App }}"
+          fi
+
+      - name: 🚀 Commit & Push (with Retry)
+        env:
+          GH_TOKEN: ${{ secrets.PAT || secrets.GITHUB_TOKEN }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          MAX_RETRIES=5
+
+          for ((i=1; i<=MAX_RETRIES; i++)); do
+            echo "Attempt $i of $MAX_RETRIES..."
+
+            # 1. Check status and Commit
+            HAS_CHANGES="false"
+            if [ -n "$(git status --porcelain "${{ matrix.App }}")" ]; then
+              git add "${{ matrix.App }}"
+              COMMIT_MSG="${{ github.event.inputs.changelog_only == 'true' && format('📝 release({0}): update changelog [skip-tests]', matrix.App) || format('🚀 release({0}): version bump [skip-tests]', matrix.App) }}"
+              if git commit -m "$COMMIT_MSG" --author="FaserF <12374134+FaserF@users.noreply.github.com>"; then
+                HAS_CHANGES="true"
+              fi
+            else
+              echo "Nothing to commit (or already committed)"
+            fi
+
+            # 2. Push
+            if git push origin master; then
+              echo "✅ Push successful!"
+              if [ "$HAS_CHANGES" = "true" ] && [ "${{ github.event.inputs.changelog_only }}" != "true" ]; then
+                echo "🔄 Triggering Orchestrator Edge Sync for ${{ matrix.App }}..."
+                gh workflow run orchestrator-edge-sync.yaml --ref master -f app="${{ matrix.App }}" || echo "⚠️ Failed to trigger edge sync workflow"
+              fi
+              exit 0
+            fi
+
+            echo "⚠️ Push failed."
+            if [ $i -lt $MAX_RETRIES ]; then
+              # Random jitter (5-14 seconds)
+              JITTER=$(( ( RANDOM % 10 )  + 5 ))
+              echo "Waiting ${JITTER}s before retry..."
+              sleep $JITTER
+
+              echo "🔄 Pulling latest changes (rebase)..."
+              git pull --rebase origin master || {
+                echo "Rebase failed, trying merge..."
+                git rebase --abort 2>/dev/null || true
+                git pull origin master --no-rebase || echo "Merge failed"
+              }
+            fi
+          done
+          echo "❌ Failed to push after $MAX_RETRIES attempts"
+          exit 1
+
+      - name: ℹ️ Get App Info (Post-Bump)
+        id: info_build
+        shell: bash
+        run: |
+          VERSION=$(yq -r '.version' "${{ matrix.App }}/config.yaml")
+          SLUG=$(yq -r '.slug' "${{ matrix.App }}/config.yaml")
+          if [ -z "$SLUG" ] || [ "$SLUG" == "null" ]; then
+            SLUG=$(echo "${{ matrix.App }}" | tr '[:upper:]' '[:lower:]')
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "slug=$SLUG" >> "$GITHUB_OUTPUT"
+
+      - name: 🗑️ Delete existing image version (if exists)
+        continue-on-error: true
+        run: |
+          # Extract version from config.yaml
+          VERSION=$(grep "^version:" "${{ matrix.App }}/config.yaml" | head -n 1 | awk '{print $2}' | tr -d '"' | tr -d "'")
+
+          # Get package name from config.yaml image field
+          # Format: ghcr.io/faserf/hassio-addons-{slug}-{arch}
+          IMAGE_FROM_CONFIG=$(grep "^image:" "${{ matrix.App }}/config.yaml" | head -n 1 | awk '{print $2}' | tr -d '"' | tr -d "'" || echo "")
+
+          if [ -z "$IMAGE_FROM_CONFIG" ]; then
+            # Fallback: use slug
+            SLUG=$(grep "^slug:" "${{ matrix.App }}/config.yaml" | head -n 1 | awk '{print $2}' | tr -d '"' | tr -d "'" || echo "")
+            PACKAGE_NAME="hassio-addons-${SLUG}"
+          else
+            # Extract package name: remove ghcr.io/faserf/ prefix
+            PACKAGE_NAME=$(echo "$IMAGE_FROM_CONFIG" | sed 's|ghcr.io/faserf/||' | sed 's/-{arch}$//' | sed 's/-amd64$//' | sed 's/-aarch64$//' | sed 's/-armhf$//' | sed 's/-armv7$//' | sed 's/-i386$//')
+          fi
+
+          OWNER="${{ github.repository_owner }}"
+
+          echo "🔍 Checking for existing image: $PACKAGE_NAME:$VERSION"
+
+          # Get GitHub API token
+          TOKEN="${{ secrets.GITHUB_TOKEN }}"
+
+          # Function to delete version from a package
+          delete_version() {
+            local pkg_name=$1
+            local version=$2
+            local base_url=$3
+
+            RESPONSE=$(curl -s -w "\n%{http_code}" -H "Authorization: Bearer ${TOKEN}" -H "Accept: application/vnd.github.v3+json" "$base_url")
+            HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+            VERSIONS_JSON=$(echo "$RESPONSE" | sed '$d')
+
+            if [ "$HTTP_CODE" = "200" ]; then
+              # Find version ID for the specific version tag
+              VERSION_ID=$(echo "$VERSIONS_JSON" | jq -r ".[] | select(.metadata.container.tags[]? == \"$version\") | .id" | head -n1)
+
+              if [ -n "$VERSION_ID" ] && [ "$VERSION_ID" != "null" ]; then
+                echo "🗑️ Found existing version $version (ID: $VERSION_ID) for $pkg_name, deleting..."
+                DELETE_URL="${base_url}/${VERSION_ID}"
+                DELETE_RESPONSE=$(curl -s -w "\n%{http_code}" -X DELETE -H "Authorization: Bearer ${TOKEN}" -H "Accept: application/vnd.github.v3+json" "$DELETE_URL")
+                DELETE_CODE=$(echo "$DELETE_RESPONSE" | tail -n1)
+
+                if [ "$DELETE_CODE" = "204" ]; then
+                  echo "✅ Successfully deleted existing version $version for $pkg_name"
+                  return 0
+                else
+                  echo "⚠️ Failed to delete version (HTTP $DELETE_CODE)"
+                  return 1
+                fi
+              fi
+            fi
+            return 1
+          }
+
+          # Try org endpoint first, then user endpoint
+          ORG_URL="https://api.github.com/orgs/${OWNER}/packages/container/${PACKAGE_NAME}/versions"
+          USER_URL="https://api.github.com/users/${OWNER}/packages/container/${PACKAGE_NAME}/versions"
+
+          if ! delete_version "$PACKAGE_NAME" "$VERSION" "$ORG_URL"; then
+            if ! delete_version "$PACKAGE_NAME" "$VERSION" "$USER_URL"; then
+              echo "ℹ️ No existing version $VERSION found for $PACKAGE_NAME, proceeding with build"
+            fi
+          fi
+
+      - name: 🏗️ Build & Push App
+        if: matrix.App != 'sap-abap-cloud-dev'
+        run: |
+          # Read architectures from config.yaml safely with yq
+          ARCHS=$(yq -r '.arch[]' "${{ matrix.App }}/config.yaml" 2>/dev/null | tr '\n' ' ' | xargs || echo "")
+
+          # Default to amd64 and aarch64 if no arches found
+          if [ -z "$ARCHS" ]; then
+            ARCHS="amd64 aarch64"
+          fi
+
+          echo "🔍 Detected architectures: $ARCHS"
+
+          # Build builder args based on supported architectures (only amd64 and aarch64)
+          # Note: armhf, armv7, and i386 are not supported by this repo
+          BUILDER_ARGS=""
+          for arch in $ARCHS; do
+            case "$arch" in
+              amd64)
+                BUILDER_ARGS="${BUILDER_ARGS}--amd64 \\\\n            "
+                ;;
+              aarch64)
+                BUILDER_ARGS="${BUILDER_ARGS}--aarch64 \\\\n            "
+                ;;
+              armhf|armv7|i386)
+                echo "⚠️ Skipping unsupported architecture: $arch"
+                ;;
+            esac
+          done
+
+          # Remove trailing backslash and newline
+          BUILDER_ARGS=$(echo -e "$BUILDER_ARGS" | sed 's/\\\\n[[:space:]]*$//')
+
+          # Ensure at least amd64 and aarch64 are built
+          if [ -z "$BUILDER_ARGS" ]; then
+            BUILDER_ARGS="--amd64 \\\\n            --aarch64"
+            BUILDER_ARGS=$(echo -e "$BUILDER_ARGS" | sed 's/\\\\n[[:space:]]*$//')
+          fi
+
+          # Extraction and normalization
+          VERSION=$(grep "^version:" "${{ matrix.App }}/config.yaml" | head -n 1 | awk '{print $2}' | tr -d '"' | tr -d "'" || echo "")
+          IMAGE_FROM_CONFIG=$(grep "^image:" "${{ matrix.App }}/config.yaml" | head -n 1 | awk '{print $2}' | tr -d '"' | tr -d "'" || echo "")
+
+          if [ -z "$IMAGE_FROM_CONFIG" ]; then
+            SLUG=$(grep "^slug:" "${{ matrix.App }}/config.yaml" | head -n 1 | awk '{print $2}' | tr -d '"' | tr -d "'" || echo "")
+            if [ -z "$SLUG" ]; then
+                SLUG=$(echo "${{ matrix.App }}" | tr '[:upper:]' '[:lower:]')
+            fi
+            IMAGE_NAME="hassio-addons-${SLUG}"
+          else
+            # Remove registry and {arch} suffix, then lowercase
+            # shellcheck disable=SC2001
+            IMAGE_NAME=$(echo "$IMAGE_FROM_CONFIG" | sed 's|ghcr.io/faserf/||' | sed 's/-{arch}//')
+          fi
+
+          # Docker/GHCR requires lowercase repository names
+          IMAGE_NAME=$(echo "$IMAGE_NAME" | tr '[:upper:]' '[:lower:]')
+          OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+
+          # Detected architectures
+          {
+            echo "ARCHS=$ARCHS"
+            # Convert space-separated ARCHS to JSON array for publish-multi-arch-manifest
+            # shellcheck disable=SC2001
+            ARCH_JSON=$(echo "$ARCHS" | jq -R -c 'split(" ")')
+            echo "ARCH_JSON=$ARCH_JSON"
+            echo "IMAGE_NAME=$IMAGE_NAME"
+            echo "OWNER=$OWNER"
+            echo "VERSION=$VERSION"
+          } >> "$GITHUB_ENV"
+
+          # Extract build_from from build.yaml (legacy format) if file exists
+          BUILD_FROM_AMD64=""
+          BUILD_FROM_AARCH64=""
+          if [ -f "${{ matrix.App }}/build.yaml" ]; then
+            BUILD_FROM_AMD64=$(yq -r '.build_from.amd64' "${{ matrix.App }}/build.yaml" 2>/dev/null || echo "")
+            if [ "$BUILD_FROM_AMD64" == "null" ] || [ -z "$BUILD_FROM_AMD64" ]; then
+              BUILD_FROM_AMD64=$(yq -r '.build_from' "${{ matrix.App }}/build.yaml" 2>/dev/null || echo "")
+            fi
+            if [ "$BUILD_FROM_AMD64" == "null" ]; then
+              BUILD_FROM_AMD64=""
+            fi
+
+            BUILD_FROM_AARCH64=$(yq -r '.build_from.aarch64' "${{ matrix.App }}/build.yaml" 2>/dev/null || echo "")
+            if [ "$BUILD_FROM_AARCH64" == "null" ] || [ -z "$BUILD_FROM_AARCH64" ]; then
+              BUILD_FROM_AARCH64=$(yq -r '.build_from' "${{ matrix.App }}/build.yaml" 2>/dev/null || echo "")
+            fi
+            if [ "$BUILD_FROM_AARCH64" == "null" ]; then
+              BUILD_FROM_AARCH64=""
+            fi
+          fi
+
+          BUILD_DESCRIPTION=$(yq -r '.description' "${{ matrix.App }}/config.yaml" 2>/dev/null || echo "")
+          BUILD_NAME=$(yq -r '.name' "${{ matrix.App }}/config.yaml" 2>/dev/null || echo "")
+          BUILD_URL=$(yq -r '.url' "${{ matrix.App }}/config.yaml" 2>/dev/null || echo "https://github.com/FaserF/hassio-addons")
+
+          {
+            echo "BUILD_FROM_AMD64=$BUILD_FROM_AMD64"
+            echo "BUILD_FROM_AARCH64=$BUILD_FROM_AARCH64"
+            echo "BUILD_DESCRIPTION=$BUILD_DESCRIPTION"
+            echo "BUILD_NAME=$BUILD_NAME"
+            echo "BUILD_URL=$BUILD_URL"
+          } >> "$GITHUB_ENV"
+
+      - name: 🏷️ Extract Docker Metadata & OCI Labels
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: |
+            ghcr.io/${{ env.OWNER }}/${{ env.IMAGE_NAME }}-amd64
+            ghcr.io/${{ env.OWNER }}/${{ env.IMAGE_NAME }}-aarch64
+          labels: |
+            org.opencontainers.image.title=${{ env.BUILD_NAME }}
+            org.opencontainers.image.description=${{ env.BUILD_DESCRIPTION }}
+            org.opencontainers.image.vendor=FaserF's Home Assistant Apps
+            org.opencontainers.image.authors=FaserF <https://github.com/FaserF>
+            org.opencontainers.image.licenses=MIT
+            org.opencontainers.image.url=${{ env.BUILD_URL }}
+            org.opencontainers.image.source=https://github.com/FaserF/hassio-addons/tree/master/${{ matrix.App }}
+            org.opencontainers.image.documentation=https://github.com/FaserF/hassio-addons/blob/master/${{ matrix.App }}/README.md
+
+      - name: 🏗️ Build and Push Addon Images
+        if: matrix.App != 'sap-abap-cloud-dev'
+        uses: docker/build-push-action@v7
+        with:
+          context: ./${{ matrix.App }}
+          file: ./${{ matrix.App }}/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ghcr.io/${{ env.OWNER }}/${{ env.IMAGE_NAME }}-amd64:${{ env.VERSION }}
+            ghcr.io/${{ env.OWNER }}/${{ env.IMAGE_NAME }}-aarch64:${{ env.VERSION }}
+          labels: ${{ steps.meta.outputs.labels }}
+          annotations: ${{ steps.meta.outputs.annotations }}
+          build-args: |
+            BUILD_ARCH=${{ matrix.App }}
+          cache-from: type=gha,scope=${{ matrix.App }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.App }},ignore-error=true
+
+      - name: 📅 Get BUILD_DATE for Standalone WhatsApp
+        if: matrix.App == 'whatsapp'
+        id: date
+        run: echo "date=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> $GITHUB_OUTPUT
+
+      - name: 🏷️ Extract Docker Metadata & OCI Labels for Standalone WhatsApp Gateway
+        if: matrix.App == 'whatsapp'
+        id: meta-standalone
+        uses: docker/metadata-action@v6
+        with:
+          images: |
+            ghcr.io/${{ env.OWNER }}/whatsapp-gw
+          labels: |
+            org.opencontainers.image.title=WhatsApp Gateway Standalone
+            org.opencontainers.image.description=Standalone Docker container for WhatsApp Home Assistant App (Baileys/Node.js REST API & Web UI).
+            org.opencontainers.image.vendor=FaserF's Home Assistant Apps
+            org.opencontainers.image.authors=FaserF <https://github.com/FaserF>
+            org.opencontainers.image.licenses=MIT
+            org.opencontainers.image.url=https://github.com/FaserF/ha-whatsapp
+            org.opencontainers.image.source=https://github.com/FaserF/hassio-addons/tree/master/whatsapp
+            org.opencontainers.image.documentation=https://github.com/FaserF/hassio-addons/blob/master/whatsapp/README.md
+
+      - name: 🏗️ Build and Push Standalone WhatsApp Image (Docker Only)
+        if: matrix.App == 'whatsapp'
+        uses: docker/build-push-action@v7
+        with:
+          context: ./whatsapp
+          file: ./whatsapp/Dockerfile-standalone
+          push: true
+          tags: |
+            ghcr.io/${{ env.OWNER }}/whatsapp-gw:latest
+            ghcr.io/${{ env.OWNER }}/whatsapp-gw:${{ env.VERSION }}
+          labels: ${{ steps.meta-standalone.outputs.labels }}
+          annotations: ${{ steps.meta-standalone.outputs.annotations }}
+          platforms: linux/amd64
+          build-args: |
+            BUILD_DATE=${{ steps.date.outputs.date }}
+
+      - name: 📢 Release Summary
+        run: |
+          {
+            echo "### 🚀 Release Complete"
+            echo ""
+            echo "**App:** ${{ matrix.App }}"
+            echo "**Type:** ${{ needs.detect.outputs.is_auto == 'true' && 'Auto-release' || 'Manual release' }}"
+            echo "**Unsupported:** ${{ steps.status.outputs.is_unsupported }}"
+            echo "**Time:** $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ================================================================================
+  # MONITOR: Check for failure threshold (3 failures) and cancel remaining jobs
+  # ================================================================================
+  monitor-failures:
+    name: ⚠️ Monitor Release Failures
+    needs: [detect]
+    if: |
+      needs.detect.outputs.is_all == 'true' &&
+      needs.detect.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: 🔍 Monitor and Cancel on Threshold
+        run: |
+          echo "Starting failure monitor for 'all' release..."
+          echo "Will cancel remaining jobs if 3 failures are detected."
+          echo "Will also cancel remaining jobs after 5 successful skipped Apps."
+          echo ""
+
+          MAX_FAILURES=3
+          MAX_SKIPPED_SUCCESS=5
+          CHECK_INTERVAL=30  # Check every 30 seconds
+          MAX_WAIT_TIME=3600  # Maximum wait time: 1 hour
+          ELAPSED=0
+
+          # Wait for jobs to populate first
+          echo "Waiting for release jobs to be registered by GitHub Actions..."
+          while true; do
+            JOBS=$(gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/jobs" --paginate --jq '.jobs[] | select(.name | startswith("🚀 Release"))' || echo "")
+            TOTAL_COUNT=$(echo "$JOBS" | jq -r '.name' | grep -c . || true)
+            if [ "$TOTAL_COUNT" -gt 0 ]; then
+              echo "✅ Found $TOTAL_COUNT release jobs. Starting monitor loop."
+              break
+            fi
+            if [ $ELAPSED -ge 300 ]; then
+              echo "⚠️ Timeout waiting for release jobs to populate. Exiting monitor."
+              exit 0
+            fi
+            sleep 10
+            ELAPSED=$((ELAPSED + 10))
+          done
+
+          ELAPSED=0
+          while [ $ELAPSED -lt $MAX_WAIT_TIME ]; do
+            # Get all release jobs for this workflow run
+            JOBS=$(gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/jobs" --paginate --jq '.jobs[] | select(.name | startswith("🚀 Release"))' || echo "[]")
+
+            # Count failed jobs
+            FAILED_COUNT=$(echo "$JOBS" | jq -r 'select(.conclusion == "failure" or .conclusion == "cancelled" or .conclusion == "timed_out") | .name' | grep -c . || true)
+            FAILED_COUNT=$((FAILED_COUNT + 0)) # Ensure integer
+
+            # Count successful skipped jobs
+            SKIPPED_COUNT=$(echo "$JOBS" | jq -r 'select(.conclusion == "success" and (.name | contains("skipped") or contains("Skipped"))) | .name' | grep -c . || true)
+            SKIPPED_COUNT=$((SKIPPED_COUNT + 0)) # Ensure integer
+
+            TOTAL_COUNT=$(echo "$JOBS" | jq -r '.name' | grep -c . || true)
+            TOTAL_COUNT=$((TOTAL_COUNT + 0)) # Ensure integer
+
+            RUNNING_COUNT=$(echo "$JOBS" | jq -r 'select(.status != "completed") | .name' | grep -c . || true)
+            RUNNING_COUNT=$((RUNNING_COUNT + 0)) # Ensure integer
+
+            echo "[$(date +'%H:%M:%S')] Status: $FAILED_COUNT failed, $SKIPPED_COUNT skipped (successful), $RUNNING_COUNT running, $TOTAL_COUNT total"
+
+            # Check if skipped threshold reached
+            if [ "$SKIPPED_COUNT" -ge "$MAX_SKIPPED_SUCCESS" ]; then
+              echo ""
+              echo "✅ Threshold reached: $SKIPPED_COUNT successful skipped Apps (threshold: $MAX_SKIPPED_SUCCESS)"
+              echo "ℹ️  Most Apps are likely working. Stopping monitor (builds will continue running)."
+              echo ""
+              echo "✅ Monitor completed early: $SKIPPED_COUNT successful skipped Apps detected. Remaining releases will continue."
+              exit 0
+            fi
+
+            # Check if failure threshold reached
+            if [ "$FAILED_COUNT" -ge "$MAX_FAILURES" ]; then
+              echo ""
+              echo "❌ Threshold reached: $FAILED_COUNT failures (threshold: $MAX_FAILURES)"
+              echo "⚠️  WARNING: Too many Apps have failed. Cancelling remaining release jobs..."
+
+              # Get all release jobs that are not completed
+              RUNNING_JOBS=$(echo "$JOBS" | jq -r 'select(.status != "completed") | .id')
+
+              if [ -z "$RUNNING_JOBS" ] || [ "$RUNNING_JOBS" = "" ]; then
+                echo "ℹ️  No remaining jobs to cancel"
+              else
+                CANCELLED_COUNT=0
+                while IFS= read -r JOB_ID; do
+                  if [ -n "$JOB_ID" ] && [ "$JOB_ID" != "null" ]; then
+                    echo "Cancelling job ID: $JOB_ID"
+                    gh api "repos/${{ github.repository }}/actions/jobs/$JOB_ID" -X POST -f state=cancelled 2>/dev/null || echo "  (Job $JOB_ID may have already completed)"
+                    ((CANCELLED_COUNT++)) || true
+                  fi
+                done <<< "$RUNNING_JOBS"
+
+                echo "✅ Cancelled $CANCELLED_COUNT remaining release job(s)"
+              fi
+
+              echo ""
+              echo "⚠️  WARNING: Too many Apps failed ($FAILED_COUNT/$MAX_FAILURES threshold). Remaining releases have been cancelled."
+              exit 0
+            fi
+
+            # If no more running jobs, exit
+            if [ "$RUNNING_COUNT" -eq 0 ]; then
+              echo ""
+              echo "✅ All release jobs completed. Final status: $FAILED_COUNT failed, $SKIPPED_COUNT skipped (successful) out of $TOTAL_COUNT total"
+              exit 0
+            fi
+
+            # Wait before next check
+            sleep $CHECK_INTERVAL
+            ELAPSED=$((ELAPSED + CHECK_INTERVAL))
+          done
+
+          echo ""
+          echo "⏱️  Monitor timeout reached. Jobs may still be running."
+        env:
+          GH_TOKEN: ${{ secrets.PAT || secrets.GITHUB_TOKEN }}
+
+  # ================================================================================
+  # CLEANUP: Prune Docker Registry after "all" releases
+  # ================================================================================
+  cleanup-registry:
+    name: 🧹 Cleanup Docker Registry
+    needs: [detect, release, monitor-failures]
+    if: |
+      always() &&
+      needs.detect.outputs.is_all == 'true' &&
+      (needs.release.result == 'success' || needs.release.result == 'failure' || needs.release.result == 'cancelled')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: ⤵️ Check out code
+        uses: actions/checkout@v7
+      - name: 🐍 Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+
+      - name: 📦 Install Python Dependencies
+        run: pip install requests pyyaml --quiet
+
+      - name: 🗑️ Prune Docker Registry
+        run: python3 .scripts/prune_registry.py
+        env:
+          GITHUB_TOKEN: ${{ secrets.PAT || secrets.GITHUB_TOKEN }} # Needs delete:packages scope
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}

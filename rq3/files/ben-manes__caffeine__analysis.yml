@@ -1,0 +1,242 @@
+name: Static analysis for Java
+permissions: {}
+on: [ push, pull_request, workflow_dispatch ]
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+env:
+  DEVELOCITY_ACCESS_KEY: ${{ secrets.DEVELOCITY_ACCESS_KEY }}
+  ALLOWED_ENDPOINTS: >-
+    api.adoptium.net:443
+    api.foojay.io:443
+    api.github.com:443
+    caffeine.develocity.cloud:443
+    downloads.gradle.org:443
+    downloads.gradle-dn.com:443
+    github.com:443
+    maven-central.storage-download.googleapis.com:443
+    objects.githubusercontent.com:443
+    plugins.gradle.org:443
+    plugins-artifacts.gradle.org:443
+    release-assets.githubusercontent.com:443
+    repo.maven.apache.org:443
+    repo1.maven.org:443
+    services.gradle.org:443
+
+jobs:
+  ecj:
+    name: Eclipse Compiler for Java
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      JAVA_VERSION: 26
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          disable-sudo-and-containers: true
+          egress-policy: block
+          allowed-endpoints: ${{ env.ALLOWED_ENDPOINTS }}
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: ECJ
+        uses: $/.github/actions/run-gradle
+        with:
+          arguments: ecj
+          java: ${{ env.JAVA_VERSION }}
+          cache-encryption-key: ${{ secrets.GRADLE_ENCRYPTION_KEY }}
+
+  errorprone:
+    name: ErrorProne
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      JAVA_VERSION: 26
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          disable-sudo-and-containers: true
+          egress-policy: block
+          allowed-endpoints: ${{ env.ALLOWED_ENDPOINTS }}
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: ErrorProne
+        uses: $/.github/actions/run-gradle
+        with:
+          lint: 'true'
+          java: ${{ env.JAVA_VERSION }}
+          cache-encryption-key: ${{ secrets.GRADLE_ENCRYPTION_KEY }}
+          arguments: resolveExternalDependencies assemble -x javadoc -x javadocJar
+
+  forbidden-apis:
+    name: Forbidden APIs
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      JAVA_VERSION: 26
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          disable-sudo-and-containers: true
+          egress-policy: block
+          allowed-endpoints: ${{ env.ALLOWED_ENDPOINTS }}
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Forbidden Apis
+        uses: $/.github/actions/run-gradle
+        with:
+          java: ${{ env.JAVA_VERSION }}
+          arguments: forbiddenApis -PforbiddenApis
+          cache-encryption-key: ${{ secrets.GRADLE_ENCRYPTION_KEY }}
+
+  pmd:
+    name: PMD
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read # Needed for uploading security scan results
+      security-events: write # Needed for uploading security scan results
+    env:
+      JAVA_VERSION: 26
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          disable-sudo-and-containers: true
+          egress-policy: block
+          allowed-endpoints: >
+            ${{ env.ALLOWED_ENDPOINTS }}
+            uploads.github.com:443
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Pmd
+        uses: $/.github/actions/run-gradle
+        with:
+          java: ${{ env.JAVA_VERSION }}
+          cache-encryption-key: ${{ secrets.GRADLE_ENCRYPTION_KEY }}
+          arguments: pmd -Ppmd
+      - name: Upload Reports
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          retention-days: 1
+          name: pmd-reports
+          path: '**/build/reports/pmd/*.html'
+      - name: Collect and merge SARIF
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p pmd-sarif
+          find . -path '*/build/reports/pmd/*.json' | while read -r f; do
+            module=$(awk -F/ '{print $2}' <<<"$f")
+            cp "$f" "pmd-sarif/${module}-$(basename "$f")"
+          done
+          if ls pmd-sarif/*.json 1>/dev/null 2>&1; then
+            jq -s '{"$schema": .[0]."$schema", version: .[0].version,
+              runs: [{tool: .[0].runs[0].tool,
+                results: [.[].runs[0].results[]?]}]}' \
+              pmd-sarif/*.json > pmd-combined.sarif
+          fi
+      - name: Upload result to GitHub Code Scanning
+        if: always() && hashFiles('pmd-combined.sarif') != ''
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@1c5b675653bb5c22dbe9b12b556ec555138e09fd # v4.38.1
+        with:
+          sarif_file: pmd-combined.sarif
+          category: pmd
+
+  roseau:
+    name: Roseau
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      JAVA_VERSION: 26
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          disable-sudo-and-containers: true
+          egress-policy: block
+          allowed-endpoints: ${{ env.ALLOWED_ENDPOINTS }}
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Roseau
+        uses: $/.github/actions/run-gradle
+        with:
+          arguments: roseau
+          java: ${{ env.JAVA_VERSION }}
+          cache-encryption-key: ${{ secrets.GRADLE_ENCRYPTION_KEY }}
+
+  spotbugs:
+    name: Spotbugs
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read # Needed for uploading security scan results
+      security-events: write # Needed for uploading security scan results
+    env:
+      JAVA_VERSION: 26
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          disable-sudo-and-containers: true
+          egress-policy: block
+          allowed-endpoints: >
+            ${{ env.ALLOWED_ENDPOINTS }}
+            uploads.github.com:443
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Spotbugs
+        uses: $/.github/actions/run-gradle
+        with:
+          java: ${{ env.JAVA_VERSION }}
+          cache-encryption-key: ${{ secrets.GRADLE_ENCRYPTION_KEY }}
+          arguments: spotbugs -Pspotbugs
+      - name: Upload Reports
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          retention-days: 1
+          name: spotbugs-reports
+          path: '**/build/reports/spotbugs/*.html'
+      - name: Collect and merge SARIF
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p spotbugs-sarif
+          find . -path '*/build/reports/spotbugs/*.sarif' | while read -r f; do
+            module=$(awk -F/ '{print $2}' <<<"$f")
+            cp "$f" "spotbugs-sarif/${module}-$(basename "$f")"
+          done
+          if ls spotbugs-sarif/*.sarif 1>/dev/null 2>&1; then
+            jq -s '{"$schema": .[0]."$schema", version: .[0].version,
+              runs: [{tool: .[0].runs[0].tool,
+                results: [.[].runs[0].results[]?]}]}' \
+              spotbugs-sarif/*.sarif > spotbugs-combined.sarif
+          fi
+      - name: Upload result to GitHub Code Scanning
+        if: always() && hashFiles('spotbugs-combined.sarif') != ''
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@1c5b675653bb5c22dbe9b12b556ec555138e09fd # v4.38.1
+        with:
+          sarif_file: spotbugs-combined.sarif
+          category: spotbugs

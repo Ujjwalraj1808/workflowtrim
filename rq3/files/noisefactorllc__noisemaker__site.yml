@@ -1,0 +1,65 @@
+name: Site
+
+# Scaffold is the sole authority for noisemaker.app deploys. This
+# workflow just fires the workflow_dispatch at scaffold's
+# static-site-release, which clones this repo at the pushed SHA, runs
+# `npm run bundle:site`, writes deployment-meta.json, and rsyncs
+# dist/site/ to ~/sites/noisemaker.app/content on nf-toronto.
+#
+# Keeping the SSH key + server IP on the scaffold side means this
+# public repo carries no deploy secrets — only the EHSRE app private
+# key, which is scoped to dispatching scaffold workflows.
+#
+# shaders.yml dispatches this same `noisemaker-site` release when a
+# shader change requires a site rebuild. Both land in scaffold's
+# per-site concurrency group, so the two triggers serialize instead of
+# racing two `rsync --delete` runs against one content root.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+    paths:
+      - 'index.html'
+      - 'site.css'
+      - 'site.js'
+      - 'llms.txt'
+      - 'llms-full.txt'
+      - 'noisemaker.png'
+      - 'og-image.png'
+      - 'favicon.ico'
+      - 'scripts/bundle-site.js'
+      - '.github/workflows/site.yml'
+
+concurrency:
+  group: site-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  trigger-scaffold-release:
+    name: Dispatch scaffold static-site-release
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+    - name: Mint scaffold GitHub App token
+      id: app-token
+      uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+      with:
+        client-id: Iv23liy6T6BW0BXuZRzx
+        private-key: ${{ secrets.EHSRE_APP_PRIVATE_KEY }}
+        owner: noisefactorllc
+        repositories: scaffold
+
+    - name: Dispatch scaffold static-site-release for noisemaker.app
+      env:
+        GH_TOKEN: ${{ steps.app-token.outputs.token }}
+      run: |
+        gh workflow run static-site-release.yml \
+          --repo noisefactorllc/scaffold \
+          --ref main \
+          -f site=noisemaker-site \
+          -f sha=${{ github.sha }}
+        echo "Dispatched scaffold static-site-release for noisemaker-site @ ${{ github.sha }}"

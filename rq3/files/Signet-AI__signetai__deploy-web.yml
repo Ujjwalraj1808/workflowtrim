@@ -1,0 +1,47 @@
+name: Deploy Website
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "web/marketing/**"
+      - "surfaces/dashboard/**"
+      - ".github/workflows/deploy-web.yml"
+      - "!**/*.test.*"
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
+      PUBLIC_POSTHOG_ENV: production
+    if: "github.event_name == 'workflow_dispatch' || !contains(github.event.head_commit.message, 'chore: release')"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: package.json
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Build core package
+        run: bun run --filter '@signet/core' build
+
+      - name: Build
+        run: bun run --cwd web/marketing build
+
+      - name: Deploy to Cloudflare
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: a19f770b9be1b20e78b8d25bdcfd3bbd
+          workingDirectory: web/marketing
+          command: deploy
+          packageManager: bun

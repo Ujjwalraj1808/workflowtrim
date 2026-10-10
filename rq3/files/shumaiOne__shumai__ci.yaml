@@ -1,0 +1,218 @@
+name: Bun Fullstack V2
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build_and_test:
+    name: Build & Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+
+      - name: Install dependencies
+        run: bun install
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ripgrep bubblewrap socat ffmpeg poppler-utils imagemagick
+
+      - name: Compile i18n
+        run: bun run i18n:compile
+
+      - name: Lint
+        run: bun run lint
+
+      - name: Typecheck
+        run: bun run typecheck
+
+      - name: Test
+        run: bun run test
+
+      - name: Test Local Release
+        run: |
+          bun run release:local --skip-check --out /tmp/shumai-local-release --force
+
+          echo "Smoke testing shumai..."
+          bun run /tmp/shumai-local-release/node/node_modules/@shumai-one/shumai/bin/shumai-app.js --check
+
+          echo "Smoke testing shumai-agent..."
+          bun run /tmp/shumai-local-release/node/node_modules/@shumai-one/shumai-agent/bin/shumai-agent-app.js --check
+
+          echo "Smoke testing shumai-transcode..."
+          bun run /tmp/shumai-local-release/node/node_modules/@shumai-one/shumai-transcode/bin/shumai-transcode-app.js --check
+
+  e2e_video_player:
+    name: Harness E2E (${{ matrix.project }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            project: chromium
+          - os: ubuntu-latest
+            project: firefox
+          # WebKit is the Safari engine; run it on a macOS runner to validate
+          # Safari compatibility.
+          - os: macos-latest
+            project: webkit
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+
+      - name: Install dependencies
+        run: bun install
+
+      - name: Compile i18n
+        run: bun run i18n:compile
+
+      - name: Install Playwright browser (${{ matrix.project }})
+        run: bunx playwright install --with-deps ${{ matrix.project }}
+
+      - name: Run video player harness tests
+        env:
+          E2E_SKIP_APP_SERVER: true
+        run: bunx playwright test --project=harness-${{ matrix.project }}
+
+      - name: Upload Playwright report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report-harness-${{ matrix.project }}
+          path: playwright-report/
+          retention-days: 7
+
+  e2e_app:
+    name: App E2E (${{ matrix.project }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            project: chromium
+          - os: ubuntu-latest
+            project: firefox
+          # App E2E needs Docker for testcontainers, run webkit on Ubuntu
+          - os: ubuntu-latest
+            project: webkit
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+
+      - name: Install dependencies
+        run: bun install
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ripgrep bubblewrap socat ffmpeg poppler-utils imagemagick
+
+      - name: Compile i18n
+        run: bun run i18n:compile
+
+      - name: Install Playwright browser (${{ matrix.project }})
+        run: bunx playwright install --with-deps ${{ matrix.project }}
+
+      - name: Run app E2E tests
+        run: bunx playwright test --project=app-${{ matrix.project }} --no-deps
+
+      - name: Upload Playwright report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report-app-${{ matrix.project }}
+          path: playwright-report/
+          retention-days: 7
+
+  workflow_e2e:
+    name: Workflow E2E
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+
+      - name: Install dependencies
+        run: bun install
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ripgrep bubblewrap socat ffmpeg poppler-utils imagemagick
+
+      - name: Run Workflow E2E Tests
+        run: bun run test:e2e:workflow
+
+  docker_compose_deploy:
+    name: Docker Compose Deployment
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker Image
+        run: |
+          docker build -t shumaione/shumai:latest .
+
+      - name: Start Docker Compose
+        run: |
+          docker compose -f docker-compose/local/docker-compose.yaml up -d
+
+      - name: Verify Home Page HTTP 200
+        run: |
+          echo "Waiting for shumai_app container to start..."
+          for i in {1..30}; do
+            STATUS_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:3000 || true)
+            echo "Attempt $i: HTTP status code $STATUS_CODE"
+            if [ "$STATUS_CODE" -eq 200 ]; then
+              echo "✅ Docker compose app is running cleanly (HTTP 200 OK)"
+              exit 0
+            fi
+            sleep 2
+          done
+
+          echo "❌ Container failed to respond with HTTP 200 OK within 60s"
+          echo "--- Container Logs ---"
+          docker compose -f docker-compose/local/docker-compose.yaml logs
+          exit 1
+
+      - name: Cleanup Docker Compose
+        if: always()
+        run: |
+          docker compose -f docker-compose/local/docker-compose.yaml down -v

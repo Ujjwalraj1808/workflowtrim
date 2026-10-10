@@ -1,0 +1,90 @@
+name: Mirror to Codeberg
+
+on:
+  push:
+    branches: [main]
+    # '**' not '*': a single asterisk does not cross slashes, so the nested
+    # modules' tags (integration/matrix/v0.1.0, server/backplane/nats/v0.2.0)
+    # never triggered a mirror run at all. They reached the mirror only as a
+    # side effect of --tags on the next push to main.
+    tags: ['**']
+  workflow_dispatch:
+
+# Serialise the mirror. A release pushes the commit and then the tag a second
+# apart, which started two jobs that raced each other for the same remote and
+# lost:
+#
+#   remote: error: cannot lock ref 'refs/heads/main': is at cc0b2ce but expected 20f5cf6
+#   remote: error: cannot lock ref 'refs/tags/integration/matrix/v0.1.1': reference already exists
+#
+# The mirror stayed correct only because whichever job won pushed everything -
+# luck, not design, since a winner that started before the loser's refs existed
+# would have left them unmirrored until the next push. cancel-in-progress stays
+# false on purpose: cancelling a queued run would skip a mirror rather than
+# delay it.
+concurrency:
+  group: mirror-to-codeberg
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    name: Sync to codeberg.org/Deln0r/ygo
+    runs-on: ubuntu-latest
+    # With runs serialised, a wedged one would hold the concurrency group for
+    # the six-hour job default and stall every mirror behind it.
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Force-push main + tags to Codeberg
+        env:
+          CODEBERG_TOKEN: ${{ secrets.CODEBERG_TOKEN }}
+        run: |
+          # Spell the destination ref out: `main` alone resolves only if the
+          # branch already exists there, so a fresh mirror could not bootstrap.
+          git push --force "https://Deln0r:${CODEBERG_TOKEN}@codeberg.org/Deln0r/ygo.git" origin/main:refs/heads/main --tags
+
+      - name: Verify the mirror is actually in sync
+        env:
+          CODEBERG_TOKEN: ${{ secrets.CODEBERG_TOKEN }}
+        run: |
+          # A guard on the RESULT, not on the exit code of the push. The README
+          # promises an EU-hosted mirror synced on every push, so this job
+          # succeeding has to mean the mirror holds what GitHub holds - not
+          # merely that a git command returned 0.
+          set -euo pipefail
+          remote="https://Deln0r:${CODEBERG_TOKEN}@codeberg.org/Deln0r/ygo.git"
+          local_main=$(git rev-parse origin/main)
+          remote_main=$(git ls-remote "$remote" refs/heads/main | cut -f1)
+          if [ "$local_main" != "$remote_main" ]; then
+            echo "main out of sync: github=$local_main codeberg=${remote_main:-<absent>}" >&2
+            exit 1
+          fi
+
+          # One round trip for the whole tag list, not one per tag: the
+          # per-tag version made a transient network failure indistinguishable
+          # from a missing tag, and its exit status was swallowed by the pipe.
+          git ls-remote --tags . | grep -v '\^{}$' | awk '{print $2}' | sort > /tmp/local-tags
+          git ls-remote --tags "$remote" | grep -v '\^{}$' | awk '{print $2}' | sort > /tmp/remote-tags
+
+          # An empty enumeration must not read as success. This repo has tags;
+          # zero of them means the enumeration failed, not that everything is
+          # present - the first version of this guard would have printed "all
+          # tags present" in exactly that case.
+          if [ ! -s /tmp/local-tags ]; then
+            echo "no tags enumerated locally; the check cannot conclude anything" >&2
+            exit 1
+          fi
+
+          if ! missing=$(comm -23 /tmp/local-tags /tmp/remote-tags); then
+            echo "comparing tag lists failed" >&2
+            exit 1
+          fi
+          if [ -n "$missing" ]; then
+            echo "tags missing on the mirror:" >&2
+            echo "$missing" >&2
+            exit 1
+          fi
+          echo "mirror verified in sync: main=$local_main, $(wc -l < /tmp/local-tags | tr -d ' ') tags all present"

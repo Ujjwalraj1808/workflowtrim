@@ -1,0 +1,95 @@
+name: CodeQL
+permissions: {}
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+on:
+  push:
+    branches: [master, v3.dev]
+  pull_request:
+    branches: [master, v3.dev]
+  schedule:
+    - cron: '0 0 * * 4'
+  workflow_dispatch: {}
+
+env:
+  DEVELOCITY_ACCESS_KEY: ${{ secrets.DEVELOCITY_ACCESS_KEY }}
+  ORG_GRADLE_PROJECT_lint: 'false'
+  JAVA_VERSION: 26
+
+jobs:
+  analyze:
+    name: Analyze
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read # Needed for uploading security scan results
+      pull-requests: read # Needed to associate with the pull request
+      security-events: write # Needed for uploading security scan results
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [ actions, java ]
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          disable-sudo-and-containers: true
+          egress-policy: block
+          allowed-endpoints: >
+            api.adoptium.net:443
+            api.foojay.io:443
+            api.github.com:443
+            caffeine.develocity.cloud:443
+            downloads.gradle.org:443
+            downloads.gradle-dn.com:443
+            ghcr.io:443
+            github.com:443
+            maven-central.storage-download.googleapis.com:443
+            objects.githubusercontent.com:443
+            pkg-containers.githubusercontent.com:443
+            plugins.gradle.org:443
+            plugins-artifacts.gradle.org:443
+            release-assets.githubusercontent.com:443
+            repo.maven.apache.org:443
+            repo1.maven.org:443
+            uploads.github.com:443
+            services.gradle.org:443
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Setup Gradle
+        uses: $/.github/actions/run-gradle
+        if: ${{ matrix.language == 'java' }}
+        with:
+          java: ${{ env.JAVA_VERSION }}
+          cache-encryption-key: ${{ secrets.GRADLE_ENCRYPTION_KEY }}
+      - name: Initialize CodeQL (Actions)
+        uses: github/codeql-action/init@1c5b675653bb5c22dbe9b12b556ec555138e09fd # v4.38.1
+        if: ${{ matrix.language == 'actions' }}
+        with:
+          languages: actions
+          dependency-caching: true
+      - name: Initialize CodeQL (Java)
+        uses: github/codeql-action/init@1c5b675653bb5c22dbe9b12b556ec555138e09fd # v4.38.1
+        if: ${{ matrix.language == 'java' }}
+        with:
+          queries: >
+            +java-code-scanning,
+            security-extended,
+            security-and-quality,
+            security-experimental
+          languages: java-kotlin
+          dependency-caching: true
+          packs: >
+            +githubsecuritylab/codeql-java-queries,
+            githubsecuritylab/codeql-java-library-sources,
+            githubsecuritylab/codeql-java-queries:suites/java-local.qls
+          config: |
+            threat-models: local
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@1c5b675653bb5c22dbe9b12b556ec555138e09fd # v4.38.1
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@1c5b675653bb5c22dbe9b12b556ec555138e09fd # v4.38.1

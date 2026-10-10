@@ -1,0 +1,81 @@
+name: golangci-lint
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  golangci:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Fetch base branch
+        run: git fetch origin ${{ github.base_ref }}
+      - name: Install libvirt dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libvirt-dev pkg-config
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.25'
+          cache: false
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          # Require: The version of golangci-lint to use.
+          # When `install-mode` is `binary` (default) the value can be v1.2 or v1.2.3 or `latest` to use the latest version.
+          # When `install-mode` is `goinstall` the value can be v1.2.3, `latest`, or the hash of a commit.
+          version: v2.12
+          # Optional: working directory, useful for monorepos
+          # working-directory: somedir
+
+          # Optional: golangci-lint command line arguments.
+          #
+          # Note: By default, the `.golangci.yml` file should be at the root of the repository.
+          # The location of the configuration file can be changed by using `--config=`
+          args: --timeout=10m --new-from-merge-base=origin/${{ github.base_ref }}
+
+          # Compare against the merge base locally instead of fetching the PR
+          # patch from GitHub API (which fails when a PR touches 300+ files).
+
+          # Optional: if set to true, then all caching functionality will be completely disabled,
+          #           takes precedence over all other caching options.
+          # skip-cache: true
+
+          # Optional: if set to true, then the action won't cache or restore ~/go/pkg.
+          # skip-pkg-cache: true
+
+          # Optional: if set to true, then the action won't cache or restore ~/.cache/go-build.
+          # skip-build-cache: true
+
+          # Optional: The mode to install golangci-lint. It can be 'binary' or 'goinstall'.
+          install-mode: "goinstall"
+
+  verify-vendor-offload:
+    name: verify-vendor (offload)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.25'
+          cache: false
+      - name: Verify go mod vendor is up to date
+        working-directory: cmd/vsphere-copy-offload-populator
+        run: |
+          go mod vendor
+          if [[ -n $(git status --porcelain -- vendor go.mod go.sum) ]]; then
+            echo "ERROR: vendor directory is out of date."
+            echo "Run 'go mod vendor' in cmd/vsphere-copy-offload-populator and commit the changes."
+            git status --porcelain -- vendor go.mod go.sum
+            git diff -- vendor go.mod go.sum
+            exit 1
+          fi

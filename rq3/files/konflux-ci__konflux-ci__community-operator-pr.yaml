@@ -1,0 +1,58 @@
+name: Community Operator PR
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'GitHub release tag (e.g., v0.0.4)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  create-pr:
+    name: Create Community Operator PR
+    runs-on: ubuntu-latest
+    # Run for both stable and candidate (prerelease) releases; skip only for non-dispatch non-release events
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'release'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+
+      - name: Determine release tag
+        id: release
+        run: |
+          if [ "${{ github.event_name }}" == "release" ]; then
+            RELEASE_TAG="${{ github.event.release.tag_name }}"
+          else
+            RELEASE_TAG="${{ inputs.release_tag }}"
+          fi
+          echo "tag=${RELEASE_TAG}" >> $GITHUB_OUTPUT
+          echo "Using release tag: ${RELEASE_TAG}"
+
+      - name: Create Community Operator PR
+        env:
+          GITHUB_TOKEN: ${{ secrets.KONFLUX_CI_BOT_PAT }}
+        run: |
+          .github/scripts/create-community-operator-pr.sh "${{ steps.release.outputs.tag }}" --draft
+
+      - name: Create issue on failure
+        if: failure()
+        working-directory: ${{ github.workspace }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          WORKFLOW_NAME: Community Operator PR
+          RELEASE_VERSION: ${{ steps.release.outputs.tag }}
+        run: |
+          .github/scripts/create-or-update-issue.sh \
+            "Community Operator PR Failure" \
+            "Creating the Community Operator PR failed."

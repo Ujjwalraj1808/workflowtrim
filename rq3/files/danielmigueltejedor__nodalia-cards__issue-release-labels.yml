@@ -1,0 +1,124 @@
+name: Issue release labels
+
+on:
+  issues:
+    types:
+      - labeled
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  release-labels:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: React to release labels
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const issue = context.payload.issue;
+            const label = context.payload.label.name;
+
+            if (issue.pull_request) return;
+
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const issue_number = issue.number;
+            const { data: releases } = await github.rest.repos.listReleases({ owner, repo, per_page: 100 });
+            const published = releases.filter(release => !release.draft);
+            const latestPreview = published.find(release => /-(?:alpha|beta|rc)\.\d+b?$/.test(release.tag_name));
+            const latestBetaOrRc = published.find(release => /-(?:beta|rc)\.\d+b?$/.test(release.tag_name));
+            const latestStable = published.find(release => !release.prerelease && !/-[0-9A-Za-z]/.test(release.tag_name));
+            const latestPreviewVersion = latestPreview?.tag_name?.replace(/^v/, "") || "latest preview";
+            const latestBetaVersion = latestBetaOrRc?.tag_name?.replace(/^v/, "") || "latest beta/RC";
+            const latestStableVersion = latestStable?.tag_name?.replace(/^v/, "") || "latest stable";
+            const previewMaturityLabel = /-alpha\.\d+b?$/.test(latestPreview?.tag_name || "")
+              ? "maturity: alpha-ready"
+              : "maturity: beta-ready";
+
+            async function add(labels) {
+              await github.rest.issues.addLabels({
+                owner,
+                repo,
+                issue_number,
+                labels
+              });
+            }
+
+            async function remove(labels) {
+              for (const name of labels) {
+                try {
+                  await github.rest.issues.removeLabel({
+                    owner,
+                    repo,
+                    issue_number,
+                    name
+                  });
+                } catch (e) {
+                  if (e.status !== 404) throw e;
+                }
+              }
+            }
+
+            async function comment(body) {
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number,
+                body
+              });
+            }
+
+            const commonRemove = [
+              "status: needs triage",
+              "status: needs attention",
+              "status: in progress"
+            ];
+
+            if (label === "release: fixed in alpha") {
+              await add(["status: implemented", previewMaturityLabel]);
+              await remove(commonRemove);
+
+              await comment([
+                "Implemented/fixed in the latest preview build ✅",
+                "",
+                "If you want to test it, install the latest prerelease from HACS:",
+                "",
+                "1. Open HACS",
+                "2. Go to Nodalia Cards",
+                "3. Click the menu → Redownload",
+                "4. Select **Need a different version?**",
+                `5. Choose **${latestPreviewVersion}**`,
+                "",
+                "If anything still feels off, please let me know."
+              ].join("\n"));
+            }
+
+            if (label === "release: fixed in beta") {
+              await add(["status: implemented", "maturity: beta-ready"]);
+              await remove(commonRemove);
+
+              await comment([
+                `Available in **${latestBetaVersion}** ✅`,
+                "",
+                "Please test it when possible and let me know if anything feels off.",
+                "If there is no further feedback, I may close this issue after validation."
+              ].join("\n"));
+            }
+
+            if (label === "release: available in stable") {
+              await add(["status: fixed", "maturity: stable"]);
+              await remove([
+                ...commonRemove,
+                "status: implemented",
+                "status: waiting feedback"
+              ]);
+
+              await comment([
+                `Released in stable **${latestStableVersion}** ✅`,
+                "",
+                "Thanks again for the feedback. I’ll close this issue unless there is anything else to adjust."
+              ].join("\n"));
+            }

@@ -1,0 +1,93 @@
+name: Profile Images
+
+# Builds each changed docker/profiles/<name>/ image against the published
+# runner so a bad checksum, dead URL, or broken smoke test fails the PR
+# instead of surfacing at the worker's on-demand EnsureImage.
+
+on:
+  pull_request:
+    paths:
+      - docker/profiles/*/**
+      - .github/workflows/profile-images.yml
+
+defaults:
+  run:
+    shell: bash -euo pipefail {0}
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  changed:
+    name: list changed profiles
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      profiles: ${{ steps.list.outputs.profiles }}
+    steps:
+      - name: Set up Git repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: List changed profiles
+        id: list
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          profiles=$(git diff --name-only "$BASE_SHA"...HEAD -- 'docker/profiles/*/*' \
+            | awk -F/ '{print $3}' | sort -u \
+            | jq -R . | jq -sc .)
+          echo "profiles=$profiles" >> "$GITHUB_OUTPUT"
+          echo "changed: $profiles"
+
+  build:
+    name: build (${{ matrix.profile }})
+    needs: changed
+    if: needs.changed.outputs.profiles != '[]'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: ${{ fromJson(needs.changed.outputs.profiles) }}
+    steps:
+      - name: Set up Git repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build profile image
+        env:
+          PROFILE: ${{ matrix.profile }}
+          RUNNER_IMAGE: ghcr.io/${{ github.repository }}-runner:latest
+        run: |
+          dir="docker/profiles/$PROFILE"
+          test -f "$dir/Dockerfile" || { echo "no Dockerfile at $dir/Dockerfile"; exit 1; }
+          base_image="$RUNNER_IMAGE"
+          # Chained profiles build FROM another profile via BASE_IMAGE, not
+          # the runner via RUNNER_IMAGE. Build the base first.
+          case "$PROFILE" in
+            ruby-rails) base=ruby ;;
+            scala)      base=java ;;
+            kotlin)     base=java ;;
+            *)          base= ;;
+          esac
+          if [[ -n "$base" ]]; then
+            docker build -t "scrutineer-profile-$base:ci" \
+              --build-arg "RUNNER_IMAGE=$RUNNER_IMAGE" \
+              -f "docker/profiles/$base/Dockerfile" "docker/profiles/$base"
+            base_image="scrutineer-profile-$base:ci"
+          fi
+          docker build -t "scrutineer-profile-$PROFILE:ci" \
+            --build-arg "RUNNER_IMAGE=$RUNNER_IMAGE" \
+            --build-arg "BASE_IMAGE=$base_image" \
+            -f "$dir/Dockerfile" "$dir"

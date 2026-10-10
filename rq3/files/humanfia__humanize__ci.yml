@@ -1,0 +1,155 @@
+# The pull request's title, lint, the package, then the unit tests one job per package and the
+# integration tests one job per topic, on Linux and macOS. `ci-ok` is the one check a branch rule
+# needs, and the merge queue runs it again on each pull request as `main` will be once it
+# merges. `tests/system` runs real agents and is never run here. docs/contributing/ci.md has the
+# rest.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    # `edited` too, so a title fixed after the pull request opened is checked again.
+    types: [opened, synchronize, reopened, edited]
+  # The merge queue: `main`, with the pull requests ahead of this one merged, and this one.
+  merge_group:
+  # release.yml runs it on the release pull request, which its token cannot start otherwise.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # Every commit to `main` keeps its run, so a failure there is pinned to one commit.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  FORCE_COLOR: "1"
+
+jobs:
+  # Squashing writes the title to the branch as the commit's, and a release's notes are those
+  # titles. A push, a dispatch or a merge group has no pull request, and skips it: a pull
+  # request's title was checked before it queued, and release.yml dispatches only for the
+  # release pull request, whose title release-please writes.
+  title:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      pull-requests: read
+    steps:
+      - uses: amannn/action-semantic-pull-request@48f256284bd46cdaab1048c3721360e808335d50 # v6.1.1
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+  # Every pre-commit hook: ruff, pyright, actionlint, zizmor and the file hygiene.
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          python-version: "3.12"
+          # Pull requests restore what `main` saved and write nothing.
+          save-cache: ${{ github.ref == 'refs/heads/main' }}
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/pre-commit
+          key: pre-commit-${{ hashFiles('.pre-commit-config.yaml') }}
+
+      - name: pre-commit
+        env:
+          # zizmor asks GitHub whether each pinned commit is the tag it says.
+          GH_TOKEN: ${{ github.token }}
+        run: uv run --frozen --all-extras pre-commit run --all-files --show-diff-on-failure
+
+  # What a release would build, so any commit on a `release/*` branch can be released.
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          enable-cache: false
+
+      - name: Build the wheel and the sdist
+        run: uv build --no-sources
+
+      - name: PyPI will render the description
+        run: uvx twine@7.0.0 check --strict dist/*
+
+  unit:
+    name: unit (${{ matrix.os }}, ${{ matrix.package }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        package: [cli, coganchor, daemon, flows, runtime, sdk, tui, web]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          python-version: "3.12"
+          # Pull requests restore what `main` saved and write nothing.
+          save-cache: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: pytest tests/unit/${{ matrix.package }}
+        env:
+          PACKAGE: ${{ matrix.package }}
+        run: uv run --frozen --all-extras pytest "tests/unit/$PACKAGE" --durations=10
+
+  integration:
+    name: integration (${{ matrix.os }}, ${{ matrix.topic }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        topic: [core, agents, tui, daemon, anchor, web]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          python-version: "3.12"
+          # Pull requests restore what `main` saved and write nothing.
+          save-cache: ${{ github.ref == 'refs/heads/main' }}
+
+      # Two workers a vCPU: these tests wait on subprocesses, sockets and pseudoterminals far
+      # more than they compute, and `-n auto` alone counts physical cores.
+      - name: pytest tests/integration/test_${{ matrix.topic }}_*.py
+        env:
+          TOPIC: ${{ matrix.topic }}
+        run: |
+          PYTEST_XDIST_AUTO_NUM_WORKERS=$((2 * $(getconf _NPROCESSORS_ONLN))) \
+            uv run --frozen --all-extras pytest tests/integration/test_"$TOPIC"_*.py --durations=25
+
+  ci-ok:
+    if: always()
+    needs: [title, lint, package, unit, integration]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: re-actors/alls-green@b5b5b37504aa4183270bd3d855c52a67f212be35 # v1.3.0
+        with:
+          allowed-skips: title
+          jobs: ${{ toJSON(needs) }}

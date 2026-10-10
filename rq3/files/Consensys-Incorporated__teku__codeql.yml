@@ -1,0 +1,101 @@
+# For most projects, this workflow file will not need changing; you simply need
+# to commit it to your repository.
+#
+# You may wish to alter this file to override the set of languages analyzed,
+# or to provide custom queries or build logic.
+#
+# ******** NOTE ********
+# We have attempted to detect the languages in your repository. Please check
+# the `language` matrix defined below to confirm you have the correct set of
+# supported CodeQL languages.
+#
+name: "CodeQL"
+
+on:
+  push:
+    branches: [ master, "*-integration", "release-*" ]
+    paths-ignore:
+      - '**/*.md'
+      - 'LICENSE*'
+      - 'NOTICE*'
+      - 'CHANGELOG*'
+      - 'CODEOWNERS'
+      - '.gitignore'
+      - '.gitattributes'
+      - '.codespell/**'
+      - 'specrefs/**'
+      - 'mlc_config.json'
+  pull_request:
+    # The branches below must be a subset of the branches above
+    branches: [ master ]
+    paths-ignore:
+      - '**/*.md'
+      - 'LICENSE*'
+      - 'NOTICE*'
+      - 'CHANGELOG*'
+      - 'CODEOWNERS'
+      - '.gitignore'
+      - '.gitattributes'
+      - '.codespell/**'
+      - 'specrefs/**'
+      - 'mlc_config.json'
+  schedule:
+    - cron: '39 22 * * 5'
+
+jobs:
+  analyze:
+    name: Analyze
+    # Compiling under the CodeQL tracer is the slow part (18 of the 21 minutes on a 4-cpu
+    # runner), so use the same 32-cpu runner as assemble.
+    runs-on: ubuntu-latest-128
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [ 'java' ]
+        # CodeQL supports [ 'c-cpp', 'csharp', 'go', 'java-kotlin', 'javascript-typescript', 'python', 'ruby', 'swift' ]
+        # Use only 'java-kotlin' to analyze code written in Java, Kotlin or both
+        # Use only 'javascript-typescript' to analyze code written in JavaScript, TypeScript or both
+        # Learn more about CodeQL language support at https://aka.ms/codeql-docs/language-support
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      # JDK 25 plus the shared read-only Gradle home cache, so dependencies are not re-downloaded
+      - name: Prepare
+        uses: ./.github/actions/prepare
+
+      # Initializes the CodeQL tools for scanning.
+      # 4
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@db488ddef3bf6cb639b32c2e9a7c0a7ea8271d28 # v4
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: manual
+          # If you wish to specify custom queries, you can do so here or in a config file.
+          # By default, queries listed here will override any specified in a config file.
+          # Prefix the list here with "+" to use these queries and those in the config file.
+
+          # For more details on CodeQL's query packs, refer to: https://docs.github.com/en/code-security/code-scanning/automatically-scanning-your-code-for-vulnerabilities-and-errors/configuring-code-scanning#using-queries-in-ql-packs
+          queries: security-extended,security-and-quality
+
+      # autobuild ran Gradle's default build, which also compiled every test, test fixture, JMH
+      # and generated reference test source set under the tracer. Only production code needs
+      # analysing, so compile just that. --no-daemon keeps javac inside the traced process tree,
+      # and --no-build-cache makes javac actually run: with the shared Gradle home restored every
+      # compileJava comes FROM-CACHE, the tracer sees nothing and database finalize fails.
+      - name: Compile production sources
+        shell: bash
+        run: |
+          ./gradlew --no-daemon --no-build-cache compileJava
+
+      # 4
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@db488ddef3bf6cb639b32c2e9a7c0a7ea8271d28 # v4
+        with:
+          category: "/language:${{matrix.language}}"

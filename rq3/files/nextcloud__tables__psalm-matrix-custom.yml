@@ -1,0 +1,60 @@
+# This workflow is provided via the organization template repository
+#
+# https://github.com/nextcloud/.github
+# https://docs.github.com/en/actions/learn-github-actions/sharing-workflows-with-your-organization
+#
+# SPDX-FileCopyrightText: 2021-2024 Nextcloud GmbH and Nextcloud contributors
+# SPDX-License-Identifier: MIT
+
+name: Static analysis
+
+on: pull_request
+
+concurrency:
+  group: psalm-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  static-analysis:
+    runs-on: ubuntu-latest
+    strategy:
+      # do not stop on another job's failure
+      fail-fast: false
+      matrix:
+        ocp-version: [ 'dev-master', 'dev-stable35', 'dev-stable34', 'dev-stable33' ]
+
+    name: static-psalm-analysis ${{ matrix.ocp-version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up php8.2
+        uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 # v2
+        with:
+          php-version: 8.2
+          extensions: bz2, ctype, curl, dom, fileinfo, gd, iconv, intl, json, libxml, mbstring, openssl, pcntl, posix, session, simplexml, xmlreader, xmlwriter, zip, zlib, sqlite, pdo_sqlite
+          coverage: none
+          ini-file: development
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install dependencies
+        run: composer i
+
+      - name: Install dependencies
+        run: composer require --dev nextcloud/ocp:${{ matrix.ocp-version }} --ignore-platform-reqs --with-dependencies
+
+      - name: Run coding standards check
+        run: composer run psalm
+
+  summary:
+    runs-on: ubuntu-latest-low
+    needs: static-analysis
+
+    if: always()
+
+    name: static-psalm-analysis-summary
+
+    steps:
+      - name: Summary status
+        run: if ${{ needs.static-analysis.result != 'success' }}; then exit 1; fi

@@ -1,0 +1,53 @@
+name: "PR Metadata"
+# if someone opens a PR, edits it, or reopens it we want to validate the title
+# This is separate from the rest of the CI as the title may change without code changes
+
+on:
+  # SECURITY: pull_request_target is used here to allow validation of PRs from forks.
+  # This is safe because:
+  # 1. No code from the PR is checked out
+  # 2. Permissions are restricted to pull-requests: read
+  # 3. Only a trusted third-party action is used to validate the PR title
+  # 4. No user-controlled code is executed
+  pull_request_target: # zizmor: ignore[dangerous-triggers]
+    types:
+      - opened
+      - edited
+      - reopened
+      - synchronize
+
+permissions:
+  pull-requests: read
+
+jobs:
+  # Rename common PR titles to follow the format requirements.
+  auto-title:
+    if: github.repository == 'louislam/uptime-kuma'
+    name: Auto Title
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            if (context.payload.pull_request.title === "Translations Update from Weblate") {
+              await github.rest.pulls.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: context.payload.pull_request.number,
+                title: "chore: Translations Update from Weblate"
+              });
+            }
+
+  pr-title:
+    if: ${{ github.repository == 'louislam/uptime-kuma' && always() }}
+    name: Validate PR title follows https://conventionalcommits.org
+    runs-on: ubuntu-latest
+    needs: [auto-title]
+    permissions:
+      pull-requests: read
+    steps:
+      - uses: amannn/action-semantic-pull-request@48f256284bd46cdaab1048c3721360e808335d50 # v6.1.1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

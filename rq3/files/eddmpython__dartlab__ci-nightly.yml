@@ -1,0 +1,139 @@
+name: CI Nightly
+
+# Tier 3 — 1x/day 확장 회귀 (목표 ≤ 45분). UTC 15:00 = KST 00:00.
+# 명령 SSOT = tests/run.py GATES. realdata 20 shard 도 tests/run.py 의 REALDATA_SHARDS.
+
+on:
+  workflow_call:
+  schedule:
+    - cron: "0 15 * * *"
+  workflow_dispatch:
+    inputs:
+      skip_realdata:
+        description: "realdata-suite-full 건너뜀"
+        default: "false"
+        type: choice
+        options: ["true", "false"]
+
+concurrency:
+  group: ci-nightly
+  cancel-in-progress: false
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ matrix.timeout || 30 }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - gate: test-full-nightly
+            timeout: 60
+          - gate: guard-full-census
+            timeout: 15
+          - gate: external-venv-smoke
+            timeout: 45
+            artifact_name: product-smoke-pypi-release
+            artifact_path: product-smoke-pypi-release.json
+          - gate: freshInstall
+          - gate: mutation-testing
+            timeout: 90
+            artifact_name: mutation-results
+            artifact_path: |
+              mutation-results.txt
+              mutants/
+          - gate: benchmark-weekly
+            timeout: 30
+          - gate: eval-full
+            timeout: 30
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Run ${{ matrix.gate }}
+        run: python -X utf8 tests/run.py gate ${{ matrix.gate }}
+      - name: Upload full test plan
+        if: ${{ always() && matrix.gate == 'test-full-nightly' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: full-test-plan-nightly
+          path: impact-test-plan.json
+          if-no-files-found: error
+      - name: Upload artifact
+        if: ${{ always() && matrix.artifact_name }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.artifact_path }}
+          retention-days: 30
+
+  realdata-cache:
+    if: ${{ github.event.inputs.skip_realdata != 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: "pip"
+      - name: Prepare realdata scan prebuild
+        env:
+          DARTLAB_DATA_DIR: ${{ github.workspace }}/tests/fixtures
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+          python -X utf8 .github/scripts/ops/prepareRealdataScanCache.py
+      - name: Upload realdata scan prebuild
+        uses: actions/upload-artifact@v7
+        with:
+          name: realdata-scan-prebuild
+          path: tests/fixtures/dart/scan/
+          if-no-files-found: error
+
+  # realdata 20 shard 전수 — 1 잡 / 1 shard fan-out.
+  # matrix.test_file 은 tests/run.py REALDATA_SHARDS 와 1:1
+  # (test_runEntrypoint.py 의 test_realdataShardsMatchNightlyMatrix 가 검증).
+  realdata-suite-full:
+    if: ${{ github.event.inputs.skip_realdata != 'true' }}
+    needs: realdata-cache
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        test_file:
+          - test_ai.py
+          - test_analysis.py
+          - test_analysisAxes.py
+          - test_companyExhaustive.py
+          - test_companyFacade.py
+          - test_companyTopics.py
+          - test_credit.py
+          - test_creditAxes.py
+          - test_freshInstall.py
+          - test_gather.py
+          - test_gatherAxes.py
+          - test_industry.py
+          - test_macro.py
+          - test_macroAxes.py
+          - test_quant.py
+          - test_story.py
+          - test_scan.py
+          - test_scanAxes.py
+          - test_search.py
+          - test_topLevelApi.py
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: "pip"
+      - name: Download realdata scan prebuild
+        uses: actions/download-artifact@v8
+        with:
+          name: realdata-scan-prebuild
+          path: tests/fixtures/dart/scan/
+      - run: python -X utf8 tests/run.py gate realdata-suite-full --test ${{ matrix.test_file }}

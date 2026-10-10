@@ -1,0 +1,315 @@
+# https://github.com/containerd/containerd/blob/main/.github/workflows/release.yml
+# https://devtron.ai/blog/create-ci-cd-pipelines-with-github-actions-for-kubernetes-the-definitive-guide
+# https://docs.github.com/en/actions/writing-workflows/choosing-when-your-workflow-runs/events-that-trigger-workflows
+# https://docs.github.com/en/actions/managing-workflow-runs-and-deployments/managing-workflow-runs/manually-running-a-workflow
+
+name: Nightly
+description: Nightly snuggsi ツ Build
+#--------------------------------------------------------------------------
+# https://github.com/step-security/secure-workflows
+# https://graphite.dev/guides/github-actions-permissions
+# https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/controlling-permissions-for-github_token
+permissions:
+  issues: none
+  checks: none
+  actions: write
+  packages: none # containers
+  contents: write # file access
+  id-token: write # Provenance
+  attestations: write # attest
+  deployments: none
+  pull-requests: none
+  repository-projects: none
+#--------------------------------------------------------------------------
+on:
+  schedule: # https://en.wikipedia.org/wiki/Cron
+    - cron: '0 0 * * *' # Daily @ 00:00 Midnight UTC
+  push:
+    branches:
+      - main
+  workflow_dispatch: {}
+#--------------------------------------------------------------------------
+env:
+  # Prevent script injection
+  EMAIL: ${{ secrets.EMAIL }}
+  OWNER: ${{ github.repository_owner }}
+  REPO: ${{ github.event.repository.name }}
+  NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+  GPG_SIGNING_KEY: ${{ secrets.GPG_SIGNING_KEY }}
+#--------------------------------------------------------------------------
+# if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+jobs:
+#--------------------------------------------------------------------------
+  scan:
+    name: 🔎 Scan
+    runs-on: ubuntu-22.04
+    steps: # --------------------------------------------------------------
+      - name: Dump GitHub context
+        env:
+          GITHUB_CONTEXT: ${{ toJson(github) }}
+        run: echo "$GITHUB_CONTEXT"
+      - name: Dump job context
+        env:
+          JOB_CONTEXT: ${{ toJson(job) }}
+        run: echo "$JOB_CONTEXT"
+      - name: Dump steps context
+        env:
+          STEPS_CONTEXT: ${{ toJson(steps) }}
+        run: echo "$STEPS_CONTEXT"
+      - name: Dump runner context
+        env:
+          RUNNER_CONTEXT: ${{ toJson(runner) }}
+        run: echo "$RUNNER_CONTEXT"
+      - name: Dump strategy context
+        env:
+          STRATEGY_CONTEXT: ${{ toJson(strategy) }}
+        run: echo "$STRATEGY_CONTEXT"
+      - name: Dump matrix context
+        env:
+          MATRIX_CONTEXT: ${{ toJson(matrix) }}
+        run: echo "$MATRIX_CONTEXT"
+
+#--------------------------------------------------------------------------
+  build:
+    if: false
+    name: 🏗️ Build
+    timeout-minutes: 5
+    runs-on: ubuntu-22.04
+    steps: # --------------------------------------------------------------
+      - name: Update
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zopfli
+
+      - name: Checkout
+        uses: actions/checkout@v4 # https://github.com/actions/checkout
+        with:
+          fetch-depth: 1
+          fetch-tags: false
+          ref: ${{ github.ref }}
+
+      - name: Setup # https://github.com/marketplace/actions/setup-node-js-environment
+        uses: actions/setup-node@v4 # https://github.com/actions/setup-node
+        with:
+          cache: npm
+          node-version: 18.x
+          # https://github.com/actions/setup-node/blob/main/docs/advanced-usage.md#working-with-lockfiles
+          cache-dependency-path: 'npm-shrinkwrap.json'
+
+      - name: Install
+        run: |
+          npm ci --no-audit --no-progress --ignore-scripts --prefer-offline
+          npm version
+
+      - name: Compile
+        run: bin/compile
+
+#--------------------------------------------------------------------------
+  test:
+    if: false
+    name: 📊 Test
+    runs-on: ubuntu-22.04
+    env: # Prevent script injection
+      SNUGGSI: '.'
+      PUPPETEER_SKIP_DOWNLOAD: true
+#     CHROMEDRIVER_BINARY: ../../../node_modules/chromedriver/lib/chromedriver/chromedriver
+    steps: # --------------------------------------------------------------
+    - name: Checkout
+      id: checkout
+      uses: actions/checkout@v4 # https://github.com/actions/checkout
+      with:
+        fetch-depth: 1
+        fetch-tags: false
+        ref: ${{ github.ref }}
+
+    - name: Node Setup # https://github.com/marketplace/actions/setup-node-js-environment
+      id: setup
+      uses: actions/setup-node@v4 # https://github.com/actions/setup-node
+      with:
+        cache: npm
+        node-version: 18.x
+        # https://github.com/actions/setup-node/blob/main/docs/advanced-usage.md#working-with-lockfiles
+        cache-dependency-path: 'npm-shrinkwrap.json'
+
+    - name: Node Install
+      id: install
+      run: |
+        npm ci --no-audit --no-progress --ignore-scripts --prefer-offline
+        npm version
+
+    - name: Chrome Setup
+      id: chrome
+      # https://github.com/browser-actions/setup-chrome
+      uses: browser-actions/setup-chrome@v1.7.2
+      with:
+        chrome-version: stable
+        # https://www.npmjs.com/package/chromedriver
+        # https://sites.google.com/chromium.org/driver
+        install-chromedriver: true
+        install-dependencies: false
+
+    - name: Test
+      id: test
+      run: |
+        npm run
+        node --version
+        ${{ steps.chrome.outputs.chrome-path }} --version
+        # TODO: Determine if necessary ------------------------
+        echo
+        echo setting nullglob
+        echo From $(shopt -p nullglob)
+        shopt -s nullglob
+        echo To $(shopt -p nullglob)
+        echo
+        # -----------------------------------------------------
+        npm test
+
+    - name: Cover
+      id: cover
+      run: bin/cover || true # TODO: Get to 100% Coverage
+
+#--------------------------------------------------------------------------
+  publish: # https://docs.github.com/en/actions/use-cases-and-examples/publishing-packages/publishing-nodejs-packages
+    name: 🗞️ Publish
+#   needs: [scan,build,test]
+    runs-on: ubuntu-22.04
+    steps: # --------------------------------------------------------------
+    - uses: actions/checkout@v4 # https://github.com/actions/checkout
+      with:
+        fetch-depth: 1
+        fetch-tags: false
+    - uses: actions/setup-node@v4
+      with:
+        node-version: 18
+        registry-url: 'https://registry.npmjs.org'
+#   - run: |
+#       print "${GPG_SIGNING_KEY}" | base64 --decode > private.key
+#       ls -al *.key
+#       gpg --import private.key
+#       gpg --list-keys
+    - run: |
+        git config user.name "$GITHUB_ACTOR"
+        git config user.email "$EMAIL"
+    - run: bin/version
+#--------------------------------------------------------------------------
+  # https://csrc.nist.gov/Projects/ssdf
+  # https://cli.github.com/manual/gh_attestation_verify
+  # https://docs.github.com /en/actions/security-for-github-actions/using-artifact-attestations
+  # https://legitsecurity.com/blog/slsa-provenance-blog-series-part-1-what-is-software-attestation
+  # https://legitsecurity.com/blog/slsa-provenance-blog-series-part-2-deeper-dive-into-slsa-provenance
+  # https://legitsecurity.com/blog/slsa-provenance-blog-series-part3-challenges-of-adopting-slsa-provenance
+  verify: # https://slsa.dev/spec/v1.0/verifying-artifacts
+    name: 🔒 Verify
+    needs: [publish]
+    timeout-minutes: 5
+    runs-on: ubuntu-22.04
+    env:
+       H_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps: # --------------------------------------------------------------
+    - name: Checkout
+      id: checkout
+      uses: actions/checkout@v4 # https://github.com/actions/checkout
+      with:
+        fetch-depth: 1
+        fetch-tags: true
+        ref: ${{ github.ref }}
+
+    - name: Check # https://github.com/slsa-framework/slsa-verifier
+      id: check
+      run: |
+        VERSION=$(git describe --tags --abbrev=0)
+        git tag -v ${VERSION} || true # TODO: Get to 100% Coverage
+        echo "RELEASE_VER=${RELEASEVER}" >> $GITHUB_ENV
+        echo $GITHUB_ENV
+        bin/weigh
+#       TAGCHECK=$(git tag -v ${releasever} 2>&1 >/dev/null)
+#       echo "${TAGCHECK}" | grep -q "error" && {
+#           echo "::error::tag ${releasever} is not a signed tag. Failing release process."
+#           exit 1
+#       } || {
+#           echo "Tag ${releasever} is signed."
+#           exit 0
+#       }
+    # https://slsa.dev/spec/v1.0
+    # https://github.com/in-toto/attestation
+    # https://docs.docker.com/build/metadata/attestations
+    # https://github.com/slsa-framework/slsa-github-generator
+    # https://security.googleblog.com/2022/04/improving-software-supply-chain.html
+    - name: Attest # https://github.com/marketplace/actions/attest-build-provenance
+      id: attest
+      uses: actions/attest-build-provenance@v2 # https://github.com/actions/attest-build-provenance
+      with:
+        subject-path: |
+          './dist/snuggsi.*'
+          './snuggsi.js' # TODO: remove
+
+    # https://slsa.dev/spec/v1.0/provenance
+    # https://docs.docker.com/build/metadata/attestations/slsa-provenance
+    - name: Provenance
+      id: provenance
+      run: |
+        ls -al
+        echo Provenance routine
+
+#--------------------------------------------------------------------------
+  release: # https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/storing-and-sharing-data-from-a-workflow
+    if: false
+    name: 🎉 Release
+    needs: [publish]
+    timeout-minutes: 5
+    runs-on: ubuntu-22.04
+#   outputs:
+#     stringver: ${{ steps.contentrel.outputs.stringver }}
+    steps: # --------------------------------------------------------------
+    - name: Checkout code
+      uses: actions/checkout@v4 # https://github.com/actions/checkout
+
+    - name: Release
+      env:
+        AID: ${{ needs.archive.outputs.aid }}
+        TAG: ${{ env.TAG }}
+      run: echo "${TAG} Artifact ID from previous job is ${AID}"
+
+#--------------------------------------------------------------------------
+  archive: # https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/storing-and-sharing-data-from-a-workflow
+    if: false
+    name: 🧊 Archive
+    needs: [publish]
+    timeout-minutes: 5
+    runs-on: ubuntu-22.04
+    outputs:
+      aid: ${{ steps.artifact-upload.outputs.artifact-id }}
+    steps: # --------------------------------------------------------------
+    - name: Checkout
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 1
+        fetch-tags: false
+
+    - name: Setup
+      uses: actions/setup-node@v4
+      with:
+        node-version: 18
+        registry-url: 'https://registry.npmjs.org'
+
+    - name: Notate
+      run: |
+        npm pkg get version
+        git tag -l "v$( npm pkg get version | tr -d \" )" -n 200 >> CHANGELOG.md
+    #git tag -l ${RELEASEVER#refs/tags/} -n20000 | tail -n +3 | cut -c 5- >> CHANGELOG.md
+
+    - name: Upload
+      uses: actions/upload-artifact@v4 # https://github.com/actions/upload-artifact
+      id: artifact-upload
+      with:
+        retention-days: 30
+        compression-level: 9
+        if-no-files-found: warn
+        name: snuggsi-${{ github.run_id }}
+        path: |
+          dist
+          !dist/*.md
+          CHANGELOG.md
+
+#--------------------------------------------------------------------------
+

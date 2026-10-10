@@ -1,0 +1,86 @@
+name: Ingest Cloud OSV
+
+on:
+  schedule:
+  - cron: '*/30 * * * *' # Every half-hour
+  workflow_dispatch:
+
+permissions: read-all
+
+jobs:
+  ingest-osv:
+    name: Ingest Cloud OSV
+    continue-on-error: false
+    runs-on: ubuntu-latest
+    timeout-minutes: 45 # Don't allow the job to run too long.
+
+    permissions:
+      actions: read
+      contents: write
+      id-token: write
+
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        token: ${{ secrets.GH_TOKEN }}
+    - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      with:
+        go-version-file: 'go.mod'
+
+    # gocloud has an issue where it requires an ADC file to work with GCS, even
+    # for anonymous requests. This change tricks the auth code into succeeding.
+    - name: GCP Credential Workaround
+      run: |
+        echo '{ "type": "service_account" }' > .dummy_adc.json
+
+    # Configure the AWS IAM role configured in the Linux Foundation OSSF using
+    # OIDC.
+    # This role can be used by third-parties to grant access to the
+    # malicious packages repository for ingesting reports.
+    # This step will only succeed when run from the "main" branch or "aws-integration"
+    # branch on the ossf/malicious-packages repository.
+    - name: Configure AWS Credentials using IAM role
+      id: awscreds
+      uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+      with:
+        audience: sts.amazonaws.com
+        aws-region: us-east-1
+        role-to-assume: arn:aws:iam::006974884227:role/malicious-packages-github-workflows
+
+    # Setup v2 credentials for accessing AWS S3 buckets. Each set of credentials
+    # is given its own profile which is then set in the config using the
+    # "profile=PROFILENAME" query parameter in the source's bucket URL.
+    - name: AWS Credentials
+      run: |
+        mkdir "$HOME/.aws"
+        envsubst >"$HOME/.aws/credentials" <<EOF
+        [reversinglabs]
+        aws_access_key_id = $RL_AWS_ACCESS_KEY_ID
+        aws_secret_access_key = $RL_AWS_SECRET_ACCESS_KEY
+        EOF
+        echo '[profile reversinglabs]' > "$HOME/.aws/config"
+      env:
+        RL_AWS_ACCESS_KEY_ID: ${{ secrets.REVERSINGLABS_AWS_KEY_ID }}
+        RL_AWS_SECRET_ACCESS_KEY: ${{ secrets.REVERSINGLABS_AWS_KEY_SECRET }}
+
+    - name: Test access to AWS
+      run: |
+        aws sts get-caller-identity
+        aws sts get-caller-identity --profile reversinglabs
+
+    - name: Ingest OSV
+      run: |
+        go run ./cmd/ingest -config config/config.yaml -start-keys config/start-keys.yaml
+      env:
+        GOOGLE_APPLICATION_CREDENTIALS: .dummy_adc.json
+
+    - name: Prepare commit
+      run: |
+        git config user.name github-actions
+        git config user.email github-actions@github.com
+        git add osv config/start-keys.yaml
+    - name: Commit report changes
+      run: git diff --cached --quiet || git commit -m 'Ingest OSV - Cloud Storage'
+    - name: Push commit
+      if: ${{ github.ref == 'refs/heads/main' }}
+      run: git push

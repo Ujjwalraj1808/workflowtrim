@@ -1,0 +1,175 @@
+name: CI
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+permissions:
+  contents: read
+env:
+  NODE_VERSION: 24
+jobs:
+  build-docs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: ruby/setup-ruby@v1
+        with:
+          bundler-cache: true
+          working-directory: ./docs
+
+      - working-directory: ./docs
+        run: bundle exec jekyll build --strict_front_matter
+
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - run: npm ci
+      - run: npm run lint
+
+  bundlemon:
+    if: github.repository_owner == 'Leaflet'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - run: npm ci
+      - run: npm run build
+      - run: npm run bundlemon
+        env:
+          CI_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+
+  test-ssr:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - run: npm ci
+      - run: npm run build
+      - run: node ./spec/ssr/ssr_node.js
+
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      - run: deno run ./spec/ssr/ssr_deno.js
+
+  test:
+    runs-on: ${{ matrix.os || 'ubuntu-latest' }}
+    timeout-minutes: 8
+    env:
+      PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}/.playwright-browsers
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - project: chromium
+          - project: firefox
+          - project: chromium-retina
+          - project: chromium
+            os: windows-latest
+          - project: webkit
+            os: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - run: npm ci
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v6
+        with:
+          path: ${{ env.PLAYWRIGHT_BROWSERS_PATH }}
+          key: pw-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+
+      - name: Install Playwright browser
+        run: npx playwright install ${{ matrix.project == 'chromium-retina' && 'chromium' || matrix.project }}
+
+      - name: Run tests on ${{ matrix.project }}
+        run: npx vitest --run --project=${{ matrix.project }}
+
+      - name: Run tests on ${{ matrix.project }} with touch
+        run: npx vitest --run --project=${{ matrix.project }}
+        env:
+          VITE_TOUCH: '1'
+
+  publish-artifacts:
+    permissions:
+      contents: write
+    if: github.repository_owner == 'Leaflet' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - run: npm ci
+      - run: npm run build
+
+      - name: Compress artifacts
+        working-directory: dist
+        run: zip -r leaflet.zip . ../CHANGELOG.md ../LICENSE ../README.md
+
+      - name: Publish development snapshot
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: dev
+          name: Development snapshot
+          prerelease: true
+          files: dist/*
+          generate_release_notes: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  publish-npm:
+    if: github.repository_owner == 'Leaflet' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          registry-url: https://registry.npmjs.org
+
+      - run: npm ci
+      - run: npm run build
+
+      - name: Publish to NPM
+        run: |
+          TAG=$(echo $GITHUB_REF_NAME | grep -oP '^v\d+\.\d+\.\d+-?\K(\w+)?')
+          npm publish --tag ${TAG:-latest}
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

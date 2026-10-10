@@ -1,0 +1,242 @@
+name: E2E DDIL
+
+on:
+  workflow_dispatch:
+    inputs:
+      quarantined:
+        description: "Comma-separated scenario letters to quarantine (A..F)"
+        required: false
+        default: ""
+
+# Shared with e2e-nightly.yml and e2e-suites.yml: every one of them provisions
+# many cells on the same runner pools and the same hypervisors, so two in
+# flight compete for their disks and their libvirt guests. Queued rather than
+# cancelled — a run in progress is someone's result, not a stale one. e2e.yml
+# is outside the group: one cluster per run is cheap enough to overlap.
+concurrency:
+  group: e2e-hypervisors
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  GIT_BRANCH: ${{ github.ref_name }}
+  SPINIFEX_OTLP_ENDPOINT: ${{ vars.SPINIFEX_OTLP_ENDPOINT || 'http://192.168.1.13:8200' }}
+  SPINIFEX_OTEL_ATTRS: ci.run_id=${{ github.run_id }},ci.workflow=${{ github.workflow }}
+
+jobs:
+  ddil:
+    name: DDIL Real Multi-Node
+    runs-on: [self-hosted, ci-multi]
+    timeout-minutes: 60
+    env:
+      TOFU_LOG: /tmp/e2e-tofu-ddil-${{ github.run_id }}.log
+      SPINIFEX_OTEL_ATTRS: ci.run_id=${{ github.run_id }},ci.workflow=${{ github.workflow }},ci.cell=ddil
+    steps:
+      - name: Clean Workspace
+        run: sudo rm -rf "$GITHUB_WORKSPACE"/*
+
+      - uses: actions/create-github-app-token@v3
+        id: app-token
+        with:
+          client-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          repositories: mulga
+
+      - uses: actions/checkout@v7
+        name: Checkout Spinifex
+        with:
+          path: spinifex
+
+      - uses: actions/checkout@v7
+        name: Checkout Mulga (tofu-cluster)
+        with:
+          repository: mulgadc/mulga
+          token: ${{ steps.app-token.outputs.token }}
+          sparse-checkout: scripts/tofu-cluster
+          path: mulga
+
+      - name: Install gotestsum
+        env:
+          GOTESTSUM_VERSION: "1.12.0"
+        run: |
+          # Prebuilt tarball, not `go install`: gotestsum v1.12.0 pulls
+          # x/tools v0.19.0 whose tokeninternal static-assert pegs a
+          # narrow Go window (~1.22). The self-hosted runner's Go falls
+          # outside that window, so source-install fails with
+          # `invalid array length -delta * delta`. A prebuilt binary
+          # sidesteps toolchain coupling entirely.
+          BIN_DIR="${RUNNER_TEMP}/gotestsum-bin"
+          mkdir -p "${BIN_DIR}"
+          if [ ! -x "${BIN_DIR}/gotestsum" ]; then
+            curl -fsSL \
+              "https://github.com/gotestyourself/gotestsum/releases/download/v${GOTESTSUM_VERSION}/gotestsum_${GOTESTSUM_VERSION}_linux_amd64.tar.gz" \
+              | tar -xz -C "${BIN_DIR}" gotestsum
+          fi
+          echo "${BIN_DIR}" >> "${GITHUB_PATH}"
+          "${BIN_DIR}/gotestsum" --version
+
+      # Adds ci.job_id alongside ci.cell, before Bootstrap bakes the attrs into
+      # the VMs, so a telemetry doc points back at this job's log directly.
+      - name: Resolve CI job id
+        uses: ./spinifex/.github/actions/otel-job-id
+        with:
+          job-name: DDIL Real Multi-Node
+
+      - name: Build Install Artifacts
+        working-directory: mulga/scripts/tofu-cluster
+        run: |
+          ./build-install-artifacts.sh "${GIT_BRANCH}" \
+            "${RUNNER_TEMP}/spinifex-distro.tar.gz" \
+            "${RUNNER_TEMP}/setup.sh" \
+            "${RUNNER_TEMP}/spinifex-tests.tar"
+
+      - name: Provision VMs
+        working-directory: mulga/scripts/tofu-cluster
+        run: |
+          set -euo pipefail
+          source "${GITHUB_WORKSPACE}/spinifex/.github/scripts/ci-fmt.sh"
+          export TF_VAR_git_branch="${GIT_BRANCH}"
+          quiet_run "tofu init"                "$TOFU_LOG" tofu init -input=false
+          quiet_run "tofu workspace select"    "$TOFU_LOG" tofu workspace select -or-create "${SPINIFEX_CI_ENV}"
+          quiet_run "tofu destroy (pre-clean)" "$TOFU_LOG" tofu destroy -var-file=envs/${SPINIFEX_CI_ENV}.tfvars -auto-approve -input=false || true
+          quiet_run "scrub-env (pre-clean)"    "$TOFU_LOG" ./scrub-env.sh "${SPINIFEX_CI_ENV}" || true
+          retry_run "tofu apply"               "$TOFU_LOG" tofu apply -var-file=envs/${SPINIFEX_CI_ENV}.tfvars -auto-approve -input=false
+          ok "VMs provisioned"
+
+      - name: Bootstrap via Binary Install
+        working-directory: mulga/scripts/tofu-cluster
+        run: |
+          SPX_EXTERNAL_POOL="${SPINIFEX_CI_POOL}" \
+          ./bootstrap-install.sh "${SPINIFEX_CI_ENV}" \
+            "${RUNNER_TEMP}/setup.sh" \
+            "${RUNNER_TEMP}/spinifex-distro.tar.gz" \
+            --test-tar "${RUNNER_TEMP}/spinifex-tests.tar"
+
+      - name: Run DDIL Scenarios
+        working-directory: mulga/scripts/tofu-cluster
+        run: |
+          set -o pipefail
+          INVENTORY=$(tofu output -json inventory)
+          SSH_KEY=$(echo "$INVENTORY" | jq -r '.ssh_key_path')
+          SSH_KEY="${SSH_KEY/#\~/$HOME}"
+          SSH_USER=$(echo "$INVENTORY" | jq -r '.ssh_user')
+          REGION=$(echo "$INVENTORY" | jq -r '.region')
+          # DDIL_NODES must be the cluster-traffic IPs: PartitionNode
+          # installs iptables DROP rules for each peer, so the runner's
+          # SSH source IP must differ from these. On single-NIC
+          # tofu-cluster, wan_ip == cluster IP and the runner's outbound
+          # IP is distinct — see e2e-ddil-test-harness.md §3 Scenario C.
+          NODE_IPS=$(echo "$INVENTORY" | jq -r '[.nodes[].wan_ip] | join(",")')
+          PRIMARY_IP=$(echo "$INVENTORY" | jq -r '.nodes[0].wan_ip')
+          echo "DDIL_NODES=${NODE_IPS}"
+
+          # Witness VMs talk to the cluster's AWS gateway via aws-sdk-go,
+          # which resolves credentials from the standard chain. spx admin
+          # init writes [spinifex] to ${SSH_USER}'s ~/.aws/credentials on
+          # node1 — pull them over SSH and export as the SDK's env-var
+          # entries so the harness can launch instances without depending
+          # on a cluster-bootstrapped profile being present on the runner.
+          CREDS=$(ssh -i "${SSH_KEY}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            "${SSH_USER}@${PRIMARY_IP}" 'cat ~/.aws/credentials')
+          AWS_ACCESS_KEY_ID=$(echo "$CREDS" | awk -F '= *' '/^aws_access_key_id/ {print $2; exit}')
+          AWS_SECRET_ACCESS_KEY=$(echo "$CREDS" | awk -F '= *' '/^aws_secret_access_key/ {print $2; exit}')
+          if [ -z "$AWS_ACCESS_KEY_ID" ] || [ -z "$AWS_SECRET_ACCESS_KEY" ]; then
+            echo "::error::Failed to extract spinifex AWS credentials from ${PRIMARY_IP}"
+            exit 1
+          fi
+
+          GUEST_KEY="${RUNNER_TEMP}/spinifex-key"
+          scp -i "${SSH_KEY}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            "${SSH_USER}@${PRIMARY_IP}:~/.ssh/spinifex-key" "${GUEST_KEY}"
+          chmod 600 "${GUEST_KEY}"
+
+          mkdir -p "${RUNNER_TEMP}/ddil-results"
+          cd "${GITHUB_WORKSPACE}/spinifex"
+          source "${GITHUB_WORKSPACE}/spinifex/.github/scripts/ci-fmt.sh"
+          banner "DDIL scenarios"
+          DDIL_NODES="${NODE_IPS}" \
+          DDIL_SSH_USER="${SSH_USER}" \
+          DDIL_SSH_KEY="${SSH_KEY}" \
+          DDIL_GUEST_SSH_KEY="${GUEST_KEY}" \
+          DDIL_QUARANTINED="${{ inputs.quarantined }}" \
+          AWS_REGION="${REGION}" \
+          AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID}" \
+          AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY}" \
+            gotestsum --jsonfile "${RUNNER_TEMP}/ddil-results/results.json" \
+                      --junitfile "${RUNNER_TEMP}/ddil-results/junit-ddil.xml" \
+                      --format testname \
+                      -- -tags=e2e -timeout 45m ./tests/e2e/ddil/scenarios/...
+          rc=$?
+          if [[ $rc -eq 0 ]]; then ok "all scenarios passed"; else bad "scenarios failed (rc=$rc)"; fi
+          exit $rc
+
+      - name: Publish test summary
+        if: always()
+        uses: ./spinifex/.github/actions/junit-report
+        with:
+          junit-glob: ${{ runner.temp }}/ddil-results/junit-*.xml
+          title: "DDIL scenario results"
+
+      # Tolerated on failure: the sink being unreachable must not turn a
+      # green test run red.
+      - name: Ship test results to Elasticsearch
+        if: always()
+        continue-on-error: true
+        uses: ./spinifex/.github/actions/junit-to-es
+        with:
+          junit-glob: ${{ runner.temp }}/ddil-results/junit-*.xml
+          cell: ddil
+
+      - name: Collect Cluster Logs
+        if: failure()
+        working-directory: mulga/scripts/tofu-cluster
+        run: |
+          set +e
+          INVENTORY=$(tofu output -json inventory)
+          SSH_KEY=$(echo "$INVENTORY" | jq -r '.ssh_key_path')
+          SSH_KEY="${SSH_KEY/#\~/$HOME}"
+          SSH_USER=$(echo "$INVENTORY" | jq -r '.ssh_user')
+          LOG_DIR="${RUNNER_TEMP}/ddil-results/cluster-logs"
+          mkdir -p "${LOG_DIR}"
+
+          source "${GITHUB_WORKSPACE}/spinifex/.github/scripts/ci-fmt.sh"
+          mapfile -t NODE_IPS < <(echo "$INVENTORY" | jq -r '.nodes[].wan_ip')
+          for ip in "${NODE_IPS[@]}"; do
+            SSH="ssh -i ${SSH_KEY} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null ${SSH_USER}@${ip}"
+            ${SSH} 'sudo journalctl -u "spinifex-*" --no-pager -n 5000' > "${LOG_DIR}/${ip}-spinifex.log" 2>&1
+            ${SSH} 'ps auxw | grep -E "qemu-system|spinifex" | grep -v grep' > "${LOG_DIR}/${ip}-procs.txt" 2>&1
+            ${SSH} 'ls -la /var/lib/spinifex 2>/dev/null; ls -la /var/log/spinifex 2>/dev/null' > "${LOG_DIR}/${ip}-state.txt" 2>&1
+            ok "$ip: $(wc -l < "${LOG_DIR}/${ip}-spinifex.log") journal lines, $(wc -l < "${LOG_DIR}/${ip}-procs.txt") procs"
+          done
+
+      - name: Upload DDIL Results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ddil-results-${{ github.run_id }}
+          path: ${{ runner.temp }}/ddil-results
+          retention-days: 30
+
+      - name: Teardown
+        if: always()
+        working-directory: mulga/scripts/tofu-cluster
+        run: |
+          set -euo pipefail
+          source "${GITHUB_WORKSPACE}/spinifex/.github/scripts/ci-fmt.sh"
+          quiet_run "tofu workspace select" "$TOFU_LOG" tofu workspace select -or-create "${SPINIFEX_CI_ENV}"
+          quiet_run "telemetry flush"       "$TOFU_LOG" timeout 120 ./flush-telemetry.sh "${SPINIFEX_CI_ENV}" || true
+          retry_run "tofu destroy"          "$TOFU_LOG" tofu destroy -var-file=envs/${SPINIFEX_CI_ENV}.tfvars -auto-approve -input=false
+          quiet_run "scrub-env"             "$TOFU_LOG" ./scrub-env.sh "${SPINIFEX_CI_ENV}" || true
+          ok "teardown complete"
+
+      - name: Upload tofu log
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: tofu-log-ddil-${{ github.run_id }}
+          path: ${{ env.TOFU_LOG }}
+          if-no-files-found: ignore
+          retention-days: 30

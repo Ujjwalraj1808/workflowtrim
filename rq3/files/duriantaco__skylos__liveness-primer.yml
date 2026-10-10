@@ -1,0 +1,190 @@
+name: Analyzer Blast Radius
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+
+env:
+  LIVENESS_PRIMER_REF: 1438a928dd00cbb3b1098a9edc82480f43daabdb # v0.2.0
+
+concurrency:
+  group: liveness-primer-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  blast-radius:
+    name: Skylos analyzer blast radius
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out trusted Skylos base
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: _trusted_skylos
+          persist-credentials: false
+
+      - name: Check out pinned liveness_primer
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: mcdigman/liveness_primer
+          ref: ${{ env.LIVENESS_PRIMER_REF }}
+          path: _liveness_primer
+          persist-credentials: false
+
+      - name: Record Go engine coverage boundary
+        env:
+          TRUSTED_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$TRUSTED_BASE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Invalid pull request base SHA" >&2
+            exit 1
+          fi
+
+          {
+            echo "## Go engine coverage boundary"
+            echo
+            echo "This comparison uses the Go engine built from base commit \`$TRUSTED_BASE_SHA\` for both detector revisions."
+            echo "Changes under \`skylos/engines/go/\` are outside this blast-radius result."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "::notice title=Go engine coverage boundary::Both detector revisions use the Go engine built from the pull request base; changes under skylos/engines/go/ are not covered."
+
+      - name: Install Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version: "1.22"
+          cache: false
+
+      - name: Build trusted base Go engine
+        env:
+          TRUSTED_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$TRUSTED_BASE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Invalid pull request base SHA" >&2
+            exit 1
+          fi
+
+          trusted_checkout_sha="$(git -C _trusted_skylos rev-parse HEAD)"
+          if [[ "$trusted_checkout_sha" != "$TRUSTED_BASE_SHA" ]]; then
+            echo "Trusted checkout does not match the pull request base" >&2
+            exit 1
+          fi
+
+          engine_dir="$RUNNER_TEMP/skylos-go-engine"
+          mkdir -p "$engine_dir" "$RUNNER_TEMP/skylos-go-build" "$RUNNER_TEMP/skylos-go-gopath"
+          cd _trusted_skylos/skylos/engines/go
+          GOCACHE="$RUNNER_TEMP/skylos-go-build" GOPATH="$RUNNER_TEMP/skylos-go-gopath" \
+            go build -trimpath -o "$engine_dir/skylos-go" ./cmd/skylos-go
+          "$engine_dir/skylos-go" --version
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          version: "0.12.5"
+          python-version: "3.13"
+          enable-cache: false
+
+      # v0.2.0 installs no extras. The full corpus includes Dart, whose parser
+      # newer Skylos revisions provide through skylos[dart]. Remove this
+      # compatibility overlay when the pinned primer supports named extras.
+      - name: Enable Dart support for the full corpus
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("_liveness_primer/liveness_primer/container.py")
+          source = path.read_text(encoding="utf-8")
+          replacements = (
+              (
+                  "from liveness_primer.envcache import (\n",
+                  "from liveness_primer.envcache import (\n    _read_pyproject_text,\n",
+              ),
+              (
+                  "    --find-links /liveness/wheelhouse /liveness/detector\n",
+                  '    --find-links /liveness/wheelhouse "/liveness/detector[dart]"\n',
+              ),
+              (
+                  "            'recipe': adapter.build_recipe.digest(),\n",
+                  "            'recipe': adapter.build_recipe.digest(),\n"
+                  "            'selected_extras': ['dart'],\n",
+              ),
+              (
+                  "            Deduplicated declared dependencies and build requirements.\n"
+                  "            Extras are deliberately left out, exactly as in the host-venv\n"
+                  "            path: the offline install selects no extras (contract §3).\n",
+                  "            Deduplicated core, build, and named Dart-extra requirements.\n"
+                  "            Other optional dependencies remain excluded.\n",
+              ),
+              (
+                  "        return tuple(dict.fromkeys((*metadata.dependencies, *metadata.build_requires)))\n",
+                  "        project = tomllib.loads(_read_pyproject_text(checkout / 'pyproject.toml'))['project']\n"
+                  "        dart_requirements = project.get('optional-dependencies', {}).get('dart', [])\n"
+                  "        return tuple(dict.fromkeys((*metadata.dependencies, *metadata.build_requires, *dart_requirements)))\n",
+              ),
+          )
+          for before, after in replacements:
+              if source.count(before) != 1:
+                  raise SystemExit("Dart overlay does not match the pinned liveness-primer source")
+              source = source.replace(before, after, 1)
+          path.write_text(source, encoding="utf-8")
+          print("Comparison containers will install skylos[dart]; cache identity includes the selected extra.")
+          PY
+
+      - name: Compare base with the pull request merge result
+        env:
+          SKYLOS_REPOSITORY: ${{ github.server_url }}/${{ github.repository }}
+          SKYLOS_GO_BIN: ${{ format('{0}/skylos-go-engine/skylos-go', runner.temp) }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          MERGE_SHA: ${{ github.sha }}
+          REPORT_JSON: liveness-primer-report.json
+          REPORT_MARKDOWN: liveness-primer-report.md
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for revision in "$BASE_SHA" "$MERGE_SHA"; do
+            if [[ ! "$revision" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "Invalid comparison revision" >&2
+              exit 1
+            fi
+          done
+
+          uv run --project _liveness_primer --locked liveness-primer run \
+            --tool skylos \
+            --repo "$SKYLOS_REPOSITORY" \
+            --old "$BASE_SHA" \
+            --new "$MERGE_SHA" \
+            --all \
+            --container \
+            --output github \
+            --json-out "$REPORT_JSON" \
+            --jobs 2 \
+            --timeout 300 \
+            | tee "$REPORT_MARKDOWN" >> "$GITHUB_STEP_SUMMARY"
+
+          test -s "$REPORT_JSON"
+
+      - name: Upload blast-radius evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: liveness-primer-report
+          path: |
+            liveness-primer-report.md
+            liveness-primer-report.json
+          if-no-files-found: error
+          retention-days: 14

@@ -1,0 +1,64 @@
+name: Migration Guard
+
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize, ready_for_review, labeled, unlabeled]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  migration-checklist:
+    name: Require migration notes when schema changes
+    runs-on: ubuntu-latest
+    if: github.event.pull_request.draft == false
+    steps:
+      - name: Validate migration checklist
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+            const labels = (pr.labels || []).map((l) => l.name.toLowerCase());
+            if (labels.includes('checklist-exception')) {
+              core.notice('Bypassing migration guard due to checklist-exception label.');
+              return;
+            }
+
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: pr.number,
+              per_page: 100,
+            });
+
+            const touchesMigration = files.some((f) =>
+              /^platform\/core\/src\/migrations\/.+\.ts$/i.test(f.filename),
+            );
+
+            if (!touchesMigration) {
+              core.notice('No migration files touched; skipping migration checklist enforcement.');
+              return;
+            }
+
+            const body = pr.body || '';
+            const required = [
+              'Migration is idempotent',
+              'Rollback / compatibility note included in PR description',
+            ];
+
+            const missing = required.filter((item) => {
+              const escaped = item.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+              const re = new RegExp(`-\\s*\\[[xX]\\]\\s*${escaped}`);
+              return !re.test(body);
+            });
+
+            if (missing.length > 0) {
+              core.setFailed([
+                'Migration files were changed, but migration checklist items are incomplete:',
+                ...missing.map((m) => `- ${m}`),
+                '',
+                'Fill the "Migration Notes (if applicable)" section in the PR template.',
+                'If this is an intentional exception, apply label: checklist-exception',
+              ].join('\n'));
+            }

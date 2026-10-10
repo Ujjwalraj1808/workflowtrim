@@ -1,0 +1,46 @@
+---
+name: Run checkstyle
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+# Cancel in-progress PR verification workflows. We only care about verifying the latest commit.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  checkstyle:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install dependencies
+        shell: bash
+        run: sudo apt-get install -y gettext git-core
+
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Rebase
+        uses: ./.github/actions/rebase
+
+      - name: Set Environment Variables
+        uses: ./.github/actions/set_vars
+        with:
+          varFilePath: ./.github/variables/pr_verification.env
+
+      - name: Set up Java
+        uses: actions/setup-java@v6
+        with:
+          distribution: ${{ env.JAVA_DISTRIBUTION }}
+          java-version: ${{ env.JAVA_VERSION }}
+          check-latest: ${{ env.JAVA_CHECK_LATEST }}
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Run checkstyle
+        run: ./gradlew checkstyle

@@ -1,0 +1,81 @@
+name: Deploy Website
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [master]
+    paths:
+      - 'website/**'
+      - 'ssl/**'
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Loading Secrets
+        uses: ./.github/actions/bitwarden
+        with:
+          bw-access-token: ${{ secrets.BW_ACCESS_TOKEN }}
+
+      - name: Write TLS private key into ssl/
+        run: |
+          set -eu
+          printf '%s\n' "$PRODUCTION_WEBSITE_CERTIFICATE_PRIVATE_KEY" > ssl/certificate.key
+          chmod 600 ssl/certificate.key
+          # Fail fast if the key does not match the leaf cert (public-key compare, no secret output)
+          key_pub=$(openssl pkey -in ssl/certificate.key -pubout -outform der | openssl sha256)
+          crt_pub=$(openssl x509 -in ssl/certificate.crt -pubkey -noout | openssl pkey -pubin -outform der | openssl sha256)
+          test "$key_pub" = "$crt_pub"
+
+      - name: Install dependencies
+        run: npm ci
+        working-directory: website
+
+      - name: Build
+        run: npm run build
+        working-directory: website
+
+      - name: Copy global resources to VM via SCP
+        uses: appleboy/scp-action@v1.0.0
+        with:
+          host: ${{ env.PRODUCTION_WEBSITE_HOST }}
+          username: ${{ env.PRODUCTION_WEBSITE_USER }}
+          key: ${{ env.PRODUCTION_WEBSITE_PRIVATE_KEY }}
+          source: "docker-compose.yml,infra/nginx,ssl"
+          target: "/home/${{ env.PRODUCTION_WEBSITE_USER }}"
+
+      - name: Prepare Standalone Folder
+        working-directory: website
+        run: |
+          cp -r public .next/standalone/
+          cp -r .next/static .next/standalone/.next/
+
+      - name: Copy build resources to VM via SCP
+        uses: appleboy/scp-action@v1.0.0
+        with:
+          host: ${{ env.PRODUCTION_WEBSITE_HOST }}
+          username: ${{ env.PRODUCTION_WEBSITE_USER }}
+          key: ${{ env.PRODUCTION_WEBSITE_PRIVATE_KEY }}
+          source: "website/.next/static,website/.next/standalone,website/Dockerfile"
+          target: "/home/${{ env.PRODUCTION_WEBSITE_USER }}/axelix-website"
+          strip_components: 1
+
+      - name: Build Docker image on server and restart container
+        uses: appleboy/ssh-action@v1.2.5
+        with:
+          host: ${{ env.PRODUCTION_WEBSITE_HOST }}
+          username: ${{ env.PRODUCTION_WEBSITE_USER }}
+          key: ${{ env.PRODUCTION_WEBSITE_PRIVATE_KEY }}
+          script: |
+            set -eux
+            cd /home/${{ env.PRODUCTION_WEBSITE_USER }}
+            sudo docker compose rm -f -s website
+            sudo docker compose up --build -d website
+            # Reload nginx so it picks up refreshed TLS material / config (bind-mounted,
+            # not re-read until reload). -t first so a bad config aborts before reload.
+            sudo docker compose exec -T nginx nginx -t
+            sudo docker compose exec -T nginx nginx -s reload

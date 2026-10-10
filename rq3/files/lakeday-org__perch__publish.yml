@@ -1,0 +1,58 @@
+# Publishes @lakeday/perch to npm when a v* tag is pushed by hand. An ordinary release is cut by release-please, which tags and
+# publishes in one workflow: a tag it writes with the job's own GITHUB_TOKEN does not start another workflow, so this one would
+# never see it. This is the way back in when a release has to be made without it.
+#
+# There is no npm token. The job proves who it is with the OIDC identity GitHub gives it, which npm checks against the trusted
+# publisher configured for the package: this repository, this workflow file. A credential minted for one run and good for minutes
+# cannot leak from a settings page or expire on a Tuesday, and npm attaches a provenance attestation saying which commit and
+# which workflow built the tarball. Renaming this file, or dropping id-token below, stops publishing until npm is told.
+name: publish
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Pack and test without publishing
+        type: boolean
+        default: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # What npm exchanges for a publish credential. Without it the publish is refused, not quietly downgraded.
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org/
+          cache: npm
+
+      # Trusted publishing needs npm 11.5.1 or later, and Node 22 ships an older one.
+      - run: npm install -g npm@latest
+
+      - run: npm ci
+
+      - name: The tag must be the version being published
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          version="$(node -p 'require("./package.json").version')"
+          test "$tag" = "$version" || { echo "tag $GITHUB_REF_NAME does not match package version $version"; exit 1; }
+
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm test
+
+      - name: Show what would be published
+        run: npm pack --dry-run
+
+      - name: Publish
+        if: ${{ github.event_name == 'push' || !inputs.dry_run }}
+        run: npm publish

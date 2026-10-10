@@ -1,0 +1,107 @@
+name: Check if translation is required
+
+on:
+  pull_request:
+    types:
+      - opened
+      - reopened
+      - synchronize
+    paths:
+      - 'java/core/src/main/resources/com/redhat/rhn/frontend/strings/**'
+      - 'backend/**'
+      - 'client/rhel/yum-rhn-plugin/**'
+      - 'client/rhel/mgr-daemon/**'
+      - 'client/rhel/spacewalk-client-tools/**'
+      - 'web/**'
+      - 'susemanager/**'
+      - 'spacecmd/**'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  compute:
+    name: Compute translation requirement
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Setup tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y make git gettext intltool python3
+
+      - name: Setup git
+        run: |
+          git config --global user.name "Galaxy CI"
+          git config --global user.email "galaxy-ci@suse.de"
+
+      - name: Checkout base repo
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 #v5.0.0
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: 'master_repo'
+
+      - name: Update translation files for base
+        run: |
+          cd master_repo
+          git switch -c check_translations
+          git branch origin_check_translations
+          ADDITIONAL_SAFE_BRANCHNAME=check_translations scripts/translation/update-all-translation-strings.sh
+          cd ..
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      - name: Count translation changes for base
+        id: base
+        run: |
+          cd master_repo
+          trs=$(git diff origin_check_translations check_translations | wc -l)
+          echo "line_count=${trs}" >> "$GITHUB_OUTPUT"
+          cd ..
+
+      - name: Checkout PR repo
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 #v5.0.0
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: 'pr_repo'
+
+      - name: Update translation files for PR
+        run: |
+          cd pr_repo
+          git switch -c check_translations
+          git branch origin_check_translations
+          ADDITIONAL_SAFE_BRANCHNAME=check_translations scripts/translation/update-all-translation-strings.sh
+          cd ..
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      - name: Count translation changes for PR
+        id: pr
+        run: |
+          cd pr_repo
+          trs=$(git diff origin_check_translations check_translations | wc -l)
+          echo "line_count=${trs}" >> "$GITHUB_OUTPUT"
+          cd ..
+
+      - name: Build translation result artifact
+        run: |
+          if [[ "${{ steps.base.outputs.line_count }}" != "${{ steps.pr.outputs.line_count }}" ]]; then
+            needs_translation=true
+          else
+            needs_translation=false
+          fi
+
+          {
+            echo "pr_number=${{ github.event.pull_request.number }}"
+            echo "needs_translation=${needs_translation}"
+          } > translation-result
+
+      - name: Upload translation result
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 #v5.0.0
+        with:
+          name: translation-check-result
+          path: translation-result

@@ -1,0 +1,44 @@
+name: Go Build
+
+on:
+  push:
+    branches: ["main"]
+    paths-ignore:
+      - "data/patterns/**"
+      - "**/*.md"
+  pull_request:
+    branches: ["main"]
+    paths-ignore:
+      - "data/patterns/**"
+      - "**/*.md"
+
+jobs:
+  test:
+    name: Run tests
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: ./go.mod
+
+      - name: Run tests
+        run: go test -v ./...
+
+      - name: Run race tests
+        run: go test -race ./internal/plugins/... ./internal/server/... ./internal/core/...
+
+      - name: Check for modernization opportunities
+        run: |
+          go run golang.org/x/tools/go/analysis/passes/modernize/cmd/modernize@latest ./...
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v21
+
+      - name: Check Formatting
+        run: nix flake check

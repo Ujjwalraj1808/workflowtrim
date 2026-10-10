@@ -1,0 +1,99 @@
+name: Release - Lock and Unlock Trunk
+
+permissions: {}
+
+concurrency:
+  group: manage-trunk-restrictions
+  cancel-in-progress: false
+
+on:
+  workflow_dispatch:
+    inputs:
+      unlock:
+        description: 'Unlock trunk (uncheck to lock it)'
+        type: boolean
+        default: true
+  workflow_call:
+    inputs:
+      unlock:
+        description: 'Unlock trunk instead of locking it'
+        required: false
+        type: boolean
+        default: false
+      message:
+        description: 'Slack message override (optional)'
+        required: false
+        type: string
+        default: ''
+    secrets:
+      SELENIUM_CI_TOKEN:
+        required: true
+      SLACK_WEBHOOK_URL:
+        required: true
+
+jobs:
+  check-authorization:
+    name: Check Authorization
+    if: ${{ !inputs.unlock || github.event_name == 'workflow_dispatch' }}
+    uses: ./.github/workflows/check-authorization.yml
+
+  manage-trunk:
+    name: Manage Trunk Branch
+    needs: [check-authorization]
+    runs-on: ubuntu-latest
+    if: ${{ !cancelled() && needs.check-authorization.result != 'failure' }}
+    env:
+      GH_TOKEN: ${{ secrets.SELENIUM_CI_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Checkout ruleset definitions
+        uses: actions/checkout@v6
+        with:
+          sparse-checkout: .github/rulesets
+          sparse-checkout-cone-mode: false
+      - name: Create release rulesets
+        if: ${{ !inputs.unlock }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          existing=$(gh api "repos/$GH_REPO/rulesets")
+          for f in .github/rulesets/release-*.json; do
+            name=$(jq -r .name "$f")
+            if jq -e --arg n "$name" 'any(.[]; .name == $n)' <<<"$existing" >/dev/null; then
+              echo "Ruleset '$name' already exists; skipping"
+            else
+              echo "Creating ruleset: $name"
+              gh api -X POST "repos/$GH_REPO/rulesets" --input "$f"
+            fi
+          done
+      - name: Delete release rulesets
+        if: inputs.unlock
+        shell: bash
+        run: |
+          set -euo pipefail
+          existing=$(gh api "repos/$GH_REPO/rulesets")
+          for f in .github/rulesets/release-*.json; do
+            name=$(jq -r .name "$f")
+            while IFS= read -r id; do
+              echo "Deleting $name (id=$id)"
+              gh api -X DELETE "repos/$GH_REPO/rulesets/$id"
+            done < <(jq -r --arg n "$name" '.[] | select(.name==$n) | .id' <<<"$existing")
+          done
+
+  notify:
+    name: Send Notification
+    needs: [manage-trunk]
+    if: always() && needs.manage-trunk.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Slack Notification
+        uses: rtCamp/action-slack-notify@v2
+        env:
+          SLACK_ICON_EMOJI: ${{ inputs.unlock && ':unlock:' || ':lock:' }}
+          SLACK_COLOR: ${{ inputs.unlock && 'good' || 'danger' }}
+          SLACK_CHANNEL: selenium-tlc
+          SLACK_USERNAME: GitHub Workflows
+          SLACK_TITLE: ${{ inputs.unlock && 'Trunk unlocked' || 'Trunk locked' }}
+          SLACK_MESSAGE: "${{ inputs.message != '' && inputs.message || (inputs.unlock && 'Trunk has been unlocked.' || 'Trunk has been locked.') }} <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|view run>"
+          MSG_MINIMAL: true
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK_URL }}

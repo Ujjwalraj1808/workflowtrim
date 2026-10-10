@@ -1,0 +1,146 @@
+name: Go Package Taint
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/go-package-taint.yml
+      - modules/helpers/ubs_core/analyzers/taint_go.py
+      - modules/helpers/ubs_core/go_scan.py
+      - test-suite/quality/test_taint_go*.py
+      - modules/lib/ubs-common.sh
+      - modules/ubs-golang.sh
+      - ubs
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package-dataflow:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+      UBS_NO_AUTO_UPDATE: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Verify checked-in decoding implementation integrity
+        run: |
+          ./scripts/verify_checksums.sh
+          ./scripts/verify_sha256sums.sh
+          test -f test-suite/quality/test_taint_go_decoding.py
+      - name: Run analyzer and incremental-cache regressions
+        run: |
+          set -o pipefail
+          python3 -m unittest discover -s test-suite/quality -p 'test_taint_go*.py' -v 2>&1 | tee "$RUNNER_TEMP/go-package-tests.log"
+          PYTHONPATH=modules/helpers python3 - <<'PY'
+          from ubs_core.analyzers.taint_go import SELF_TESTS
+          for name, test in SELF_TESTS:
+              test()
+              print(name, 'PASS')
+          PY
+      - name: Install real scanner dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq ripgrep rsync shellcheck
+          npm install --global @ast-grep/cli
+      - name: Verify the complete checked-in integrity chain is reproducible
+        run: |
+          python3 scripts/update_checksums.py
+          ./scripts/update_sha256sums.sh
+          ./scripts/verify_checksums.sh
+          ./scripts/verify_sha256sums.sh
+          git diff --exit-code
+          for script in ubs modules/lib/ubs-common.sh scripts/new-module.sh modules/ubs-*.sh; do
+            bash -n "$script"
+          done
+          git diff --check
+      - name: Exercise decoded request flows through actual JSON and SARIF scanners
+        env:
+          UBS_TAINT_E2E: '1'
+        run: |
+          set -o pipefail
+          python3 -m unittest discover -s test-suite/quality -p test_taint_go_decoding.py -v 2>&1 | tee "$RUNNER_TEMP/go-package-decoding-e2e.log"
+      - name: Exercise the real scanner on cross-file source and sink pairs
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+          import tempfile
+          root = Path.cwd()
+          artifacts = root / 'test-suite/artifacts/go-package-taint'
+          cases = [
+              ('returned-input', 'func source() string { return r.FormValue("q") }', 'func h() { db.Query(source()) }', {'sql'}),
+              ('helper-sink', 'func send(v string) { exec.Command("sh", "-c", v) }', 'func h() { send(r.FormValue("q")) }', {'command'}),
+              ('html-clean', 'func escape(v string) string { return html.EscapeString(v) }', 'func h() { fmt.Fprint(w, escape(r.FormValue("q"))) }', set()),
+              ('html-not-sql', 'func escape(v string) string { return html.EscapeString(v) }', 'func h() { db.Query(escape(r.FormValue("q"))) }', {'sql'}),
+              ('safe-constant', 'func send(v string) { exec.Command("sh", "-c", v) }', 'func h() { send("echo safe") }', set()),
+              ('parameterized-sql', 'func lookup(v string) { db.Query("SELECT $1", v) }', 'func h() { lookup(r.FormValue("q")) }', set()),
+              ('forward-initializer', 'var raw = os.Getenv("QUERY")', 'var query = raw\nfunc h() { db.Query(query) }', {'sql'}),
+              ('grouped-initializer', 'var raw = os.Getenv("QUERY")', 'var (query string = raw)\nfunc h() { db.Query(query) }', {'sql'}),
+              ('clean-initializer', 'var raw = "SELECT 1"', 'var (query string = raw)\nfunc h() { db.Query(query) }', set()),
+          ]
+          for name, helper, caller, expected in cases:
+              with tempfile.TemporaryDirectory(prefix='ubs-go-package-e2e-') as tmp:
+                  project = Path(tmp)
+                  (project / 'helper.go').write_text('package app\n' + helper + '\n')
+                  (project / 'handler.go').write_text('package app\n' + caller + '\n')
+                  result = subprocess.run([str(root / 'ubs'), str(project), '--ci', '--only=golang', '--format=json'],
+                                          cwd=tmp, capture_output=True, text=True, timeout=180,
+                                          env=dict(os.environ, UBS_CACHE_DIR=str(project / 'cache')))
+                  folder = artifacts / name
+                  folder.mkdir(parents=True, exist_ok=True)
+                  (folder / 'stdout.log').write_text(result.stdout)
+                  (folder / 'stderr.log').write_text(result.stderr)
+                  assert result.returncode in (0, 1), (name, result.stdout, result.stderr)
+                  report = json.loads(result.stdout)
+                  (folder / 'result.json').write_text(json.dumps(report, indent=2))
+                  assert report['status'] == 'ok', report
+                  rules = set()
+                  def visit(value):
+                      if isinstance(value, dict):
+                          for key in ('rule', 'rule_id', 'ruleId'):
+                              rule = value.get(key)
+                              if isinstance(rule, str) and rule.startswith(('go.taint.', 'golang.taint.')):
+                                  rules.add(rule.rsplit('.', 1)[-1])
+                          for child in value.values():
+                              visit(child)
+                      elif isinstance(value, list):
+                          for child in value:
+                              visit(child)
+                  visit(report)
+                  assert rules == expected, (name, rules, expected, report)
+                  print('GO_PACKAGE_E2E_PASS', name, sorted(rules), flush=True)
+          PY
+          python3 test-suite/run_manifest.py --case golang-taint-buggy --case golang-taint-clean
+      - name: Verify tests left checked-in source unchanged
+        run: |
+          python3 scripts/update_checksums.py
+          ./scripts/update_sha256sums.sh
+          ./scripts/verify_checksums.sh
+          ./scripts/verify_sha256sums.sh
+          git diff --exit-code
+          test -z "$(git ls-files --others --exclude-standard)"
+      - name: Preserve exact candidate sources
+        if: always()
+        run: |
+          git rev-parse HEAD > "$RUNNER_TEMP/go-package-source-head.txt"
+          git ls-files -s > "$RUNNER_TEMP/go-package-source-index.txt"
+          git ls-files -z | tar --null -T - -czf "$RUNNER_TEMP/go-package-source.tar.gz"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: go-package-validation
+          path: |
+            ${{ runner.temp }}/go-package-*
+            test-suite/artifacts/go-package-taint
+            test-suite/artifacts/go-decoding
+          retention-days: 3

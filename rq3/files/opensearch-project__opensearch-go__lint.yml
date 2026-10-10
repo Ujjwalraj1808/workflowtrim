@@ -1,0 +1,103 @@
+name: Lint check
+
+on: [push, pull_request]
+
+env:
+  GITHUB_ACTIONS: true
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # golangci-lint can only compile one point in the build-tag space per
+        # run. Two mutually-exclusive boolean axes (integration/!integration and
+        # multinode/!multinode) partition the source tree, so a single tag set
+        # can never lint every file. Feature tags (core, plugins, ...) are
+        # pure-OR alternatives and union harmlessly into every run, so complete
+        # coverage needs one run per (integration, multinode) combination.
+        build-tags:
+          - "core plugins plugin_security plugin_index_management"
+          - "integration core plugins plugin_security plugin_index_management"
+          - "integration core plugins plugin_security plugin_index_management multinode"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with: { go-version-file: 'go.mod' }
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9
+        with:
+          version: v2.14.0
+          # No --fix: the runner's tree is thrown away, so a fix applied here
+          # reaches nobody and the finding neither fails the build nor lands in
+          # the repository. Report instead, and let the developer run the fixer.
+          args: --build-tags "${{ matrix.build-tags }}"
+      - name: How to fix
+        if: failure()
+        run: |
+          echo "::error::golangci-lint reported findings. Run 'make lint.local' to apply the autofixable ones, then commit the result."
+          exit 1
+
+  discover-submodules:
+    name: Discover sub-modules
+    runs-on: ubuntu-latest
+    outputs:
+      modules: ${{ steps.find.outputs.modules }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - id: find
+        # Every nested go.mod (exclude the root module, any dotdirs, and
+        # testdata fixtures) as a compact JSON array, so the lint matrix below
+        # picks up new modules with no workflow edit. Mirrors the Makefile's
+        # SUBMODULES discovery. The testdata/ exclusion is defensive:
+        # osapilint's rewrite-corpus fixtures ship as txtar archives with no
+        # go.mod on disk, but it still guards against a future testdata module.
+        run: |
+          set -euo pipefail
+          modules=$(find . -name go.mod -not -path './go.mod' -not -path '*/.*' \
+            -not -path '*/testdata/*' \
+            -exec dirname {} \; | sed 's|^\./||' | sort | jq -R . | jq -sc .)
+          echo "modules=$modules" >> "$GITHUB_OUTPUT"
+          echo "Discovered sub-modules: $modules"
+
+  lint-submodules:
+    name: Lint sub-modules
+    needs: discover-submodules
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Nested Go modules are linted separately: the root golangci-lint run
+        # does not descend into modules with their own go.mod. These modules
+        # have no build-constrained files, so a single maximal tag set covers
+        # each. The list is discovered dynamically by discover-submodules.
+        module: ${{ fromJSON(needs.discover-submodules.outputs.modules) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with: { go-version-file: '${{ matrix.module }}/go.mod' }
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9
+        with:
+          version: v2.14.0
+          working-directory: ${{ matrix.module }}
+          # No --fix; see the root lint job above.
+          args: --build-tags "integration core plugins plugin_security plugin_index_management multinode"
+      - name: How to fix
+        if: failure()
+        run: |
+          echo "::error::golangci-lint reported findings in ${{ matrix.module }}. Run 'make lint.local' to apply the autofixable ones, then commit the result."
+          exit 1
+
+  prettify:
+    name: Prettify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - name: Install dependencies
+        run: npm i -g prettier
+      - name: Check markdown files
+        run: |
+          make lint.markdown
+          git diff --exit-code || { echo "::error::Markdown files are not formatted. Run 'make lint.markdown' and commit the result."; exit 1; }

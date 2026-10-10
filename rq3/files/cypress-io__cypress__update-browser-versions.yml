@@ -1,0 +1,151 @@
+name: Update Browser Versions
+on:
+  workflow_dispatch:
+
+  schedule:
+    - cron: '0 8 * * *' #  every day at 8am UTC (3/4am EST/EDT)
+jobs:
+  update-browser-versions:
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    env:
+      BASE_BRANCH: develop
+    # Prevent from running this workflow on forks
+    if: github.repository == 'cypress-io/cypress'
+    steps:
+      - name: Generate Cypress Bot App token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
+        with:
+          client-id: ${{ secrets.CYPRESS_BOT_APP_CLIENT_ID }}
+          private-key: ${{ secrets.CYPRESS_BOT_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+          # Required to request a team (e.g. @cypress-io/app) as PR reviewer
+          permission-members: read
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ env.BASE_BRANCH }}
+          fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token }}
+      - name: Fetch remote branches
+        run: git fetch origin
+      - name: Set up Node.js
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version-file: .node-version
+      - name: install dependencies
+        run: CI=true yarn
+      - name: Check for new Chrome versions
+        id: get-versions
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        with:
+          script: |
+            const { getVersions } = require('./scripts/github-actions/update-browser-versions.js')
+
+            getVersions({ core })
+      - name: Check if an open PR already exists for the update branch
+        id: check-branch
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          BRANCH_NAME: update-browser-versions
+        run: |
+          pr_exists=$(gh pr list --repo ${{ github.repository }} --head "$BRANCH_NAME" --base "$BASE_BRANCH" --state open --json number --jq 'length > 0')
+          # A leftover branch from a closed PR would base the new PR on a stale fork point
+          if [[ "$pr_exists" != "true" ]] && git show-ref --verify --quiet "refs/remotes/origin/$BRANCH_NAME"; then
+            git push origin --delete "$BRANCH_NAME"
+          fi
+          echo "branch_name=$BRANCH_NAME" >> $GITHUB_OUTPUT
+          echo "pr_exists=$pr_exists" >> $GITHUB_OUTPUT
+      - name: Check need for PR or branch update
+        id: check-need-for-pr
+        run: |
+          echo "needs_pr=${{ steps.get-versions.outputs.has_update == 'true' && steps.check-branch.outputs.pr_exists != 'true' }}" >> $GITHUB_OUTPUT
+          echo "needs_branch_update=${{ steps.get-versions.outputs.has_update == 'true' && steps.check-branch.outputs.pr_exists == 'true' }}" >> $GITHUB_OUTPUT
+      ## Update available and a branch/PR already exists
+      - name: Checkout existing branch
+        if: ${{ steps.check-need-for-pr.outputs.needs_branch_update == 'true' }}
+        run: git checkout ${{ steps.check-branch.outputs.branch_name }}
+      - name: Check need for update on existing branch
+        if: ${{ steps.check-need-for-pr.outputs.needs_branch_update == 'true' }}
+        id: check-need-for-branch-update
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        with:
+          script: |
+            const { checkNeedForBranchUpdate } = require('./scripts/github-actions/update-browser-versions.js')
+
+            checkNeedForBranchUpdate({
+              core,
+              latestStableVersion: '${{ steps.get-versions.outputs.latest_stable_version }}',
+              latestBetaVersion: '${{ steps.get-versions.outputs.latest_beta_version }}',
+              latestChromeForTestingStableVersion: '${{ steps.get-versions.outputs.latest_chrome_for_testing_stable_version }}',
+            })
+      ## Both
+      - name: Update Browser Versions File
+        if: ${{ steps.check-need-for-pr.outputs.needs_pr == 'true' || steps.check-need-for-branch-update.outputs.has_newer_update == 'true' }}
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        with:
+          script: |
+            const { updateBrowserVersionsFile } = require('./scripts/github-actions/update-browser-versions.js')
+
+            updateBrowserVersionsFile({
+              latestStableVersion: '${{ steps.get-versions.outputs.latest_stable_version }}',
+              latestBetaVersion: '${{ steps.get-versions.outputs.latest_beta_version }}',
+              latestChromeForTestingStableVersion: '${{ steps.get-versions.outputs.latest_chrome_for_testing_stable_version }}',
+            })
+      - name: Commit and push via API
+        if: ${{ steps.check-need-for-pr.outputs.needs_pr == 'true' || steps.check-need-for-branch-update.outputs.has_newer_update == 'true' }}
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        with:
+          github-token: ${{ steps.app-token.outputs.token }}
+          script: |
+            const { join } = await import('node:path')
+            const { pathToFileURL } = await import('node:url')
+            const moduleUrl = pathToFileURL(join(process.cwd(), 'scripts/github-actions/commit-via-api.mjs')).href
+            const { commitViaApi } = await import(moduleUrl)
+
+            await commitViaApi({
+              context,
+              github,
+              baseBranch: '${{ env.BASE_BRANCH }}',
+              branchName: '${{ steps.check-branch.outputs.branch_name }}',
+              filePaths: ['.circleci/src/pipeline/@pipeline.yml'],
+              message: 'chore: ${{ steps.get-versions.outputs.description }}',
+            })
+      ## Update available and a branch/PR already exists
+      - name: Update PR Title
+        if: ${{ steps.check-need-for-pr.outputs.needs_branch_update == 'true' }}
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        with:
+          github-token: ${{ steps.app-token.outputs.token }}
+          script: |
+            const { updatePRTitle } = require('./scripts/github-actions/update-browser-versions.js')
+
+            await updatePRTitle({
+              context,
+              github,
+              baseBranch: '${{ env.BASE_BRANCH }}',
+              branchName: '${{ steps.check-branch.outputs.branch_name }}',
+              description: '${{ steps.get-versions.outputs.description }}',
+            })
+      # Update available and a PR doesn't already exist
+      - name: Create Pull Request
+        id: create-pr
+        if: ${{ steps.check-need-for-pr.outputs.needs_pr == 'true' }}
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        with:
+          github-token: ${{ steps.app-token.outputs.token }}
+          script: |
+            const { createPullRequest } = require('./scripts/github-actions/create-pull-request.js')
+
+            await createPullRequest({
+              context,
+              github,
+              baseBranch: '${{ env.BASE_BRANCH }}',
+              branchName: '${{ steps.check-branch.outputs.branch_name }}',
+              description: '${{ steps.get-versions.outputs.description }}',
+              body: 'This PR was auto-generated to update pinned Chrome (Version History), Chrome for Testing ([last-known-good-versions.json](https://googlechromelabs.github.io/chrome-for-testing/last-known-good-versions.json)), or both for CI.',
+              team_reviewers: ['app']
+            })

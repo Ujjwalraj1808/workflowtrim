@@ -1,0 +1,18 @@
+name: Lint
+on:
+  workflow_call:
+permissions:
+  actions: write
+  contents: read
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github
+      - uses: ./.github/actions/cache-checkout
+      - uses: ./.github/actions/yarn-install
+      - name: Run Lint
+        run: yarn lint

@@ -1,0 +1,67 @@
+name: Unit
+
+on: [push, pull_request]
+
+env:
+  GITHUB_ACTIONS: true
+
+jobs:
+  test:
+    name: "Tests (${{ matrix.os }})"
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macOS-latest]
+      fail-fast: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with: { go-version-file: 'go.mod' }
+      - run: go version
+      - run: make test-unit race=true
+        if: matrix.os != 'ubuntu-latest'
+      - run: make test-unit race=true coverage=true
+        if: matrix.os == 'ubuntu-latest'
+      - id: covfiles
+        # Collect every coverage profile make test-unit produced (root +
+        # each nested module) so codecov picks up new modules with no edit.
+        run: echo "files=$(ls tmp/*.cov | paste -sd, -)" >> "$GITHUB_OUTPUT"
+        if: matrix.os == 'ubuntu-latest'
+      - uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: ${{ steps.covfiles.outputs.files }}
+          flags: unit
+        if: matrix.os == 'ubuntu-latest'
+
+  bench:
+    name: Benchmarks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with: { go-version-file: 'go.mod' }
+      - run: go version
+      - run: make test-bench
+      - run: make test-alloc
+
+  modules:
+    name: Nested modules build standalone
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with: { go-version-file: 'go.mod' }
+      - run: go version
+      - run: make check-modules-standalone
+
+  samples:
+    name: Build samples
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with: { go-version-file: 'go.mod' }
+      - run: go version
+      - run: make build-samples
+

@@ -1,0 +1,101 @@
+name: Build and Publish keep-the-why-lint (PyPI)
+
+# Manual trigger only. Builds the linter package from lint/, publishes it to
+# PyPI via trusted publishing (environment "pypi"), and — only after the
+# upload succeeded — pushes a lightweight tag lint-v<version> so every PyPI
+# release points at exactly one commit, and moves the lint-latest tag the
+# GitHub Action snippet references. PyPI is the source of truth; the tags
+# are traceability, created by the same run, never by hand.
+#
+# No GitHub Release is created here: the releases page stays skill-only.
+# The lint-v* tag pattern deliberately doesn't match release.yml's v*.*.*.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Read package version
+        id: version
+        working-directory: lint
+        run: |
+          V=$(python -c "import ktw_lint; print(ktw_lint.__version__)")
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "keep-the-why-lint $V"
+
+      - name: Refuse to publish a version that is already tagged
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          if git ls-remote --exit-code --tags origin "refs/tags/lint-v$VERSION" >/dev/null 2>&1; then
+            echo "::error::tag lint-v$VERSION already exists — bump lint/ktw_lint/__init__.py first"
+            exit 1
+          fi
+
+      - name: Run test suite
+        working-directory: lint
+        run: python -m unittest discover -s tests -v
+
+      - name: Build sdist and wheel
+        working-directory: lint
+        run: |
+          python -m pip install --quiet build
+          python -m build
+          ls -l dist/
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dist
+          path: lint/dist/*
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: dist
+          path: dist
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+        with:
+          packages-dir: dist
+
+      - name: Tag the published commit
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag "lint-v$VERSION" -m "keep-the-why-lint $VERSION (PyPI)"
+          git push origin "lint-v$VERSION"
+
+      # lint-latest is the ref the GitHub Action snippet uses
+      # (uses: oliver-zehentleitner/keep-the-why@lint-latest). It follows
+      # linter publishes, not skill releases: the skill's own moving `latest`
+      # tag only advances with a skill release, which left action.yml
+      # unreachable to consumers between the first linter publish and the
+      # next skill release. See context/release-and-distribution.md.
+      - name: Move lint-latest tag
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          git tag -f lint-latest "lint-v$VERSION"
+          git push origin lint-latest --force

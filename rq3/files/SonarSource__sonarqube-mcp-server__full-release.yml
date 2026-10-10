@@ -1,0 +1,150 @@
+name: Full release
+
+on:
+  workflow_dispatch:
+    inputs:
+      short-description:
+        description: 'A short description for the release ticket'
+        required: true
+        type: string
+      branch:
+        description: 'The branch from which to release.'
+        required: false
+        default: 'master'
+        type: string
+      new-version:
+        description: 'New Jira version to create after the release (e.g. 1.19). Leave empty to auto-increment the last segment.'
+        required: false
+        type: string
+      dry-run:
+        description: 'Test mode: use Jira sandbox and create a draft GitHub release'
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  check-draft-exists:
+    name: Check draft release exists
+    runs-on: github-ubuntu-latest-s
+    # contents: write is required — draft releases are only visible to tokens with write access.
+    permissions:
+      contents: write
+    outputs:
+      release-version: ${{ steps.version.outputs.release-version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.branch }}
+
+      - name: Get release version
+        id: version
+        run: |
+          RAW=$(grep '^version=' gradle.properties | sed -E 's/^version=//; s/-SNAPSHOT$//')
+          IFS='.' read -ra PARTS <<< "$RAW"
+          while [ "${#PARTS[@]}" -lt 3 ]; do PARTS+=("0"); done
+          VERSION="${PARTS[0]}.${PARTS[1]}.${PARTS[2]}"
+          echo "release-version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Resolved release version: $VERSION"
+
+      - name: Verify draft release exists for expected version
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.version.outputs.release-version }}
+        run: |
+          echo "Expecting a draft release tagged '$VERSION'."
+          IS_DRAFT=$(gh release view "$VERSION" --json isDraft -q '.isDraft' 2>/dev/null || echo "missing")
+          if [ "$IS_DRAFT" = "true" ]; then
+            echo "Found a draft release tagged '$VERSION'. Proceeding."
+          elif [ "$IS_DRAFT" = "false" ]; then
+            echo "::error::Release '$VERSION' already exists and is published. Aborting to avoid duplicate publication."
+            exit 1
+          else
+            echo "::error::No draft release tagged '$VERSION' found. Run prepare-release-notes.yml first to generate and review the release notes."
+            exit 1
+          fi
+
+  release:
+    name: Release
+    needs:
+      - check-draft-exists
+    uses: SonarSource/release-github-actions/.github/workflows/ide-automated-release.yml@e9a93a9d84a482a3a90d750cd3079d645b7d423a # 1.9.16
+    permissions:
+      statuses: read
+      id-token: write
+      contents: write
+      actions: write
+      pull-requests: write
+    with:
+      jira-project-key: "MCP"
+      project-name: "SonarQube MCP Server"
+      short-description: ${{ inputs.short-description }}
+      branch: ${{ inputs.branch }}
+      slack-channel: "C06JQ30RV88" #squad-ide-slcore-bots
+      is-test-run: ${{ inputs.dry-run }}
+      new-version: ${{ inputs.new-version }}
+
+  bump-version:
+    name: Create a PR to bump version and update version references
+    needs: [release]
+    # Dry-run safety: never open a bot PR against master during a sandbox test
+    if: ${{ !inputs.dry-run && needs.release.result == 'success' }}
+    runs-on: github-ubuntu-latest-s
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.branch }}
+
+      - name: Update released-version references
+        env:
+          RELEASED_VERSION: ${{ needs.release.outputs.released-version }}
+        run: |
+          SHORT=$(echo "$RELEASED_VERSION" | sed -E 's/^([0-9]+\.[0-9]+\.[0-9]+)\.[0-9]+$/\1/')
+          if [[ -z "$SHORT" ]]; then
+            echo "ERROR: Could not extract 3-segment version from RELEASED_VERSION='$RELEASED_VERSION'" >&2
+            exit 1
+          fi
+          sed -i -E "s|^(ARG MCP_SERVER_VERSION=)[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$|\1${RELEASED_VERSION}|" Dockerfile
+          grep -qE "^ARG MCP_SERVER_VERSION=${RELEASED_VERSION}$" Dockerfile \
+            || { echo "ERROR: Dockerfile version was not updated" >&2; exit 1; }
+          sed -i -E "s|(\"version\":[[:space:]]*\")[0-9]+\.[0-9]+\.[0-9]+(\")|\1${SHORT}\2|" server.json
+          grep -qE "\"version\":[[:space:]]*\"${SHORT}\"" server.json \
+            || { echo "ERROR: server.json version was not updated" >&2; exit 1; }
+
+      - name: Bump gradle.properties
+        env:
+          NEW_VERSION: ${{ needs.release.outputs.new-version }}
+        run: sed -i -E "s|^version=.*|version=${NEW_VERSION}-SNAPSHOT|" gradle.properties
+
+      - uses: SonarSource/release-github-actions/create-pull-request@e9a93a9d84a482a3a90d750cd3079d645b7d423a # 1.9.16
+        with:
+          commit-message: Prepare next development iteration ${{ needs.release.outputs.new-version }}
+          title: Prepare next development iteration ${{ needs.release.outputs.new-version }}
+          branch: bot/prepare-next-development-iteration-${{ needs.release.outputs.new-version }}
+          base: ${{ inputs.branch }}
+          reviewers: ${{ github.actor }}
+
+  publish-release-notes:
+    name: Copy reviewed notes to published release
+    runs-on: github-ubuntu-latest-s
+    needs: [check-draft-exists, release]
+    if: ${{ !inputs.dry-run && needs.release.result == 'success' }}
+    permissions:
+      contents: write
+    steps:
+      - name: Copy draft body to published release and delete draft
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          DRAFT_VERSION: ${{ needs.check-draft-exists.outputs.release-version }}
+          RELEASED_VERSION: ${{ needs.release.outputs.released-version }}
+        run: |
+          echo "Copying notes from draft '$DRAFT_VERSION' to published release '$RELEASED_VERSION'..."
+          gh release view "$DRAFT_VERSION" --json body --jq '.body' > release-notes.md
+          gh release edit "$RELEASED_VERSION" --notes-file release-notes.md
+          # Draft releases do not create a git tag, so --cleanup-tag is intentionally omitted.
+          echo "Deleting draft '$DRAFT_VERSION'..."
+          gh release delete "$DRAFT_VERSION" --yes
+          echo "Done."

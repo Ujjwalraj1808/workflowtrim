@@ -1,0 +1,81 @@
+name: JavaScript Taint Domains
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - modules/helpers/ubs_core/analyzers/taint_js.py
+      - test-suite/js/test_taint_domains.py
+      - .github/workflows/javascript-taint-domains.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  scanner-regressions:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+      UBS_NO_AUTO_UPDATE: '1'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Verify committed integrity chain
+        run: |
+          ./scripts/verify_checksums.sh
+          ./scripts/verify_sha256sums.sh
+          python3 scripts/update_checksums.py
+          git diff --exit-code
+      - name: Validate source regressions
+        run: python3 test-suite/js/test_taint_domains.py
+      - name: Install end-to-end dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq ripgrep rsync shellcheck
+          npm install --global @ast-grep/cli
+      - name: Run existing JavaScript quality tests
+        run: python3 -m unittest discover -s test-suite/quality -p '*js*.py' -v
+      - name: Validate real scanner findings and clean controls
+        run: |
+          python3 - <<'PY'
+          import json
+          import subprocess
+          import tempfile
+          from pathlib import Path
+          root = Path.cwd()
+          cases = [
+              ('eval-domain', 'eval(DOMPurify.sanitize(req.query.value));', {'js.taint.eval'}, set()),
+              ('sql-bindings', 'db.query(req.query.sql, [req.query.id]);', {'js.taint.sql'}, set()),
+              ('template-command', 'const cmd = `echo ${req.query.value}`;\nshell.exec(cmd);', {'js.taint.command'}, set()),
+              ('multiline-html', 'document.write(\n req.query.html\n);', {'js.taint.xss'}, set()),
+              ('html-clean', 'const clean = DOMPurify.sanitize(req.query.value);\nres.send(clean);', set(), {'js.taint.xss'}),
+              ('sql-clean', 'db.query("SELECT * FROM users WHERE id = ?", [req.query.id]);', set(), {'js.taint.sql'}),
+          ]
+          for name, source, expected, forbidden in cases:
+              with tempfile.TemporaryDirectory(prefix='ubs-js-domains-') as tmp:
+                  path = Path(tmp) / 'app.js'
+                  path.write_text(source + '\n', encoding='utf-8')
+                  result = subprocess.run([str(root / 'ubs'), str(path), '--only=js', '--format=json', '--ci'],
+                                          cwd=tmp, text=True, capture_output=True, timeout=120)
+                  print(name, 'exit', result.returncode, result.stderr, flush=True)
+                  assert result.returncode in (0, 1), result.stdout
+                  data = json.loads(result.stdout)
+                  rules = set()
+                  def visit(value):
+                      if isinstance(value, dict):
+                          for key in ('rule', 'rule_id', 'ruleId'):
+                              if isinstance(value.get(key), str):
+                                  rules.add(value[key].replace('javascript.', 'js.'))
+                          for item in value.values():
+                              visit(item)
+                      elif isinstance(value, list):
+                          for item in value:
+                              visit(item)
+                  visit(data)
+                  assert expected <= rules, (name, expected, rules, data)
+                  assert not forbidden & rules, (name, forbidden, rules)
+                  print('JS_TAINT_E2E_PASS', name, sorted(rules), flush=True)
+          PY

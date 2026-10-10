@@ -1,0 +1,52 @@
+name: Action self-test
+
+# Dogfoods action.yml itself, end to end, the same way a real consumer's
+# workflow would invoke it (uses: Aletheore/Aletheore@vX) - every other
+# check in this repo only exercises the underlying `aletheore scan`/`diff`
+# CLI commands as unit tests, never the composite action's own wiring
+# (checkout-into-subdir, GITHUB_OUTPUT multiline heredoc, step summary,
+# conditional PR-comment step). A break in any of that would only be
+# caught by an actual user's CI failing.
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  self-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Run Aletheore action against this PR's own base/head
+        id: aletheore
+        uses: ./
+        with:
+          # post-pr-comment defaults to true - left off here on purpose,
+          # since this is a self-test of the action's own machinery, not
+          # a real product interaction, and must never post a comment onto
+          # this repo's own maintenance PRs.
+          post-pr-comment: "false"
+
+      - name: Verify the action produced a real diff-json output
+        shell: bash
+        run: |
+          # The output is JSON full of double quotes, apostrophes and parentheses
+          # (advisory titles, finding messages). Pasting it into a shell string,
+          # as this step used to, only works until the content happens to contain
+          # a character the quoting cannot absorb: a diff that resolved an
+          # advisory titled "...parse()..." failed with a bash syntax error that
+          # had nothing to do with the action. A quoted heredoc writes it to a
+          # file verbatim, with no shell interpretation and no size limit (an
+          # env var is capped at 128 KB, and this output already reaches ~80 KB).
+          cat > "$RUNNER_TEMP/diff-json-output.json" <<'ALETHEORE_SELFTEST_DIFF_JSON_EOF'
+          ${{ steps.aletheore.outputs.diff-json }}
+          ALETHEORE_SELFTEST_DIFF_JSON_EOF
+          if [ -z "$(tr -d '[:space:]' < "$RUNNER_TEMP/diff-json-output.json")" ]; then
+            echo "::error::diff-json output was empty - the action did not run to completion"
+            exit 1
+          fi
+          python3 -m json.tool < "$RUNNER_TEMP/diff-json-output.json" > /dev/null
+          echo "diff-json output is valid, non-empty JSON"

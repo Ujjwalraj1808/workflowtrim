@@ -1,0 +1,60 @@
+name: Market-maker ramp sandbox
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ramp-sandbox-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  LC_ALL: C
+  TZ: UTC
+
+jobs:
+  real-ramp-journeys:
+    name: Real provider and LayerX sandbox journeys
+    environment: ramp-sandbox
+    runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && 'ubuntu-24.04' || vars.CI_LINUX_RUNNER || 'lx-runner' }}
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Prepare private artifact directory
+        run: |
+          set -eu
+          umask 077
+          mkdir "${RUNNER_TEMP}/ramp-build-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+      - name: Build source-bound ramp artifacts once
+        env:
+          PAXEER_X_EVIDENCE_DIR: ${{ runner.temp }}/ramp-build-${{ github.run_id }}-${{ github.run_attempt }}
+          PAXEER_X_RAMP_BUILD_MANIFEST: ${{ runner.temp }}/ramp-build-${{ github.run_id }}-${{ github.run_attempt }}/artifacts.json
+        run: make interop-build-ramps
+      - name: Exercise full receipt-backed ramp contract
+        env:
+          LAYERX_DEPLOYMENT_PROFILE: private-network
+          PAXEER_X_EVIDENCE_DIR: ${{ runner.temp }}/ramp-build-${{ github.run_id }}-${{ github.run_attempt }}
+          PAXEER_X_RAMP_BUILD_MANIFEST: ${{ runner.temp }}/ramp-build-${{ github.run_id }}-${{ github.run_attempt }}/artifacts.json
+          PAXEER_X_CANDIDATE_MANIFEST: ${{ vars.RAMP_CANDIDATE_MANIFEST_FILE }}
+          LAYERX_RAMP_URL: ${{ vars.RAMP_UNIFIED_URL }}
+          LAYERX_RAMP_PUBLIC_PATH_PREFIX: /v1/ramp
+          LAYERX_RAMP_OPERATOR_URL: ${{ vars.RAMP_OPERATOR_URL }}
+          LAYERX_RAMP_AUTHORITY_URL: ${{ vars.RAMP_AUTHORITY_URL }}
+          LAYERX_RAMP_CA_PEM: ${{ vars.RAMP_CA_PEM_FILE }}
+          LAYERX_RAMP_CLIENT_CERT_PEM: ${{ vars.RAMP_CLIENT_CERT_PEM_FILE }}
+          LAYERX_RAMP_CLIENT_KEY_FILE: ${{ vars.RAMP_CLIENT_KEY_FILE }}
+          LAYERX_RAMP_CUSTOMER_TOKEN_FILE: ${{ vars.RAMP_CUSTOMER_TOKEN_FILE }}
+          LAYERX_RAMP_OTHER_CUSTOMER_TOKEN_FILE: ${{ vars.RAMP_OTHER_CUSTOMER_TOKEN_FILE }}
+          LAYERX_RAMP_OPERATOR_TOKEN_FILE: ${{ vars.RAMP_OPERATOR_TOKEN_FILE }}
+          LAYERX_RAMP_AUTHORITY_TOKEN_FILE: ${{ vars.RAMP_AUTHORITY_TOKEN_FILE }}
+          LAYERX_RAMP_INPUTS_FILE: ${{ vars.RAMP_INPUTS_FILE }}
+          LAYERX_RAMP_RECEIPT_VERIFIER_CONFIG: ${{ vars.RAMP_RECEIPT_VERIFIER_CONFIG_FILE }}
+          LAYERX_RAMP_RECOVERY_CONTRACT_CONFIG: ${{ vars.RAMP_RECOVERY_CONTRACT_CONFIG_FILE }}
+          LAYERX_RAMP_RECOVERY_CONTRACT_ORDER: ${{ vars.RAMP_RECOVERY_CONTRACT_ORDER_FILE }}
+          LAYERX_RAMP_RECOVERY_CONTRACT_CALLBACK: ${{ vars.RAMP_RECOVERY_CONTRACT_CALLBACK_FILE }}
+        run: timeout 30m tools/paxeer-x/verify-task.sh 104.26.1

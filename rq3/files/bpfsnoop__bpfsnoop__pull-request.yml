@@ -1,0 +1,49 @@
+name: Pull Request
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  fixup-and-testlocal:
+    name: fixup-and-testlocal (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-26.04
+          - arch: arm64
+            runner: ubuntu-26.04-arm
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: ./.github/actions/setup-build-environment
+
+      - name: Install gofumpt
+        run: |
+          go install mvdan.cc/gofumpt@latest
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: Show kernel version
+        run: uname -r
+
+      - name: Build bpfsnoop
+        run: make -j8
+
+      - name: Check formatting
+        run: |
+          make fixup
+          git diff --exit-code
+
+      - name: Run local tests
+        run: sudo make testlocal
+
+      - name: Run MCP tests
+        run: sudo make testmcp

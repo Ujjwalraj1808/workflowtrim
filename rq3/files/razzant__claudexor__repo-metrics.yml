@@ -1,0 +1,94 @@
+name: Repo metrics
+
+# Daily refresh of the total-downloads ledger and Shields endpoint badge (D-15).
+# Generated state is published to the dedicated `repo-metrics` branch because
+# protected `main` requires CI checks and must never receive bot bypass pushes.
+#
+# GITHUB_TOKEN push semantics: output-branch commits do NOT trigger further
+# workflow runs. Do not swap in a PAT, which could re-enable recursive triggers.
+
+on:
+  schedule:
+    # 06:17 UTC daily. Off the top of the hour to dodge cron congestion; the
+    # npm point range and GitHub cumulative counts do not care about the minute.
+    - cron: "17 6 * * *"
+  workflow_dispatch: {}
+
+# Serialize runs so a slow fetch cannot race a later scheduled run into a
+# conflicting commit. Never cancel an in-flight run mid-commit.
+concurrency:
+  group: repo-metrics
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  METRICS_BRANCH: repo-metrics
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: true
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .node-version
+
+      # The collector is dependency-free stdlib Node, so there is no install
+      # step. Prove the pure logic before touching the network or the ledger.
+      - name: Self-test the metrics collector
+        run: node scripts/update-repo-metrics.mjs --check
+
+      - name: Restore the durable npm watermark
+        run: |
+          set -euo pipefail
+          if git ls-remote --exit-code origin "refs/heads/$METRICS_BRANCH" >/dev/null 2>&1; then
+            git fetch --no-tags origin \
+              "$METRICS_BRANCH:refs/remotes/origin/$METRICS_BRANCH"
+            if git cat-file -e \
+              "origin/$METRICS_BRANCH:docs/assets/repo-metrics.csv" 2>/dev/null; then
+              git show "origin/$METRICS_BRANCH:docs/assets/repo-metrics.csv" \
+                > docs/assets/repo-metrics.csv
+            fi
+          fi
+
+      - name: Refresh metrics and badge
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node scripts/update-repo-metrics.mjs
+
+      - name: Publish generated state without touching protected main
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          publish="$RUNNER_TEMP/repo-metrics-branch"
+          new_branch=false
+          if git show-ref --verify --quiet "refs/remotes/origin/$METRICS_BRANCH"; then
+            git worktree add --detach "$publish" "origin/$METRICS_BRANCH"
+          else
+            new_branch=true
+            git worktree add -b "$METRICS_BRANCH" "$publish" HEAD
+          fi
+
+          mkdir -p "$publish/docs/assets"
+          cp docs/assets/repo-metrics.csv docs/assets/downloads-badge.json \
+            "$publish/docs/assets/"
+          cd "$publish"
+          git add docs/assets/repo-metrics.csv docs/assets/downloads-badge.json
+          if git diff --cached --quiet; then
+            if [ "$new_branch" = true ]; then
+              git push origin "HEAD:refs/heads/$METRICS_BRANCH"
+              echo "Initialized the metrics output branch from the current seed."
+              exit 0
+            fi
+            echo "No metrics change today; nothing to commit."
+            exit 0
+          fi
+          git commit -m "chore(metrics): daily repo metrics refresh"
+          git push origin "HEAD:refs/heads/$METRICS_BRANCH"

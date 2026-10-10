@@ -1,0 +1,389 @@
+name: Version Bump PR
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_branch:
+        description: Branch to update
+        required: true
+        type: string
+        default: main
+      bump:
+        description: Which segment to bump (ignored when channel=rc and current version is already an rc)
+        required: true
+        type: choice
+        default: patch
+        options:
+          - patch
+          - minor
+          - major
+      channel:
+        description: Release channel — rc builds a pre-release for testing; stable promotes to Latest
+        required: true
+        type: choice
+        default: rc
+        options:
+          - rc
+          - stable
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: version-bump-${{ github.event.inputs.target_branch }}
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    name: Bump package.json Version
+
+    steps:
+      - name: Mint bot app token
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.APP_ID }}
+          private-key: ${{ secrets.CLOUD_CODE_BOT_PRIVATE_KEY }}
+
+      - name: Checkout target branch
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.target_branch }}
+          # Use the bot token so the branch push is the bot's and triggers
+          # downstream workflows (the default GITHUB_TOKEN does not).
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+
+      - name: Configure Git author
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Bump package.json version
+        id: bump
+        env:
+          BUMP_TYPE: ${{ inputs.bump }}
+          CHANNEL: ${{ inputs.channel }}
+        run: |
+          set -euo pipefail
+
+          OLD_VERSION="$(node -p "require('./package.json').version")"
+          NEW_VERSION="$(node <<'NODE'
+          const fs = require('node:fs')
+
+          const bumpType = process.env.BUMP_TYPE
+          const channel = process.env.CHANNEL
+          const pkgPath = 'package.json'
+          const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'))
+          // Accept X.Y.Z, X.Y.Z-rc, or X.Y.Z-rc.N. Bare `-rc` (no `.N`)
+          // shows up when an earlier manual bump landed without the
+          // numeric suffix — treat it as `-rc.0` so the next rc bump
+          // produces `-rc.1` and a stable bump drops the suffix.
+          const match = String(pkg.version).match(/^(\d+)\.(\d+)\.(\d+)(-rc(?:\.(\d+))?)?$/)
+
+          if (!match) {
+            throw new Error(`Unsupported version format: ${pkg.version} (expected X.Y.Z, X.Y.Z-rc, or X.Y.Z-rc.N)`)
+          }
+
+          let major = Number(match[1])
+          let minor = Number(match[2])
+          let patch = Number(match[3])
+          // match[4] is the whole suffix (e.g. "-rc", "-rc.3", or undefined).
+          // match[5] is the explicit N. Missing N on a present suffix → 0.
+          const currentRc = match[4] === undefined ? null : (match[5] === undefined ? 0 : Number(match[5]))
+
+          const applyBaseBump = () => {
+            if (bumpType === 'major') {
+              major += 1
+              minor = 0
+              patch = 0
+            } else if (bumpType === 'minor') {
+              minor += 1
+              patch = 0
+            } else if (bumpType === 'patch') {
+              patch += 1
+            } else {
+              throw new Error(`Unsupported bump type: ${bumpType}`)
+            }
+          }
+
+          let nextVersion
+          if (channel === 'stable') {
+            // stable: drop -rc suffix if present, otherwise apply the requested bump
+            if (currentRc !== null) {
+              nextVersion = `${major}.${minor}.${patch}`
+            } else {
+              applyBaseBump()
+              nextVersion = `${major}.${minor}.${patch}`
+            }
+          } else if (channel === 'rc') {
+            // rc: increment -rc.N if already on the same base, otherwise bump base and start at -rc.1
+            if (currentRc !== null) {
+              nextVersion = `${major}.${minor}.${patch}-rc.${currentRc + 1}`
+            } else {
+              applyBaseBump()
+              nextVersion = `${major}.${minor}.${patch}-rc.1`
+            }
+          } else {
+            throw new Error(`Unsupported channel: ${channel}`)
+          }
+
+          pkg.version = nextVersion
+          fs.writeFileSync(pkgPath, `${JSON.stringify(pkg, null, 2)}\n`)
+          process.stdout.write(nextVersion)
+          NODE
+          )"
+
+          echo "old_version=${OLD_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "new_version=${NEW_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Bumped version ${OLD_VERSION} -> ${NEW_VERSION} (channel=${CHANNEL})"
+
+      - name: Prepare PR metadata
+        id: prepare
+        env:
+          TARGET_BRANCH: ${{ inputs.target_branch }}
+          NEW_VERSION: ${{ steps.bump.outputs.new_version }}
+        run: |
+          set -euo pipefail
+
+          SAFE_TARGET_BRANCH="$(echo "${TARGET_BRANCH}" | tr '/ ' '--' | tr -cd '[:alnum:]._-')"
+          PR_BRANCH="automation/version-bump/${SAFE_TARGET_BRANCH}/v${NEW_VERSION}"
+
+          echo "pr_branch=${PR_BRANCH}" >> "$GITHUB_OUTPUT"
+
+      - name: Commit and push version bump branch
+        id: branch
+        env:
+          NEW_VERSION: ${{ steps.bump.outputs.new_version }}
+          PR_BRANCH: ${{ steps.prepare.outputs.pr_branch }}
+        run: |
+          set -euo pipefail
+
+          if git diff --quiet -- package.json; then
+            echo "No changes detected in package.json."
+            exit 1
+          fi
+
+          git checkout -B "${PR_BRANCH}"
+          git add package.json
+          git commit -m "chore: bump version to ${NEW_VERSION}"
+          git push --force origin "${PR_BRANCH}"
+
+      - name: Draft release notes from commits since last tag
+        id: notes
+        run: |
+          set -euo pipefail
+
+          # Last released tag (annotated or lightweight). If the repo has
+          # no tags yet (first release), fall back to the full history.
+          LAST_TAG="$(git describe --tags --abbrev=0 2>/dev/null || true)"
+          if [ -n "${LAST_TAG}" ]; then
+            RANGE="${LAST_TAG}..HEAD"
+          else
+            RANGE="HEAD"
+          fi
+
+          FEATS="${RUNNER_TEMP}/notes-features.md"
+          FIXES="${RUNNER_TEMP}/notes-fixes.md"
+          : > "${FEATS}"
+          : > "${FIXES}"
+
+          # Group conventional commits by type. Strip the prefix/scope.
+          # Drop the version-bump commit itself (always a chore).
+          while IFS= read -r line; do
+            [ -z "${line}" ] && continue
+            msg="$(printf '%s' "${line}" | sed -E 's/^(feat|fix|chore|docs|refactor|test|infra|ci|perf|build|style)(\([^)]*\))?(!)?: //')"
+            case "${line}" in
+              feat:*|feat\(*|feat!*)
+                printf -- '- %s\n' "${msg}" >> "${FEATS}"
+                ;;
+              fix:*|fix\(*|fix!*)
+                printf -- '- %s\n' "${msg}" >> "${FIXES}"
+                ;;
+            esac
+          done < <(git log --no-merges --pretty='format:%s' "${RANGE}")
+
+          # Placeholder when a section is empty so the human notices.
+          [ -s "${FEATS}" ] || echo "- _(no \`feat:\` commits since ${LAST_TAG:-repo start} — add highlights here)_" > "${FEATS}"
+          [ -s "${FIXES}" ] || echo "- _(no \`fix:\` commits since ${LAST_TAG:-repo start} — add highlights here)_" > "${FIXES}"
+
+          echo "features_file=${FEATS}" >> "$GITHUB_OUTPUT"
+          echo "fixes_file=${FIXES}" >> "$GITHUB_OUTPUT"
+          echo "last_tag=${LAST_TAG:-<none>}" >> "$GITHUB_OUTPUT"
+
+      - name: Build pull request body
+        id: body
+        env:
+          TARGET_BRANCH: ${{ inputs.target_branch }}
+          OLD_VERSION: ${{ steps.bump.outputs.old_version }}
+          NEW_VERSION: ${{ steps.bump.outputs.new_version }}
+          BUMP_TYPE: ${{ inputs.bump }}
+          CHANNEL: ${{ inputs.channel }}
+          LAST_TAG: ${{ steps.notes.outputs.last_tag }}
+          FEATURES_FILE: ${{ steps.notes.outputs.features_file }}
+          FIXES_FILE: ${{ steps.notes.outputs.fixes_file }}
+        run: |
+          set -euo pipefail
+
+          BODY_FILE="${RUNNER_TEMP}/version-bump-pr-body.md"
+          {
+            cat <<HEADER
+          ## Summary
+          - bump \`package.json\` version from \`${OLD_VERSION}\` to \`${NEW_VERSION}\`
+          - channel: \`${CHANNEL}\` (rc → GitHub pre-release, stable → Latest)
+          - commits since \`${LAST_TAG}\` were auto-grouped below
+
+          ## How merging this PR ships the build
+          1. Merge — \`Release From Version PR\` workflow tags \`v${NEW_VERSION}\` on the merge commit
+          2. Tag triggers \`Publish All / build-release\`, which creates the GitHub Release using **this PR body as the release notes**
+          3. ToDesktop picks up the new build and rolls it out
+
+          > **Polish the sections below before merge.** The auto-fill is a starting point — rewrite for users, not for the changelog.
+
+          ## Features
+          HEADER
+            cat "${FEATURES_FILE}"
+            printf '\n## Fixes\n'
+            cat "${FIXES_FILE}"
+            cat <<FOOTER
+
+          ## Install
+          - 👉 [comfy.org/download](https://comfy.org/download)
+          FOOTER
+          } > "${BODY_FILE}"
+
+          echo "body_file=${BODY_FILE}" >> "$GITHUB_OUTPUT"
+
+      - name: Find existing version bump pull request
+        id: find_pr
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          TARGET_BRANCH: ${{ inputs.target_branch }}
+          PR_BRANCH: ${{ steps.prepare.outputs.pr_branch }}
+        run: |
+          set -euo pipefail
+
+          EXISTING_PR_NUMBER="$(gh pr list \
+            --repo "${GITHUB_REPOSITORY}" \
+            --base "${TARGET_BRANCH}" \
+            --head "${PR_BRANCH}" \
+            --state open \
+            --json number \
+            --jq '.[0].number // ""')"
+
+          if [ -n "${EXISTING_PR_NUMBER}" ]; then
+            echo "Found existing PR #${EXISTING_PR_NUMBER} for ${PR_BRANCH}."
+          else
+            echo "No existing PR found for ${PR_BRANCH}; a new PR will be created."
+          fi
+
+          echo "existing_pr_number=${EXISTING_PR_NUMBER}" >> "$GITHUB_OUTPUT"
+
+      - name: Create or update version bump pull request
+        id: upsert_pr
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          TARGET_BRANCH: ${{ inputs.target_branch }}
+          PR_BRANCH: ${{ steps.prepare.outputs.pr_branch }}
+          BODY_FILE: ${{ steps.body.outputs.body_file }}
+          NEW_VERSION: ${{ steps.bump.outputs.new_version }}
+          EXISTING_PR_NUMBER: ${{ steps.find_pr.outputs.existing_pr_number }}
+        run: |
+          set -euo pipefail
+
+          if [ -n "${EXISTING_PR_NUMBER}" ]; then
+            if ! gh pr edit "${EXISTING_PR_NUMBER}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --title "chore: bump version to ${NEW_VERSION}" \
+              --body-file "${BODY_FILE}"; then
+              echo "Failed to update existing PR #${EXISTING_PR_NUMBER}."
+              exit 1
+            fi
+          else
+            CREATE_OUTPUT=""
+            if ! CREATE_OUTPUT="$(gh pr create \
+              --repo "${GITHUB_REPOSITORY}" \
+              --base "${TARGET_BRANCH}" \
+              --head "${PR_BRANCH}" \
+              --title "chore: bump version to ${NEW_VERSION}" \
+              --body-file "${BODY_FILE}" 2>&1)"; then
+              echo "Failed to create PR for ${PR_BRANCH} -> ${TARGET_BRANCH}."
+              echo "${CREATE_OUTPUT}"
+              exit 1
+            fi
+            echo "${CREATE_OUTPUT}"
+          fi
+
+          PR_NUMBER="$(gh pr list \
+            --repo "${GITHUB_REPOSITORY}" \
+            --base "${TARGET_BRANCH}" \
+            --head "${PR_BRANCH}" \
+            --state open \
+            --json number \
+            --jq '.[0].number // ""')"
+          PR_URL="$(gh pr list \
+            --repo "${GITHUB_REPOSITORY}" \
+            --base "${TARGET_BRANCH}" \
+            --head "${PR_BRANCH}" \
+            --state open \
+            --json url \
+            --jq '.[0].url // ""')"
+
+          if [ -z "${PR_NUMBER}" ] || [ -z "${PR_URL}" ]; then
+            echo "Could not resolve PR metadata after create/update."
+            gh pr list \
+              --repo "${GITHUB_REPOSITORY}" \
+              --base "${TARGET_BRANCH}" \
+              --head "${PR_BRANCH}" \
+              --state open \
+              --json number,url
+            exit 1
+          fi
+
+          echo "pull_request_number=${PR_NUMBER}" >> "$GITHUB_OUTPUT"
+          echo "pull_request_url=${PR_URL}" >> "$GITHUB_OUTPUT"
+
+      - name: Ensure Release label exists and apply it
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ steps.upsert_pr.outputs.pull_request_number }}
+          RELEASE_LABEL: Release
+        run: |
+          set -euo pipefail
+
+          if ! gh api --silent --method GET "repos/${GITHUB_REPOSITORY}/labels/${RELEASE_LABEL}" >/dev/null 2>&1; then
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/labels" \
+              -f name="${RELEASE_LABEL}" \
+              -f color="0e8a16" \
+              -f description="Tag + GitHub Release on merge (set by Version Bump PR)" >/dev/null
+          fi
+
+          gh pr edit "${PR_NUMBER}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --add-label "${RELEASE_LABEL}"
+
+      - name: Print results
+        env:
+          CHANNEL: ${{ inputs.channel }}
+          NEW_VERSION: ${{ steps.bump.outputs.new_version }}
+          PR_URL: ${{ steps.upsert_pr.outputs.pull_request_url }}
+        run: |
+          echo "pull_request_url=${PR_URL}"
+          echo "channel=${CHANNEL}"
+          echo "post_merge_tag=v${NEW_VERSION}"
+          if [ "${CHANNEL}" = "rc" ]; then
+            echo "GitHub will mark v${NEW_VERSION} as Pre-release on tag push."
+          else
+            echo "GitHub will mark v${NEW_VERSION} as Latest on tag push."
+          fi
+          echo ""
+          echo "Tip: add the 'automerge' label to ${PR_URL} once you're"
+          echo "happy with the notes — the PR will merge as soon as CI is green."

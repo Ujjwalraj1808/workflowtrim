@@ -1,0 +1,195 @@
+name: Build and push Docker image
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    # Re-run on PRs that could plausibly change any image. The image
+    # variants build in parallel via the matrix below; doc-only PRs are
+    # still skipped.
+    paths:
+      - "Dockerfile"
+      - "go.mod"
+      - "go.sum"
+      - "cmd/**"
+      - "internal/**"
+      - "web/**"
+      - "design-system/**"
+      - "tests/sdk-monitor/**"
+      - ".github/workflows/build-image.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write  # for keyless cosign signing via Sigstore OIDC
+
+concurrency:
+  # One concurrency group per ref. The matrix below already parallelizes
+  # the two images within a single run; the group then queues *across*
+  # runs so back-to-back pushes to the same ref don't race to publish
+  # the same tag (workflow-level concurrency can't reference matrix
+  # variables, so per-image scoping isn't possible without restructuring).
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # Image builds shouldn't be canceled mid-flight: a half-pushed
+  # multi-arch manifest is recoverable but better avoided. Tests can be
+  # canceled (test.yml does), publishes shouldn't.
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build ${{ matrix.display_name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      # Don't cancel the server build if the web build fails (or vice
+      # versa) — they're independent images.
+      fail-fast: false
+      matrix:
+        include:
+          - image: e2a
+            display_name: server image
+            context: .
+            dockerfile: Dockerfile
+          - image: e2a-web
+            display_name: web image
+            # Repo root: the web image needs the sibling @e2a/ui workspace
+            # (file:../design-system). web/Dockerfile.dockerignore trims the
+            # context. See web/Dockerfile.
+            context: .
+            dockerfile: web/Dockerfile
+          - image: e2a-prober
+            display_name: prober image
+            # The critical-path self-test runner (cmd/e2a-prober), co-versioned
+            # with the server so the hosted deploy pins it to the same tag.
+            context: .
+            dockerfile: Dockerfile.prober
+          - image: e2a-sdk-monitor
+            display_name: SDK monitor image
+            # Continuously exercises the *published* client surfaces (raw API,
+            # Python SDK, MCP, TypeScript SDK, CLI) against prod
+            # (tests/sdk-monitor). Context is deliberately the service directory,
+            # not the repo root: the build must not be able to see sdks/python,
+            # sdks/typescript, or cli/, so every dependency can only come from a
+            # real PyPI/npm install of the published package.
+            context: tests/sdk-monitor
+            dockerfile: tests/sdk-monitor/Dockerfile
+    steps:
+      - uses: actions/checkout@v7
+
+      # QEMU registers binfmt_misc handlers so this amd64 runner can
+      # cross-build arm64 layers under emulation. Without this step the
+      # arm64 build fails with "exec format error" — buildx alone does
+      # not install the emulators.
+      - uses: docker/setup-qemu-action@v4
+      - uses: docker/setup-buildx-action@v4
+
+      # Skip login on PR builds: we don't push from a PR, and PRs from
+      # forks only get a read-only GITHUB_TOKEN anyway.
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/metadata-action@v6
+        id: meta
+        with:
+          images: ghcr.io/tokencanopy/${{ matrix.image }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=sha,prefix=sha-,format=long
+            # "latest" tracks the newest stable release, not the tip of
+            # main, so `docker pull …:latest` is never an untested build.
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+
+      - uses: docker/build-push-action@v7
+        id: build
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          # Build on PRs to verify the Dockerfile still works, but only
+          # push on real branch/tag/manual events.
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          platforms: linux/amd64,linux/arm64
+          # Per-image cache scopes — without scoping, the two matrix
+          # entries would clobber each other's cache and rebuild from
+          # scratch every time.
+          cache-from: type=gha,scope=${{ matrix.image }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image }}
+          # Supply-chain transparency for OSS images: provenance records
+          # how the image was built; SBOM enumerates installed packages.
+          # Both are attached as in-toto attestations on the registry.
+          provenance: mode=max
+          sbom: true
+
+      - name: Install cosign
+        if: github.event_name != 'pull_request'
+        uses: sigstore/cosign-installer@v3
+
+      # Keyless signing: the workflow's OIDC token gets exchanged for a
+      # short-lived cert from Sigstore's Fulcio CA. No long-lived keys
+      # to manage or rotate. Verify with:
+      #   cosign verify ghcr.io/tokencanopy/<image>:<tag> \
+      #     --certificate-identity-regexp '^https://github\.com/tokencanopy/e2a/' \
+      #     --certificate-oidc-issuer https://token.actions.githubusercontent.com
+      - name: Sign image with cosign
+        if: github.event_name != 'pull_request'
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          images=""
+          for tag in ${TAGS}; do
+            images+="${tag}@${DIGEST} "
+          done
+          cosign sign --yes ${images}
+
+  # Every v* tag must surface as a *published* GitHub Release. Downstream
+  # automation keys off the Release object, not the git tag: the hosted-ops
+  # release poller discovers new versions via `gh release list`, and
+  # publish-cli.yml triggers on `release: published`. v1.0.9, v1.0.10, and
+  # v1.0.10-hotfix.1 existed only as bare tags, so neither ever fired.
+  # Runs after the image builds so a Release never advertises a version
+  # whose images aren't pullable yet. Idempotent: an already-published
+  # Release is left untouched; a hand-created draft is published in place.
+  #
+  # KNOWN LIMIT: a Release created with the workflow's GITHUB_TOKEN does
+  # NOT fire other workflows' `release: published` triggers (GitHub's
+  # recursion guard) — so this closes the poller gap (`gh release list`
+  # sees the Release regardless of author) but publish-cli.yml still won't
+  # auto-fire off it; run it via workflow_dispatch, or publish the release
+  # by hand as before. No regression: a bare tag fired nothing either.
+  release:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Ensure a published release exists for the tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if gh release view "$TAG" --json isDraft --jq '.isDraft' > is_draft.txt 2>/dev/null; then
+            if [ "$(cat is_draft.txt)" = "true" ]; then
+              echo "Draft release exists for $TAG — publishing it."
+              gh release edit "$TAG" --draft=false
+            else
+              echo "Release $TAG already published — nothing to do."
+            fi
+          else
+            gh release create "$TAG" --verify-tag --title "$TAG" --generate-notes
+          fi

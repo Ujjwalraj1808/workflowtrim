@@ -1,0 +1,162 @@
+name: Project
+
+on:
+  pull_request:
+  push:
+    branches: [master, mq-working-branch-master-*]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref == 'refs/heads/master' && github.run_id || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  actionlint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: .github
+      - uses: ./.github/actions/node/latest
+      - name: actionlint
+        id: actionlint
+        uses: raven-actions/actionlint@3d39aea434753780c3b3d4a1a31c854b4dbf49d7 # v2.2.0
+        with:
+          matcher: true
+          fail-on-error: true
+          shellcheck: true
+      - name: actionlint Summary
+        if: ${{ steps.actionlint.outputs.exit-code != 0 }}
+        run: |
+          echo "Used actionlint version ${{ steps.actionlint.outputs.version-semver }}"
+          echo "Used actionlint release ${{ steps.actionlint.outputs.version-tag }}"
+          echo "actionlint ended with ${{ steps.actionlint.outputs.exit-code }} exit code"
+          echo "actionlint ended because '${{ steps.actionlint.outputs.exit-message }}'"
+          echo "actionlint found ${{ steps.actionlint.outputs.total-errors }} errors"
+          echo "actionlint checked ${{ steps.actionlint.outputs.total-files }} files"
+          echo "actionlint cache used: ${{ steps.actionlint.outputs.cache-hit }}"
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/node/latest
+      - uses: ./.github/actions/install
+      - run: npm run lint
+
+  lint-windows:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/node/latest
+      - uses: ./.github/actions/install
+      - run: npm run lint
+
+  lint-editorconfig:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: docker build -q -t ec .github/editorconfig-checker && docker run --rm --volume="$PWD":/check ec
+
+  release-scripts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/node/latest
+      - uses: ./.github/actions/install
+      - run: npm run test:release
+      - run: npm run test:scripts
+
+  generated-config-types:
+    runs-on: ubuntu-latest
+    name: Generated config types
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/node/latest
+      - run: npm run verify:config:types
+
+  generated-rewriter-targets:
+    runs-on: ubuntu-latest
+    name: Generated rewriter targets
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/node/latest
+      - run: npm run verify:rewriter:targets
+
+  workflow-job-names:
+    runs-on: ubuntu-latest
+    name: Workflow job names (unique)
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: |
+            .github
+            scripts/verify-workflow-job-names.js
+      - uses: ./.github/actions/node/latest
+      - run: npm install yaml
+      - run: node scripts/verify-workflow-job-names.js
+
+  # The package size is especially useful in constrained environments, so the
+  # computation is done only on the package that would be installed there.
+  # In order to do that, the current folder is wiped and replaced with what
+  # would be installed is those environments before running the computation.
+  package-size-report:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+    steps:
+      - uses: DataDog/dd-octo-sts-action@c85802a58e202b7e764b5441e4378c76043c8108 # v1.0.5
+        id: octo-sts
+        with:
+          scope: DataDog/dd-trace-js
+          policy: package-size-report
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/node/latest
+      - run: FILENAME=$(npm pack --silent --pack-destination /tmp) && mv /tmp/"$FILENAME" /tmp/dd-trace.tgz
+      - run: rm -rf ./*
+      - run: tar -zxf /tmp/dd-trace.tgz -C "$(pwd)" --strip-components=1
+      - run: yarn --prod --ignore-optional
+      - run: ls -lisa
+      - name: Compute module size tree and report
+        uses: qard/heaviest-objects-in-the-universe@1e02edbdda803a45537a808ede97866db47756d3 # Unreleased
+        with:
+          github-token: ${{ steps.octo-sts.outputs.token }}
+
+  static-analysis:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+    name: Datadog Static Analyzer
+    if: github.actor != 'dependabot[bot]' && github.event_name != 'pull_request'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/dd-sts-api-key
+        id: dd-sts-api-key
+      - uses: ./.github/actions/dd-sts-app-key
+        id: dd-sts-app-key
+      - name: Check code meets quality and security standards
+        id: datadog-static-analysis
+        uses: DataDog/datadog-static-analyzer-github-action@8340f18875fcefca86844b5f947ce2431387e552 # v3.0.0
+        with:
+          dd_api_key: ${{ steps.dd-sts-api-key.outputs.api_key }}
+          dd_app_key: ${{ steps.dd-sts-app-key.outputs.app_key }}
+          dd_site: datadoghq.com
+          cpu_count: 2
+
+  typescript:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/node/latest
+      - uses: ./.github/actions/install
+      - run: npm run type:doc:test
+      - run: npm run type:doc:build
+
+  # TODO: Remove need for `npm show` before re-enabling to avoid rate limit errors.
+  # verify-yaml:
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+  #     - uses: ./.github/actions/node/latest
+  #     - uses: ./.github/actions/install
+  #     - run: node scripts/verify-ci-config.js

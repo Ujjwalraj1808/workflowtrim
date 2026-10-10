@@ -1,0 +1,180 @@
+name: DR backup freshness monitor
+
+# Off-platform monitor: runs in GitHub (not GCP) so it survives a full GCP
+# compromise. If the nightly backup pipeline dies silently, this catches it.
+#
+# Required secrets:
+#   AWS_BACKUP_READONLY_ACCESS_KEY_ID
+#   AWS_BACKUP_READONLY_SECRET_ACCESS_KEY
+#   DR_MONITOR_DISCORD_WEBHOOK
+#
+# Setup: see docs/DISASTER-RECOVERY.md § "Backup freshness monitor".
+
+on:
+  schedule:
+    # Daily at 14:00 UTC (~9h after the 1am ET backup window).
+    - cron: "0 14 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  check-freshness:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_BACKUP_READONLY_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_BACKUP_READONLY_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: us-east-1
+      BUCKET: nomadkaraoke-backup
+      DISCORD_WEBHOOK: ${{ secrets.DR_MONITOR_DISCORD_WEBHOOK }}
+
+    steps:
+      - name: Verify required secrets are set
+        run: |
+          missing=0
+          for var in AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY DISCORD_WEBHOOK; do
+            if [ -z "${!var}" ]; then
+              echo "::error::Required secret $var is empty"
+              missing=1
+            fi
+          done
+          [ "$missing" = "0" ] || exit 1
+
+      - name: Install boto3
+        run: pip install --quiet boto3
+
+      - name: Check freshness of each tracked prefix
+        id: check
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import os, sys, datetime, boto3
+
+          BUCKET = os.environ["BUCKET"]
+          # (label, prefix, max_age_hours, require_suffix)
+          # require_suffix: only objects with this key suffix count toward
+          # freshness (None = any object).
+          # NOTE: Firestore and BigQuery export to GCS staging nightly but are
+          # only uploaded to S3 *weekly* (Sundays) to cut cross-cloud egress —
+          # see backup_to_aws/main.py (firestore_to_s3_today). This monitor only
+          # sees the S3 (off-site) copy, so their limits must allow a full week
+          # plus slack (192h ≈ 8 days), NOT the 36h nightly cadence. Secrets DO
+          # upload to S3 nightly, so they stay at 36h. GCS job files are NOT
+          # tracked: their off-site copy was stopped 2026-10-01 (egress cost
+          # cut) — they rely on GCS versioning + soft-delete only.
+          # Git repos are also weekly (Sundays) AND incremental since
+          # 2026-09-26 — only repos pushed that week get a fresh bundle, so a
+          # quiet week legitimately leaves every .bundle older than 8 days.
+          # Freshness is judged on git-repos/manifest.json instead (rewritten
+          # every weekly run), and the manifest's contents are checked below so
+          # a run where every repo failed still reads as stale.
+          TARGETS = [
+              ("Firestore",         "firestore/",              192, None),
+              ("Encrypted secrets", "secrets/",                36,  None),
+              ("BigQuery weekly",   "bigquery/daily-refresh/", 192, None),
+              ("Git repos",         "git-repos/manifest.json", 192, None),
+          ]
+
+          s3 = boto3.client("s3")
+          now = datetime.datetime.now(datetime.timezone.utc)
+          stale, ok = [], []
+
+          # Paginated scan — JMESPath --query on `aws s3api list-objects-v2`
+          # operates per-page, which silently breaks "newest across all pages"
+          # queries on prefixes with >1000 objects (e.g. firestore/ has ~22k).
+          paginator = s3.get_paginator("list_objects_v2")
+          for label, prefix, max_hours, require_suffix in TARGETS:
+              latest = None
+              for page in paginator.paginate(Bucket=BUCKET, Prefix=prefix):
+                  for obj in page.get("Contents", []):
+                      if require_suffix and not obj["Key"].endswith(require_suffix):
+                          continue
+                      if latest is None or obj["LastModified"] > latest:
+                          latest = obj["LastModified"]
+
+              if latest is None:
+                  stale.append(f"{label}: NO OBJECTS in s3://{BUCKET}/{prefix}")
+                  continue
+              age = (now - latest).total_seconds()
+              age_h = int(age // 3600)
+              line = f"{label}: {age_h}h old (limit {max_hours}h) — last {latest.isoformat()}"
+              (stale if age > max_hours * 3600 else ok).append(line)
+
+          # Git manifest contents: ANY bundle error alerts, even though the
+          # manifest itself is fresh. The git step is weekly + incremental, so
+          # a repo that failed keeps an ever-older S3 bundle until the next
+          # Sunday — silence here would let it drift past the 7-day RPO.
+          try:
+              import json as _json
+              m = _json.loads(s3.get_object(Bucket=BUCKET, Key="git-repos/manifest.json")["Body"].read())
+              if int(m.get("errors", 0)) > 0:
+                  failed = [r.get("full_name") for r in m.get("repos", []) if r.get("status") == "error"]
+                  stale.append(f"Git repos: last run had {m.get('errors')} bundle errors: {', '.join(failed[:10])}")
+          except Exception as e:  # noqa: BLE001
+              stale.append(f"Git repos: could not read manifest.json ({e})")
+
+          summary = ["## DR backup freshness", ""]
+          if stale:
+              summary.append("### Stale")
+              summary.extend(f"- {s}" for s in stale)
+              summary.append("")
+          summary.append("### Fresh")
+          summary.extend(f"- {o}" for o in ok)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+              f.write("\n".join(summary) + "\n")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"ok_count={len(ok)}\n")
+              f.write(f"stale_count={len(stale)}\n")
+              if stale:
+                  f.write("STALE_LIST<<EOF\n")
+                  f.write("\n".join(stale) + "\n")
+                  f.write("EOF\n")
+
+          for o in ok:
+              print("OK:", o)
+          if stale:
+              for s in stale:
+                  print("STALE:", s, file=sys.stderr)
+              sys.exit(1)
+          PY
+
+      - name: Alert Discord on stale backup
+        if: failure() && steps.check.outputs.stale_count != ''
+        env:
+          STALE: ${{ steps.check.outputs.STALE_LIST }}
+        run: |
+          payload=$(jq -n \
+            --arg title "🚨 DR backup is stale" \
+            --arg desc "$STALE" \
+            --arg url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            '{
+               embeds: [{
+                 title: $title,
+                 description: $desc,
+                 color: 15158332,
+                 fields: [{name: "Workflow run", value: $url}]
+               }]
+             }')
+          curl -fsS -X POST -H "Content-Type: application/json" \
+            -d "$payload" "$DISCORD_WEBHOOK"
+
+      - name: Alert Discord on workflow failure (catch-all)
+        if: failure() && steps.check.outputs.stale_count == ''
+        run: |
+          payload=$(jq -n \
+            --arg title "⚠️ DR freshness monitor failed to run" \
+            --arg desc "Could not list S3 backup bucket — credentials, network, or bucket policy may be broken." \
+            --arg url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            '{
+               embeds: [{
+                 title: $title,
+                 description: $desc,
+                 color: 15844367,
+                 fields: [{name: "Workflow run", value: $url}]
+               }]
+             }')
+          curl -fsS -X POST -H "Content-Type: application/json" \
+            -d "$payload" "$DISCORD_WEBHOOK"

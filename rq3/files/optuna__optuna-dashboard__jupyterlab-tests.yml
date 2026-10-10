@@ -1,0 +1,58 @@
+name: tests
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/jupyterlab-tests.yml'
+      - '**.py'
+      - '**.ts'
+      - '**.tsx'
+      - 'optuna_dashboard/package.json'
+      - 'tslib/react/package.json'
+      - 'tslib/storage/package.json'
+      - 'pnpm-lock.yaml'
+      - 'pnpm-workspace.yaml'
+      - 'jupyterlab/pyproject.toml'
+      - 'jupyterlab/package.json'
+      - 'jupyterlab/yarn.lock'
+      - 'jupyterlab/tsconfig.json'
+
+permissions:
+  contents: read
+
+jobs:
+  test-build:
+    name: Test build for JupyterLab extension
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
+        with:
+          python-version: '3.13'
+      
+      - name: Install dependencies
+        working-directory: jupyterlab
+        run: |
+          uv venv
+          uv pip install --exclude-newer="2 days" --upgrade pip setuptools build
+          uv pip install --exclude-newer="2 days" jupyterlab
+      
+      - name: Setup pnpm
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413  # v6.1.0
+
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
+        with:
+          node-version: '24'
+
+      # Prime JupyterLab's Yarn environment before the extension build.
+      - name: Install JupyterLab frontend dependencies
+        working-directory: jupyterlab
+        run: uv run --no-sync jlpm install --immutable
+      
+      - run: make jupyterlab-extension

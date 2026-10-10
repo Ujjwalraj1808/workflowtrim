@@ -1,0 +1,208 @@
+name: check
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+
+jobs:
+  go:
+    name: Go quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v7
+        with:
+          go-version: 1.27.0
+          cache: true
+      - name: Format
+        run: test -z "$(gofmt -l $(find . -name '*.go' -not -path './frontend/node_modules/*'))"
+      - run: go vet ./...
+      - run: go test ./...
+
+  journal:
+    name: Linux journald logging acceptance
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+      - uses: actions/setup-go@v7
+        with:
+          go-version: 1.27.0
+          cache: true
+      - name: Run opt-in user-journal integration test
+        env:
+          HERDR_TEST_JOURNAL: "1"
+        run: go test ./cmd/herdr-mobile-relay -run '^TestJournalIntegration$' -count=1 -v
+
+  # The race detector more than doubles the Go suite, and the shell suites are
+  # unrelated to it. Both used to sit behind `go test` in one serial job and
+  # decided when every later job could start.
+  race:
+    name: Go race detector
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v7
+        with:
+          go-version: 1.27.0
+          cache: true
+      - run: go test -race ./...
+
+  shell:
+    name: Shell and production paths
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.0
+      - uses: actions/setup-go@v7
+        with:
+          go-version: 1.27.0
+          cache: true
+      - run: make shell-check production-path-audit
+
+  frontend:
+    name: Frontend and mobile browsers (Bun 1.4)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.0
+      - uses: actions/setup-go@v7
+        with:
+          go-version: 1.27.0
+          cache: true
+      - run: bun install --frozen-lockfile --cwd frontend
+      # Native browsers instead of the multi-GB Playwright container image:
+      # the binaries are the same Playwright-pinned builds either way, and no
+      # assertion in the suite depends on the image's font set. Ubuntu is a
+      # supported install-deps target; Fedora is not, which is why the
+      # container path in run-browser-tests.sh stays for local Fedora runs.
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('frontend/bun.lock') }}
+      - run: cd frontend && bun x playwright install --with-deps chromium webkit
+      - run: make frontend-check
+      - run: make web-release-check
+
+  # Bundles are one of the things this workflow checks, not something it
+  # publishes, so they no longer wait behind the test jobs: a red run fails on
+  # its own job and a green run stops paying for the serial hop.
+  release:
+    name: Complete release bundles
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v7
+        with:
+          go-version: 1.27.0
+          cache: true
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.0
+      - name: Build, manifest, checksum, and offline-verify four targets
+        run: |
+          make cross-build
+          version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' herdr-plugin.toml)"
+          scripts/package-release.sh "$version" "$GITHUB_SHA" dist/release
+          scripts/check-installed-release.sh \
+            "dist/release/herdr-mobile-relay_${version}_linux_amd64.tar.gz" \
+            dist/release/checksums.txt "$version" "$GITHUB_SHA" linux/amd64
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-bundles
+          path: dist/release/
+          retention-days: 1
+
+  release-native-smoke:
+    name: Native release smoke (${{ matrix.target }})
+    needs: release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: linux_amd64
+          - runner: ubuntu-24.04-arm
+            target: linux_arm64
+          - runner: macos-15-intel
+            target: darwin_amd64
+          - runner: macos-15
+            target: darwin_arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: release-bundles
+          path: dist/release
+      - name: Exercise packaged relay on its native target
+        run: |
+          version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' herdr-plugin.toml)"
+          target="${{ matrix.target }}"
+          scripts/check-installed-release.sh \
+            "dist/release/herdr-mobile-relay_${version}_${{ matrix.target }}.tar.gz" \
+            dist/release/checksums.txt "$version" "$GITHUB_SHA" \
+            "${target%_*}/${target#*_}"
+
+  mobile-host-check:
+    name: Mobile harness checks
+    # Temporarily disabled while mobile CI is isolated on ci-mobile.
+    if: ${{ github.event_name == 'herdr-mobile-check-disabled' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.0
+      - uses: actions/setup-go@v7
+        with:
+          go-version: 1.27.0
+          cache: true
+      - name: Install required XML test tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxml2-utils
+      - run: make mobile-ci-check
+
+  mobile:
+    name: Mobile device CI
+    # Temporarily disabled alongside mobile-host-check and the release caller.
+    if: ${{ github.event_name == 'herdr-mobile-check-disabled' }}
+    needs: [release, mobile-host-check]
+    uses: ./.github/workflows/mobile-ci.yml
+    with:
+      artifact_run_id: ${{ github.run_id }}
+      artifact_name: release-bundles
+      candidate_commit: ${{ github.sha }}
+      head_commit: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+      platform: all
+      suite: ${{ github.ref == 'refs/heads/dev' && 'smoke' || 'release' }}
+      baseline_set: ${{ github.ref == 'refs/heads/dev' && 'latest' || 'all' }}
+    permissions:
+      actions: read
+      contents: read

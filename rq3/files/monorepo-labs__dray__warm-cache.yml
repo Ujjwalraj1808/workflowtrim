@@ -1,0 +1,75 @@
+name: Warm cache
+
+# Exists for the cache it leaves behind, and for being the only thing that
+# compiles the browser.
+#
+# The `cef` feature is off by default, so `cargo check`, `cargo test` and
+# everything run by hand skip `src/cef/` entirely — and the build below is the
+# one place on `main` that turns it on. Whatever else this job is for, a red
+# run here means the browser does not compile.
+#
+# The release workflow only ever runs on a tag, and GitHub scopes cache *reads*
+# to the ref that wrote them plus the default branch. So each release wrote a
+# 668 MiB cache under its own `refs/tags/…` scope that no later release could
+# ever read — three identical keys, three separate scopes, `No cache found.`
+# every time — and every build compiled the dependency tree from cold. That was
+# ~19 of the ~20 minutes. `main` is the one scope a tag build can read.
+#
+# The cache key, paths and everything feeding them live in
+# .github/actions/desktop-setup, which the release job runs too.
+
+on:
+  push:
+    branches: [main]
+    # The cache turns over on the Rust dependency graph, so frontend-only
+    # commits have nothing to warm.
+    paths:
+      - "apps/desktop/src-tauri/**"
+      - ".github/workflows/warm-cache.yml"
+      - ".github/actions/desktop-setup/**"
+  workflow_dispatch:
+
+# Superseded runs are left to finish. Cancelling saved runner minutes back when
+# the cache was all this produced, but the build is also the compile signal for
+# the browser now, and the push that supersedes a run is usually the release
+# bump minutes behind it — which is exactly how DRA-166's fix reached a tag with
+# its own run cancelled and nothing having compiled `cef.rs`.
+concurrency:
+  group: warm-cache
+  cancel-in-progress: false
+
+env:
+  # Incremental artifacts are worthless across machines and are most of what a
+  # target dir weighs. rust-cache used to set this; a plain cache does not.
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  warm:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: setup
+        uses: ./.github/actions/desktop-setup
+
+      # Compiled the way the release compiles it, rather than with a bare
+      # `cargo build --release`. `tauri build` turns on production features —
+      # `custom-protocol` among them — which change the feature set of `tauri`
+      # and of everything depending on it, so artifacts built without them are
+      # unusable to the release. Measured on v0.1.1: the cache restored a full
+      # match and the release still rebuilt 79 crates, tauri, ring and
+      # libgit2-sys included, for 15 of its 17 minutes.
+      #
+      # `--no-bundle` stops before bundling, so this needs no signing key and no
+      # Apple credentials, and produces nothing but the cache. It runs
+      # `beforeBuildCommand` itself, which is why there is no separate frontend
+      # build step.
+      - run: pnpm tauri build --no-bundle --target universal-apple-darwin --features cef
+        working-directory: apps/desktop
+
+      # The setup action only restores; this is the one job that writes.
+      - if: steps.setup.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ steps.setup.outputs.cache-path }}
+          key: ${{ steps.setup.outputs.cache-key }}

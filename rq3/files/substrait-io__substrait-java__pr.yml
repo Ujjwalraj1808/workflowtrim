@@ -1,0 +1,142 @@
+name: PR Build Check
+
+on:
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  editorconfig-checker:
+    name: Check editorconfig
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: editorconfig-checker/action-editorconfig-checker@v3.0.0
+      - run: editorconfig-checker
+  yamllint:
+    name: Lint YAML
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.14'
+      - uses: pre-commit/action@v3.0.1
+        with:
+          extra_args: yamllint --all-files
+  security:
+    name: Security validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: gradle/actions/wrapper-validation@v6.4.0
+  osv-scanner:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        project:
+          - core
+          - isthmus
+          - isthmus-cli
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v6
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v6.4.0
+      - name: Scan
+        id: scan
+        run: make scan-${{ matrix.project }}
+        env:
+          OSV_SCANNER_ARGS: --format=markdown --output-file=osv-scanner.md
+      - name: Report failure
+        if: ${{ failure() && steps.scan.conclusion == 'failure' }}
+        run: |
+          cat osv-scanner.md >> ${GITHUB_STEP_SUMMARY}
+  java:
+    name: Build and Test Java
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Set up JDK 17
+        uses: actions/setup-java@v6
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v6.4.0
+      - name: Build with Gradle
+        run: ./gradlew build --rerun-tasks
+  integration:
+    name: Integration tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Set up JDK 17
+        uses: actions/setup-java@v6
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v6.4.0
+      - name: Build with Gradle
+        run: ./gradlew integrationTest
+  isthmus-native-image-linux:
+    # Only the Linux native image is built per PR: it validates the GraalVM
+    # configuration and runs the smoke tests, and its binary is throwaway (only
+    # smoke-tested, never shipped). macOS-specific native coverage runs in
+    # native-image-macos.yml (on push to main + a weekly schedule), keeping the
+    # slow, 10x-billed macOS build off the PR critical path. This job also runs
+    # in parallel with the java/integration jobs rather than after them.
+    name: Build Isthmus Native Image
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest]
+    steps:
+    - uses: actions/checkout@v7
+    - uses: actions/setup-java@v6
+      with:
+        java-version: 25
+        distribution: graalvm
+    - name: Setup Gradle
+      uses: gradle/actions/setup-gradle@v6.4.0
+    - name: Report Java Version
+      run: java -version
+    - name: Build with Gradle
+      run: |
+        # --quick-build-native (-Ob) trades binary runtime performance for a
+        # much faster build; the PR binary is only smoke-tested, so this is free.
+        ./gradlew nativeCompile --quick-build-native
+    - name: Smoke Test
+      run: |
+        ./isthmus-cli/src/test/script/smoke.sh
+        ./isthmus-cli/src/test/script/tpch_smoke.sh
+    - name: Rename the artifact to OS-unique name
+      working-directory: isthmus-cli/build/native/nativeCompile
+      run: mv isthmus isthmus-${{ matrix.os }}
+    - name: Publish artifact
+      uses: actions/upload-artifact@v7
+      with:
+        name: isthmus-${{ matrix.os }}
+        path: isthmus-cli/build/native/nativeCompile/isthmus-${{ matrix.os }}
+  dry-run-release:
+    name: Dry-run release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+      - name: Check current status before next release
+        run: ./ci/release/dry_run.sh

@@ -1,0 +1,216 @@
+# 打 tag 就出安装包。用法：**先把 package.json 的 version 改成同一个号**，
+# 再 git tag v0.1.1 && git push origin v0.1.1。完整清单在 docs/发版.md。
+#
+# 为什么 Windows 包必须在 CI 上打：开发机是 Mac，没装 wine，electron-builder 造不出 NSIS 安装器。
+# 所以 Windows 那份是这条流水线第一次真正跑出来的产物——它没在开发机上被人工验证过，
+# 谁先装谁就是第一个测试者，有问题请开 issue。
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch: # 也允许手动点一次，用来验证流水线本身通不通
+
+permissions:
+  contents: write # 创建 Release 要写权限
+
+jobs:
+  # 发版前先跑全套测试。放 macOS 单独一个 job，不塞进下面 build 的两条腿里：
+  # e2e 里有 execFileSync("/bin/sh", ...) 和 .app 装机态验证，Windows runner 上过不了，
+  # 硬塞进 matrix 会把 Windows 那份包直接打没——而那份恰恰是开发机造不出来、最需要发的。
+  test:
+    runs-on: macos-latest
+    timeout-minutes: 40 # 卡住要红，别挂满 6 小时把整次发版拖死（同 test.yml）
+    steps:
+      # 要完整 git log 的理由同 test.yml：npm test 里有一道闸门拿 git log 核对 README 的日期
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      # 产物名来自 package.json 的 ${version}，流水线认的却是 tag。两边不一致 =
+      # Release v0.1.7 里挂着 0.1.6 的包；更糟的是 src/server/updater.js 的 currentVersion() 读的也是
+      # package.json，装完的用户「设置 → 关于 → 检查更新」会永远显示有新版，点过去下的还是同一个包。
+      # 加 if 是为了不误杀第 11 行那条手动通道：workflow_dispatch 时 GITHUB_REF_NAME 是分支名 main，
+      # 'main'.replace(/^v/,'') 仍然非空，不守卫的话手动跑一次流水线必红。
+      - name: 核对 package.json 版本号和 tag 一致
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash # matrix 外也显式写死：Windows 上默认 pwsh，引号规则不一样
+        run: |
+          node -e "const v=require('./package.json').version,t=process.env.GITHUB_REF_NAME.replace(/^v/,'');if(v!==t){console.error('对不上：package.json 是 '+v+'，tag 是 '+t+'。先改 package.json 再重打 tag。');process.exit(1)}"
+      - run: npm test
+
+  build:
+    needs: test
+    strategy:
+      fail-fast: false # 一个平台挂了，另一个平台照样打包上传（能不能进 Release 看 release job 的 if）
+      matrix:
+        include:
+          - os: macos-latest
+            script: dist:mac
+            artifact: mac
+          - os: windows-latest
+            script: dist:win
+            artifact: win
+    runs-on: ${{ matrix.os }}
+    steps:
+      # 大版本跟 test.yml 同一套口径：只抬到跑 Node 24 的那一档（node20 已被判弃用）
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      # Windows 包里要带系统沙箱的小助手（native/owb-sandbox，Go 写的），产物不进 git，这里现编。
+      # 漏了这两步 electron-builder 的 afterPack 当场红，不会发出一个设置页有开关、底下却没沙箱的包
+      - if: runner.os == 'Windows'
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: native/owb-sandbox/go.mod
+          cache: false # 只用标准库，没有 go.sum 可当缓存键
+      - if: runner.os == 'Windows'
+        run: npm run build:sandbox
+      # 不签名、不公证：没有 Apple Developer ID 证书。用户首次打开要手动放行，README 里写了。
+      # 显式写死这个变量，免得哪天 runner 的钥匙串里有了证书就被自动捡去签
+      - run: npm run ${{ matrix.script }}
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: false
+      # 作者只有 Mac，Windows 包以前打完就上传，没在 Windows 上真启动过一次。
+      # 这里静默装上、打开、等页面加载完；起不来这条腿就红，坏包进不了 Release（mac 那条照发）
+      - if: runner.os == 'Windows'
+        run: node scripts/win-smoke.js dist
+      - uses: actions/upload-artifact@v6
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            dist/*.dmg
+            dist/*.zip
+            dist/*.exe
+          if-no-files-found: error
+
+  release:
+    needs: build
+    # 带 needs 的 job 默认门槛是 success()，只有 if 里出现状态函数才会被顶掉。
+    # 不写 !cancelled() 的话：Windows 那条腿一红，已经打好的 mac dmg/zip 就只能躺在
+    # Actions 运行页的 artifact 里等 90 天过期，用户侧看到的是「推了 tag 却没有新版本可下」。
+    # startsWith 这一半不能省，否则手动 workflow_dispatch 也会去建 Release。
+    # != 'skipped' 是拦测试没过的情况——那时 build 整个被跳过，不该建一个空 Release。
+    if: ${{ !cancelled() && needs.build.result != 'skipped' && startsWith(github.ref, 'refs/tags/') }}
+    runs-on: ubuntu-24.04
+    steps:
+      # 不写 name，一次把两条腿的产物都拉下来摊成 dist/mac、dist/win——
+      # 下面 files: dist/**/* 正是按这个形状 glob 的，换大版本时先确认这个行为没变
+      # 要 git 历史：正文最上面那段「这一版改了什么」是拿上一个 tag 到这个 tag
+      # README 里**新增的**那几行凑的（scripts/release-notes.js）。浅克隆下取不到上一个 tag，
+      # 脚本会一个字都不写——Release 页于是退回只有安装指南，跟以前一样，不会印错东西
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - id: notes
+        run: |
+          md="$(node scripts/release-notes.js "${GITHUB_REF_NAME}")"
+          [ -n "$md" ] || echo "::warning::README「最新动态」这一版没有新条目，Release 页不会有「这一版改了什么」"
+          {
+            echo 'md<<OWB_NOTES_EOF'
+            printf '%s\n' "$md"
+            echo OWB_NOTES_EOF
+          } >> "$GITHUB_OUTPUT"
+      - uses: actions/download-artifact@v7
+        # 两条腿全挂时这一步会报 "Unable to find any artifacts"。download-artifact 没有
+        # 「允许缺失」这种输入项，只能靠 continue-on-error 兜，别让它把整个 release 拖红
+        continue-on-error: true
+        with: { path: dist }
+      - uses: softprops/action-gh-release@v3
+        with:
+          # 缺了平台就落草稿由人拍板：下面那段正文写死了 Windows 的文件名，
+          # 缺 Windows 还照发，等于给用户指了几个不存在的下载链接
+          draft: ${{ needs.build.result != 'success' }}
+          files: dist/**/*
+          generate_release_notes: true
+          body: |
+            ${{ steps.notes.outputs.md }}
+            ## 安装
+
+            **macOS 一句话装好**（下载 → 装进「应用程序」→ 摘掉隔离标记 → 打开，不会被 Gatekeeper 拦）：
+
+            ```
+            curl -fsSL https://raw.githubusercontent.com/CatCatUncle/openworkbuddy/main/install-mac.sh | bash
+            ```
+
+            手动下包的话：
+
+            - **macOS（Apple 芯片）** → `OpenWorkBuddy-*-mac-arm64.dmg`
+            - **macOS（Intel）** → `OpenWorkBuddy-*-mac-x64.dmg`
+              —— ⚠️ **下 dmg 的第一次打开一定会弹「未打开“OpenWorkBuddy”· Apple 无法验证…」，只有「完成 / 移到废纸篓」两个按钮。**
+              点**「完成」**→ **系统设置 → 隐私与安全性** → 滚到最下面 → 点**「仍要打开」**→ 输开机密码。做这一次就够了。
+              细节和另外两条路见下面「第一次打开会被系统拦一下」。
+            - **Windows（x64 / ARM 同一个包）** → `OpenWorkBuddy-*-win-setup.exe` ← **绝大多数人下这个**（双击打开安装向导，能选装在哪个盘，有进度条，装时自动选架构）
+            - **Windows 免安装版** → `OpenWorkBuddy-*-win-x64-portable.exe` / `-win-arm64-portable.exe`
+              —— **只在公司电脑不让装软件时才用**。它的原理是自解压：每次启动都要把整个应用解压到 `%TEMP%`，
+              还要被 Defender 逐个扫一遍，第一次可能要等好几分钟，期间任务管理器里有进程、屏幕上什么都没有。
+
+            ## 第一次打开会被系统拦一下
+
+            代码签名证书还在申请（苹果一年 99 美元、Windows 一年几千块），所以现在发出去的包是 ad-hoc 签名的。
+            系统拦的是「这个开发者我没见过」，**不是「这个文件有毒」**——包里的签名本身完好，
+            `codesign --verify --deep --strict` 自己验得出来。证书批下来之后这一步就没有了。
+
+            **macOS · 三条路，挑一条**
+
+            1. **不想碰终端（推荐）**：双击 → 弹窗点 **「完成」**（**别点「移到废纸篓」**）→ 打开
+               **「系统设置 → 隐私与安全性」**→ 一直滚到最下面的「安全性」那一段，会看到
+               「已阻止使用“OpenWorkBuddy”，因为它来自身份不明的开发者」→ 点 **「仍要打开」**→
+               输开机密码 → 再弹一次点 **「打开」**。做这一次就够了，以后双击直接开。
+               （「仍要打开」这一栏**只在你刚刚被拦过之后才出现**。设置里翻不到的话，先回去双击一次应用，再进设置。）
+            2. **一句命令**：**先把 .app 从 dmg 拖进「应用程序」**（dmg 是只读卷，在里面执行会失败），然后在终端跑：
+
+            ```
+            xattr -dr com.apple.quarantine /Applications/OpenWorkBuddy.app
+            ```
+
+            3. **一个弹窗都不想见**：用最上面那句 curl。浏览器下载的文件会被打上 `com.apple.quarantine` 标记，
+               curl 下的不会——整条路径上没有 Gatekeeper。
+
+            两条容易走错的岔路：
+
+            - **别照着网上「右键 → 打开」的教程点。** 那条只在 **macOS 14 及更早**有效；macOS 15 (Sequoia) 起
+              苹果取消了这条通道，右键弹窗里已经没有第二个「打开」按钮——照着点会以为「就是打不开」。
+            - **提示「已损坏，应将它移到废纸篓」和上面不是一回事。** 那是签名真的被弄坏了（网盘、同步盘、
+              某些解压工具都会干这事）。重下一次，或者就地重签：`codesign --force --deep --sign - /Applications/OpenWorkBuddy.app`
+
+            **Windows**：弹出「Windows 已保护你的电脑」时，点弹窗里的灰色小字 **「更多信息」**，下面才会出现 **「仍要运行」**。
+
+            装完先去设置里填模型 API Key。你的配置、会话、工作区都在 `~/OpenWorkBuddy`，卸载不会删。
+
+            ## 双击了没反应？
+
+            每次启动都会写一份日志，先看它停在哪儿：
+
+            ```
+            ~/OpenWorkBuddy/logs/boot.log          # Windows: C:\Users\你\OpenWorkBuddy\logs\boot.log
+            ```
+
+            常见的几种，以及对应的解法：
+
+            | 现象 | 解法 |
+            |---|---|
+            | 双击安装包没反应，也没弹「Windows 已保护你的电脑」 | 看 360 / 火绒 / 电脑管家的隔离区，把 OpenWorkBuddy 恢复并加进信任 |
+            | 免安装版双击后一直停在「正在打开」 | 改用 `-win-setup.exe` 安装版（免安装版每次启动都要解压整包） |
+            | 窗口不出现，或者出来一整片黑 | 在 `~/OpenWorkBuddy/config.json` 的 `server` 里加 `"disable_gpu": true` |
+            | 弹框说「放数据的文件夹建不起来」 | 设环境变量 `OPENWORKBUDDY_HOME` 指到本机一个能写的文件夹 |
+            | 弹框说「已经在运行了，但窗口没出来」 | 任务管理器里结束 OpenWorkBuddy 进程再打开 |
+            | 弹框说端口用不了 | 把 `config.json` 里的 `server.port` 换成 3810 之类 |
+
+            **失败时应该总有一个写着原因的窗口或弹框。如果你什么都没看到，那本身就值得开一个 issue**，
+            带上那份 `boot.log`。更全的排查表在 [安装与启动](https://github.com/CatCatUncle/openworkbuddy/blob/main/docs/%E5%AE%89%E8%A3%85%E4%B8%8E%E5%90%AF%E5%8A%A8.md)。
+
+            ## 升级
+
+            以后有新版，**不用卸载重装**：下这里的新包覆盖装一次就行，`~/OpenWorkBuddy` 里的配置、
+            会话和成果文件都不动。从源码跑的话 `git pull && npm install` 重启即可。
+
+            应用里 **设置 → 关于 → 检查更新** 会告诉你线上是不是有新版、你这种装法怎么升。
+            （没有一键自动更新：这些包没有代码签名证书，macOS 的自动更新通道会校验签名，硬做只会是一颗永远报错的按钮。）

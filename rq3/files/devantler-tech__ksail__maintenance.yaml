@@ -1,0 +1,79 @@
+name: Maintenance
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 0 * * *" # Daily bounded workflow-run cleanup
+    - cron: "15 0 1 * *" # Monthly package cleanup
+
+concurrency:
+  group: "${{ github.workflow }}-${{ github.ref }}"
+  cancel-in-progress: false
+  # Keep a pending run instead of replacing it, so the daily and monthly
+  # cleanups cannot silently drop each other.
+  queue: max
+
+permissions:
+  contents: read
+
+jobs:
+  delete-old-workflow-runs:
+    if: >-
+      github.event_name == 'workflow_dispatch'
+      || github.event.schedule == '0 0 * * *'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: 📄 Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Delete old workflow runs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          .github/scripts/delete-old-workflow-runs.sh \
+            --repository "${{ github.repository }}" \
+            --retain-days 30 \
+            --keep-minimum-runs 6 \
+            --max-deletions 750
+
+  # The link checker accepts a 502/503/504 so a momentary outage cannot fail an
+  # unrelated PR (see lychee.toml). This job keeps a real outage of our own docs
+  # site visible: it retries six times, 30 seconds apart (up to about 3.5 minutes,
+  # or longer when attempts time out), so only an outage that outlasts the
+  # retries fails the run. The 10-minute job timeout bounds the worst case.
+  check-docs-site-availability:
+    if: >-
+      github.event_name == 'workflow_dispatch'
+      || github.event.schedule == '0 0 * * *'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions: {}
+    steps:
+      - name: Check the docs site responds
+        run: |
+          curl --fail --silent --show-error --location \
+            --output /dev/null \
+            --max-time 30 \
+            --retry 6 --retry-delay 30 --retry-all-errors \
+            https://ksail.devantler.tech/
+
+  delete-old-images:
+    if: >-
+      github.event_name == 'workflow_dispatch'
+      || github.event.schedule == '15 0 1 * *'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      packages: write
+    steps:
+      - name: Delete old package versions
+        uses: actions/delete-package-versions@e5bc658cc4c965c472efe991f8beea3981499c55 # v5.0.0
+        with:
+          package-name: "ksail/system-test-manifests"
+          package-type: "container"
+          min-versions-to-keep: 100

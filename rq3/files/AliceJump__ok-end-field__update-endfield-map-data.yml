@@ -1,0 +1,177 @@
+name: Update Endfield Map Data
+
+on:
+  schedule:
+    # 每天 UTC 00:00（北京时间 08:00）
+    - cron: "0 0 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: update-endfield-map
+  cancel-in-progress: true
+
+jobs:
+  update:
+    if: ${{ github.repository_owner == 'AliceJump' }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check schedule
+        id: schedule
+        shell: bash
+        run: |
+          # 2026-07-16 已完成一次，因此以后每 21 天执行
+          START_DATE="2026-07-16"
+
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          TODAY=$(date -u +%F)
+
+          START=$(date -d "$START_DATE" +%s)
+          NOW=$(date -d "$TODAY" +%s)
+
+          DAYS=$(( (NOW - START) / 86400 ))
+
+          if (( DAYS % 21 == 0 )); then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v6
+        if: steps.schedule.outputs.run == 'true'
+        with:
+          fetch-depth: 2
+
+      - uses: actions/setup-python@v6
+        if: steps.schedule.outputs.run == 'true'
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Backup current data
+        if: steps.schedule.outputs.run == 'true'
+        run: |
+          cp assets/items/map/summary.json summary_old.json
+          cp assets/items/map/item_names.json item_names_old.json
+
+      - name: Generate latest map data
+        if: steps.schedule.outputs.run == 'true'
+        run: |
+          python scripts/data-capture/dump_endfield_map_marks_public.py
+
+      - name: Validate data
+        if: steps.schedule.outputs.run == 'true'
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+
+          def count_points(summary):
+              total = 0
+              for groups in summary.values():
+                  for pts in groups.values():
+                      total += len(pts)
+              return total
+
+          with open("summary_old.json", encoding="utf-8") as f:
+              old_summary = json.load(f)
+
+          with open("assets/items/map/summary.json", encoding="utf-8") as f:
+              new_summary = json.load(f)
+
+          with open("item_names_old.json", encoding="utf-8") as f:
+              old_names = json.load(f)
+
+          with open("assets/items/map/item_names.json", encoding="utf-8") as f:
+              new_names = json.load(f)
+
+          old_maps = len(old_summary)
+          new_maps = len(new_summary)
+
+          old_items = len(old_names)
+          new_items = len(new_names)
+
+          old_points = count_points(old_summary)
+          new_points = count_points(new_summary)
+
+          print(f"Maps   : {old_maps} -> {new_maps}")
+          print(f"Items  : {old_items} -> {new_items}")
+          print(f"Points : {old_points} -> {new_points}")
+
+          # ---------- 绝对校验 ----------
+
+          assert new_maps >= 3, "Too few maps."
+          assert new_items >= 20, "Too few item types."
+          assert new_points >= 100, "Too few points."
+
+          # ---------- 相对校验 ----------
+
+          if old_maps:
+              assert new_maps >= old_maps * 0.8, "Map count dropped unexpectedly."
+
+          if old_items:
+              assert new_items >= old_items * 0.8, "Item count dropped unexpectedly."
+
+          if old_points:
+              assert new_points >= old_points * 0.8, "Point count dropped unexpectedly."
+
+          # 每张地图不能为空
+          for map_id, groups in new_summary.items():
+              point_count = sum(len(v) for v in groups.values())
+              assert point_count > 0, f"{map_id} has no points."
+
+          print("Validation passed.")
+          PY
+
+      - name: Commit to branch
+        id: commit
+        if: steps.schedule.outputs.run == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add assets/items/map
+
+          if git diff --cached --quiet; then
+            echo "No changes."
+            exit 0
+          fi
+
+          BRANCH="chore/update-map-data-$(date -u +%Y%m%d%H%M%S)"
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+          git checkout -b "$BRANCH"
+          git commit -m "chore(map): update endfield map data"
+
+      - name: Push branch and open PR
+        if: steps.commit.outputs.branch != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          BRANCH="${{ steps.commit.outputs.branch }}"
+          git push -u origin "$BRANCH"
+          gh pr create --base master --head "$BRANCH" \
+            --title "chore(map): 更新地图数据" \
+            --body "由 update-endfield-map-data 工作流自动生成的地图数据更新。"
+          echo "Created new PR for $BRANCH"
+          # 启用 auto-merge：校验已在 PR 创建前完成（Validate data 步骤），
+          # checks 通过后自动 squash 合并（master ruleset approval=0，squash 允许）
+          # PR 已是 clean status（无待等待的 check）时 enablePullRequestAutoMerge 会被拒绝，
+          # 此时所有合并条件已满足，直接合并即可
+          if ! gh pr merge "$BRANCH" --auto --squash --delete-branch \
+                --subject "chore(map): 更新地图数据" \
+                --body "由 update-endfield-map-data 工作流自动生成的地图数据更新。"; then
+            echo "Auto-merge unavailable (clean status), merging directly"
+            gh pr merge "$BRANCH" --squash --delete-branch \
+              --subject "chore(map): 更新地图数据" \
+              --body "由 update-endfield-map-data 工作流自动生成的地图数据更新。"
+          fi
+          echo "Merged or auto-merge enabled for $BRANCH"

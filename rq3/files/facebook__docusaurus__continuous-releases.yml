@@ -1,0 +1,53 @@
+name: Continuous Releases
+
+on:
+  push:
+    branches:
+      - main
+      - docusaurus-v**
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  release:
+    name: Continuous Releases
+    if: github.repository == 'facebook/docusaurus'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: lts/*
+          check-latest: true
+          #  ⚠️ Do not use any cache on purpose
+          # It increases the chance of a compromised release being publish
+          # See https://github.com/actions/setup-node/issues/1445#issuecomment-4040130833
+          # cache: pnpm
+          package-manager-cache: false
+
+      - name: Installation
+        run: pnpm install --frozen-lockfile || pnpm install --frozen-lockfile || pnpm install --frozen-lockfile
+
+      - name: Build packages
+        run: pnpm build:packages
+
+      - name: Initialize fresh templates
+        run: |
+          node ./packages/create-docusaurus/bin/index.js template/docusaurus-classic-js classic --javascript -p npm
+          node ./packages/create-docusaurus/bin/index.js template/docusaurus-classic-ts classic --typescript -p npm
+
+      - name: Release
+        run: pnpm pkg-pr-new publish './packages/*' --template './template/*' --compact --comment=off

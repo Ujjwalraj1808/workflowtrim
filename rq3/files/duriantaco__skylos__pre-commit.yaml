@@ -1,0 +1,157 @@
+name: Quality Advisory Checks
+
+on:
+  pull_request:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  advisory:
+    name: Advisory quality checks
+    runs-on: ubuntu-latest
+    env:
+      PYTHON_VERSION: "3.11"
+      PYO3_PYTHON: python
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.11"
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "20"
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+
+      - uses: astral-sh/setup-uv@e4db8464a088ece1b920f60402e813ea4de65b8f # v4
+
+      - name: Install Python quality tooling
+        shell: bash
+        run: |
+          uv venv --python "$PYTHON_VERSION"
+          # Keep this workflow from executing PR-controlled package/build code.
+          uv pip install --python .venv/bin/python pre-commit ruff mypy
+
+      - name: Validate pre-commit config
+        shell: bash
+        run: |
+          source .venv/bin/activate
+          pre-commit validate-config
+
+      - name: Ruff advisory
+        shell: bash
+        run: |
+          set +e
+          echo "### Ruff" >> "$GITHUB_STEP_SUMMARY"
+          .venv/bin/python -m ruff check .
+          status=$?
+          if [ "$status" -eq 0 ]; then
+            echo "Ruff passed." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::warning title=Ruff advisory::ruff check found issues (exit $status). CI is advisory for now."
+            echo "Ruff found issues (exit $status). CI is advisory for now." >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit 0
+
+      - name: Python type-check advisory
+        shell: bash
+        run: |
+          set +e
+          echo "### Python type-check" >> "$GITHUB_STEP_SUMMARY"
+          .venv/bin/python -m mypy skylos
+          status=$?
+          if [ "$status" -eq 0 ]; then
+            echo "mypy passed." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::warning title=Python type-check advisory::mypy found issues (exit $status). CI is advisory for now."
+            echo "mypy found issues (exit $status). CI is advisory for now." >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit 0
+
+      - name: TypeScript build and test advisory
+        shell: bash
+        run: |
+          set +e
+          echo "### TypeScript build and tests" >> "$GITHUB_STEP_SUMMARY"
+          overall=0
+
+          npm ci --ignore-scripts --prefix editors/vscode
+          status=$?
+          if [ "$status" -eq 0 ]; then
+            npm test --prefix editors/vscode
+            status=$?
+          fi
+          if [ "$status" -ne 0 ]; then
+            overall=1
+            echo "::warning title=VS Code TypeScript advisory::editors/vscode build or tests failed (exit $status)."
+            echo "editors/vscode build or tests failed (exit $status)." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "editors/vscode build and tests passed." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          if [ -f skylos-demo/web/package-lock.json ]; then
+            npm ci --ignore-scripts --prefix skylos-demo/web
+          else
+            npm install --ignore-scripts --prefix skylos-demo/web
+          fi
+          status=$?
+          if [ "$status" -eq 0 ]; then
+            npm run build --prefix skylos-demo/web
+            status=$?
+          fi
+          if [ "$status" -ne 0 ]; then
+            overall=1
+            echo "::warning title=Demo TypeScript advisory::skylos-demo/web build failed (exit $status)."
+            echo "skylos-demo/web build failed (exit $status)." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "skylos-demo/web build passed." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          if [ "$overall" -ne 0 ]; then
+            echo "TypeScript build issues are advisory for now." >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit 0
+
+      - name: Rust fmt and clippy advisory
+        shell: bash
+        run: |
+          set +e
+          echo "### Rust fmt and clippy" >> "$GITHUB_STEP_SUMMARY"
+          overall=0
+
+          cargo fmt --manifest-path rust/Cargo.toml --check
+          status=$?
+          if [ "$status" -ne 0 ]; then
+            overall=1
+            echo "::warning title=Rust fmt advisory::cargo fmt --check found issues (exit $status)."
+            echo "cargo fmt --check found issues (exit $status)." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "cargo fmt --check passed." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          cargo clippy --manifest-path rust/Cargo.toml --all-targets --all-features -- -D warnings
+          status=$?
+          if [ "$status" -ne 0 ]; then
+            overall=1
+            echo "::warning title=Rust clippy advisory::cargo clippy found issues (exit $status)."
+            echo "cargo clippy found issues (exit $status)." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "cargo clippy passed." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          if [ "$overall" -ne 0 ]; then
+            echo "Rust quality issues are advisory for now." >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit 0

@@ -1,0 +1,103 @@
+# This action is centrally managed in https://github.com/asyncapi/.github/
+# Don't make changes to this file in this repo as they will be overwritten with changes made to the same file in above mentioned repo
+
+name: 'Announce releases in different channels'
+
+on: 
+  release:
+    types: 
+      - published
+
+permissions:
+  contents: read            # To checkout code and read release information
+
+jobs:
+
+  slack-announce:
+    name: Slack - notify on every release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Convert markdown to slack markdown for issue
+        # This workflow is from our own org repo and safe to reference by 'master'.
+        uses: asyncapi/.github/.github/actions/slackify-markdown@master # //NOSONAR
+        id: markdown
+        env:
+          RELEASE_TAG: ${{github.event.release.tag_name}}
+          RELEASE_URL: ${{github.event.release.html_url}}
+          RELEASE_BODY: ${{ github.event.release.body }}
+        with:
+          markdown: "[${{ env.RELEASE_TAG }}](${{ env.RELEASE_URL }}) \n ${{ env.RELEASE_BODY }}"
+      - name: Send info about release to Slack
+        uses: rtCamp/action-slack-notify@33ca3be66c6f378fe1610fd1d5258632dbed5e58 # v2.4.0
+        env:
+            SLACK_WEBHOOK: ${{ secrets.SLACK_RELEASES }}
+            SLACK_TITLE: Release ${{ env.RELEASE_TAG }} for ${{ env.REPO_NAME }} is out in the wild 😱💪🍾🎂
+            SLACK_MESSAGE: ${{steps.markdown.outputs.text}}
+            MSG_MINIMAL: true
+            RELEASE_TAG: ${{github.event.release.tag_name}}
+            REPO_NAME: ${{github.repository}}
+
+  twitter-announce:
+    name: Twitter - notify on minor and major releases
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Get version of last and previous release
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        id: versions
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const query = `query($owner:String!, $name:String!) {
+              repository(owner:$owner, name:$name){
+                releases(first: 2, orderBy: {field: CREATED_AT, direction: DESC}) {
+                  nodes {
+                    name
+                  }
+                }
+              }
+            }`;
+            const variables = {
+              owner: context.repo.owner,
+              name: context.repo.repo
+            };
+            const { repository: { releases: { nodes } } } = await github.graphql(query, variables);
+            core.setOutput('lastver', nodes[0].name);
+            // In case of first release in the package, there is no such thing as previous error, so we set info about previous version only once we have it
+            // We should tweet about the release no matter of the type as it is initial release
+            if (nodes.length != 1) core.setOutput('previousver', nodes[1].name);
+      - name: Identify release type
+        id: releasetype
+        # if previousver is not provided then this steps just logs information about missing version, no errors
+        env:
+          PREV_VERSION: ${{steps.versions.outputs.previousver}}
+          LAST_VERSION: ${{steps.versions.outputs.lastver}}
+        run: echo "type=$(npx -q -p semver-diff-cli semver-diff "$PREV_VERSION" "$LAST_VERSION")" >> "$GITHUB_OUTPUT"
+      - name: Get name of the person that is behind the newly released version
+        id: author
+        run: |
+          AUTHOR_NAME=$(git log -1 --pretty=format:'%an')
+          printf 'name=%s\n' "$AUTHOR_NAME" >> "$GITHUB_OUTPUT"
+      - name: Publish information about the release to Twitter # tweet only if detected version change is not a patch
+        # tweet goes out even if the type is not major or minor but "You need provide version number to compare."
+        # it is ok, it just means we did not identify previous version as we are tweeting out information about the release for the first time
+        if: steps.releasetype.outputs.type != 'null' && steps.releasetype.outputs.type != 'patch' # null means that versions are the same
+        uses: m1ner79/Github-Twittction@d1e508b6c2170145127138f93c49b7c46c6ff3a7 # v2.0.0
+        env:
+          RELEASE_TAG: ${{github.event.release.tag_name}}
+          REPO_NAME: ${{github.repository}}
+          AUTHOR_NAME: ${{ steps.author.outputs.name }}
+          RELEASE_URL: ${{github.event.release.html_url}}
+        with:
+          twitter_status: "Release ${{ env.RELEASE_TAG }} for ${{ env.REPO_NAME }} is out in the wild 😱💪🍾🎂\n\nThank you for the contribution ${{ env.AUTHOR_NAME }} ${{ env.RELEASE_URL }}"
+          twitter_consumer_key: ${{ secrets.TWITTER_CONSUMER_KEY }} 
+          twitter_consumer_secret: ${{ secrets.TWITTER_CONSUMER_SECRET }} 
+          twitter_access_token_key: ${{ secrets.TWITTER_ACCESS_TOKEN_KEY }} 
+          twitter_access_token_secret: ${{ secrets.TWITTER_ACCESS_TOKEN_SECRET }}

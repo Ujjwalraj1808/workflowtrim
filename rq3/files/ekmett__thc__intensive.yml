@@ -1,0 +1,250 @@
+# SPDX-FileCopyrightText: 2026 Edward Kmett
+# SPDX-License-Identifier: UPL-1.0 AND BSD-3-Clause
+
+name: Intensive
+on:
+  schedule:
+    - cron: '17 7 * * *'
+  workflow_dispatch:
+    inputs:
+      expected_sha:
+        description: Expected source commit (empty uses this run's commit)
+        type: string
+        required: false
+permissions:
+  contents: read
+  actions: read
+jobs:
+  automation:
+    uses: ./.github/workflows/checks.yml
+    with:
+      cadence: nightly
+      expected_sha: ${{ inputs.expected_sha || github.sha }}
+  jvm-linux:
+    needs: automation
+    name: Linux ordinary tests
+    uses: ./.github/workflows/test-groups.yml
+    with:
+      os: ubuntu-latest
+      expected_sha: ${{ inputs.expected_sha || github.sha }}
+      cadence: nightly
+  jvm-macos:
+    needs: automation
+    name: macOS ordinary tests
+    uses: ./.github/workflows/test-groups.yml
+    with:
+      os: macos-26
+      expected_sha: ${{ inputs.expected_sha || github.sha }}
+      cadence: nightly
+  build:
+    needs: automation
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-26]
+    runs-on: ${{ matrix.os }}
+    # Keep the existing cold preparation budget; test and compiler limits are unchanged.
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          submodules: false
+          persist-credentials: false
+      - name: Check dispatched revision
+        env:
+          EXPECTED_SHA: ${{ inputs.expected_sha || github.sha }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+      - uses: ./.github/actions/setup
+      - name: Restore published Core and native dependency objects
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cache/thc-core/core-bundles
+            ~/.cache/thc-core/unit-core
+            ~/.cache/thc-core/pinned-libraries
+            ~/.cache/thc-core/pinned-sources
+            ~/.cache/thc-core/installed-foreign
+            !~/.cache/thc-core/**/*.lock
+            !~/.cache/thc-core/**/*.failed-*
+          key: cbd-${{ runner.os }}-${{ runner.arch }}-ghc9.14.1-lookup
+          restore-keys: cbd-${{ runner.os }}-${{ runner.arch }}-ghc9.14.1-
+      - name: Verify pinned toolchain
+        shell: bash
+        run: |
+          test "$(ghc --numeric-version)" = 9.14.1
+          test "$(ghc-pkg --version)" = 'GHC package manager version 9.14.1'
+          case "$(cabal --numeric-version)" in 3.16.*) ;; *) exit 1 ;; esac
+          java --version
+      - name: Resolve Cabal driver dependencies
+        run: cabal build exe:thc
+      - name: Check LLVM backend tools
+        run: |
+          for tool in clang llc opt llvm-nm llvm-link llvm-objcopy; do
+            command -v "$tool"
+            major=$("$tool" --version | sed -nE 's/.*version ([0-9]+).*/\1/p' | sed -n '1p')
+            test "$major" = 18
+          done
+      - name: Build JVM distribution from source
+        run: |
+          bin/build-compiler.sh
+          ./gradlew --no-daemon installDist toolsJar
+      - name: Check Haskell calls into JavaScript
+        run: |
+          python3 bin/test-polyglot-audit.py
+          python3 -O bin/test-polyglot-audit.py
+          bin/polyglot-demo.sh
+          python3 bin/test-javascript-ffi.py
+          bin/javascript-demo.sh
+          ./gradlew polyglotTest
+      - name: Compare public packages with native GHC on both backends and handoff modes
+        run: cabal test driver-tests -fdevelopment --test-options=--public-packages-only --test-show-details=direct
+      - name: Check cold project dependency acquisition
+        env:
+          THC_CACHE_HOME: ${{ runner.temp }}/thc-cold-acquisition
+        run: cabal test driver-tests -fdevelopment --test-options=--acquire-project-only --test-show-details=direct
+      - name: Prepare fresh library source and native oracles
+        run: python3 bin/prepare-library-tests.py
+      - name: Package verified library inputs and installed runtime
+        run: python3 .github/scripts/library_bundle.py pack --output build/library-transfer.tar.gz
+      - name: Share this platform's library inputs with this workflow attempt
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: library-inputs-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: build/library-transfer.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+      - name: Prepare fresh Map source and native oracle
+        env:
+          THC_DIAGNOSTIC_UNSUPPORTED: 'true'
+        run: bin/prepare-map.sh
+      - name: Check diagnostic Map on both backends and handoff modes
+        shell: bash
+        run: |
+          set -euo pipefail
+          matrix_status=0
+          for handoff in false true; do
+            for backend in ast bytecode; do
+              java --add-modules=jdk.incubator.vector --enable-native-access=ALL-UNNAMED --add-opens=java.base/java.lang=ALL-UNNAMED -Xss2m \
+                -Xshare:off -Xms256m -Xmx256m -XX:-UseCompactObjectHeaders -XX:+UnlockExperimentalVMOptions -XX:+UseJamGC \
+                "-Dthc.backend=$backend" "-Dthc.handoffSlabs=$handoff" \
+                -Dthc.diagnosticUnsupported=true -Dthc.traceCompilation=true \
+                -cp 'build/install/thc/lib/*:build/diagnostics/thc-tools.jar' thc.MapCheck build/map/modules.txt build/map/oracle.tsv \
+                2>&1 | tee "build/map/check-$backend-handoff-$handoff.log" || matrix_status=1
+            done
+          done
+          exit "$matrix_status"
+      - name: Identify the set of cached Core objects
+        if: always() && env.THC_CACHE_HOME != ''
+        id: core-cache
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import hashlib, os
+          from pathlib import Path
+          root = Path(os.environ['THC_CACHE_HOME'])
+          # Driver receipts validate restored objects. Include file sizes so an
+          # interrupted object's completion also creates a new archive key.
+          names = sorted(str(path.relative_to(root))
+              + ':' + str(path.stat().st_size)
+              for tree in ('core-bundles', 'unit-core', 'pinned-libraries', 'pinned-sources', 'installed-foreign')
+              for path in (root / tree).rglob('*') if path.is_file()
+              and not any(part.endswith('.lock') or '.failed-' in part for part in path.parts))
+          if names:
+              with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+                  output.write('key=' + hashlib.sha256('\n'.join(names).encode()).hexdigest() + '\n')
+          PY
+      - name: Save acquired Core objects independently of test results
+        if: always() && steps.core-cache.outputs.key != ''
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cache/thc-core/core-bundles
+            ~/.cache/thc-core/unit-core
+            ~/.cache/thc-core/pinned-libraries
+            ~/.cache/thc-core/pinned-sources
+            ~/.cache/thc-core/installed-foreign
+            !~/.cache/thc-core/**/*.lock
+            !~/.cache/thc-core/**/*.failed-*
+          key: cbd-${{ runner.os }}-${{ runner.arch }}-ghc9.14.1-${{ steps.core-cache.outputs.key }}
+      - uses: actions/upload-artifact@v7.0.1
+        if: always()
+        with:
+          name: test-results-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            build/ci/setup-results/
+            build/reports/tests/
+            build/test-results/
+            build/libraries/cases.json
+            build/libraries/oracle.tsv
+            build/libraries/oracle-validation.json
+            build/libraries/check-*.log
+            build/libraries/*/audit.json
+            build/libraries/sequence/*.audit.json
+            build/libraries/*/provenance.json
+            build/map/audit.json
+            build/map/check-*.log
+            build/map/modules.txt
+            build/map/oracle.tsv
+            build/map/oracle-validation.json
+            build/map/provenance.json
+            build/map/reproduction-provenance.json
+
+  library:
+    name: library (${{ matrix.os }}, ${{ matrix.backend }}, handoff=${{ matrix.handoff }})
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-26]
+        backend: [ast, bytecode]
+        handoff: ['false', 'true']
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          submodules: true
+          persist-credentials: false
+      - name: Check dispatched revision
+        env:
+          EXPECTED_SHA: ${{ inputs.expected_sha || github.sha }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - uses: ./.github/actions/jam
+      - name: Download only this platform and workflow attempt
+        uses: actions/download-artifact@v8
+        with:
+          name: library-inputs-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: build/library-download
+          digest-mismatch: error
+      - name: Verify source, platform, pinned JDK and original library fingerprints
+        run: python3 .github/scripts/library_bundle.py restore --archive build/library-download/library-transfer.tar.gz
+      - name: Run the complete strict and compiled library checks
+        shell: bash
+        env:
+          BACKEND: ${{ matrix.backend }}
+          HANDOFF: ${{ matrix.handoff }}
+        run: |
+          set -euo pipefail
+          "$JAVA_HOME/bin/java" --add-modules=jdk.incubator.vector --enable-native-access=ALL-UNNAMED --add-opens=java.base/java.lang=ALL-UNNAMED -Xss2m \
+            -Xshare:off -Xms256m -Xmx256m -XX:-UseCompactObjectHeaders -XX:+UnlockExperimentalVMOptions -XX:+UseJamGC \
+            "-Dthc.handoffSlabs=$HANDOFF" -cp 'build/install/thc/lib/*:build/diagnostics/thc-tools.jar' \
+            thc.LibraryCheck build/libraries/cases.json "$BACKEND" \
+            2>&1 | tee "build/libraries/check-$BACKEND-handoff-$HANDOFF.log"
+      - name: Preserve each library mode's results
+        uses: actions/upload-artifact@v7.0.1
+        if: always()
+        with:
+          name: library-results-${{ runner.os }}-${{ matrix.backend }}-handoff-${{ matrix.handoff }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            build/library-transfer-verified.json
+            build/libraries/check-*.log

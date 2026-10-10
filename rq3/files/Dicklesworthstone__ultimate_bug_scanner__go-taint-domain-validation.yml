@@ -1,0 +1,88 @@
+name: Go Taint Domain Validation
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/go-taint-domain-validation.yml
+      - ubs
+      - modules/ubs-golang.sh
+      - modules/lib/ubs-common.sh
+      - modules/helpers/ubs_core/**
+      - test-suite/quality/test_taint_go_domains.py
+      - test-suite/quality/test_ubs_core.py
+      - test-suite/manifest.json
+      - test-suite/run_manifest.py
+  workflow_dispatch:
+
+# The analyzer is shipped: validate the checked-out revision and its integrity
+# chain, rather than replacing it with a previously reviewed candidate blob.
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      UBS_NO_AUTO_UPDATE: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install scanner dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq ripgrep rsync shellcheck python3-yaml python3-jsonschema
+          npm install --global @ast-grep/cli
+      - name: Record the production revision under test
+        run: echo "GO_TAINT_REVISION $(git rev-parse HEAD)"
+      - name: Run source regressions and registry compatibility
+        run: |
+          python3 -m unittest discover -s test-suite/quality -p test_taint_go_domains.py -v
+          python3 -m unittest discover -s test-suite/quality -p test_ubs_core.py -v
+      - name: Run real Go taint manifest scans without changing expectations
+        run: |
+          python3 - <<'PY'
+          import json
+          import subprocess
+          from pathlib import Path
+          cases = json.loads(Path('test-suite/manifest.json').read_text())['cases']
+          selected = [case['id'] for case in cases if case.get('enabled', True)
+                      and ('golang' in case['id'] or case['id'].startswith('go-'))
+                      and 'taint' in json.dumps(case).lower()]
+          print('GO_TAINT_MANIFEST_CASES', selected, flush=True)
+          assert selected, 'No Go taint manifest cases found'
+          args = ['python3', 'test-suite/run_manifest.py']
+          for name in selected:
+              args.extend(['--case', name])
+          subprocess.run(args, check=True)
+          PY
+      - name: Verify the complete integrity chain and generation idempotence
+        run: |
+          ./scripts/verify_checksums.sh
+          ./scripts/verify_sha256sums.sh
+          bash -n ubs
+          bash -n modules/lib/ubs-common.sh
+          for module in modules/ubs-*.sh; do bash -n "$module"; done
+          git diff --check
+          git diff > "$RUNNER_TEMP/go-taint-tested.diff"
+          python3 scripts/update_checksums.py
+          ./scripts/update_sha256sums.sh
+          git diff > "$RUNNER_TEMP/go-taint-idempotent.diff"
+          cmp "$RUNNER_TEMP/go-taint-tested.diff" "$RUNNER_TEMP/go-taint-idempotent.diff"
+      - name: Package source and diagnostic artifacts
+        if: always()
+        run: |
+          git ls-files -z | tar --null -T - -czf "$RUNNER_TEMP/go-taint-source-snapshot.tar.gz"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: go-taint-domain-validation
+          path: |
+            ${{ runner.temp }}/go-taint-source-snapshot.tar.gz
+            ${{ runner.temp }}/go-taint-*.diff
+            test-suite/artifacts/
+          retention-days: 3

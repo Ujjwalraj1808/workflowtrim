@@ -1,0 +1,231 @@
+name: checks
+
+on:
+  # PR merge-ref caches cannot seed other PRs. Populate the same caches from
+  # trusted main commits; only the Go matrix needs to run for this event.
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: checks-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test-go:
+    name: Go tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
+          - macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Go
+        id: go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Locate Go caches
+        id: go-cache-paths
+        shell: pwsh
+        run: |
+          $paths = go env -json GOMODCACHE GOCACHE | ConvertFrom-Json
+          "modules=$($paths.GOMODCACHE)" >> $env:GITHUB_OUTPUT
+          "build=$($paths.GOCACHE)" >> $env:GITHUB_OUTPUT
+
+      - name: Restore Go modules
+        id: go-modules
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ steps.go-cache-paths.outputs.modules }}
+          key: go-modules-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.go.outputs.go-version }}-${{ hashFiles('go.sum') }}
+          restore-keys: |
+            go-modules-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.go.outputs.go-version }}-
+
+      # Keep race-test outputs separate from other Go jobs. Restore the latest
+      # compatible snapshot, then save refreshed results under this commit's key.
+      - name: Restore Go test results
+        id: go-tests
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ steps.go-cache-paths.outputs.build }}
+          key: go-tests-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.go.outputs.go-version }}-race-${{ hashFiles('go.sum') }}-${{ github.sha }}
+          restore-keys: |
+            go-tests-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.go.outputs.go-version }}-race-${{ hashFiles('go.sum') }}-
+            go-tests-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.go.outputs.go-version }}-race-
+
+      - name: Report Go cache restores
+        shell: pwsh
+        env:
+          CACHE_REF: ${{ github.ref }}
+          MODULE_PRIMARY: ${{ steps.go-modules.outputs.cache-primary-key }}
+          MODULE_MATCHED: ${{ steps.go-modules.outputs.cache-matched-key }}
+          MODULE_EXACT: ${{ steps.go-modules.outputs.cache-hit }}
+          BUILD_PRIMARY: ${{ steps.go-tests.outputs.cache-primary-key }}
+          BUILD_MATCHED: ${{ steps.go-tests.outputs.cache-matched-key }}
+          BUILD_EXACT: ${{ steps.go-tests.outputs.cache-hit }}
+          MODULE_PATH: ${{ steps.go-cache-paths.outputs.modules }}
+          BUILD_PATH: ${{ steps.go-cache-paths.outputs.build }}
+        run: |
+          Write-Host "Cache scope: $env:CACHE_REF (default-branch fallback is also eligible)"
+          Write-Host "Modules: primary=$env:MODULE_PRIMARY matched=$env:MODULE_MATCHED exact=$env:MODULE_EXACT"
+          Write-Host "Race build: primary=$env:BUILD_PRIMARY matched=$env:BUILD_MATCHED exact=$env:BUILD_EXACT"
+          Write-Host "Cache paths: modules=$env:MODULE_PATH build=$env:BUILD_PATH"
+          Write-Host "An archive restore does not guarantee Go package test-result cache hits."
+
+      # Download before tests so even a failed test run leaves reusable modules.
+      # A fallback archive can contain older modules; Go resolves/verifies the
+      # versions selected by this checkout's go.mod and go.sum.
+      - name: Download Go modules
+        run: go mod download
+
+      - name: Save Go modules
+        if: steps.go-modules.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ steps.go-cache-paths.outputs.modules }}
+          key: ${{ steps.go-modules.outputs.cache-primary-key }}
+
+      - name: Run Go tests
+        id: tests
+        # These flags limit each package's test binary; package concurrency keeps Go's default -p.
+        run: go test -race -v -cpu=4 -parallel=4 -timeout 20m ./...
+
+      # Go caches successful compile actions even if another package/test fails.
+      # Keep the test's failure status and never upload after cancellation. Reuse
+      # the immutable commit key on retries instead of producing per-run archives.
+      - name: Save Go test results
+        if: ${{ !cancelled() && (steps.tests.outcome == 'success' || steps.tests.outcome == 'failure') && steps.go-tests.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ steps.go-cache-paths.outputs.build }}
+          key: ${{ steps.go-tests.outputs.cache-primary-key }}
+
+  test-frontend:
+    if: github.event_name != 'push'
+    name: Frontend checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 10.27.0
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: webui/pnpm-lock.yaml
+
+      - name: Install frontend dependencies
+        working-directory: webui
+        run: pnpm install --frozen-lockfile
+
+      # Prettier keeps its own per-file cache keyed on Prettier's version and the
+      # effective config, so the Actions cache key only needs to change when one of
+      # those changes. Hashing the config files (not source) keeps the key stable
+      # across PRs, giving a high hit rate on the primary key.
+      - name: Restore Prettier cache
+        id: prettier-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: webui/node_modules/.cache/prettier
+          key: prettier-${{ runner.os }}-${{ hashFiles('webui/package.json', 'webui/pnpm-lock.yaml', 'webui/.prettierrc*', 'webui/prettier.config.*') }}
+          restore-keys: |
+            prettier-${{ runner.os }}-
+
+      - name: Run frontend lint
+        working-directory: webui
+        run: pnpm run lint
+
+      - name: Run frontend dead-code lint
+        working-directory: webui
+        run: pnpm run lint:dead
+
+      - name: Run frontend typecheck
+        working-directory: webui
+        run: pnpm run typecheck
+
+      - name: Run frontend unit tests
+        working-directory: webui
+        run: pnpm run test:unit
+
+      - name: Check frontend formatting
+        working-directory: webui
+        run: pnpm run format:check
+
+      # Save only when the primary key wasn't an exact restore-hit so we don't retry
+      # writing to an existing cache entry (no-op warning). `always()` lets the cache
+      # persist even when `format:check` found diffs — the cache contents are valid
+      # regardless of pass/fail. This follows the documented split-restore/save pattern
+      # in actions/cache's README.
+      - name: Save Prettier cache
+        if: always() && steps.prettier-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: webui/node_modules/.cache/prettier
+          key: ${{ steps.prettier-cache.outputs.cache-primary-key }}
+
+  test-documentation:
+    if: github.event_name != 'push'
+    name: Documentation checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 11.15.1
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: documentation/pnpm-lock.yaml
+
+      - name: Install documentation dependencies
+        working-directory: documentation
+        run: pnpm install --frozen-lockfile
+
+      - name: Check documentation
+        working-directory: documentation
+        run: pnpm run check
+
+  vulnerability-monitor-tests:
+    name: Vulnerability monitor tests
+    if: github.event_name != 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: python -m pip install PyYAML==6.0.3
+      - run: python -m unittest discover -s scripts/vulnerability -v

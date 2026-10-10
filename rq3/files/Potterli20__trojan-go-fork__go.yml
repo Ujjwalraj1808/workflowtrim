@@ -1,0 +1,48 @@
+name: go-mod
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 */6 * * *"
+jobs:
+  go:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Setup Go 1.x.y
+        uses: actions/setup-go@main
+        with:
+          go-version: ^1.27
+      - name: Checkout codebase
+        uses: actions/checkout@main
+
+      - name: go-modules
+        run: |
+          if [ -f "go.mod" ]; then
+            go clean -modcache
+            gofmt -w -r 'interface{} -> any' .
+            go fix ./...
+            go mod tidy -compat=1.27
+            go mod download
+          else
+            echo "没有找到 go.mod 文件，跳过模块更新"
+            exit 0
+          fi
+
+      - name: fix go-modules
+        run: |
+          bash ./gomod/gomod.sh
+
+      - name: Git push
+        run: |
+          git config --local user.name "github-actions[bot]"
+          git config --local user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote set-url origin "https://${{ github.actor }}:${{ secrets.GITHUBTOKEN }}@github.com/${{ github.repository }}"
+          git gc --aggressive
+          git add --all
+          git commit -m "update go $(date +%Y.%m.%d.%H.%M)" || echo "No changes to commit"
+          git push -f -u origin master || true
+
+      - name: Delete workflow runs
+        uses: GitRML/delete-workflow-runs@main
+        with:
+          retain_days: 0.1
+          keep_minimum_runs: 1

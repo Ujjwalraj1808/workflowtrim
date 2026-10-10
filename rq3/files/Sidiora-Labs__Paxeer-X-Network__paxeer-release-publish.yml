@@ -1,0 +1,80 @@
+name: Paxeer / Release Publish
+
+on:
+  push:
+    tags:
+      - 'paxeer-network/v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing paxeer-network/vX.Y.Z tag to publish
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  releaser:
+    name: Build and publish Paxeer release
+    runs-on: ${{ vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
+    env:
+      RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+    steps:
+      - name: Checkout tag
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: refs/tags/${{ env.RELEASE_TAG }}
+          fetch-depth: 0
+      - name: Validate tag against version.json
+        run: |
+          set -euo pipefail
+          version=$(jq -er '.version' version.json)
+          semver_re='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$'
+          if [[ ! "$version" =~ $semver_re ]]; then
+            echo "Invalid Paxeer semantic version: $version"
+            exit 1
+          fi
+          if [[ "$RELEASE_TAG" != "paxeer-network/$version" ]]; then
+            echo "Tag $RELEASE_TAG does not match version.json $version"
+            exit 1
+          fi
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential libssl-dev libsqlite3-dev
+      - name: Build release binaries
+        env:
+          PAXD_RELEASE_LAYERXD: '1'
+        run: tools/release/build-paxd.sh
+      - name: Generate release notes
+        run: |
+          set -euo pipefail
+          python3 -m pip install --user git-cliff==2.8.0
+          git-cliff --config cliff.toml --tag-pattern '^paxeer-network/v[0-9]' --current --strip header \
+            --output "$RUNNER_TEMP/release-notes.md"
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version=${RELEASE_TAG#paxeer-network/}
+          gh release create "$RELEASE_TAG" \
+            --verify-tag \
+            --title "Paxeer Network $version" \
+            --notes-file "$RUNNER_TEMP/release-notes.md" \
+            "dist/$RELEASE_TAG"/*
+          {
+            echo "### Paxeer Network release $RELEASE_TAG"
+            echo '```'
+            cat "dist/$RELEASE_TAG/SHA256SUMS"
+            echo '```'
+            echo "$(gh release view "$RELEASE_TAG" --json url --jq '.url')"
+          } >> "$GITHUB_STEP_SUMMARY"

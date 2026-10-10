@@ -1,0 +1,729 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  changes:
+    if: github.event_name != 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    permissions:
+      pull-requests: read
+    outputs:
+      docs: ${{ steps.filter.outputs.docs }}
+      docs_only: ${{ steps.check.outputs.docs_only }}
+      release_metadata_only: ${{ steps.release-classifier.outputs.release_metadata_only }}
+      python: ${{ steps.filter.outputs.python }}
+      repo_tooling: ${{ steps.filter.outputs.repo_tooling }}
+      npm: ${{ steps.filter.outputs.npm }}
+      chatgpt_app: ${{ steps.filter.outputs.chatgpt_app }}
+      schemas: ${{ steps.filter.outputs.schemas }}
+      workflows: ${{ steps.filter.outputs.workflows }}
+      dependencies: ${{ steps.filter.outputs.dependencies }}
+      rustsec: ${{ steps.filter.outputs.rustsec }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d
+        id: filter
+        with:
+          filters: |
+            python:
+              - 'src/**'
+              - 'tests/**'
+              - 'pyproject.toml'
+              - 'uv.lock'
+              - 'uv.toml'
+              - 'scripts/**'
+              - 'conftest.py'
+              - 'pyrightconfig.json'
+              - '.python-version'
+              - 'performance/**'
+              - 'evals/**'
+            repo_tooling:
+              - 'package.json'
+              - 'pnpm-workspace.yaml'
+              - 'Dockerfile'
+              - 'docker-compose.yml'
+              - 'lefthook.yml'
+              - '.pre-commit-config.yaml'
+              - 'Taskfile.yml'
+              - '.mergify.yml'
+              - '.github/dependabot.yml'
+              - '.github/rulesets/**'
+              - 'sonar-project.properties'
+              - 'AGENTS.md'
+              - '**/AGENTS.md'
+            npm:
+              - 'packages/**'
+              - 'package.json'
+              - 'pnpm-lock.yaml'
+              - 'pnpm-workspace.yaml'
+              - '.node-version'
+              - '.npmrc'
+              - 'commitlint.config.cjs'
+              - '.commitlintrc.json'
+            chatgpt_app:
+              - 'integrations/chatgpt-app/apps-sdk/**'
+              - 'tests/unit/test_chatgpt_app_contract.py'
+              - '.github/workflows/ci.yml'
+            schemas:
+              - 'packages/protocol-schemas/**'
+            workflows:
+              - '.github/workflows/**'
+              - '.github/actions/**'
+              - '.github/actions-policy.json'
+              - 'codecov.yml'
+            rustsec:
+              - 'src-tauri/Cargo.lock'
+              - 'src-tauri/Cargo.toml'
+              - 'src-tauri/.cargo/audit.toml'
+              - 'rust-toolchain.toml'
+              - 'scripts/check_rustsec_audit.py'
+              - '.github/security/rustsec-baseline.json'
+              - '.github/workflows/ci.yml'
+            dependencies:
+              - 'package.json'
+              - 'pnpm-lock.yaml'
+              - 'pyproject.toml'
+              - 'uv.lock'
+              - 'Dockerfile'
+              - '.github/dependabot.yml'
+            docs:
+              - 'docs/**'
+              - 'README.md'
+              - 'CONTRIBUTING.md'
+              - 'CHANGELOG.md'
+              - 'CODE_OF_CONDUCT.md'
+              - 'GOVERNANCE.md'
+              - 'MAINTAINERS.md'
+              - 'ROADMAP.md'
+              - 'SECURITY.md'
+              - 'SUPPORT.md'
+              - 'ARCHITECTURE.md'
+              - 'CITATION.cff'
+              - 'LICENSE'
+              - 'mkdocs.yml'
+              - 'assets/**'
+              - 'integrations/chatgpt-app/**/*.md'
+      - name: Detect release metadata-only change set
+        id: release-classifier
+        shell: bash
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_EVENT_NAME" == 'pull_request' ]]; then
+            base_sha="$(git rev-parse HEAD^1)"
+            head_sha="$(git rev-parse HEAD^2)"
+          else
+            base_sha="$BEFORE_SHA"
+            head_sha="$(git rev-parse HEAD)"
+            if [[ -z "$base_sha" || "$base_sha" =~ ^0+$ ]]; then
+              base_sha="$(git rev-parse HEAD^)"
+            fi
+          fi
+          git diff --name-only "$base_sha" "$head_sha" > "${RUNNER_TEMP}/changed-paths.txt"
+          if python scripts/check_release_please_metadata_only.py \
+            --paths-file "${RUNNER_TEMP}/changed-paths.txt"; then
+            echo 'release_metadata_only=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'release_metadata_only=false' >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Compute docs_only flag
+        id: check
+        shell: bash
+        run: |
+          if [[ "${{ steps.filter.outputs.python }}" == 'false' && \
+                "${{ steps.filter.outputs.repo_tooling }}" == 'false' && \
+                "${{ steps.filter.outputs.npm }}" == 'false' && \
+                "${{ steps.filter.outputs.chatgpt_app }}" == 'false' && \
+                "${{ steps.filter.outputs.schemas }}" == 'false' && \
+                "${{ steps.filter.outputs.workflows }}" == 'false' && \
+                "${{ steps.filter.outputs.dependencies }}" == 'false' && \
+                "${{ steps.filter.outputs.rustsec }}" == 'false' && \
+                "${{ steps.filter.outputs.docs }}" == 'true' ]]; then
+            echo 'docs_only=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'docs_only=false' >> "$GITHUB_OUTPUT"
+          fi
+      - name: Summarize detected changes
+        run: |
+          {
+            echo '## Change Detection Summary'
+            echo ''
+            echo '| Category | Changed |'
+            echo '|----------|---------|'
+            echo '| python | ${{ steps.filter.outputs.python }} |'
+            echo '| repo_tooling | ${{ steps.filter.outputs.repo_tooling }} |'
+            echo '| npm | ${{ steps.filter.outputs.npm }} |'
+            echo '| chatgpt_app | ${{ steps.filter.outputs.chatgpt_app }} |'
+            echo '| schemas | ${{ steps.filter.outputs.schemas }} |'
+            echo '| workflows | ${{ steps.filter.outputs.workflows }} |'
+            echo '| dependencies | ${{ steps.filter.outputs.dependencies }} |'
+            echo '| rustsec | ${{ steps.filter.outputs.rustsec }} |'
+            echo '| docs | ${{ steps.filter.outputs.docs }} |'
+            echo '| **docs_only** | **${{ steps.check.outputs.docs_only }}** |'
+            echo '| **release_metadata_only** | **${{ steps.release-classifier.outputs.release_metadata_only }}** |'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  release-metadata:
+    name: Release metadata consistency
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7
+        with:
+          enable-cache: true
+          prune-cache: true
+          version-file: uv.toml
+      - run: uv sync --all-extras --frozen
+      - name: Verify canonical public metadata is synchronized
+        run: uv run --all-extras python scripts/sync_mcp_metadata.py --check
+      - name: Validate deterministic KiCad PCM package
+        run: uv run --all-extras python scripts/build_kicad_pcm.py --output-dir "/tmp/kicad-pcm" --verify
+
+  python-changed-quality:
+    name: Python changed-file quality
+    needs: [changes, release-metadata]
+    if: >-
+      always() &&
+      needs.release-metadata.result == 'success' &&
+      (github.repository_owner == 'oaslananka' || github.repository_owner == 'oaslananka-ops')
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Skip changed Python quality when unaffected
+        if: >-
+          github.event_name == 'workflow_dispatch' ||
+          needs.changes.outputs.release_metadata_only == 'true' ||
+          needs.changes.outputs.python != 'true'
+        run: |
+          echo "::notice::Skipping changed Python Ruff parity — no applicable diff"
+          echo "skip_ci=true" >> "$GITHUB_ENV"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        if: env.skip_ci != 'true'
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7
+        if: env.skip_ci != 'true'
+        with:
+          enable-cache: true
+          prune-cache: true
+          version-file: uv.toml
+      - run: uv sync --all-extras --frozen
+        if: env.skip_ci != 'true'
+      - name: Enforce changed Python Ruff scope
+        if: env.skip_ci != 'true'
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          # pull_request checks out GitHub's synthetic merge commit; HEAD^1 is its base parent.
+          if [[ "$GITHUB_EVENT_NAME" == 'pull_request' ]]; then
+            base_sha="$(git rev-parse HEAD^1)"
+          else
+            base_sha="$BEFORE_SHA"
+            if [[ -z "$base_sha" || "$base_sha" =~ ^0+$ ]]; then
+              base_sha="$(git rev-parse HEAD^)"
+            fi
+          fi
+          uv run --all-extras python scripts/hook_pre_push.py --base "$base_sha" --ruff-only
+
+  mcp-server:
+    needs: [changes, release-metadata]
+    if: >-
+      always() &&
+      needs.release-metadata.result == 'success' &&
+      (github.repository_owner == 'oaslananka' || github.repository_owner == 'oaslananka-ops')
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2025, macos-15]
+    steps:
+      - name: Skip mcp-server when unaffected or redundant
+        if: >-
+          github.event_name != 'workflow_dispatch' &&
+          ((needs.changes.outputs.release_metadata_only == 'true' && matrix.os != 'ubuntu-24.04') ||
+           (needs.changes.outputs.release_metadata_only != 'true' &&
+            needs.changes.outputs.python != 'true' &&
+            needs.changes.outputs.repo_tooling != 'true' &&
+            needs.changes.outputs.workflows != 'true'))
+        shell: bash
+        run: |
+          echo "::notice::Skipping mcp-server CI — change set does not require this lane"
+          echo "skip_ci=true" >> "$GITHUB_ENV"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        if: env.skip_ci != 'true'
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        if: env.skip_ci != 'true'
+        with:
+          node-version-file: .node-version
+          package-manager-cache: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7
+        if: env.skip_ci != 'true'
+        with:
+          enable-cache: true
+          prune-cache: true
+          version-file: uv.toml
+      - run: corepack enable
+        if: env.skip_ci != 'true'
+      - run: corepack pnpm install --frozen-lockfile
+        if: env.skip_ci != 'true'
+      - run: uv sync --all-extras --frozen
+        if: env.skip_ci != 'true'
+      - run: corepack pnpm run format:check
+        if: env.skip_ci != 'true'
+      - run: corepack pnpm run lint
+        if: env.skip_ci != 'true'
+      - run: corepack pnpm run typecheck
+        if: env.skip_ci != 'true'
+      - run: corepack pnpm run architecture:check
+        if: env.skip_ci != 'true'
+      - run: corepack pnpm run test:unit
+        if: env.skip_ci != 'true'
+      - run: corepack pnpm run metadata:check
+        if: env.skip_ci != 'true'
+      - run: corepack pnpm run mcp:manifest:check
+        if: env.skip_ci != 'true'
+      - run: corepack pnpm run package:check
+        if: env.skip_ci != 'true'
+
+  coverage:
+    name: CI Tests / Coverage
+    needs: [changes, release-metadata]
+    if: >-
+      always() &&
+      needs.release-metadata.result == 'success' &&
+      (github.repository_owner == 'oaslananka' || github.repository_owner == 'oaslananka-ops')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Skip full coverage when Python is unaffected
+        if: >-
+          github.event_name != 'workflow_dispatch' &&
+          (needs.changes.outputs.release_metadata_only == 'true' ||
+           (needs.changes.outputs.python != 'true' &&
+            needs.changes.outputs.repo_tooling != 'true' &&
+            needs.changes.outputs.workflows != 'true'))
+        run: |
+          echo "::notice::Skipping full Python coverage — no Python, repository-tooling, or workflow changes detected"
+          echo "skip_ci=true" >> "$GITHUB_ENV"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        if: env.skip_ci != 'true'
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Run full Python suite with coverage and JUnit
+        id: python-tests
+        if: env.skip_ci != 'true'
+        continue-on-error: true
+        uses: ./.github/actions/python-full-suite
+        with:
+          junitxml: python.junit.xml
+      - name: Enforce Python patch coverage
+        id: patch-coverage
+        if: >-
+          env.skip_ci != 'true' &&
+          github.event_name == 'pull_request' &&
+          needs.changes.outputs.python == 'true' &&
+          steps.python-tests.outcome == 'success'
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          # pull_request checks out GitHub's synthetic merge commit; HEAD^1 is its base parent.
+          uv run python scripts/check_patch_coverage.py \
+            --coverage-file coverage.json \
+            --min-percent 90
+      - name: Upload Python coverage to Codecov
+        if: env.skip_ci != 'true' && !cancelled() && hashFiles('coverage.xml') != ''
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5
+        with:
+          use_oidc: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+          files: coverage.xml
+          disable_search: true
+          disable_telem: true
+          fail_ci_if_error: false
+          flags: python-full
+          name: python-full
+          verbose: true
+      - name: Upload Python test results to Codecov
+        if: env.skip_ci != 'true' && !cancelled() && hashFiles('python.junit.xml') != ''
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5
+        with:
+          use_oidc: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+          report_type: test_results
+          files: python.junit.xml
+          disable_search: true
+          disable_telem: true
+          fail_ci_if_error: false
+          flags: python-full
+          name: python-full-tests
+          verbose: true
+      - name: Upload Python coverage to Codacy
+        if: env.skip_ci != 'true' && !cancelled() && hashFiles('coverage.xml') != ''
+        continue-on-error: true
+        env:
+          CODACY_PROJECT_TOKEN: ${{ secrets.CODACY_PROJECT_TOKEN }}
+          CODACY_REPORTER_VERSION: "14.1.3"
+        run: |
+          set -euo pipefail
+          if [[ -z "${CODACY_PROJECT_TOKEN:-}" ]]; then
+            echo "::warning::CODACY_PROJECT_TOKEN secret is not set — Codacy upload skipped."
+            exit 0
+          fi
+          curl --fail --silent --show-error --location \
+               --retry 3 --retry-all-errors --connect-timeout 10 \
+               https://coverage.codacy.com/get.sh \
+               --output "${RUNNER_TEMP}/codacy-get.sh"
+          bash "${RUNNER_TEMP}/codacy-get.sh" report -r coverage.xml
+      - name: Propagate Python coverage or test failure
+        if: >-
+          env.skip_ci != 'true' &&
+          (steps.python-tests.outcome == 'failure' ||
+           steps.patch-coverage.outcome == 'failure')
+        env:
+          PYTHON_TEST_OUTCOME: ${{ steps.python-tests.outcome }}
+          PATCH_COVERAGE_OUTCOME: ${{ steps.patch-coverage.outcome }}
+        run: |
+          if [[ "$PYTHON_TEST_OUTCOME" == "failure" ]]; then
+            echo "Full Python suite failed; Codecov uploads were attempted before failing the job."
+          fi
+          if [[ "$PATCH_COVERAGE_OUTCOME" == "failure" ]]; then
+            echo "Python patch coverage gate failed; see the preceding gate output for details."
+          fi
+          exit 1
+
+  mcp-2026-compat:
+    name: MCP 2026 Compatibility
+    needs: [changes, release-metadata]
+    if: >-
+      always() &&
+      needs.release-metadata.result == 'success' &&
+      (github.repository_owner == 'oaslananka' || github.repository_owner == 'oaslananka-ops')
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Skip candidate protocol lane when unaffected
+        if: >-
+          github.event_name != 'workflow_dispatch' &&
+          (needs.changes.outputs.release_metadata_only == 'true' ||
+           (needs.changes.outputs.python != 'true' &&
+            needs.changes.outputs.schemas != 'true' &&
+            needs.changes.outputs.workflows != 'true'))
+        run: |
+          echo "::notice::Skipping MCP 2026 compatibility — docs-only PR detected"
+          echo "skip_ci=true" >> "$GITHUB_ENV"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        if: env.skip_ci != 'true'
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7
+        if: env.skip_ci != 'true'
+        with:
+          enable-cache: true
+          prune-cache: true
+          version-file: uv.toml
+      - run: uv sync --all-extras --frozen
+        if: env.skip_ci != 'true'
+      - name: Run stable-independent MCP 2026 compatibility contracts
+        if: env.skip_ci != 'true'
+        run: >-
+          uv run pytest tests/unit/test_mcp_2026_config.py
+          tests/unit/test_native_2026_bridge_disposition.py
+          tests/unit/test_mcp_protocol_2026_contract.py -q
+
+      - name: Run supported-host MCP 2026 smoke cases
+        if: env.skip_ci != 'true'
+        run: uv run pytest tests/integration/test_mcp_2026_host_smoke.py -q
+
+      - name: Run native SDK v2 protocol evidence
+        if: env.skip_ci != 'true'
+        run: uv run pytest tests/integration/test_mcp_native_v2_protocol.py -q
+
+  mcp-npm:
+    needs: [changes, release-metadata]
+    if: >-
+      always() &&
+      needs.release-metadata.result == 'success' &&
+      (github.repository_owner == 'oaslananka' || github.repository_owner == 'oaslananka-ops')
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2025, macos-15]
+    defaults:
+      run:
+        working-directory: packages/mcp-npm
+    steps:
+      - name: Skip mcp-npm when unaffected or redundant
+        if: >-
+          github.event_name != 'workflow_dispatch' &&
+          ((needs.changes.outputs.release_metadata_only == 'true' && matrix.os != 'ubuntu-24.04') ||
+           (needs.changes.outputs.release_metadata_only != 'true' &&
+            needs.changes.outputs.npm != 'true' &&
+            needs.changes.outputs.workflows != 'true'))
+        working-directory: ${{ github.workspace }}
+        shell: bash
+        run: |
+          echo "::notice::Skipping mcp-npm CI — change set does not require this lane"
+          echo "skip_ci=true" >> "$GITHUB_ENV"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        if: env.skip_ci != 'true'
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        if: env.skip_ci != 'true'
+        with:
+          node-version-file: .node-version
+          package-manager-cache: false
+      - run: npm ci --ignore-scripts=false
+        if: env.skip_ci != 'true'
+      - run: npm pack --dry-run
+        if: env.skip_ci != 'true'
+      - run: npm run build
+        if: env.skip_ci != 'true'
+
+  chatgpt-app:
+    needs: [changes, release-metadata]
+    if: >-
+      always() &&
+      needs.release-metadata.result == 'success' &&
+      (github.repository_owner == 'oaslananka' || github.repository_owner == 'oaslananka-ops')
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: integrations/chatgpt-app/apps-sdk
+    steps:
+      - name: Skip ChatGPT App CI when unaffected
+        if: github.event_name != 'workflow_dispatch' && needs.changes.outputs.chatgpt_app != 'true'
+        working-directory: ${{ github.workspace }}
+        run: |
+          echo "::notice::Skipping ChatGPT App CI - no app contract changes detected"
+          echo "skip_ci=true" >> "$GITHUB_ENV"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        if: env.skip_ci != 'true'
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        if: env.skip_ci != 'true'
+        with:
+          node-version-file: .node-version
+          package-manager-cache: false
+      - run: npm ci --ignore-scripts=false
+        if: env.skip_ci != 'true'
+      - run: npm run typecheck
+        if: env.skip_ci != 'true'
+      - run: npm run build
+        if: env.skip_ci != 'true'
+      - run: npm run test:smoke
+        if: env.skip_ci != 'true'
+
+  protocol-schemas:
+    needs: [changes, release-metadata]
+    if: >-
+      always() &&
+      needs.release-metadata.result == 'success' &&
+      (github.repository_owner == 'oaslananka' || github.repository_owner == 'oaslananka-ops')
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Skip protocol-schemas CI when unaffected
+        if: >-
+          github.event_name != 'workflow_dispatch' &&
+          needs.changes.outputs.schemas != 'true' &&
+          needs.changes.outputs.workflows != 'true'
+        run: |
+          echo "::notice::Skipping protocol-schemas CI — schema surface unchanged"
+          echo "skip_ci=true" >> "$GITHUB_ENV"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        if: env.skip_ci != 'true'
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        if: env.skip_ci != 'true'
+        with:
+          node-version-file: .node-version
+          package-manager-cache: false
+      - run: corepack enable
+        if: env.skip_ci != 'true'
+      - run: corepack pnpm install --frozen-lockfile
+        if: env.skip_ci != 'true'
+      - run: corepack pnpm --filter @oaslananka/kicad-protocol-schemas run format:check
+        if: env.skip_ci != 'true'
+      - run: corepack pnpm --filter @oaslananka/kicad-protocol-schemas run lint
+        if: env.skip_ci != 'true'
+      - run: corepack pnpm --filter @oaslananka/kicad-protocol-schemas run typecheck
+        if: env.skip_ci != 'true'
+      - run: corepack pnpm --filter @oaslananka/kicad-protocol-schemas run test
+        if: env.skip_ci != 'true'
+
+  workflow-policy:
+    needs: [changes, release-metadata]
+    if: >-
+      always() &&
+      needs.release-metadata.result == 'success' &&
+      (github.repository_owner == 'oaslananka' || github.repository_owner == 'oaslananka-ops')
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7
+        with:
+          enable-cache: true
+          prune-cache: true
+          version-file: uv.toml
+      - run: uv sync --all-extras --frozen
+      - run: uv run --all-extras python scripts/check_github_actions_policy.py
+      - run: uv run --all-extras python scripts/check_workflows.py --actionlint
+      - run: uv run --all-extras python scripts/workflow_security.py --min-severity high
+
+  security:
+    needs: [changes, release-metadata]
+    if: >-
+      always() &&
+      needs.release-metadata.result == 'success' &&
+      (github.repository_owner == 'oaslananka' || github.repository_owner == 'oaslananka-ops')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Skip Trivy scan for non-runtime metadata changes
+        if: >-
+          needs.changes.outputs.docs_only == 'true' ||
+          needs.changes.outputs.release_metadata_only == 'true'
+        run: |
+          echo "::notice::Skipping Trivy filesystem scan — docs-only PR detected"
+          echo "skip_ci=true" >> "$GITHUB_ENV"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        if: env.skip_ci != 'true'
+        with:
+          persist-credentials: false
+      - uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25
+        if: env.skip_ci != 'true'
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: table
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+          version: v0.70.0
+      - name: Install pinned cargo-audit
+        if: >-
+          env.skip_ci != 'true' &&
+          (needs.changes.outputs.rustsec == 'true' || github.event_name == 'workflow_dispatch')
+        run: cargo install cargo-audit --version 0.22.2 --locked
+      - name: Verify reviewed RustSec dependency baseline
+        if: >-
+          env.skip_ci != 'true' &&
+          (needs.changes.outputs.rustsec == 'true' || github.event_name == 'workflow_dispatch')
+        working-directory: src-tauri
+        shell: bash
+        run: |
+          set -euo pipefail
+          audit_status=0
+          cargo audit --json --no-yanked > ../rustsec-audit.json || audit_status=$?
+          if [ "$audit_status" -gt 1 ]; then
+            echo "cargo-audit failed before producing valid audit evidence (exit=$audit_status)" >&2
+            exit "$audit_status"
+          fi
+          audit_version="$(cargo audit --version | awk '{print $2}')"
+          python3 ../scripts/check_rustsec_audit.py \
+            --report ../rustsec-audit.json \
+            --baseline ../.github/security/rustsec-baseline.json \
+            --cargo-audit-version "$audit_version"
+
+  release-readiness:
+    name: Release Readiness
+    if: startsWith(github.head_ref, 'release-please--')
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7
+        with:
+          enable-cache: false
+          version-file: uv.toml
+      - run: uv sync --all-extras --frozen
+      - name: Enforce live-model release readiness
+        run: uv run --all-extras python scripts/check_live_model_release_policy.py --require-ready release --ref HEAD
+
+  required-pr-gate:
+    name: Required PR Gate
+    needs: [changes, release-metadata, python-changed-quality, mcp-server, coverage, mcp-npm, chatgpt-app, protocol-schemas, mcp-2026-compat, workflow-policy, security, release-readiness]
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Evaluate required job results
+        shell: bash
+        run: |
+          set -euo pipefail
+          declare -A results=(
+            [changes]="${{ needs.changes.result }}"
+            [release-metadata]="${{ needs.release-metadata.result }}"
+            [python-changed-quality]="${{ needs.python-changed-quality.result }}"
+            [mcp-server]="${{ needs.mcp-server.result }}"
+            [coverage]="${{ needs.coverage.result }}"
+            [mcp-npm]="${{ needs.mcp-npm.result }}"
+            [chatgpt-app]="${{ needs.chatgpt-app.result }}"
+            [protocol-schemas]="${{ needs.protocol-schemas.result }}"
+            [mcp-2026-compat]="${{ needs.mcp-2026-compat.result }}"
+            [workflow-policy]="${{ needs.workflow-policy.result }}"
+            [security]="${{ needs.security.result }}"
+            [release-readiness]="${{ needs.release-readiness.result }}"
+          )
+          docs_only="${{ needs.changes.outputs.docs_only }}"
+          release_metadata_only="${{ needs.changes.outputs.release_metadata_only }}"
+
+          {
+            echo '## Required PR Gate'
+            echo ''
+            echo "docs_only: **${docs_only:-n/a}**"
+            echo "release_metadata_only: **${release_metadata_only:-n/a}**"
+            echo ''
+            echo '| Job | Result |'
+            echo '|-----|--------|'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          failed=0
+          for job in changes release-metadata python-changed-quality mcp-server coverage mcp-npm chatgpt-app protocol-schemas mcp-2026-compat workflow-policy security release-readiness; do
+            result="${results[$job]}"
+            echo "| $job | $result |" >> "$GITHUB_STEP_SUMMARY"
+            case "$result" in
+              failure|cancelled)
+                failed=1
+                ;;
+            esac
+          done
+
+          if [[ "$failed" -eq 1 ]]; then
+            echo '' >> "$GITHUB_STEP_SUMMARY"
+            echo '❌ One or more required jobs failed or was cancelled.' >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          echo '' >> "$GITHUB_STEP_SUMMARY"
+          echo '✅ All required jobs passed or were not applicable to this event.' >> "$GITHUB_STEP_SUMMARY"

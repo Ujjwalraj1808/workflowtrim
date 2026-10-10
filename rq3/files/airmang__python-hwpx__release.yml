@@ -1,0 +1,219 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+      - "[0-9]*"
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  legacy-cap:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Require public 5.1.1 legacy cap before core 5
+        run: python scripts/verify_legacy_release_cap.py --venv "${RUNNER_TEMP}/hwpx-phase0-legacy"
+
+  prepublish:
+    needs: legacy-cap
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Install release test dependencies
+        run: python -m pip install -e ".[test,typecheck]"
+      # The executable-docs gate builds a throwaway venv with uv and fails
+      # closed when the binary is absent; runners do not ship it.
+      - name: Install uv for the installed-wheel docs gate
+        run: python -m pip install "uv>=0.7"
+      - name: Check public repository hygiene
+        run: python scripts/check_public_hygiene.py
+      - name: Run Ruff gates
+        run: |
+          ruff check --select E9,F .
+          ruff check --select E4,E7,E9,F \
+            src/hwpx/document.py \
+            src/hwpx/oxml/{_document_impl,_document_primitives,document,document_parts,header_part,memo,numbering,objects,paragraph,run,section,section_format,section_story,simple_parts,table}.py \
+            src/hwpx/tools/package_validator.py \
+            tests/template_automation/generate_fixtures.py \
+            tests/{test_oxml_modularization,test_paragraph_section_management,test_section_headers}.py
+      - name: Run typing checks
+        run: |
+          python scripts/check_typing_generics_scope.py
+          mypy
+          pyright
+      - name: Run tests with coverage ratchet
+        run: pytest -q --cov=hwpx --cov-report=term-missing --cov-fail-under=80
+
+  release:
+    needs: prepublish
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Validate tag/version consistency
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TAG_NAME="${GITHUB_REF_NAME}"
+          TAG_VERSION="${TAG_NAME#v}"
+
+          PYPROJECT_VERSION=$(python - <<'PY'
+          import tomllib
+          from pathlib import Path
+
+          data = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
+          print(data["project"]["version"])
+          PY
+          )
+
+          CHANGELOG_VERSION=$(python - <<'PY'
+          import re
+          from pathlib import Path
+
+          changelog = Path("CHANGELOG.md").read_text(encoding="utf-8")
+          # Skip the conventional [Unreleased] heading so keep-a-changelog
+          # workflow (pre-collecting notes above the released version) is
+          # preserved alongside tag-based release automation.
+          matches = re.findall(r"^## \[([^\]]+)\]", changelog, re.MULTILINE)
+          version = next(
+              (m.strip() for m in matches if m.strip().lower() != "unreleased"),
+              None,
+          )
+          if version is None:
+              raise SystemExit("CHANGELOG.md에서 버전 섹션(## [x.y.z])을 찾지 못했습니다.")
+          print(version)
+          PY
+          )
+
+          echo "Tag version: ${TAG_VERSION}"
+          echo "pyproject version: ${PYPROJECT_VERSION}"
+          echo "changelog version: ${CHANGELOG_VERSION}"
+
+          if [[ "${TAG_VERSION}" != "${PYPROJECT_VERSION}" ]]; then
+            echo "태그 버전(${TAG_VERSION})과 pyproject 버전(${PYPROJECT_VERSION})이 일치하지 않습니다." >&2
+            exit 1
+          fi
+
+          if [[ "${TAG_VERSION}" != "${CHANGELOG_VERSION}" ]]; then
+            echo "태그 버전(${TAG_VERSION})과 changelog 최신 버전(${CHANGELOG_VERSION})이 일치하지 않습니다." >&2
+            exit 1
+          fi
+
+      - name: Extract latest changelog section for release notes
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          lines = Path("CHANGELOG.md").read_text(encoding="utf-8").splitlines()
+          # Find the first released version heading, skipping [Unreleased].
+          start = next(
+              (
+                  i
+                  for i, line in enumerate(lines)
+                  if line.startswith("## [") and "unreleased" not in line.lower()
+              ),
+              None,
+          )
+          if start is None:
+              raise SystemExit("CHANGELOG.md에서 릴리스 섹션을 찾지 못했습니다.")
+
+          end = next(
+              (i for i in range(start + 1, len(lines)) if lines[i].startswith("## [")),
+              len(lines),
+          )
+
+          section = "\n".join(lines[start:end]).strip() + "\n"
+          Path("release_notes.md").write_text(section, encoding="utf-8")
+          PY
+
+      - name: Build distributions (migrated from scripts/build-and-publish.sh)
+        run: |
+          set -euo pipefail
+          export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+          test -n "${SOURCE_DATE_EPOCH}"
+          python -m pip install "build==1.5.0" "twine==6.2.0"
+          rm -rf dist build
+          python -m build
+          twine check dist/*
+          mkdir -p release-artifacts
+          python - <<'PY'
+          import hashlib
+          from pathlib import Path
+
+          artifacts = sorted(path for path in Path("dist").iterdir() if path.is_file())
+          if not artifacts:
+              raise SystemExit("dist/ has no release artifacts")
+          lines = [
+              f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.name}"
+              for path in artifacts
+          ]
+          Path("release-artifacts/SHA256SUMS").write_text(
+              "\n".join(lines) + "\n",
+              encoding="utf-8",
+          )
+          PY
+          python scripts/check_public_hygiene.py
+
+      - name: Generate release SBOM
+        run: |
+          python -m venv .sbom-runtime
+          .sbom-runtime/bin/python -m pip install dist/*.whl
+          python -m venv .sbom-tool
+          .sbom-tool/bin/python -m pip install "cyclonedx-bom==7.3.0"
+          mkdir -p release-artifacts
+          .sbom-tool/bin/cyclonedx-py environment .sbom-runtime/bin/python \
+            --pyproject pyproject.toml \
+            --mc-type library \
+            --output-reproducible \
+            --output-format JSON \
+            --output-file "release-artifacts/python-hwpx-${GITHUB_REF_NAME}.cdx.json"
+
+      # Same bytes as the Release asset, exposed as a workflow artifact for
+      # sandboxed AI runtimes whose GitHub connector cannot download Release
+      # assets. wheel-artifact.yml re-publishes it under the same name on a
+      # schedule so the 90-day artifact expiry does not strand users.
+      - name: Upload wheel as a workflow artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: python-hwpx-wheel
+          path: |
+            dist/*.whl
+            release-artifacts/SHA256SUMS
+          retention-days: 90
+          if-no-files-found: error
+
+      - name: Publish package to PyPI
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
+        with:
+          body_path: release_notes.md
+          draft: false
+          files: |
+            dist/*
+            release-artifacts/*
+          prerelease: false
+
+      - name: Verify PyPI and GitHub release hashes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python scripts/verify_release_hashes.py --manifest release-artifacts/SHA256SUMS --asset-dir "${RUNNER_TEMP}/python-hwpx-release-assets" --tag "${GITHUB_REF_NAME}"

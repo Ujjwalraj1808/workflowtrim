@@ -1,0 +1,183 @@
+name: CI Code Quality
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "main", "develop" ]
+  pull_request:
+    branches: [ "main", "develop" ]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: "22"
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  quality-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install dependencies
+        run: uv sync --group dev -p ${{ env.PYTHON_VERSION }}
+
+      # WebUI 前端行为测试（tests/test_webui_runtime_chat_behavior.py）用 jsdom
+      # 驱动真实 DOM；缺这段安装时该文件的 _require_env() 会让用例直接失败
+      # （只有在本地非 CI 环境下才会 skip）。
+      - name: Install frontend test dependencies
+        run: npm ci --prefix tests/frontend
+
+      - name: Cache Ruff
+        uses: actions/cache@v4
+        with:
+          path: .ruff_cache
+          key: ${{ runner.os }}-ruff-${{ hashFiles('**/uv.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-ruff-
+
+      - name: Run Ruff
+        run: |
+          uv run ruff check .
+          uv run ruff format --check .
+
+      - name: Cache Mypy
+        uses: actions/cache@v4
+        with:
+          path: .mypy_cache
+          key: ${{ runner.os }}-mypy-${{ hashFiles('**/uv.lock') }}-${{ hashFiles('src/**/*.py') }}
+          restore-keys: |
+            ${{ runner.os }}-mypy-${{ hashFiles('**/uv.lock') }}-
+            ${{ runner.os }}-mypy-
+
+      - name: Run Mypy
+        run: uv run mypy .
+
+      - name: Run Tests (with coverage gate)
+        env:
+          # 让部署模板的「wheel 内容」测试真正构建一次 wheel（本地默认跳过）
+          UNDEFINED_DEPLOY_WHEEL_CHECK: "1"
+        run: uv run pytest tests/ --cov --cov-report=term
+
+      - name: Build wheel
+        run: uv build --wheel
+
+      - name: Verify wheel contains resources
+        run: |
+          uv run python -c "import glob, zipfile; whl=glob.glob('dist/*.whl')[0]; z=zipfile.ZipFile(whl); names=set(z.namelist()); required={'config.toml.example','res/prompts/undefined.xml','img/xlwy.jpg','Undefined/deploy/cli.py','Undefined/deploy/templates/Dockerfile.bot','Undefined/deploy/templates/compose.base.yaml'}; missing=sorted([p for p in required if p not in names]); assert not missing, f'missing in wheel: {missing}'"
+
+  python-compat:
+    name: Python compat (${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # pyproject 声明 >=3.11,<3.14；主岗位跑 3.12，这里覆盖两端边界
+        python-version: ["3.11", "3.13"]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Install dependencies
+        run: uv sync --group dev -p ${{ matrix.python-version }}
+
+      - name: Install frontend test dependencies
+        run: npm ci --prefix tests/frontend
+
+      - name: Run Mypy
+        run: uv run mypy .
+
+      - name: Run Tests
+        run: uv run pytest tests/
+
+  native-app-quality-check:
+    name: Native app quality (${{ matrix.app_dir }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - product: console
+            app_dir: apps/undefined-console
+          - product: chat
+            app_dir: apps/undefined-chat
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: "npm"
+          cache-dependency-path: ${{ matrix.app_dir }}/package-lock.json
+
+      - name: Cache node_modules
+        id: cache-node-modules
+        uses: actions/cache@v4
+        with:
+          path: ${{ matrix.app_dir }}/node_modules
+          key: ${{ runner.os }}-node-${{ env.NODE_VERSION }}-node-modules-${{ matrix.product }}-${{ hashFiles(format('{0}/package-lock.json', matrix.app_dir)) }}
+          restore-keys: |
+            ${{ runner.os }}-node-${{ env.NODE_VERSION }}-node-modules-${{ matrix.product }}-
+            ${{ runner.os }}-node-${{ env.NODE_VERSION }}-node-modules-
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ci-${{ matrix.product }}-${{ hashFiles(format('{0}/src-tauri/Cargo.lock', matrix.app_dir), format('{0}/package-lock.json', matrix.app_dir)) }}
+          workspaces: |
+            ${{ matrix.app_dir }}/src-tauri -> target
+
+      - name: Install Linux system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf
+
+      - name: Install app dependencies
+        if: steps.cache-node-modules.outputs.cache-hit != 'true'
+        working-directory: ${{ matrix.app_dir }}
+        run: npm ci
+
+      - name: Run native app checks
+        working-directory: ${{ matrix.app_dir }}
+        run: npm run check

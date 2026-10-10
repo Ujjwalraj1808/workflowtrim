@@ -1,0 +1,638 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Restrict permissions to minimum required for CI
+permissions:
+  contents: read
+
+env:
+  GO_VERSION: "1.26.3"
+
+jobs:
+  # ============================================================================
+  # REALITY GUARDS - WS0 systemic gates (bd-ws0-guards-klz98)
+  # Runs scripts/check_allowlists.sh plus every guard in scripts/guards/*.sh via
+  # run_all.sh. Later lanes add guards by dropping a script into scripts/guards/
+  # (see the plug-in contract in scripts/guards/run_all.sh) — this job never
+  # needs editing. No Go toolchain or br required: br-absent degradation is by
+  # design (check_allowlists.sh validates format + bead-ID shape in CI; the
+  # open-bead check runs locally where br exists).
+  # ============================================================================
+  reality-guards:
+    name: Reality Guards
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+      - name: Validate allowlists (format + waiver-bead shape)
+        run: bash scripts/check_allowlists.sh
+      - name: Run all reality guards (ratchets + canaries)
+        run: bash scripts/guards/run_all.sh
+
+  # ============================================================================
+  # REALITY GUARDS (GO) - the Go-toolchain-needing WS0 gates
+  # The bare reality-guards job (no Go, by design) runs only the allowlist
+  # format side of these guards; this job guarantees the full analyses run in
+  # CI: the G1 dead-code gate (bd-ws0-guards-klz98.2: pinned deadcode tool,
+  # GOOS={linux,darwin,windows} intersection, orphan-package check, canary)
+  # and the G2 config-key liveness test (bd-ws0-guards-klz98.3).
+  # ============================================================================
+  reality-guards-go:
+    name: Reality Guards (Go)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: G1 dead-code gate (deadcode multi-GOOS intersect + canary + ratchet)
+        run: bash scripts/guards/deadcode_gate.sh
+
+      - name: G2 config-key liveness (RegisterReader claims + canary + ratchet)
+        run: bash scripts/guards/config_liveness.sh
+
+      - name: Tagged-test compile gate (go vet per test build tag + canary, bd-xj28x)
+        run: bash scripts/guards/tagged_vet.sh
+
+  # ============================================================================
+  # RELEASE PREFLIGHT (dry-run) - WS0-G4 release-artifact lockstep
+  # (bd-ws0-guards-klz98.5). Releases are DSR-only (AGENTS.md), so this job is
+  # a DRY-RUN of scripts/release_preflight.sh against the VERSION file: every
+  # artifact declared in release_artifacts.toml must be present and
+  # version-locked, and any buildable deliverable dir (web/, vscode/) without
+  # a manifest entry fails — "finished but never shipped" is structurally
+  # impossible. The --self-test step is the merge-blocking canary (skewed
+  # fixture must fail) and runs in CI forever. The same script is STEP 0 of
+  # the DSR release checklist in AGENTS.md.
+  # ============================================================================
+  release-preflight:
+    name: Release Preflight (dry-run)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Self-test (canaries must fire)
+        run: bash scripts/release_preflight.sh --self-test
+
+      - name: Dry-run pre-flight against release_artifacts.toml
+        run: bash scripts/release_preflight.sh --dry-run
+
+  # ============================================================================
+  # VSCODE EXTENSION - compile gate + vsix package build (F2,
+  # bd-ws5-ship-or-cut-jv0rc.2). The extension rotted silently for 8 minor
+  # versions because nothing compiled it; this job makes rot loud on every
+  # push. The DSR release attaches the .vsix built by scripts/build_vsix.sh
+  # (marketplace publishing deferred per the Q1 ledger entry on the bead).
+  # ============================================================================
+  vscode-extension:
+    name: VSCode Extension (tsc + vsix)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: vscode
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Typecheck (tsc --noEmit)
+        run: npx tsc -p . --noEmit
+
+      - name: Package .vsix (build check, version lockstep vs VERSION)
+        working-directory: .
+        run: bash scripts/build_vsix.sh
+
+  # ============================================================================
+  # LINT - Static analysis and code quality
+  # ============================================================================
+  lint:
+    name: Lint
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Install golangci-lint from source
+        run: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2
+
+      - name: Run golangci-lint
+        run: golangci-lint run --timeout=5m
+
+      - name: Check go mod tidy
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod go.sum
+
+      - name: Check formatting
+        run: |
+          gofmt -l .
+          test -z "$(gofmt -l .)"
+
+      - name: Run go vet
+        run: go vet ./...
+
+  # ============================================================================
+  # OPENAPI DRIFT - the served chi router is the single OpenAPI source of truth
+  # (bd-ws4-openapi-parity-wpwck.2.2). docs/openapi.json and
+  # docs/parity_matrix.json are GENERATED by `ntm openapi generate`, which
+  # hermetically instantiates the serve mux and chi.Walks it. This job
+  # regenerates both artifacts and fails on any diff against the committed
+  # versions. (It replaces the retired scripts/gen_openapi.ts drift step and
+  # the kernel-registry drift step.)
+  # ============================================================================
+  openapi-drift:
+    name: OpenAPI Drift
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Regenerate OpenAPI spec + parity matrix from the served router
+        run: |
+          go build -o ntm ./cmd/ntm
+          ./ntm openapi generate --parity-matrix docs/parity_matrix.json
+
+      - name: Fail on drift against committed artifacts
+        run: |
+          git diff --exit-code docs/openapi.json docs/parity_matrix.json || {
+            echo ""
+            echo "========================================================================"
+            echo "  ERROR: OpenAPI drift detected!"
+            echo ""
+            echo "  docs/openapi.json / docs/parity_matrix.json no longer match the"
+            echo "  served router. Regenerate and commit:"
+            echo "    ntm openapi generate --parity-matrix docs/parity_matrix.json"
+            echo "========================================================================"
+            exit 1
+          }
+
+      - name: Validate OpenAPI document
+        run: go run github.com/getkin/kin-openapi/cmd/validate@v0.142.0 docs/openapi.json
+
+  # ============================================================================
+  # TEST - Unit tests with coverage on multiple platforms
+  # ============================================================================
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+        # Note: Windows excluded since ntm requires tmux which is Unix-only
+
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Install tmux (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y tmux
+
+      - name: Install tmux (macOS)
+        if: runner.os == 'macOS'
+        run: brew install tmux
+
+      - name: Build
+        run: go build -v ./...
+
+      - name: Test with Coverage
+        env:
+          # Opt in to tests/integration: its TestMain refuses to silently no-op
+          # the package in CI when this is unset (bd-zaarm).
+          NTM_INTEGRATION_TESTS: "1"
+        run: |
+          go test -v -race -timeout=15m -covermode=atomic -coverprofile=coverage.out ./...
+
+      - name: Upload Coverage to Codecov
+        if: matrix.os == 'ubuntu-24.04'
+        uses: codecov/codecov-action@0fb7174895f61a3b6b78fc075e0cd60383518dac # v5
+        with:
+          files: coverage.out
+          flags: unittests
+          name: codecov-ntm
+          fail_ci_if_error: false
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+      - name: Upload Coverage Artifact
+        if: matrix.os == 'ubuntu-24.04'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: coverage-report
+          path: coverage.out
+          retention-days: 7
+
+  # ============================================================================
+  # PARITY HARNESS - Hermetic-serve CLI-vs-REST parity (WS4, un-skipped)
+  # Boots `ntm serve` hermetically, sets NTM_TEST_SERVER, and runs the parity
+  # suite in tests/integration/parity_gate_test.go. The script asserts
+  # executed-count > 0 and skipped-count == 0: a skipped parity test is a
+  # FAILURE (bd-ws4-openapi-parity-wpwck.1).
+  # ============================================================================
+  parity-harness:
+    name: Hermetic Serve Parity
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Install tmux
+        run: sudo apt-get update && sudo apt-get install -y tmux
+
+      - name: Run hermetic-serve parity harness
+        run: bash scripts/parity_harness.sh
+
+  # ============================================================================
+  # COVERAGE - Enforce coverage thresholds
+  # ============================================================================
+  coverage:
+    name: Coverage Thresholds
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    needs: test
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Install tmux
+        run: sudo apt-get update && sudo apt-get install -y tmux
+
+      - name: Run tests with coverage
+        env:
+          # Opt in to tests/integration: its TestMain refuses to silently no-op
+          # the package in CI when this is unset (bd-zaarm).
+          NTM_INTEGRATION_TESTS: "1"
+        run: go test -covermode=atomic -coverprofile=coverage.out ./...
+
+      - name: Enforce Project Coverage Threshold
+        run: |
+          total=$(go tool cover -func=coverage.out | tail -1 | awk '{print $3}' | tr -d '%')
+          echo "Total coverage: ${total}%"
+          threshold=35
+          echo "Threshold: ${threshold}%"
+          awk -v c="$total" -v t="$threshold" 'BEGIN {
+            if (c < t) {
+              printf("Coverage %.2f%% is below threshold %.2f%%\n", c, t);
+              exit 1
+            } else {
+              printf("Coverage %.2f%% meets threshold %.2f%%\n", c, t);
+            }
+          }'
+
+      - name: Generate HTML Coverage Report
+        run: go tool cover -html=coverage.out -o coverage.html
+
+      - name: Upload HTML Coverage Report
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: coverage-html
+          path: coverage.html
+          retention-days: 14
+
+  # ============================================================================
+  # BUILD - Cross-platform build verification
+  # ============================================================================
+  build:
+    name: Build (${{ matrix.goos }}/${{ matrix.goarch }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: linux
+            goarch: arm
+            goarm: "7"
+          - goos: darwin
+            goarch: amd64
+          - goos: darwin
+            goarch: arm64
+          - goos: windows
+            goarch: amd64
+          - goos: freebsd
+            goarch: amd64
+
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+          CGO_ENABLED: "0"
+        run: |
+          output="ntm-${{ matrix.goos }}-${{ matrix.goarch }}"
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            output="${output}.exe"
+          fi
+          if [ -n "${{ matrix.goarm }}" ]; then
+            output="ntm-${{ matrix.goos }}-${{ matrix.goarch }}v${{ matrix.goarm }}"
+          fi
+          go build -trimpath -ldflags="-s -w" -o "${output}" ./cmd/ntm
+          ls -la "${output}"
+
+      - name: Upload Binary
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ntm-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.goarm && format('v{0}', matrix.goarm) || '' }}
+          path: ntm-*
+          retention-days: 7
+
+  # ============================================================================
+  # SECURITY - Vulnerability scanning
+  # ============================================================================
+  security:
+    name: Security Scan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Run Govulncheck
+        continue-on-error: true  # Don't fail CI on stdlib vulnerabilities
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@v1.6.0
+          govulncheck ./...
+
+      - name: Run Gosec
+        uses: securego/gosec@9e6a9843d7a4a6e3e9a8539b02612c8a4aa3f889 # v2.27.1
+        with:
+          args: "-no-fail -fmt sarif -out results.sarif ./..."
+
+      - name: Upload SARIF file
+        uses: github/codeql-action/upload-sarif@99df26d4f13ea111d4ec1a7dddef6063f76b97e9 # v4
+        if: always() && hashFiles('results.sarif') != ''
+        continue-on-error: true  # Don't fail CI if SARIF upload fails (permissions/GHAS not enabled)
+        with:
+          sarif_file: results.sarif
+
+  # ============================================================================
+  # GORELEASER - Verify release configuration
+  # ============================================================================
+  goreleaser-check:
+    name: GoReleaser Check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Check GoReleaser config
+        uses: goreleaser/goreleaser-action@e435ccd777264be153ace6237001ef4d979d3a7a # v6
+        with:
+          distribution: goreleaser
+          version: "v2.17.0"
+          args: check
+
+      - name: GoReleaser Dry Run
+        uses: goreleaser/goreleaser-action@e435ccd777264be153ace6237001ef4d979d3a7a # v6
+        with:
+          distribution: goreleaser
+          version: "v2.17.0"
+          # Skip SBOM and signing in dry run (they require external tools)
+          args: release --snapshot --skip=publish,sbom,sign --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ============================================================================
+  # DEPENDENCY - Check for dependency issues
+  # ============================================================================
+  dependency-review:
+    name: Dependency Review
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    if: github.event_name == 'pull_request'
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      - name: Dependency Review
+        uses: actions/dependency-review-action@2031cfc080254a8a887f58cffee85186f0e49e48 # v4.9.0
+        with:
+          fail-on-severity: high
+          deny-licenses: GPL-3.0, AGPL-3.0
+
+  # ============================================================================
+  # INTEGRATION - Run integration tests (if tmux available)
+  # ============================================================================
+  integration:
+    name: Integration Tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Install tmux
+        run: sudo apt-get update && sudo apt-get install -y tmux
+
+      - name: Build ntm
+        run: go build -o ntm ./cmd/ntm
+
+      - name: Verify ntm binary
+        run: |
+          ./ntm version
+          ./ntm --help
+
+      - name: Test shell init output
+        run: |
+          ./ntm shell bash | head -20
+          ./ntm shell zsh | head -20
+
+      - name: Run real tmux integration tests
+        env:
+          TMUX_TMPDIR: ${{ runner.temp }}/ntm-tmux
+          TMUX: ""
+        run: |
+          mkdir -p "$TMUX_TMPDIR"
+          go test -v -tags=integration -count=1 -timeout=5m ./internal/pipeline \
+            -run '^TestRealTmuxPipelineE2E_(RunPersistAndLoad|ResumeFailedTemplateDispatch|NonZeroExitPersistsDiagnostics)$'
+          go test -v -tags=integration -count=1 -timeout=5m ./internal/tui/dashboard \
+            -run '^TestRealTmuxDashboardE2E$'
+          go test -v -count=1 -timeout=2m ./internal/robot \
+            -run '^TestPrintReplayRealTmuxDeliversOnce$'
+
+      - name: Clean up private tmux server
+        if: always()
+        env:
+          TMUX_TMPDIR: ${{ runner.temp }}/ntm-tmux
+          TMUX: ""
+        run: tmux kill-server 2>/dev/null || true
+
+  # ============================================================================
+  # UPGRADE-CHECK - Verify upgrade command works against current releases
+  # This catches asset naming drift between upgrade.go and GoReleaser BEFORE release
+  # ============================================================================
+  upgrade-check:
+    name: Upgrade Check (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Build ntm
+        run: go build -trimpath -ldflags "-X github.com/Dicklesworthstone/ntm/internal/cli.Version=0.0.0" -o ntm ./cmd/ntm
+
+      - name: Verify strict upgrade asset resolution
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          echo "Testing upgrade --check against latest release..."
+          ./ntm upgrade --check --strict 2>&1 | tee upgrade_output.txt
+          grep -q "Asset available:" upgrade_output.txt
+          echo "Strict upgrade asset naming contract verified"
+
+  # ============================================================================
+  # SUMMARY - Final status check
+  # ============================================================================
+  ci-success:
+    name: CI Success
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    needs: [reality-guards, reality-guards-go, lint, openapi-drift, test, coverage, build, security, goreleaser-check, integration, upgrade-check, vscode-extension]
+    if: always()
+    steps:
+      - name: Check all jobs passed
+        run: |
+          if [ "${{ needs.reality-guards.result }}" != "success" ] || \
+             [ "${{ needs.reality-guards-go.result }}" != "success" ] || \
+             [ "${{ needs.lint.result }}" != "success" ] || \
+             [ "${{ needs.openapi-drift.result }}" != "success" ] || \
+             [ "${{ needs.test.result }}" != "success" ] || \
+             [ "${{ needs.coverage.result }}" != "success" ] || \
+             [ "${{ needs.build.result }}" != "success" ] || \
+             [ "${{ needs.security.result }}" != "success" ] || \
+             [ "${{ needs.goreleaser-check.result }}" != "success" ] || \
+             [ "${{ needs.integration.result }}" != "success" ] || \
+             [ "${{ needs.upgrade-check.result }}" != "success" ] || \
+             [ "${{ needs.vscode-extension.result }}" != "success" ]; then
+            echo "One or more jobs failed"
+            exit 1
+          fi
+          echo "All CI checks passed!"

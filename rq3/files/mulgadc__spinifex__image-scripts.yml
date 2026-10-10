@@ -1,0 +1,57 @@
+name: Image Scripts
+
+on:
+  push:
+    branches:
+      - main
+      - dev
+    paths:
+      - scripts/images/**
+      - images/**
+      - .github/workflows/image-scripts.yml
+  pull_request:
+    branches:
+      - main
+      - dev
+    paths:
+      - scripts/images/**
+      - images/**
+      - .github/workflows/image-scripts.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  image_scripts:
+    name: Image Scripts
+    runs-on: ubuntu-26.04
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v7
+
+      - name: Run image script tests + shellcheck
+        run: make test-images
+
+  eks_mkosi_image:
+    name: Build mkosi EKS image
+    runs-on: [self-hosted, ci-single]
+    concurrency:
+      group: eks-mkosi-image-${{ github.ref }}
+      cancel-in-progress: true
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: "go.mod"
+          # Self-hosted: the module + build cache already persists on local
+          # disk, and cache-save would re-upload hundreds of MB for nothing.
+          cache: false
+
+      - name: Build the image
+        run: make build-eks-node-mkosi-image

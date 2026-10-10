@@ -1,0 +1,200 @@
+name: build
+
+on:
+  push:
+    branches: [ "*" ]  # This will trigger the workflow on push to any branch
+    tags:
+      - '*'  # Trigger on all tags
+  pull_request:
+    branches: [ "*" ]  # This will trigger the workflow on pull requests to any branch
+
+jobs:
+  apk:
+    name: Generate APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: '${{ github.ref }}'
+          submodules: true
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
+
+      - name: Build with Gradle
+        run: ./gradlew assembleAndroidFdroidRelease -c settings.android.gradle
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk
+          path: '**/*.apk'
+
+      - name: Upload APK to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: '**/*.apk'
+
+  build_check:
+    name: Flavors build check
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: '${{ github.ref }}'
+          submodules: true
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
+
+      - name: Build with Gradle
+        run: ./gradlew assemble -c settings.android.gradle
+
+  package-linux:
+    name: Package Linux X64
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: '${{ github.ref }}'
+          submodules: true
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'  # Use the latest version of Python 3
+
+      - name: Install Python dependencies
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install lxml
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
+
+      - name: Package Linux X64 with Gradle
+        run: ./gradlew -c settings.desktop.gradle packageLinuxX64 --no-configuration-cache
+
+      - name: Upload Linux Bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-bundle
+          path: 'dist/*'  # Adjust this path to match the output of your Linux bundle
+
+  package-windows:
+    name: Package Windows X64
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: '${{ github.ref }}'
+          submodules: true
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'  # Use the latest version of Python 3
+
+      - name: Install Python dependencies
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install lxml
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
+
+      - name: Package Windows X64 with Gradle
+        run: ./gradlew -c settings.desktop.gradle packageWinX64 --no-configuration-cache
+
+      - name: Upload Windows Bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-bundle
+          path: 'dist/*'  # Adjust this path to match the output of your Windows bundle
+
+  package-appimage:
+    name: Package AppImage
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: '${{ github.ref }}'
+          submodules: true
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Install Python dependencies
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install lxml
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
+
+      - name: Download appimagetool
+        run: |
+          sudo apt-get install -y libfuse2
+          wget -q https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage -O /tmp/appimagetool
+          chmod +x /tmp/appimagetool
+
+      - name: Package AppImage with Gradle
+        run: |
+          export PATH="/tmp:$PATH"
+          ./gradlew -c settings.desktop.gradle packageAppImage -Pflavor_market=appimage --no-configuration-cache
+
+      - name: Upload AppImage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: appimage
+          path: 'dist/*.AppImage'
+          if-no-files-found: error
+
+      - name: Upload AppImage to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.AppImage

@@ -1,0 +1,207 @@
+name: Deploy to Production
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      image-tag:
+        description: >-
+          Existing GHCR image tag to deploy (e.g. 2.0.3 or a short sha) —
+          skips the build entirely, so this is the rollback path.
+          Leave empty to build and deploy the current ref.
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+concurrency:
+  group: production-deploy
+  cancel-in-progress: false
+
+jobs:
+  build:
+    # releases always build; manual dispatch skips the build when an existing
+    # image tag is supplied (rollback path)
+    if: github.event_name == 'release' || inputs.image-tag == ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image-tag: ${{ steps.meta.outputs.version }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GHCR_PAT }}
+
+      # On release: 2.1.0 + short sha + latest (so self-hosters on :latest
+      # track releases, not whatever main happens to be). On manual dispatch
+      # without a tag input: short sha only.
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=sha,prefix=,format=short
+            type=raw,value=latest,enable=${{ github.event_name == 'release' }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            APP_VERSION=${{ steps.meta.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: linux/amd64,linux/arm64
+
+  deploy:
+    needs: build
+    # run when build succeeded OR was skipped (rollback path)
+    if: ${{ !failure() && !cancelled() }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      IMAGE_TAG: ${{ inputs.image-tag != '' && inputs.image-tag || needs.build.outputs.image-tag }}
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.2.5
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER || 'root' }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: 22
+          envs: IMAGE_TAG
+          script: |
+            set -e
+            cd /opt/spoo
+            echo "${{ secrets.GHCR_PAT }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+            # The shell copy would shadow .env for compose, so a rollback
+            # that rewrote .env still deployed the new image. Compose must
+            # only ever read the tag from .env.
+            TARGET_TAG="${IMAGE_TAG}"
+            unset IMAGE_TAG
+            PREV_TAG=$(grep '^IMAGE_TAG=' .env | cut -d= -f2- || true)
+            echo "deploying ${TARGET_TAG} (previous: ${PREV_TAG:-<none>})"
+
+            set_tag() {
+              grep -v '^IMAGE_TAG=' .env > .env.tmp 2>/dev/null || true
+              echo "IMAGE_TAG=$1" >> .env.tmp
+              mv .env.tmp .env
+              chmod 600 .env
+            }
+
+            wait_healthy() {
+              # Caddy keeps a connection pool to app:8000 with retries, so
+              # users see a brief latency bump (not 502) during the swap.
+              # Budget: app startup (imports plus index creation, 35s seen)
+              # plus the 30s start_period plus one 15s probe interval.
+              [ -n "$1" ] || { echo "::error::wait_healthy: missing container name"; return 1; }
+              status=""
+              for i in $(seq 1 40); do
+                status=$(docker inspect "$1" --format '{{.State.Health.Status}}' 2>/dev/null || echo "missing")
+                if [ "$status" = "healthy" ]; then
+                  running=$(docker inspect "$1" --format '{{.Config.Image}}' 2>/dev/null || true)
+                  case "$running" in *:"$2") return 0 ;; esac
+                  echo "::error::$1 is healthy on ${running}, expected tag $2"; return 1
+                fi
+                echo "$1 $status, retry $i"; sleep 3
+              done
+              return 1
+            }
+
+            set_tag "${TARGET_TAG}"
+            docker compose --env-file .env -f docker-compose.prod.yml pull app
+            docker compose --env-file .env -f docker-compose.prod.yml up -d --no-deps app
+
+            if ! wait_healthy spoo_app "${TARGET_TAG}"; then
+              echo "::error::app failed to reach healthy on ${TARGET_TAG} (last status: $status)"
+              # diagnostics must never abort the rollback below (set -e)
+              docker compose --env-file .env -f docker-compose.prod.yml logs --tail=100 app || true
+              if [ -n "$PREV_TAG" ] && [ "$PREV_TAG" != "$TARGET_TAG" ]; then
+                echo "rolling back to ${PREV_TAG}"
+                set_tag "${PREV_TAG}"
+                docker compose --env-file .env -f docker-compose.prod.yml pull app || true
+                docker compose --env-file .env -f docker-compose.prod.yml up -d --no-deps app
+                if wait_healthy spoo_app "${PREV_TAG}"; then
+                  echo "::warning::rolled back — prod is healthy on previous image ${PREV_TAG}"
+                else
+                  echo "::error::rollback to ${PREV_TAG} also unhealthy — manual intervention needed"
+                fi
+              fi
+              exit 1
+            fi
+
+            # The click worker runs the SAME image (shared wire contract with
+            # the app) — swap it only after the app is confirmed healthy, so
+            # an app rollback leaves the worker untouched on the old pair.
+            docker compose --env-file .env -f docker-compose.prod.yml up -d --no-deps click-worker
+
+            if ! wait_healthy spoo_click_worker "${TARGET_TAG}"; then
+              echo "::error::click worker failed to reach healthy on ${TARGET_TAG} (last status: $status)"
+              docker compose --env-file .env -f docker-compose.prod.yml logs --tail=100 click-worker || true
+              if [ -n "$PREV_TAG" ] && [ "$PREV_TAG" != "$TARGET_TAG" ]; then
+                echo "rolling back app + worker to ${PREV_TAG}"
+                set_tag "${PREV_TAG}"
+                docker compose --env-file .env -f docker-compose.prod.yml pull app click-worker || true
+                docker compose --env-file .env -f docker-compose.prod.yml up -d --no-deps app click-worker
+                if wait_healthy spoo_app "${PREV_TAG}" && wait_healthy spoo_click_worker "${PREV_TAG}"; then
+                  echo "::warning::rolled back — prod is healthy on previous image ${PREV_TAG}"
+                else
+                  echo "::error::rollback to ${PREV_TAG} also unhealthy — manual intervention needed"
+                fi
+              fi
+              exit 1
+            fi
+
+            docker image prune -f
+            docker compose --env-file .env -f docker-compose.prod.yml ps
+
+      - name: Verify health
+        uses: appleboy/ssh-action@v1.2.5
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER || 'root' }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: 22
+          script: |
+            sleep 10
+            for i in 1 2 3 4 5; do
+              if body=$(docker exec spoo_app curl -fsS http://localhost:8000/health); then
+                echo "Healthy after $i attempts: $body"
+                exit 0
+              fi
+              echo "Attempt $i failed, retrying..."
+              sleep 5
+            done
+            echo "Health check failed after 5 attempts"
+            docker compose -f /opt/spoo/docker-compose.prod.yml logs --tail=100 app
+            exit 1

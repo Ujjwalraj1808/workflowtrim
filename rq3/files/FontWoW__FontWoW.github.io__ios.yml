@@ -1,0 +1,74 @@
+name: Build iOS App
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'capacitor.config.json'
+      - 'package.json'
+      - '.github/workflows/ios.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build web application
+        run: npm run build
+
+      - name: Add Capacitor iOS Platform (CocoaPods)
+        run: npx cap add ios --packagemanager cocoapods
+
+      - name: Sync iOS and run pod install
+        run: npx cap sync ios
+
+      - name: Build iOS App (.app Simulator Build)
+        run: |
+          xcodebuild -workspace ios/App/App.xcworkspace \
+            -scheme App \
+            -configuration Release \
+            -sdk iphonesimulator \
+            -derivedDataPath build \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+
+      - name: Package iOS Application
+        run: |
+          VERSION_NAME=$(node -e "import('./src/updates.js').then(m => console.log(m.APP_VERSION))")
+          ZIP_NAME="FontWoW-v${VERSION_NAME}-iOS.zip"
+          mkdir -p dist-ios
+          cd build/Build/Products/Release-iphonesimulator
+          zip -r "$GITHUB_WORKSPACE/dist-ios/${ZIP_NAME}" App.app
+          echo "zip_name=${ZIP_NAME}" >> "$GITHUB_ENV"
+          echo "zip_path=dist-ios/${ZIP_NAME}" >> "$GITHUB_ENV"
+
+      - name: Upload iOS App Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.zip_name }}
+          path: ${{ env.zip_path }}
+
+      - name: Publish rolling release asset for iOS
+        uses: softprops/action-gh-release@v2
+        if: github.ref == 'refs/heads/main'
+        with:
+          tag_name: latest
+          name: FontWoW (Latest Build)
+          prerelease: true
+          files: ${{ env.zip_path }}

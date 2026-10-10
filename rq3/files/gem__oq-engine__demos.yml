@@ -1,0 +1,105 @@
+---
+name: demos
+on:
+  workflow_dispatch:
+    inputs:
+      git-ref:
+        description: Git Ref
+        default: master
+        required: true
+      oq-release:
+        description: 'OQ Release'
+        required: true
+        default: 'latest'
+        type: choice
+        options:
+        - latest
+        - LTS
+        - dev
+  push:
+    branches: [ master ]
+jobs:
+  demos:
+    runs-on: ubuntu-latest
+    env:
+      GITHUB_PULL_REQUEST: ${{ github.event.number }}
+      GITHUB_DEF_BR:  ${{ github.event.repository.default_branch }}
+      GITHUB_REF:  ${{ github.ref }}
+      GITHUB_HD_REF:  ${{ github.head_ref }}
+      GITHUB_BS_REF:  ${{ github.base_ref }}
+      GITHUB_INPUT_REF: ${{ github.event.inputs.git-ref }}
+    steps:
+      - name: Check out the codebase (Master)
+        if: github.event.inputs.git-ref == ''
+        uses: actions/checkout@v6
+      - name: Check out the codebase (Custom Ref)
+        if: github.event.inputs.git-ref != ''
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.git-ref }}
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Upgrade pip and install requirements
+        run: |
+          export PIP_DEFAULT_TIMEOUT=100
+          pip install --default-timeout=100 -U pip
+          pip install pydata-sphinx-theme
+      - name: Install OpenQuake engine
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        #      GITHUB_DEF_BR:  ${{ github.event.repository.default_branch }}
+        #      GITHUB_REF:  ${{ github.ref }}
+        run: |
+          if [ -z "$GITHUB_INPUT_REF" ]
+          then
+              echo "This is not a workflow_dispatch RUN, use: $GITHUB_DEF_BR"
+              python install.py devel --version ${GITHUB_DEF_BR}
+          else
+              echo "This is a workflow_dispatch RUN, use: $GITHUB_INPUT_REF"
+              python install.py devel --version ${GITHUB_INPUT_REF}
+          fi
+      - name: Run demos and upload to docs.openquake.org
+        # uncomment the line below to avoid running this part when triggering the action manually
+        # if: github.event.inputs.git-ref == ''
+        shell: bash
+        env:
+          DOCS_SSH: ${{ secrets.DOCS_ARTIFACTS }}
+          GITHUB_PULL_REQUEST: ${{ github.event.number }}
+          GITHUB_DEF_BR:  ${{ github.event.repository.default_branch }}
+          GITHUB_REF:  ${{ github.ref }}
+          GITHUB_HD_REF:  ${{ github.head_ref }}
+          GITHUB_BS_REF:  ${{ github.base_ref }}
+        run: |
+          source ~/openquake/bin/activate
+          zip -q -r /tmp/demos.zip demos/
+          OQ_DISTRIBUTE=zmq bin/run-demos.sh demos/ openquake/qa_tests_data/
+          oq dump /tmp/oqdata.zip
+          # OQ_DISTRIBUTE=slurm oq run demos/hazard/AreaSourceClassicalPSHA/job.ini
+          oq restore /tmp/oqdata.zip /tmp/oqdata
+          helpers/zipdemos.sh $(pwd)/demos
+          if [ -z "$GITHUB_INPUT_REF" ]
+          then
+              echo "This is not a workflow_dispatch RUN"
+              echo "Check if this is a pull request or not"
+              if [ -z "$GITHUB_HD_REF" ]
+              then
+                  echo "This is not a pull request, use branch: $GITHUB_DEF_BR"
+                  GITHUB_BR=$GITHUB_DEF_BR
+              else
+                  echo "This is a pull request, use branch: $GITHUB_HD_REF"
+                  GITHUB_BR=$GITHUB_HD_REF
+              fi
+          else
+              echo "This is a workflow_dispatch RUN, use: $GITHUB_INPUT_REF"
+              GITHUB_BR=$GITHUB_INPUT_REF
+          fi
+          echo "BRANCH set to $GITHUB_BR"
+          gpg --quiet --batch --yes --decrypt --passphrase="$DOCS_SSH" --output ./.deploy_rsa ./.deploy_docs.enc
+          chmod 600 ./.deploy_rsa
+          eval $(ssh-agent -s) && ssh-add ./.deploy_rsa
+          set -x
+          scp -v -o ConnectTimeout=120 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null /tmp/demos.zip docs@docs.openquake.org:/var/www/artifacts.openquake.org/travis/demos-${GITHUB_BR}.zip
+          scp -v -o ConnectTimeout=120 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null /tmp/oqdata.zip docs@docs.openquake.org:/var/www/artifacts.openquake.org/travis/oqdata-${GITHUB_BR}.zip
+          set +x

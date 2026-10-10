@@ -1,0 +1,80 @@
+name: Deploy to GitHub Pages
+
+on:
+  push:
+    tags:
+      - 'site-v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build shared package
+        run: pnpm --filter @yep-anywhere/shared build
+
+      - name: Build site (Astro)
+        run: cd site && npm ci && npm run build
+
+      - name: Build remote client
+        run: |
+          pnpm --filter @yep-anywhere/client exec tsc
+          pnpm --filter @yep-anywhere/client exec vite build --config vite.config.remote.ts --base /remote/
+
+      - name: Prepare deployment directory
+        run: |
+          mkdir -p deploy
+          cp -r site/dist/. deploy/
+          cp -r packages/client/dist-remote deploy/remote
+          # GitHub Pages needs index.html to serve the /remote/ directory
+          cp deploy/remote/remote.html deploy/remote/index.html
+          # Root 404.html enables SPA routing for /remote/* paths (GitHub Pages only uses root 404)
+          cp deploy/remote/remote.html deploy/404.html
+
+      - name: Setup Pages
+        uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6
+        with:
+          enablement: true
+
+      - name: Verify Digital Asset Links artifact
+        run: test -f deploy/.well-known/assetlinks.json
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5
+        with:
+          path: deploy
+          include-hidden-files: true
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5

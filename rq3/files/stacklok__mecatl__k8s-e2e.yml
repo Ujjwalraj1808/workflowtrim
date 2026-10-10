@@ -1,0 +1,249 @@
+# kind-based k8s e2e suite for mecak8s.
+#
+# Spins a real kind cluster + Redis StatefulSet + two storage-free mecak8s agent
+# replicas and asserts lease exclusion, graceful failover, session persistence,
+# and caller identity against an in-cluster Dex OIDC provider. The suite lives
+# under e2e/k8s/ (build tag `kind_e2e`); `task e2e:k8s` runs
+# `GOWORK=off go test -tags kind_e2e -count=1 -timeout 30m ./e2e/k8s/...`. Slow
+# (~5-8 min) and needs Docker, so it is NOT part of `task test` and runs only on
+# changes (the mecak8s binary, the Redis store, the server surface it composes, the
+# deploy manifests, the suite itself, and the build config).
+#
+# Trigger model:
+#   - push to main, pull_request — both gated by a `paths:` filter so an unrelated
+#     doc-only or engine-only PR never pays the kind spin-up cost.
+#
+# Deliberately uses `pull_request` (NOT `pull_request_target`): this job checks out
+# and executes untrusted PR code, so it must run WITHOUT access to repo secrets —
+# the same pwn-request rationale as ci.yml. The suite is fully offline (no provider
+# key); the image is built into the local Docker daemon under a ko.local ref with
+# no registry push, so no credentials are needed at all.
+#
+# All third-party actions are SHA-pinned (with a # vX.Y.Z comment) so a re-pointed
+# tag from a compromised maintainer cannot change what runs here. Pins match the
+# Stacklok house set used in ci.yml / e2e-live.yml.
+name: k8s-e2e
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - cmd/mecak8s/**
+      - internal/cliconfig/**
+      - adapters/redisstore/**
+      - adapters/go.mod
+      - adapters/go.sum
+      - internal/adaptersupport/**
+      - contracts/gen/go/mecatl/driver/**
+      - go.work
+      - go.work.sum
+      - internal/adapter/server/authn.go
+      - internal/adapter/server/service.go
+      - internal/adapter/server/errors.go
+      - internal/adapter/server/grpc.go
+      - internal/adapter/server/http.go
+      - deploy/helm/mecak8s/**
+      - deploy/helm/mecatl-execution/**
+      - cmd/mecatl-execution-provider/**
+      - cmd/mecatl-executor/**
+      - internal/adapter/executioncontroller/**
+      - internal/adapter/executionclient/**
+      - internal/executionenv/**
+      - contracts/proto/mecatl/execution/**
+      - e2e/k8s_execution/**
+      - deploy/mecatl-execution-kind/**
+      - build/execution-provider/Dockerfile
+      - build/execution-workload/Dockerfile
+      - e2e/k8s/**
+      - go.mod
+      - go.sum
+      - .ko.yaml
+      - Taskfile.yml
+      - .github/workflows/k8s-e2e.yml
+  pull_request:
+    paths:
+      - cmd/mecak8s/**
+      - internal/cliconfig/**
+      - adapters/redisstore/**
+      - adapters/go.mod
+      - adapters/go.sum
+      - internal/adaptersupport/**
+      - contracts/gen/go/mecatl/driver/**
+      - go.work
+      - go.work.sum
+      - internal/adapter/server/authn.go
+      - internal/adapter/server/service.go
+      - internal/adapter/server/errors.go
+      - internal/adapter/server/grpc.go
+      - internal/adapter/server/http.go
+      - deploy/helm/mecak8s/**
+      - deploy/helm/mecatl-execution/**
+      - cmd/mecatl-execution-provider/**
+      - cmd/mecatl-executor/**
+      - internal/adapter/executioncontroller/**
+      - internal/adapter/executionclient/**
+      - internal/executionenv/**
+      - contracts/proto/mecatl/execution/**
+      - e2e/k8s_execution/**
+      - deploy/mecatl-execution-kind/**
+      - build/execution-provider/Dockerfile
+      - build/execution-workload/Dockerfile
+      - e2e/k8s/**
+      - go.mod
+      - go.sum
+      - .ko.yaml
+      - Taskfile.yml
+      - .github/workflows/k8s-e2e.yml
+
+# Least-privilege: the job only reads source. The suite is fully offline; no
+# registry push and no API write are needed.
+permissions:
+  contents: read
+
+# Cancel superseded runs on the same ref so a force-push doesn't pile up minutes
+# (same shape as ci.yml).
+concurrency:
+  group: k8s-e2e-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GOTOOLCHAIN: local
+  GOFLAGS: -mod=readonly
+
+jobs:
+  k8s-e2e:
+    name: k8s e2e (kind)
+    runs-on: ubuntu-24.04
+    # `task e2e:k8s` has a 30m `go test -timeout`; setup and build consume this
+    # job budget too. Leave the suite enough outer-deadline margin to emit its
+    # diagnostics and upload the tee'd failure log.
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+          # engine/ is its own module (go.work monorepo); its go.sum is part of
+          # the build cache key alongside the root's.
+          cache-dependency-path: |
+            go.sum
+            engine/go.sum
+            adapters/go.sum
+            internal/adaptersupport/go.sum
+            contracts/gen/go/mecatl/driver/go.sum
+
+      - uses: go-task/setup-task@a00fbb05ce67b35648be3c78cbc9fd85354c757e # v2.2.0
+        with:
+          version: 3.x
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      # Validate the chart's default + oidc.enabled renders before the runtime
+      # suite. The Dex fixture adds its test-only private-issuer relaxation
+      # imperatively, so it cannot prove the operator-facing chart remains safe
+      # or well-formed. Match the Helm version used to package releases.
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v3.18.4
+
+      - name: Install deploy manifest validators
+        run: go install github.com/yannh/kubeconform/cmd/kubeconform@v0.7.0
+
+      - name: Run Helm unit tests
+        run: task deploy:helm-unittest
+
+      - name: task deploy:check
+        run: task deploy:check
+
+      # kind: pinned version, installed via `go install` (no third-party action —
+      # the house idiom for go-installable tools, matching actionlint/govulncheck
+      # in ci.yml). v0.33.0 is the current release.
+      - name: Install kind
+        run: go install sigs.k8s.io/kind@v0.33.0
+
+      # ko: pinned version, same `go install` idiom. v0.18.1 builds the mecak8s
+      # image from .ko.yaml onto the distroless base. KO_DOCKER_REPO=ko.local below
+      # loads it into the local container daemon with no registry push.
+      - name: Install ko
+        run: go install github.com/google/ko@v0.18.1
+
+      # kubectl is pre-installed on ubuntu-24.04 runners.
+
+      # `task e2e:k8s` == `task build` (deps), then
+      # `GOWORK=off go test -tags kind_e2e -count=1 -timeout 30m ./e2e/k8s/...`.
+      # The suite builds the image with `ko build` under a deterministic
+      # ko.local/mecak8s:e2e ref (the test itself pins KO_DOCKER_REPO, so this
+      # step's env is a documentation-only fallback), then `<runtime> save` +
+      # `kind load image-archive` loads the tarball into the kind node —
+      # bypassing `kind load docker-image`'s containerd-snapshotter bridge, which
+      # fails on the runner's Docker daemon ("failed to detect containerd
+      # snapshotter"). No podman needed. It then `helm upgrade --install`s the
+      # deploy/helm/mecak8s chart with the Kind values profile. Output is teed so
+      # the failure-artifact upload has the full log; explicit `shell: bash`
+      # gives `-o pipefail` so the tee never masks a test failure.
+      - name: task e2e:k8s
+        shell: bash
+        env:
+          KO_DOCKER_REPO: ko.local
+        run: task e2e:k8s 2>&1 | tee k8s-e2e-output.log
+
+      # Failure-only artifact upload (mirrors e2e-live.yml's pattern): the tee'd
+      # test log is the deliverable of a failed run — it carries the full `go test`
+      # output (kind bring-up, pod logs, assertion failures). if-no-files-found is
+      # `warn` (not `ignore`) so a future regression in the tee path is VISIBLE in
+      # the job log instead of silent.
+      - name: Upload failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: k8s-e2e-artifacts-${{ github.run_id }}
+          path: k8s-e2e-output.log
+          retention-days: 7
+          if-no-files-found: warn
+
+  execution-production-e2e:
+    name: execution provider production profile (kind)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: |
+            go.sum
+            engine/go.sum
+            adapters/go.sum
+            internal/adaptersupport/go.sum
+            contracts/gen/go/mecatl/driver/go.sum
+      - uses: go-task/setup-task@a00fbb05ce67b35648be3c78cbc9fd85354c757e # v2.2.0
+        with:
+          version: 3.x
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v3.18.4
+      - name: Install pinned Kind and ko
+        run: |
+          go install sigs.k8s.io/kind@v0.33.0
+          go install github.com/google/ko@v0.18.1
+      - name: Run production execution qualification
+        shell: bash
+        env:
+          CONTAINER_ENGINE: docker
+          MECATL_EXECUTION_QUAL_CI: "1"
+        run: task e2e:k8s:execution:production
+      - name: Upload bounded failure artifact
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: execution-e2e-artifacts-${{ github.run_id }}
+          path: .scratch/k8s-execution/*/production-failure-artifact.txt
+          retention-days: 7
+          if-no-files-found: warn

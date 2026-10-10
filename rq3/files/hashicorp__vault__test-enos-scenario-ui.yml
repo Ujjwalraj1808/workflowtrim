@@ -1,0 +1,179 @@
+---
+name: Vault UI Tests
+
+# cancel existing runs of the same workflow on the same ref
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+on:
+  workflow_call:
+    inputs:
+      test_filter:
+        type: string
+        description: "A filter to limit the ui tests to. Will be appended to the ember test command as '-f=<filter>'"
+        required: false
+      storage_backend:
+        type: string
+        description: "The storage backend to use, either 'raft' or 'consul'"
+        default: raft
+  workflow_dispatch:
+    inputs:
+      test_filter:
+        type: string
+        description: "A filter to limit the ui tests to. Will be appended to the ember test command as '-f=<filter>'"
+        required: false
+      storage_backend:
+        description: "The storage backend to use, either 'raft' or 'consul'"
+        required: true
+        default: raft
+        type: choice
+        options:
+          - raft
+          - consul
+
+jobs:
+  get-metadata:
+    name: Get metadata
+    runs-on: ${{ github.repository == 'hashicorp/vault' && 'ubuntu-latest' || fromJSON('["self-hosted","ubuntu-22.04-x64"]') }}
+    permissions:
+      contents: read
+    outputs:
+      is-ent-branch: ${{ steps.metadata.outputs.is-ent-branch }}
+      is-ent-repo: ${{ steps.metadata.outputs.is-ent-repo }}
+      runs-on: ${{ steps.get-outputs.outputs.runs-on }}
+      vault_edition: ${{ steps.get-outputs.outputs.vault_edition }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/metadata
+        id: metadata
+      - id: get-outputs
+        run: |
+          if [[ '${{ steps.metadata.outputs.is-ent-repo }}' == 'true' ]]; then
+            echo 'runs-on=["self-hosted","ubuntu-22.04-x64","xlarge"]' >> "$GITHUB_OUTPUT"
+          else
+            echo "runs-on=\"custom-linux-xl-vault-latest\"" >> "$GITHUB_OUTPUT"
+          fi
+
+          if [[ '${{ steps.metadata.outputs.is-ent-branch }}' == 'true' ]]; then
+            echo "detected vault_edition=ent"
+            echo "vault_edition=ent" >> "$GITHUB_OUTPUT"
+          else
+            echo "detected vault_edition=ce"
+            echo "vault_edition=oss" >> "$GITHUB_OUTPUT"
+          fi
+
+  run-ui-tests:
+    name: Run UI Tests
+    needs: get-metadata
+    runs-on: ${{ fromJSON(needs.get-metadata.outputs.runs-on) }}
+    permissions:
+      contents: read
+      id-token: write
+    timeout-minutes: 90
+    env:
+      GITHUB_TOKEN: ${{ secrets.ELEVATED_GITHUB_TOKEN }}
+      # Pass in enos variables
+      ENOS_VAR_aws_region: us-east-1
+      ENOS_VAR_aws_ssh_keypair_name: ${{ github.event.repository.name }}-ci-ssh-key
+      ENOS_VAR_aws_ssh_private_key_path: ./support/private_key.pem
+      ENOS_VAR_terraform_plugin_cache_dir: ./support/terraform-plugin-cache
+      ENOS_VAR_vault_license_path: ./support/vault.hclic
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/set-up-go
+        with:
+          github-token: ${{ secrets.ELEVATED_GITHUB_TOKEN }}
+      - uses: hashicorp/action-setup-enos@bfd47bdf7d118b9372acfaab048bcb9967026747 # v1.54
+        with:
+          github-token: ${{ secrets.ELEVATED_GITHUB_TOKEN }}
+      - name: Set Up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: './ui/package.json'
+          cache: pnpm
+          cache-dependency-path: ui/pnpm-lock.yaml
+      - name: Install PNPM
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+        with:
+          package_json_file: './ui/package.json'
+      - name: Set Up Terraform
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          cli_config_credentials_token: ${{ secrets.TF_API_TOKEN }}
+          terraform_wrapper: false
+      - name: Prepare scenario dependencies
+        run: |
+          mkdir -p ./enos/support/terraform-plugin-cache
+          echo "${{ secrets.SSH_KEY_PRIVATE_CI }}" > ./enos/support/private_key.pem
+          chmod 600 ./enos/support/private_key.pem
+      - name: Set Up Vault Enterprise License
+        if: ${{ needs.get-metadata.outputs.is-ent-branch == 'true' }}
+        run: echo "${{ secrets.VAULT_LICENSE }}" > ./enos/support/vault.hclic || true
+      - name: Check Chrome Installed
+        id: chrome-check
+        run: echo "chrome-version=$(chrome --version 2> /dev/null || google-chrome --version 2> /dev/null || google-chrome-stable --version 2> /dev/null || echo 'not-installed')" >> "$GITHUB_OUTPUT"
+      - name: Install Chrome Dependencies
+        if: steps.chrome-check.outputs.chrome-version == 'not-installed'
+        run: |
+          sudo apt update
+          sudo apt install -y libnss3-dev libgdk-pixbuf2.0-dev libgtk-3-dev libxss-dev libasound2
+      - name: Install Chrome
+        if: steps.chrome-check.outputs.chrome-version == 'not-installed'
+        uses: browser-actions/setup-chrome@48ad923757ca74d66703209fe939badbdf80f2f4 # v2.2.0
+      - name: Installed Chrome Version
+        run: |
+          echo "Installed Chrome Version = [$(chrome --version 2> /dev/null || google-chrome --version 2> /dev/null || google-chrome-stable --version 2> /dev/null)]"
+      - if: needs.get-metadata.outputs.is-ent-repo == 'true'
+        id: vault-auth
+        name: Vault Authenticate
+        run: vault-auth
+      - if: needs.get-metadata.outputs.is-ent-repo == 'true'
+        id: vault-secrets
+        name: Fetch Vault Secrets
+        uses: hashicorp/vault-action@892a26828f195e65540a40b4768ae4571f51ebfc # v4.0.0
+        with:
+          url: ${{ steps.vault-auth.outputs.addr }}
+          caCertificate: ${{ steps.vault-auth.outputs.ca_certificate }}
+          token: ${{ steps.vault-auth.outputs.token }}
+          secrets: |
+            kv/data/github/${{ github.repository }}/aws access-key-id_070182026 | AWS_ACCESS_KEY_ID_CI_070182026;
+            kv/data/github/${{ github.repository }}/aws secret-access-key_070182026 | AWS_SECRET_ACCESS_KEY_CI_070182026;
+            kv/data/github/${{ github.repository }}/aws role-arn | AWS_ROLE_ARN_CI;
+      - name: Configure AWS credentials from Test account
+        uses: aws-actions/configure-aws-credentials@cbe3b392738ccf3f987d68400dafcf4b0624a56c # v6.2.4
+        with:
+          aws-access-key-id: ${{ needs.get-metadata.outputs.is-ent-repo == 'true' && steps.vault-secrets.outputs.AWS_ACCESS_KEY_ID_CI_070182026 || secrets.AWS_ACCESS_KEY_ID_CI_070182026 }}
+          aws-secret-access-key: ${{ needs.get-metadata.outputs.is-ent-repo == 'true' && steps.vault-secrets.outputs.AWS_SECRET_ACCESS_KEY_CI_070182026 || secrets.AWS_SECRET_ACCESS_KEY_CI_070182026 }}
+          aws-region: us-east-1
+          role-to-assume: ${{ needs.get-metadata.outputs.is-ent-repo == 'true' && steps.vault-secrets.outputs.AWS_ROLE_ARN_CI || secrets.AWS_ROLE_ARN_CI }}
+          role-skip-session-tagging: true
+          role-duration-seconds: 3600
+      - name: Set Up Cluster
+        id: setup_cluster
+        env:
+          ENOS_VAR_ui_run_tests: false
+        # Continue once and retry to handle occasional blips when creating infrastructure.
+        continue-on-error: true
+        run: enos scenario launch --timeout 60m0s --chdir ./enos ui edition:${{ needs.get-metadata.outputs.vault_edition }} backend:${{ inputs.storage_backend }}
+      - name: Retry Set Up Cluster
+        id: setup_cluster_retry
+        if: steps.setup_cluster.outcome == 'failure'
+        env:
+          ENOS_VAR_ui_run_tests: false
+        run: enos scenario launch --timeout 60m0s --chdir ./enos ui edition:${{ needs.get-metadata.outputs.vault_edition }} backend:${{ inputs.storage_backend }}
+      - name: Run UI Tests
+        id: run_ui_tests
+        env:
+          ENOS_VAR_ui_test_filter: "${{ inputs.test_filter }}"
+        run: enos scenario run --timeout 60m0s --chdir ./enos ui edition:${{ needs.get-metadata.outputs.vault_edition }} backend:${{ inputs.storage_backend }}
+      - name: Ensure scenario has been destroyed
+        if: ${{ always() }}
+        run: enos scenario destroy --timeout 60m0s --chdir ./enos ui edition:${{ needs.get-metadata.outputs.vault_edition }} backend:${{ inputs.storage_backend }}
+      - name: Clean up Enos runtime directories
+        if: ${{ always() }}
+        run: |
+          rm -rf /tmp/enos*
+          rm -rf ./enos/support
+          rm -rf ./enos/.enos

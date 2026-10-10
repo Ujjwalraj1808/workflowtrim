@@ -1,0 +1,110 @@
+name: JavaScript Captured Writes
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ubs
+      - modules/helpers/ubs_core/**
+      - modules/lib/ubs-common.sh
+      - modules/ubs-js.sh
+      - test-suite/js/test_taint_effects.py
+      - .github/workflows/javascript-captured-writes.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  captured-write-regressions:
+    runs-on: macos-15
+    timeout-minutes: 20
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+      UBS_NO_AUTO_UPDATE: '1'
+      HOMEBREW_NO_AUTO_UPDATE: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+      - name: Test the production write-summary implementation
+        run: |
+          python3 test-suite/js/test_taint_effects.py
+          python3 test-suite/js/test_taint_scopes.py
+          python3 test-suite/js/test_taint_domains.py
+      - name: Install real-scanner dependencies
+        run: |
+          brew install bash jq ripgrep shellcheck
+          echo "$(brew --prefix)/bin" >> "$GITHUB_PATH"
+          npm install --global @ast-grep/cli
+      - name: Check real scanner and existing JavaScript suites
+        run: |
+          ./scripts/verify_checksums.sh
+          ./scripts/verify_sha256sums.sh
+          python3 -m unittest discover -s test-suite/quality -p '*js*.py' -v
+          python3 - <<'PY'
+          import json
+          import subprocess
+          import tempfile
+          from pathlib import Path
+          root = Path.cwd()
+          artifacts = root / 'test-suite/artifacts/javascript-captured-writes'
+          cases = [
+              ('setter-source', 'let result; function store(x) { result = x; } store(req.query.html); res.send(result);', {'xss'}),
+              ('captured-local', 'function wrap(x) { let value; function set(y) { value = y; } set(x); return value; } eval(wrap(req.query.code));', {'eval'}),
+              ('recursive-setter', 'let result; function a(x) { if (flag) return b(x); result = x; } function b(y) { a(y); } b(req.query.html); res.send(result);', {'xss'}),
+              ('finally-write', 'let result; function store(x) { try { return; } finally { result = x; } } store(req.query.html); res.send(result);', {'xss'}),
+              ('default-write', 'let result; function store(x) { result = x; } function trigger(v = store(req.query.html)) {} trigger(); res.send(result);', {'xss'}),
+              ('clean-overwrite', 'let result = req.query.html; function clear() { result = "hello"; } clear(); res.send(result);', set()),
+              ('uncalled-clean', 'let result = "hello"; function store() { result = req.query.html; } res.send(result);', set()),
+              ('call-isolation', 'function wrap(x) { let v; function set(y) { v = y; } set(x); return v; } const bad = wrap(req.query.html); res.send(wrap("hello"));', set()),
+          ]
+          for name, code, expected in cases:
+              with tempfile.TemporaryDirectory(prefix='ubs-effects-e2e-') as tmp:
+                  source = Path(tmp) / 'handler.js'
+                  source.write_text(code + '\n')
+                  result = subprocess.run([str(root / 'ubs'), str(source), '--ci', '--only=js', '--format=json'],
+                                          cwd=tmp, capture_output=True, text=True, timeout=120)
+                  folder = artifacts / name
+                  folder.mkdir(parents=True, exist_ok=True)
+                  (folder / 'stdout.log').write_text(result.stdout)
+                  (folder / 'stderr.log').write_text(result.stderr)
+                  assert result.returncode in (0, 1), (name, result.stdout, result.stderr)
+                  report = json.loads(result.stdout)
+                  (folder / 'result.json').write_text(json.dumps(report, indent=2))
+                  assert report['status'] == 'ok', report
+                  rules = set()
+                  def visit(value):
+                      if isinstance(value, dict):
+                          for key in ('rule', 'rule_id', 'ruleId'):
+                              rule = value.get(key)
+                              if isinstance(rule, str) and rule.startswith(('javascript.taint.', 'js.taint.')):
+                                  rules.add(rule.rsplit('.', 1)[-1])
+                          for child in value.values():
+                              visit(child)
+                      elif isinstance(value, list):
+                          for child in value:
+                              visit(child)
+                  visit(report)
+                  assert rules == expected, (name, rules, expected, report)
+                  print('JS_EFFECTS_E2E_PASS', name, sorted(rules), flush=True)
+          PY
+      - name: Verify production integrity regeneration is byte-identical
+        run: |
+          git diff --check
+          git diff > "$RUNNER_TEMP/js-effects-tested.diff"
+          python3 scripts/update_checksums.py
+          ./scripts/update_sha256sums.sh
+          git diff > "$RUNNER_TEMP/js-effects-regenerated.diff"
+          cmp "$RUNNER_TEMP/js-effects-tested.diff" "$RUNNER_TEMP/js-effects-regenerated.diff"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: javascript-captured-writes
+          path: |
+            ${{ runner.temp }}/js-effects-*.diff
+            test-suite/artifacts/javascript-captured-writes/
+          retention-days: 3

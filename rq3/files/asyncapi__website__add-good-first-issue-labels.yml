@@ -1,0 +1,76 @@
+# This workflow is centrally managed in https://github.com/asyncapi/.github/
+# Don't make changes to this file in this repo as they will be overwritten with changes made to the same file in above mentioned repo
+
+# Purpose of this workflow is to enable anyone to label issue with 'Good First Issue' and 'area/*' with a single command.
+name: Add 'Good First Issue' and 'area/*' labels # if proper comment added
+
+on:
+  issue_comment:
+    types:
+      - created
+
+permissions: {}
+
+jobs:
+  add-labels:
+    name: Add 'Good First Issue' and 'area/*' labels
+    if: ${{(!github.event.issue.pull_request && github.event.issue.state != 'closed' && github.event.comment.user.login != 'asyncapi-bot') && (contains(github.event.comment.body, '/good-first-issue') || contains(github.event.comment.body, '/gfi' ))}}
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write    # This is needed to add labels to issues.
+    steps:
+      - name: Add label
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const areas = ['javascript', 'typescript', 'java' , 'go', 'docs', 'ci-cd', 'design'];
+            const words = context.payload.comment.body.trim().split(" ");
+            const areaIndex = words.findIndex((word)=> word === '/gfi' || word === '/good-first-issue') + 1
+            let area = words[areaIndex];
+            switch(area){
+              case 'ts':
+                area = 'typescript';
+                break;
+              case 'js':
+                area = 'javascript';
+                break;
+              case 'markdown':
+                area = 'docs';
+                break;
+            }
+            if(!areas.includes(area)){
+              const message = `Hey @${context.payload.sender.login}, your message doesn't follow the requirements, you can try \`/help\`.`
+
+              await github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: message
+              })
+            } else {
+
+              // remove area if there is any before adding new labels.
+              const currentLabels = (await github.rest.issues.listLabelsOnIssue({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+              })).data.map(label => label.name);
+
+              const shouldBeRemoved = currentLabels.filter(label => (label.startsWith('area/') && !label.endsWith(area)));
+              shouldBeRemoved.forEach(label => {
+                github.rest.issues.deleteLabel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  name: label,
+                });
+              });
+
+               // Add new labels.
+              github.rest.issues.addLabels({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                labels: ['good first issue', `area/${area}`]
+              });
+            }

@@ -1,0 +1,38 @@
+name: Analyzer Speed Check
+
+on:
+  pull_request:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  analyzer-speed:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      SKYLOS_ANALYZER_SPEED_MAX_SECONDS: "8.0"
+      SKYLOS_ANALYZER_SCALE_SIZE: "256"
+
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@e4db8464a088ece1b920f60402e813ea4de65b8f # v4
+
+      - name: Create venv + install deps
+        run: |
+          uv venv
+          uv pip install -e .
+
+      - name: Run analyzer speed check
+        run: |
+          uv run python scripts/analyzer_speed_check.py \
+            --per-language 24 \
+            --warmups 1 \
+            --iterations 3 \
+            --max-seconds "$SKYLOS_ANALYZER_SPEED_MAX_SECONDS" \
+            --scale-size "$SKYLOS_ANALYZER_SCALE_SIZE" \
+            | tee /tmp/skylos-analyzer-speed-summary.txt
+          cat /tmp/skylos-analyzer-speed-summary.txt >> "$GITHUB_STEP_SUMMARY"

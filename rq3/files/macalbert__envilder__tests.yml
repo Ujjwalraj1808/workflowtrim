@@ -1,0 +1,102 @@
+name: 🍄 1-Up Test Run
+
+permissions:
+  id-token: write # Required for OIDC authentication with AWS
+  checks: write
+  pull-requests: write
+  contents: read
+
+on:
+  workflow_dispatch:
+
+  pull_request:
+    branches:
+      - "*"
+    types:
+      - opened
+      - reopened
+      - synchronize
+      - ready_for_review
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  # No `paths:` filter here on purpose: a required check gated by a
+  # workflow-level `paths:` filter never posts a status when skipped and
+  # blocks merging forever. A job-level `if:` skip reports "success"
+  # instead, so the path check moves here and gates powerup-test below.
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      core: ${{ steps.filter.outputs.core }}
+    steps:
+      - name: 🧱 Checkout
+        uses: actions/checkout@v7
+      - name: 🔍 Detect relevant changes
+        if: github.event_name == 'pull_request'
+        uses: dorny/paths-filter@v4
+        id: filter
+        with:
+          filters: |
+            core:
+              - ".github/workflows/tests.yml"
+              - "github-action/action.yml"
+              - "src/envilder/**"
+              - "tests/envilder/**"
+              - "e2e/**"
+              - "package.json"
+              - "pnpm-lock.yaml"
+              - "tsconfig.json"
+              - "vite.config.ts"
+
+  powerup-test:
+    needs: changes
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'workflow_dispatch' || (needs.changes.outputs.core == 'true' && !github.event.pull_request.draft) }}
+    timeout-minutes: 30
+    env:
+      LOCALSTACK_AUTH_TOKEN: ${{ secrets.LOCALSTACK_AUTH_TOKEN }}
+
+    steps:
+      - name: 🧱 Enter the Pipe (Checkout)
+        uses: actions/checkout@v7
+
+      - name: 📦 Install pnpm
+        uses: pnpm/action-setup@v6
+
+      - name: 🍄 Grab a Mushroom (Setup Node.js with Cache)
+        uses: actions/setup-node@v7
+        with:
+          node-version: "22.x"
+          cache: "pnpm"
+
+      - name: 🪙 Collect Coins (Configure AWS credentials)
+        uses: aws-actions/configure-aws-credentials@v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: 📦 Open the ? Block (Install packages)
+        run: pnpm install --frozen-lockfile
+
+      - name: 🌟 Shine Sprite (Run formatting checker)
+        run: pnpm format:check
+
+      - name: 🏁 Flagpole (Run code quality checker)
+        run: pnpm lint
+
+      - name: 🏗️ Build the Castle
+        run: pnpm build
+
+      - name: 🏎️ Race Through the Track (Run unit-test)
+        run: pnpm test:ci
+
+      - name: 🍄 Reveal the Power-Up (Test core results)
+        uses: dorny/test-reporter@v3
+        if: always()
+        with:
+          name: ✅ Test Core Unit Tests
+          path: ./coverage/junit/test-results.xml
+          reporter: jest-junit

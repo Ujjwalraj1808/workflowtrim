@@ -1,0 +1,26 @@
+name: "0: Public PR"
+
+# Fork code is intentionally not checked out or executed here. GitHub runs
+# pull_request_target from protected main, so a fork cannot weaken this policy
+# by editing its workflow. A disposable, default-deny egress validation lane is
+# required before executing public contributor code.
+on:
+  pull_request_target:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: 0-public-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  policy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Record isolated-validation requirement
+        run: |
+          echo "Public PR code is not executed by GitHub Actions."
+          echo "Validate fork changes only in a disposable runner with default-deny egress."

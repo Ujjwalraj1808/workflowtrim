@@ -1,0 +1,107 @@
+name: Store pytest durations
+
+on:
+  workflow_dispatch:
+    inputs:
+      target-ref:
+        description: Branch to measure (defaults to the dispatched branch)
+        type: string
+        default: ''
+      python-versions:
+        description: JSON list of Python versions
+        type: string
+        default: '["3.10", "3.14"]'
+      shards:
+        description: Number of independent runners
+        type: number
+        default: 10
+      workers:
+        description: Pytest workers per runner
+        type: number
+        default: 2
+      distribution:
+        type: choice
+        options: [load, worksteal]
+        default: load
+  schedule:
+    - cron: "30 6 * * 1"
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: durations-${{ github.ref }}-${{ inputs.target-ref }}-${{ inputs.workers || 2 }}-${{ inputs.shards || 10 }}-${{ inputs.distribution || 'load' }}
+  cancel-in-progress: false
+
+jobs:
+  branches:
+    runs-on: ubuntu-latest
+    outputs:
+      refs: ${{ steps.refs.outputs.refs }}
+    steps:
+      - id: refs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          TARGET_REF: ${{ inputs.target-ref || github.ref_name }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          if [ "$EVENT" == schedule ]; then
+            # Scheduled workflows only run on the default branch. Measure the
+            # newest release branch too, where the active release tests live.
+            release=$(gh api "repos/$REPOSITORY/git/matching-refs/heads/release-" --jq               '[.[].ref | select(test("^refs/heads/release-[0-9]+\\.[0-9]+\\.[0-9]+$"))] | sort_by(ltrimstr("refs/heads/release-") | split(".") | map(tonumber)) | last // "" | ltrimstr("refs/heads/")')
+            refs=$(jq -cn --arg main "$DEFAULT_BRANCH" --arg release "$release" '[$main, $release] | map(select(length > 0)) | unique')
+          else
+            refs=$(jq -cn --arg ref "$TARGET_REF" '[$ref]')
+          fi
+          echo "refs=$refs" >> "$GITHUB_OUTPUT"
+
+  measure:
+    needs: branches
+    strategy:
+      fail-fast: false
+      matrix:
+        ref: ${{ fromJSON(needs.branches.outputs.refs) }}
+    uses: ./.github/workflows/backend-unit-tests.yml
+    with:
+      ref: ${{ matrix.ref }}
+      python-versions: ${{ inputs.python-versions || '["3.10", "3.14"]' }}
+      shards: ${{ fromJSON(format('{0}', inputs.shards || 10)) }}
+      workers: ${{ fromJSON(format('{0}', inputs.workers || 2)) }}
+      distribution: ${{ inputs.distribution || 'load' }}
+      publish-coverage: false
+    secrets:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+
+  alert-on-failure:
+    name: Alert on failure
+    needs: [branches, measure]
+    if: always() && github.event_name == 'schedule' && (contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Send failure notification to Slack
+        env:
+          WEBHOOK_URL: ${{ secrets.LANGFLOW_ENG_SLACK_WEBHOOK_URL }}
+        run: |
+          if [ -z "$WEBHOOK_URL" ]; then
+            echo "LANGFLOW_ENG_SLACK_WEBHOOK_URL not set; skipping Slack alert"
+            exit 0
+          fi
+          # --fail-with-body: a Slack 4xx (e.g. rotated/revoked webhook) must
+          # fail this job, or a broken alert path stays green unnoticed.
+          curl --fail-with-body -X POST -H 'Content-type: application/json' \
+            --data "{
+              \"blocks\": [
+                {
+                  \"type\": \"section\",
+                  \"text\": {
+                    \"type\": \"mrkdwn\",
+                    \"text\": \":warning: *Store pytest durations failed.* A backend timing baseline was not refreshed. See the run for failed tests or incomplete measurements.\n<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View run>\"
+                  }
+                }
+              ]
+            }" "$WEBHOOK_URL"

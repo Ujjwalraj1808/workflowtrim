@@ -1,0 +1,689 @@
+name: Build & Push - Dev - Split Strategy
+# Builds + pushes a multi-platform dev image. Pushes to GHCR always;
+# also pushes to DockerHub when the operator has set the repo variable
+# DOCKERHUB_PUSH_ENABLED='true' AND the secrets DOCKERHUB_USERNAME +
+# DOCKERHUB_PA_TOKEN are present. Without those, the workflow runs in
+# GHCR-only mode — useful on the standalone fork where DockerHub
+# credentials don't exist. Earlier runs failed at the DockerHub login
+# step because the secrets were empty; this gating fixes that.
+
+on:
+  # Dev channel (release-train policy, 2026-06-06): every merge to main builds
+  # and pushes :dev + :dev-<n> to GHCR. teenyverse (the operator's household
+  # instance) tracks :dev as the canary; public releases batch via the daily
+  # release train (see LOOP.md / CLAUDE.md "Release policy"). Docs- and
+  # tests-only changes skip the build — they can't change the image behavior.
+  push:
+    branches: [main]
+  # A cheap classifier runs on every PR, but only same-repository PRs whose
+  # architectural concurrency closure changed build. Forks never receive a
+  # package-write job. An ordinary PR pays for checkout + classification plus
+  # one short routing job: the build gate below reads a single build_required
+  # decision, so that job has to reach a verdict on every event rather than
+  # being skipped. Its checkout, GHCR login and publish steps stay individually
+  # gated on alias_image, which no pull_request event can set.
+  pull_request:
+    branches: [main, dev]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Commit SHA or branch to build (defaults to github.ref if empty)"
+        required: false
+        type: string
+      branch:
+        description: "Branch name to tag the dev image with (defaults to github.ref_name if empty)"
+        required: false
+        type: string
+
+concurrency:
+  group: dev-image-${{ github.event.pull_request.number || github.ref }}
+  # Superseded PR heads may cancel their own unpublished verification build.
+  # Main/manual runs publish load-bearing artifacts and must serialize so an
+  # older build can never finish after a newer one and move :dev backwards.
+  # GitHub may still cancel an older pending main run when another one queues;
+  # the alias gate below recovers by building its exact subject in that case.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# GITHUB_TOKEN is read-only on packages by default. Builds push to
+# ghcr.io/new-usemame/calibre-web-nextgen, so packages:write is
+# required. Without it the build silently failed at the GHCR push step
+# with "denied: installation not allowed to Write organization
+# package". Mirrors the release workflow minus id-token/attestations,
+# which the dev workflow explicitly disables (provenance: false).
+permissions:
+  actions: read
+  contents: read
+  packages: write
+jobs:
+  classify:
+    name: Classify image work
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      full_build: ${{ steps.gate.outputs.full_build }}
+      alias_image: ${{ steps.gate.outputs.alias_image }}
+      image_source: ${{ steps.gate.outputs.image_source }}
+    steps:
+      - name: Checkout subject
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
+
+      - name: Classify paths with the trusted base implementation
+        id: detect
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+            printf 'frontend=false\nbuild=true\nconcurrency=true\nimage=true\n' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          files="$(git diff --name-only "${BASE_SHA}...${HEAD_SHA}" 2>/dev/null \
+            || git diff --name-only "${BASE_SHA}" "${HEAD_SHA}")"
+          printf '%s\n' "$files"
+
+          classifier_root="$GITHUB_WORKSPACE"
+          if [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
+            # A PR must not edit the policy that decides whether its own hard
+            # gate runs. Execute the base commit's classifier against the base
+            # tree. This classifier's introducing PR fails closed into every
+            # lane because its base has no trusted implementation yet.
+            classifier_ref="$BASE_SHA"
+            if ! git cat-file -e "$classifier_ref:scripts/ci_path_classification.py" \
+              || ! git cat-file -e "$classifier_ref:.dockerignore"; then
+              echo "::warning::Base has no trusted classifier policy; enabling every image gate"
+              printf 'frontend=true\nbuild=true\nconcurrency=true\nimage=true\n' >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            classifier_root="$RUNNER_TEMP/base-path-classifier"
+            mkdir -p "$classifier_root"
+            git archive "$classifier_ref" cps .dockerignore scripts/ci_path_classification.py \
+              | tar -x -C "$classifier_root"
+          fi
+          printf '%s\n' "$files" \
+            | python3 "$classifier_root/scripts/ci_path_classification.py" \
+                --repo-root "$classifier_root" --github-output "$GITHUB_OUTPUT"
+
+      - name: Decide build and alias work
+        id: gate
+        env:
+          CONCURRENCY: ${{ steps.detect.outputs.concurrency }}
+          IMAGE: ${{ steps.detect.outputs.image }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          IS_FORK: ${{ github.event.pull_request.head.repo.fork == true }}
+        run: |
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+            {
+              echo "full_build=true"
+              echo "alias_image=false"
+              echo "image_source="
+            } >> "$GITHUB_OUTPUT"
+          elif [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
+            [[ "$CONCURRENCY" == "true" && "$IS_FORK" != "true" ]] \
+              && full_build=true || full_build=false
+            {
+              echo "full_build=$full_build"
+              echo "alias_image=false"
+              echo "image_source="
+            } >> "$GITHUB_OUTPUT"
+          else
+            [[ "$IMAGE" == "true" ]] && alias=false || alias=true
+            if [[ "$alias" == "true" ]]; then
+              source="$(python3 scripts/ci_path_classification.py \
+                --latest-image-commit "$HEAD_SHA")"
+            else
+              source=""
+            fi
+            {
+              echo "full_build=$IMAGE"
+              echo "alias_image=$alias"
+              echo "image_source=$source"
+            } >> "$GITHUB_OUTPUT"
+          fi
+
+  # --------------------------------------------------------------------------------
+  # JOB 0: Ensure the python-build-standalone GHCR mirror exists before building.
+  # The image build COPYs Python from ghcr.io/new-usemame/pbs-cache instead of the
+  # flaky GitHub release CDN. This job (idempotent — a no-op when the mirror is
+  # already present) builds it the first time after a Python bump. See
+  # scripts/ensure-python-mirror.sh + notes/PYTHON-BUILD-MIRROR.md.
+  # --------------------------------------------------------------------------------
+  ensure-mirror:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [classify, alias-image-neutral-commit]
+    if: needs.alias-image-neutral-commit.outputs.build_required == 'true'
+    steps:
+      - name: Checkout (read Python pin from Dockerfile)
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref || github.event.pull_request.head.sha || github.ref }}
+      - name: Ensure python-build-standalone mirror exists
+        env:
+          GHCR_TOKEN: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+        run: bash scripts/ensure-python-mirror.sh
+
+  # --------------------------------------------------------------------------------
+  # JOB 1: Build Intel (amd64) on GitHub Runners
+  # --------------------------------------------------------------------------------
+  build-amd64:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    needs: [classify, alias-image-neutral-commit, ensure-mirror]
+    if: needs.alias-image-neutral-commit.outputs.build_required == 'true'
+    steps:
+      - name: Set build ref
+        env:
+          INPUT_REF: ${{ inputs.ref }}
+          SUBJECT_REF: ${{ github.event.pull_request.head.sha || github.sha }}
+          INPUT_BRANCH: ${{ inputs.branch }}
+          SUBJECT_BRANCH: ${{ github.head_ref || github.ref_name }}
+        run: |
+          if [ -n "$INPUT_REF" ]; then
+            echo "BUILD_REF=$INPUT_REF" >> "$GITHUB_ENV"
+          else
+            echo "BUILD_REF=$SUBJECT_REF" >> "$GITHUB_ENV"
+          fi
+
+          if [ -n "$INPUT_BRANCH" ]; then
+            echo "BRANCH_NAME=$INPUT_BRANCH" >> "$GITHUB_ENV"
+          else
+            echo "BRANCH_NAME=$SUBJECT_BRANCH" >> "$GITHUB_ENV"
+          fi
+
+      - name: Checkout correct ref
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ env.BUILD_REF }}
+
+      # --- 1. Calculate Variables ---
+      - name: Set repo name to lowercase
+        run: echo "LOWER_REPO_NAME=$(echo ${{ github.event.repository.name }} | tr '[:upper:]' '[:lower:]')" >> $GITHUB_ENV
+
+      - name: Determine Docker Image Tag
+        id: tag
+        run: |
+          # Use $BRANCH_NAME, never a GitHub expression here: an expression is
+          # substituted into the script TEXT before the shell parses it, so a
+          # branch name containing $( ) would execute. Reading it from the
+          # environment cannot execute. github.head_ref is attacker-controlled
+          # on a fork PR; the fork gate on this job is what makes that
+          # unreachable today, and this line is what keeps it unreachable if
+          # anyone ever relaxes the gate.
+          if [[ "$BRANCH_NAME" == "main" ]]; then
+            echo "IMAGE_TAG=dev" >> $GITHUB_ENV
+          else
+            sanitized_branch=$(echo "$BRANCH_NAME" | sed 's/[^a-zA-Z0-9.-]/-/g')
+            echo "IMAGE_TAG=dev-${sanitized_branch}" >> $GITHUB_ENV
+          fi
+
+      # --- 2. Logins ---
+      - name: DockerHub Login
+        # Skipped on the standalone fork where DOCKERHUB secrets aren't set.
+        # Operator opts in by setting repo variable DOCKERHUB_PUSH_ENABLED='true'.
+        if: vars.DOCKERHUB_PUSH_ENABLED == 'true' && github.event_name != 'pull_request'
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_PA_TOKEN }}
+
+      - name: GitHub Container Registry Login
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          # GH_PAT (read:packages) so BuildKit can COPY --from our private
+          # pbs-cache mirror; falls back to GITHUB_TOKEN for push-only contexts.
+          password: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+
+      # --- 3. Build & Push (Digest Only) ---
+      # Unlike the merge job, this one genuinely needs BuildKit, so it can't
+      # drop the container driver. Pre-pull with backoff instead: the Docker
+      # Hub timeouts that red these builds are transient, and
+      # setup-buildx-action boots from the local image when one is present.
+      # Fail-soft — if the pull never lands, or the action's default image tag
+      # moves in a future buildx, fall through and let it pull as before.
+      - name: Pre-pull BuildKit image (Docker Hub flake guard)
+        run: |
+          set -u
+          for attempt in 1 2 3; do
+            if docker pull moby/buildkit:buildx-stable-1; then
+              exit 0
+            fi
+            echo "buildkit pull attempt ${attempt} failed; retrying in $((attempt * 15))s"
+            sleep "$((attempt * 15))"
+          done
+          echo "::warning::Could not pre-pull moby/buildkit after 3 attempts; letting setup-buildx-action try."
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+        with:
+          driver-opts: network=host
+
+      - name: Compose docker outputs (GHCR always; DockerHub when opted-in)
+        run: |
+          GHCR_LINE="type=image,name=ghcr.io/${{ github.repository_owner }}/${{ env.LOWER_REPO_NAME }},push-by-digest=true,name-canonical=true,push=true"
+          if [ "${{ vars.DOCKERHUB_PUSH_ENABLED }}" = "true" ] && [ "${{ github.event_name }}" != "pull_request" ]; then
+            DH_LINE="type=image,name=${{ secrets.DOCKERHUB_USERNAME }}/calibre-web-automated,push-by-digest=true,name-canonical=true,push=true"
+            printf 'DOCKER_BUILD_OUTPUTS<<EOF\n%s\n%s\nEOF\n' "$DH_LINE" "$GHCR_LINE" >> "$GITHUB_ENV"
+          else
+            printf 'DOCKER_BUILD_OUTPUTS<<EOF\n%s\nEOF\n' "$GHCR_LINE" >> "$GITHUB_ENV"
+          fi
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          provenance: false
+          context: .
+          file: ./Dockerfile
+          # We build AMD64 here natively
+          platforms: linux/amd64
+          # CACHE STRATEGY: Use GitHub Actions Cache (Ephemeral Runner)
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          # GHCR is always a target. DockerHub is added by the
+          # "Compose docker outputs" step above, which conditionally
+          # includes the DockerHub image name when DOCKERHUB_PUSH_ENABLED.
+          outputs: ${{ env.DOCKER_BUILD_OUTPUTS }}
+          # Same-repository/main builds use the GHCR mirror rather than the
+          # flaky release CDN. Keep the selector fork-aware even though the
+          # build gate already excludes forks: the recovery gate must never
+          # make the private mirror reachable if its classification regresses.
+          build-args: |
+            BUILD_DATE=${{ github.event.repository.updated_at }}
+            VERSION=DEV_BUILD-${{ env.IMAGE_TAG }}-${{ vars.CURRENT_DEV_BUILD_NUM }}
+            PBS_SOURCE=${{ github.event.pull_request.head.repo.fork == true && 'upstream' || 'ghcr' }}
+
+      # --- 4. Export Digest for Merge Job ---
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v7
+        with:
+          name: digests-amd64
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # --------------------------------------------------------------------------------
+  # JOB 2: Build ARM (arm64 Only) on Oracle Runner
+  # --------------------------------------------------------------------------------
+  build-arm:
+    # GitHub's free native ARM64 hosted runner. The workflow originally
+    # ran on a self-hosted Oracle Cloud ARM VM (inherited from upstream
+    # CWA), but no such runner exists on Calibre-Web-NextGen — the job
+    # had been queuing indefinitely. A self-hosted runner on a *public*
+    # repo is also a meaningful attack surface (any PR can execute on
+    # operator hardware), so GitHub-hosted is the safer default.
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    needs: [classify, alias-image-neutral-commit, ensure-mirror]
+    if: needs.alias-image-neutral-commit.outputs.build_required == 'true'
+    steps:
+      - name: Set build ref
+        env:
+          INPUT_REF: ${{ inputs.ref }}
+          SUBJECT_REF: ${{ github.event.pull_request.head.sha || github.sha }}
+          INPUT_BRANCH: ${{ inputs.branch }}
+          SUBJECT_BRANCH: ${{ github.head_ref || github.ref_name }}
+        run: |
+          if [ -n "$INPUT_REF" ]; then
+            echo "BUILD_REF=$INPUT_REF" >> "$GITHUB_ENV"
+          else
+            echo "BUILD_REF=$SUBJECT_REF" >> "$GITHUB_ENV"
+          fi
+
+          if [ -n "$INPUT_BRANCH" ]; then
+            echo "BRANCH_NAME=$INPUT_BRANCH" >> "$GITHUB_ENV"
+          else
+            echo "BRANCH_NAME=$SUBJECT_BRANCH" >> "$GITHUB_ENV"
+          fi
+
+      - name: Checkout correct ref
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ env.BUILD_REF }}
+
+      # --- 1. Calculate Variables ---
+      - name: Set repo name to lowercase
+        run: echo "LOWER_REPO_NAME=$(echo ${{ github.event.repository.name }} | tr '[:upper:]' '[:lower:]')" >> $GITHUB_ENV
+
+      - name: Determine Docker Image Tag
+        id: tag
+        run: |
+          # Use $BRANCH_NAME, never a GitHub expression here: an expression is
+          # substituted into the script TEXT before the shell parses it, so a
+          # branch name containing $( ) would execute. Reading it from the
+          # environment cannot execute. github.head_ref is attacker-controlled
+          # on a fork PR; the fork gate on this job is what makes that
+          # unreachable today, and this line is what keeps it unreachable if
+          # anyone ever relaxes the gate.
+          if [[ "$BRANCH_NAME" == "main" ]]; then
+            echo "IMAGE_TAG=dev" >> $GITHUB_ENV
+          else
+            sanitized_branch=$(echo "$BRANCH_NAME" | sed 's/[^a-zA-Z0-9.-]/-/g')
+            echo "IMAGE_TAG=dev-${sanitized_branch}" >> $GITHUB_ENV
+          fi
+
+      # --- 2. Logins ---
+      - name: DockerHub Login
+        # Skipped on the standalone fork where DOCKERHUB secrets aren't set.
+        # Operator opts in by setting repo variable DOCKERHUB_PUSH_ENABLED='true'.
+        if: vars.DOCKERHUB_PUSH_ENABLED == 'true' && github.event_name != 'pull_request'
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_PA_TOKEN }}
+
+      - name: GitHub Container Registry Login
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          # GH_PAT (read:packages) so BuildKit can COPY --from our private
+          # pbs-cache mirror; falls back to GITHUB_TOKEN for push-only contexts.
+          password: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+
+      # --- 3. Build & Push (Digest Only) ---
+      # Unlike the merge job, this one genuinely needs BuildKit, so it can't
+      # drop the container driver. Pre-pull with backoff instead: the Docker
+      # Hub timeouts that red these builds are transient, and
+      # setup-buildx-action boots from the local image when one is present.
+      # Fail-soft — if the pull never lands, or the action's default image tag
+      # moves in a future buildx, fall through and let it pull as before.
+      - name: Pre-pull BuildKit image (Docker Hub flake guard)
+        run: |
+          set -u
+          for attempt in 1 2 3; do
+            if docker pull moby/buildkit:buildx-stable-1; then
+              exit 0
+            fi
+            echo "buildkit pull attempt ${attempt} failed; retrying in $((attempt * 15))s"
+            sleep "$((attempt * 15))"
+          done
+          echo "::warning::Could not pre-pull moby/buildkit after 3 attempts; letting setup-buildx-action try."
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+        with:
+          driver-opts: network=host
+
+      - name: Compose docker outputs (GHCR always; DockerHub when opted-in)
+        run: |
+          GHCR_LINE="type=image,name=ghcr.io/${{ github.repository_owner }}/${{ env.LOWER_REPO_NAME }},push-by-digest=true,name-canonical=true,push=true"
+          if [ "${{ vars.DOCKERHUB_PUSH_ENABLED }}" = "true" ] && [ "${{ github.event_name }}" != "pull_request" ]; then
+            DH_LINE="type=image,name=${{ secrets.DOCKERHUB_USERNAME }}/calibre-web-automated,push-by-digest=true,name-canonical=true,push=true"
+            printf 'DOCKER_BUILD_OUTPUTS<<EOF\n%s\n%s\nEOF\n' "$DH_LINE" "$GHCR_LINE" >> "$GITHUB_ENV"
+          else
+            printf 'DOCKER_BUILD_OUTPUTS<<EOF\n%s\nEOF\n' "$GHCR_LINE" >> "$GITHUB_ENV"
+          fi
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          provenance: false
+          context: .
+          file: ./Dockerfile
+          # We build ARM64 here natively
+          platforms: linux/arm64
+          # CACHE STRATEGY: Use Local Disk Cache (Persistent Runner)
+          # Saves bandwidth and time by storing cache directly on the Oracle VM
+          cache-from: type=local,src=/tmp/.buildx-cache
+          cache-to: type=local,dest=/tmp/.buildx-cache-new,mode=max
+          # GHCR is always a target. DockerHub is added by the
+          # "Compose docker outputs" step below, which conditionally
+          # includes the DockerHub image name when DOCKERHUB_PUSH_ENABLED.
+          outputs: ${{ env.DOCKER_BUILD_OUTPUTS }}
+          # Same-repository/main builds use the GHCR mirror rather than the
+          # flaky release CDN. Keep the selector fork-aware even though the
+          # build gate already excludes forks: the recovery gate must never
+          # make the private mirror reachable if its classification regresses.
+          build-args: |
+            BUILD_DATE=${{ github.event.repository.updated_at }}
+            VERSION=DEV_BUILD-${{ env.IMAGE_TAG }}-${{ vars.CURRENT_DEV_BUILD_NUM }}
+            PBS_SOURCE=${{ github.event.pull_request.head.repo.fork == true && 'upstream' || 'ghcr' }}
+
+      # --- 4. Rotate Cache (Prevent Infinite Growth) ---
+      - name: Move cache
+        run: |
+          rm -rf /tmp/.buildx-cache
+          mv /tmp/.buildx-cache-new /tmp/.buildx-cache
+
+      # --- 5. Export Digest for Merge Job ---
+      - name: Export digest
+        run: |
+          rm -rf /tmp/digests
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v7
+        with:
+          name: digests-arm
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+      # --- 6. Janitor: Clean up Docker Garbage ---
+      - name: Prune Docker Garbage
+        if: always() # Run even if build fails to keep disk clean
+        run: |
+          echo "Pruning dangling images..."
+          docker image prune -f
+          echo "Pruning old build cache (older than 1 week)..."
+          docker builder prune -f --filter "until=168h"
+
+  # --------------------------------------------------------------------------------
+  # JOB 3: Merge & Tag (Runs on GitHub)
+  # --------------------------------------------------------------------------------
+  merge:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [classify, alias-image-neutral-commit, build-amd64, build-arm]
+    if: needs.alias-image-neutral-commit.outputs.build_required == 'true'
+    steps:
+      # --- 1. Calculate Variables ---
+      - name: Set build ref
+        env:
+          INPUT_REF: ${{ inputs.ref }}
+          SUBJECT_REF: ${{ github.event.pull_request.head.sha || github.sha }}
+          INPUT_BRANCH: ${{ inputs.branch }}
+          SUBJECT_BRANCH: ${{ github.head_ref || github.ref_name }}
+        run: |
+          if [ -n "$INPUT_REF" ]; then
+            echo "BUILD_REF=$INPUT_REF" >> "$GITHUB_ENV"
+          else
+            echo "BUILD_REF=$SUBJECT_REF" >> "$GITHUB_ENV"
+          fi
+
+          if [ -n "$INPUT_BRANCH" ]; then
+            echo "BRANCH_NAME=$INPUT_BRANCH" >> "$GITHUB_ENV"
+          else
+            echo "BRANCH_NAME=$SUBJECT_BRANCH" >> "$GITHUB_ENV"
+          fi
+
+      - name: Checkout correct ref
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ env.BUILD_REF }}
+
+      - name: Set repo name to lowercase
+        run: echo "LOWER_REPO_NAME=$(echo ${{ github.event.repository.name }} | tr '[:upper:]' '[:lower:]')" >> $GITHUB_ENV
+
+      - name: Determine Docker Image Tags
+        id: tag
+        run: |
+          # 1. Determine the "Floating" Tag (e.g., 'dev' or 'dev-featurebranch')
+          # Use $BRANCH_NAME, never a GitHub expression here: an expression is
+          # substituted into the script TEXT before the shell parses it, so a
+          # branch name containing $( ) would execute. Reading it from the
+          # environment cannot execute. github.head_ref is attacker-controlled
+          # on a fork PR; the fork gate on this job is what makes that
+          # unreachable today, and this line is what keeps it unreachable if
+          # anyone ever relaxes the gate.
+          if [[ "$BRANCH_NAME" == "main" ]]; then
+            echo "FLOAT_TAG=dev" >> $GITHUB_ENV
+          else
+            sanitized_branch=$(echo "$BRANCH_NAME" | sed 's/[^a-zA-Z0-9.-]/-/g')
+            echo "FLOAT_TAG=dev-${sanitized_branch}" >> $GITHUB_ENV
+          fi
+          
+          # 2. Determine the "Unique" Tag (e.g., 'dev-371')
+          # We use the build number that was passed to the build jobs
+          # Note: We append the build number to the 'dev' prefix to keep them grouped
+          echo "UNIQUE_TAG=dev-${{ vars.CURRENT_DEV_BUILD_NUM }}" >> $GITHUB_ENV
+          echo "COMMIT_TAG=sha-$(git rev-parse HEAD)" >> $GITHUB_ENV
+
+      # --- 2. Logins ---
+      - name: DockerHub Login
+        # Skipped on the standalone fork where DOCKERHUB secrets aren't set.
+        # Operator opts in by setting repo variable DOCKERHUB_PUSH_ENABLED='true'.
+        if: vars.DOCKERHUB_PUSH_ENABLED == 'true' && github.event_name != 'pull_request'
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_PA_TOKEN }}
+
+      - name: GitHub Container Registry Login
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          # GH_PAT (read:packages) so BuildKit can COPY --from our private
+          # pbs-cache mirror; falls back to GITHUB_TOKEN for push-only contexts.
+          password: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+
+      # --- 3. Merge Digests ---
+      - name: Download digests
+        uses: actions/download-artifact@v8
+        with:
+          path: /tmp/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      # `imagetools create` below is a registry-only operation — it reads the
+      # per-arch manifests and writes a manifest list. It needs no BuildKit.
+      # The default docker-container driver would boot moby/buildkit pulled
+      # from Docker Hub, whose egress from GitHub runners intermittently times
+      # out; on 2026-07-27 that killed three consecutive dev builds at "booting
+      # buildkit" *after* both arch builds had already pushed, stranding :dev.
+      # `driver: docker` reuses the local dockerd, so this job touches only GHCR.
+      - name: Set up Docker Buildx (local driver — no Docker Hub pull)
+        uses: docker/setup-buildx-action@v4
+        with:
+          driver: docker
+
+      - name: Create manifest list and push
+        working-directory: /tmp/digests
+        run: |
+          # 1. Push to DockerHub (only when DOCKERHUB_PUSH_ENABLED) — both tags
+          if [ "${{ vars.DOCKERHUB_PUSH_ENABLED }}" = "true" ] && [ "${{ github.event_name }}" != "pull_request" ]; then
+            docker buildx imagetools create \
+              -t ${{ secrets.DOCKERHUB_USERNAME }}/calibre-web-automated:${{ env.FLOAT_TAG }} \
+              -t ${{ secrets.DOCKERHUB_USERNAME }}/calibre-web-automated:${{ env.UNIQUE_TAG }} \
+              $(printf '${{ secrets.DOCKERHUB_USERNAME }}/calibre-web-automated@sha256:%s ' *)
+          else
+            echo "DOCKERHUB_PUSH_ENABLED is not 'true' — skipping DockerHub manifest push (GHCR-only mode)."
+          fi
+
+          # 2. GHCR always gets an immutable commit tag. Main/manual builds also
+          # advance the delivery-channel tags; PR verification builds must not.
+          base="ghcr.io/${{ github.repository_owner }}/${{ env.LOWER_REPO_NAME }}"
+          tags=(-t "$base:${{ env.COMMIT_TAG }}")
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            tags+=(-t "$base:${{ env.FLOAT_TAG }}" -t "$base:${{ env.UNIQUE_TAG }}")
+          fi
+          docker buildx imagetools create "${tags[@]}" \
+            $(printf "$base@sha256:%s " *)
+
+      # --- 4. Increment Build Number (Last Step) ---
+      # Inherited from upstream CWA. Bumps repo variable CURRENT_DEV_BUILD_NUM
+      # so each dev image gets a unique VERSION=DEV_BUILD-dev-N string. Purely
+      # cosmetic — the :dev floating tag and :sha-* tags don't depend on it,
+      # and the image works regardless. Prefer GH_PAT (already configured for
+      # the translation workflow) over the missing DEV_BUILD_NUM_INCREMENTOR_TOKEN
+      # secret, and fail-soft: a hiccup in this purely-bookkeeping step must
+      # never mark an otherwise-successful build red.
+      - name: Increment dev build number
+        if: github.event_name != 'pull_request'
+        uses: action-pack/increment@v2
+        id: increment
+        continue-on-error: true
+        with:
+          name: 'CURRENT_DEV_BUILD_NUM'
+          token: ${{ secrets.GH_PAT || secrets.DEV_BUILD_NUM_INCREMENTOR_TOKEN }}
+
+  # Image-neutral main commits normally do not rebuild or advance :dev. They
+  # still need an immutable subject identifier so Test Suite can prove which
+  # backend it exercised. Copying the existing manifest to sha-<commit> is
+  # registry-only and does not restart the canary. If the exact source producer
+  # was cancelled or failed, this gate promotes the subject into the ordinary
+  # serialized build path: rebuilding the subject is always byte-correct, while
+  # copying any older available image would not be.
+  alias-image-neutral-commit:
+    name: Prepare immutable subject image
+    runs-on: ubuntu-latest
+    # The source producer may legitimately consume its full 95-minute
+    # classify+mirror+architecture+merge budget. The script stops sooner when
+    # that exact run/job fails and never substitutes the floating :dev tag.
+    timeout-minutes: 100
+    needs: classify
+    outputs:
+      build_required: ${{ steps.route.outputs.build_required }}
+    steps:
+      - name: Checkout exact subject
+        if: needs.classify.outputs.alias_image == 'true'
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          ref: ${{ github.sha }}
+
+      - name: Log in to GHCR
+        if: needs.classify.outputs.alias_image == 'true'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx (registry-only)
+        if: needs.classify.outputs.alias_image == 'true'
+        uses: docker/setup-buildx-action@v4
+        with:
+          driver: docker
+
+      - name: Publish immutable commit alias
+        id: publish
+        if: needs.classify.outputs.alias_image == 'true'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          IMAGE_SOURCE: ${{ needs.classify.outputs.image_source }}
+          SUBJECT_SHA: ${{ github.sha }}
+        run: |
+          base="ghcr.io/${{ github.repository_owner }}/$(echo '${{ github.event.repository.name }}' | tr '[:upper:]' '[:lower:]')"
+          bash scripts/alias-e2e-image.sh \
+            "$base" "$IMAGE_SOURCE" "$SUBJECT_SHA" 191 30 \
+            "${{ github.repository }}" push "${{ github.api_url }}" \
+            "$GITHUB_OUTPUT"
+
+      - name: Route unavailable alias to exact-subject build
+        id: route
+        env:
+          CLASSIFIED_FULL_BUILD: ${{ needs.classify.outputs.full_build }}
+          RECOVERY_BUILD: ${{ steps.publish.outputs.recovery_build }}
+        run: |
+          if [[ "$CLASSIFIED_FULL_BUILD" == "true" || "$RECOVERY_BUILD" == "true" ]]; then
+            echo "build_required=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "build_required=false" >> "$GITHUB_OUTPUT"
+          fi

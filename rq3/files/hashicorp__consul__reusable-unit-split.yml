@@ -1,0 +1,199 @@
+name: reusable-unit-split
+
+on:
+  workflow_call:
+    inputs:
+      directory:
+        required: true
+        type: string
+      runs-on:
+        description: An expression indicating which kind of runners to use.
+        required: true
+        type: string
+      go-arch:
+        required: false
+        type: string
+        default: ""
+      uploaded-binary-name:
+        required: false
+        type: string
+        default: "consul-bin" 
+      args:
+        required: false
+        type: string
+        default: ""
+      runner-count: 
+        required: false
+        type: number
+        default: 1
+      go-test-flags:
+        required: false
+        type: string
+        default: ""
+      repository-name:
+        required: true
+        type: string
+      go-tags:
+        required: false
+        type: string
+        default: ""
+      go-version:
+        required: true
+        type: string
+    secrets:
+      elevated-github-token:
+        required: true
+      consul-license:
+        required: true
+      datadog-api-key:
+        required: true
+env:
+  TEST_RESULTS: /tmp/test-results
+  GOTESTSUM_VERSION: "1.12.3"
+  GOARCH: ${{inputs.go-arch}}
+  TOTAL_RUNNERS: ${{inputs.runner-count}}
+  CONSUL_LICENSE: ${{secrets.consul-license}}
+  GOTAGS: ${{ inputs.go-tags}}
+  GOPRIVATE: github.com/hashicorp # Required for enterprise deps
+  DATADOG_API_KEY: ${{secrets.datadog-api-key}}
+  
+jobs:
+  set-test-package-matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      package-matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: ${{ inputs.go-version }}
+      - id: set-matrix
+        run: ./.github/scripts/set_test_package_matrix.sh ${{env.TOTAL_RUNNERS}}
+
+  go-test:
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    name: "go-test"
+    needs:
+      - set-test-package-matrix
+    strategy:
+      fail-fast: false
+      matrix:
+        package: ${{ fromJson(needs.set-test-package-matrix.outputs.package-matrix) }}
+    steps:   
+      - name: ulimit
+        run: |
+          echo "Soft limits"
+          ulimit -Sa
+          echo "Hard limits"
+          ulimit -Ha   
+      # upload-artifact requires a unique ID per run. These steps will be repeated with the matrix run, and other unit tests
+      # will also overlap with the names here. We use a random string rather than trying to do trickery 
+      # with the package matrix.
+      - id: generate-matrix-id
+        run: |
+          MATRIX_RUN_ID=$(head /dev/urandom | tr -dc A-Z | head -c8)
+          echo "The matrix run ID is $MATRIX_RUN_ID"
+          echo "matrix-run-id=$MATRIX_RUN_ID" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      # NOTE: This step is specifically needed for ENT. It allows us to access the required private HashiCorp repos.
+      - name: Setup Git
+        if: ${{ endsWith(inputs.repository-name, '-enterprise') }}
+        run: git config --global url."https://${{ secrets.elevated-github-token }}:@github.com".insteadOf "https://github.com"
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: ${{ inputs.go-version }}
+      # setup-go v6 writes GOTOOLCHAIN=local to $GITHUB_ENV, which persists for all
+      # later steps and overrides the job-level env block. Override it back to auto
+      # so backward-compat lanes can upgrade the toolchain when a module requires it.
+      - name: Restore GOTOOLCHAIN=auto
+        run: echo "GOTOOLCHAIN=auto" >> "$GITHUB_ENV"
+      - run: mkdir -p ${{env.TEST_RESULTS}}
+      - name: go mod download
+        working-directory: ${{inputs.directory}}
+        run: go mod download
+      - name: Download consul
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{inputs.uploaded-binary-name}}
+          path: ${{inputs.directory}} 
+      - name: Display downloaded file
+        run: ls -ld consul 
+        working-directory: ${{inputs.directory}}
+      - run: echo "$GITHUB_WORKSPACE/${{inputs.directory}}" >> $GITHUB_PATH
+      - name: Make sure consul is executable
+        run: chmod +x $GITHUB_WORKSPACE/${{inputs.directory}}/consul
+      - run: go env
+      - name: Run tests 
+        working-directory: ${{inputs.directory}}
+        run: |
+          # separate the list
+          PACKAGE_NAMES="${{ join(matrix.package, ' ') }}"
+          # PACKAGE_NAMES="${{ matrix.package }}"
+
+          # some tests expect this umask, and arm images have a different default
+          umask 0022
+
+          go run gotest.tools/gotestsum@v${{env.GOTESTSUM_VERSION}} \
+          --format=github-actions \
+          --format-hide-empty-pkg \
+          --jsonfile /tmp/jsonfile/go-test.log \
+          --rerun-fails \
+          --rerun-fails-report=/tmp/gotestsum-rerun-fails \
+          --packages="$PACKAGE_NAMES" \
+          --junitfile ${{env.TEST_RESULTS}}/gotestsum-report.xml -- \
+          -tags="${{env.GOTAGS}}" \
+          ${{inputs.go-test-flags}} \
+          -cover -coverprofile=coverage.txt \
+          -timeout=30m
+
+      # NOTE: ENT specific step as we store secrets in Vault.
+      - name: Authenticate to Vault
+        if: ${{ !cancelled() && endsWith(github.repository, '-enterprise') }}
+        id: vault-auth
+        run: vault-auth
+
+      # NOTE: ENT specific step as we store secrets in Vault.
+      - name: Fetch Secrets
+        if: ${{ !cancelled() && endsWith(github.repository, '-enterprise') }}
+        id: secrets
+        uses: hashicorp/vault-action@v3
+        with:
+          url: ${{ steps.vault-auth.outputs.addr }}
+          caCertificate: ${{ steps.vault-auth.outputs.ca_certificate }}
+          token: ${{ steps.vault-auth.outputs.token }}
+          secrets: |
+              kv/data/github/${{ github.repository }}/datadog apikey | DATADOG_API_KEY;
+
+      - name: prepare datadog-ci
+        if: ${{ !cancelled() && !endsWith(github.repository, '-enterprise') }}
+        run: |
+          curl -L --fail "https://github.com/DataDog/datadog-ci/releases/latest/download/datadog-ci_linux-x64" --output "/usr/local/bin/datadog-ci"
+          chmod +x /usr/local/bin/datadog-ci
+
+      - name: upload coverage
+        # do not run on forks
+        if: ${{ !cancelled() && env.DATADOG_API_KEY}}
+        env:
+          DD_ENV: ci
+        run: datadog-ci junit upload --service "$GITHUB_REPOSITORY" ${{env.TEST_RESULTS}}/gotestsum-report.xml
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ !cancelled() }}
+        with:
+          name: ${{ steps.generate-matrix-id.outputs.matrix-run-id }}-test-results
+          path: ${{env.TEST_RESULTS}}
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ !cancelled() }}
+        with:
+          name: ${{ steps.generate-matrix-id.outputs.matrix-run-id }}-jsonfile
+          path: /tmp/jsonfile
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ !cancelled() }}
+        with:
+          name: ${{ steps.generate-matrix-id.outputs.matrix-run-id }}-coverage
+          path: ${{inputs.directory}}/coverage.txt
+          if-no-files-found: ignore
+      - name: "Re-run fails report"
+        if: ${{ !cancelled() }}
+        run: |
+          .github/scripts/rerun_fails_report.sh /tmp/gotestsum-rerun-fails

@@ -1,0 +1,36 @@
+name: Integration Tests
+
+on:
+  schedule:
+    - cron: '0 6 * * *'  # Daily at 6am UTC (10pm PST)
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  integration-tests:
+    name: Run Integration Tests
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: recursive
+    - uses: astral-sh/setup-uv@v5
+      with:
+        version: "0.11.8"
+        enable-cache: true
+        cache-dependency-glob: "**/pyproject.toml"
+    - uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+    - name: Install system dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y mafft
+    - name: Install dependencies
+      run: |
+        uv pip install --system -e ".[dev]"
+        uv pip install --system -e ./proto-tools
+    - run: pytest --integration --cpu-only -v --random-order

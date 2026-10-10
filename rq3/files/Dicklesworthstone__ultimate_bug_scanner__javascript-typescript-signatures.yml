@@ -1,0 +1,107 @@
+name: TypeScript Taint Signatures
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ubs
+      - modules/ubs-js.sh
+      - modules/lib/ubs-common.sh
+      - modules/helpers/ubs_core/**
+      - test-suite/js/test_taint_scopes.py
+      - test-suite/js/test_taint_domains.py
+      - test-suite/quality/*js*.py
+      - test-suite/patches/javascript-typescript-signatures.patch
+      - .github/workflows/javascript-typescript-signatures.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate-signatures:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+      UBS_NO_AUTO_UPDATE: '1'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      # The signature parser is production code. The retained patch records
+      # its development history; CI exercises the checked-out implementation.
+      - name: Record the production revision under test
+        run: echo "TS_SIGNATURES_REVISION $(git rev-parse HEAD)"
+      - name: Validate source regressions and existing taint controls
+        run: |
+          python3 test-suite/js/test_taint_scopes.py
+          python3 test-suite/js/test_taint_domains.py
+      - name: Install scanner dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq ripgrep rsync shellcheck
+          npm install --global @ast-grep/cli
+      - name: Run existing JavaScript quality tests
+        run: python3 -m unittest discover -s test-suite/quality -p '*js*.py' -v
+      - name: Validate the real scanner on typed helper sources and clean controls
+        run: |
+          python3 - <<'PY'
+          import json
+          import subprocess
+          import tempfile
+          from pathlib import Path
+          root = Path.cwd()
+          artifacts = root / 'test-suite' / 'artifacts' / 'javascript-typescript-signatures'
+          artifacts.mkdir(parents=True, exist_ok=True)
+          cases = [
+              ('typed-arrow', 'const read: () => string = () => req.query.html; res.send(read());', True),
+              ('object-return', 'function id(x): {html: string} { return x; } res.send(id(req.query));', True),
+              ('generic-arrow', 'const read = <T,>(x: T) => req.query.html; res.send(read("hello"));', True),
+              ('wrapped-arrow', 'const read = ((() => req.query.html)); res.send(read());', True),
+              ('typed-clean', 'function clean(x): {html: string} { return {html: "hello"}; } res.send(clean(req.query).html);', False),
+              ('wrapped-clean', 'const clean = ((x => "hello")); res.send(clean(req.query.html));', False),
+          ]
+          for name, source, expected in cases:
+              with tempfile.TemporaryDirectory(prefix='ubs-ts-signatures-') as tmp:
+                  target = Path(tmp) / 'app.ts'
+                  target.write_text(source + '\n', encoding='utf-8')
+                  result = subprocess.run([str(root / 'ubs'), str(target), '--only=js', '--format=json', '--ci'],
+                                          cwd=tmp, capture_output=True, text=True, timeout=120)
+                  (artifacts / f'{name}.json').write_text(result.stdout)
+                  (artifacts / f'{name}.stderr.log').write_text(result.stderr)
+                  print(name, 'exit', result.returncode, result.stderr, flush=True)
+                  assert result.returncode in (0, 1), result.stdout
+                  rules = set()
+                  def visit(value):
+                      if isinstance(value, dict):
+                          for key in ('rule', 'rule_id', 'ruleId'):
+                              if isinstance(value.get(key), str):
+                                  rules.add(value[key].replace('javascript.', 'js.'))
+                          for child in value.values():
+                              visit(child)
+                      elif isinstance(value, list):
+                          for child in value:
+                              visit(child)
+                  visit(json.loads(result.stdout))
+                  assert ('js.taint.xss' in rules) == expected, (name, rules, result.stdout)
+                  print('TS_SIGNATURES_E2E_PASS', name, flush=True)
+          PY
+      - name: Verify the production integrity chain and deterministic regeneration
+        run: |
+          ./scripts/verify_checksums.sh
+          ./scripts/verify_sha256sums.sh
+          git diff --check
+          git diff > "$RUNNER_TEMP/typescript-signatures-tested.diff"
+          python3 scripts/update_checksums.py
+          ./scripts/update_sha256sums.sh
+          git diff > "$RUNNER_TEMP/typescript-signatures-idempotent.diff"
+          cmp "$RUNNER_TEMP/typescript-signatures-tested.diff" "$RUNNER_TEMP/typescript-signatures-idempotent.diff"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: javascript-typescript-signatures
+          path: |
+            ${{ runner.temp }}/typescript-signatures-*.diff
+            test-suite/artifacts/javascript-typescript-signatures/
+          retention-days: 3

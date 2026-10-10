@@ -1,0 +1,92 @@
+name: "💬 Issue Chat Notification"
+
+on:
+  issues:
+    types: [opened, reopened]
+
+jobs:
+  notify-google-chat:
+    if: |
+      !contains(format(',{0},', vars.PROJECT_MAINTAINERS), format(',{0},', github.actor))
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send Notification to Google Chat
+        env:
+          GOOGLE_CHAT_WEBHOOK: ${{ secrets.GOOGLE_CHAT_WEBHOOK }}
+          ISSUE_TITLE: ${{ github.event.issue.title }}
+          ISSUE_CREATOR: ${{ github.event.issue.user.login }}
+          ISSUE_URL: ${{ github.event.issue.html_url }}
+          ISSUE_LABELS: ${{ toJson(github.event.issue.labels) }}
+          ISSUE_ACTION: ${{ github.event.action }}
+        run: |
+          if [ -z "$GOOGLE_CHAT_WEBHOOK" ]; then
+            echo "GOOGLE_CHAT_WEBHOOK secret is not set. Skipping notification."
+            exit 1
+          fi
+
+          # Collect labels as comma-separated string
+          # Handle empty labels by setting "None" as the value when no labels exist
+          labels=$(echo "$ISSUE_LABELS" | jq -r 'if length == 0 then "None" else map(.name) | join(", ") end')
+          
+          # Create JSON payload for Google Chat
+          # Set header title based on the action (opened or reopened)
+          if [ "$ISSUE_ACTION" = "reopened" ]; then
+            header_title="Github Issue - Reopened"
+          else
+            header_title="Github Issue - Created"
+          fi
+          
+          jq -n \
+            --arg title "$ISSUE_TITLE" \
+            --arg creator "$ISSUE_CREATOR" \
+            --arg url "$ISSUE_URL" \
+            --arg labels "$labels" \
+            --arg header "$header_title" \
+            '{
+              "cards": [{
+                "header": {
+                  "title": $header,
+                  "imageUrl": "https://github.githubassets.com/images/modules/logos_page/GitHub-Mark.png",
+                  "imageStyle": "AVATAR"
+                },
+                "sections": [{
+                  "widgets": [
+                    {
+                      "keyValue": {
+                        "topLabel": "Title",
+                        "content": $title
+                      }
+                    },
+                    {
+                      "keyValue": {
+                        "topLabel": "Labels",
+                        "content": $labels
+                      }
+                    },
+                    {
+                      "keyValue": {
+                        "topLabel": "Created By",
+                        "content": $creator
+                      }
+                    },
+                    {
+                      "buttons": [{
+                        "textButton": {
+                          "text": "VIEW ISSUE",
+                          "onClick": {
+                            "openLink": {
+                              "url": $url
+                            }
+                          }
+                        }
+                      }]
+                    }
+                  ]
+                }]
+              }]
+            }' > payload.json
+          
+          # Send the payload to Google Chat (only once)
+          curl -X POST -H "Content-Type: application/json" \
+            -d @payload.json \
+            "$GOOGLE_CHAT_WEBHOOK"

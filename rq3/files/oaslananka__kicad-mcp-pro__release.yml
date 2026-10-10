@@ -1,0 +1,61 @@
+name: Release Validation
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/release.yml"
+      - ".github/workflows/publish-*.yml"
+      - ".github/workflows/release-please.yml"
+      - "release-please-config.json"
+      - ".release-please-manifest.json"
+      - "pyproject.toml"
+      - "src-tauri/Cargo.toml"
+      - "src-tauri/Cargo.lock"
+      - "package.json"
+      - "server.json"
+      - "compatibility.yaml"
+      - "ROADMAP.md"
+      - "docs/faq.md"
+      - "scripts/sync_mcp_metadata.py"
+      - "scripts/check_release_preflight.py"
+      - "scripts/check_live_model_release_policy.py"
+      - "evals/live/release-policy.yaml"
+      - "evals/live/baselines.yaml"
+      - "scripts/build_kicad_pcm.py"
+      - "packaging/kicad-pcm/**"
+      - "packages/kicad-plugin/**"
+      - "docs/development/release-process.md"
+      - "docs/security/release-integrity.md"
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-validation-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    if: github.repository_owner == 'oaslananka' || github.repository_owner == 'oaslananka-ops'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7
+        with:
+          enable-cache: false
+          version-file: uv.toml
+      - run: corepack enable
+      - run: corepack pnpm install --frozen-lockfile
+      - run: uv sync --all-extras --frozen
+      - name: Enforce live-model release readiness
+        if: github.event_name == 'release' || startsWith(github.head_ref, 'release-please--')
+        run: uv run --all-extras python scripts/check_live_model_release_policy.py --require-ready release --ref HEAD
+      - run: corepack pnpm run metadata:check
+      - run: corepack pnpm run release:check
+      - run: corepack pnpm run package:check

@@ -1,0 +1,71 @@
+# Copyright (c) 2023 Contributors to the Eclipse Foundation
+#
+# See the NOTICE file(s) distributed with this work for additional
+# information regarding copyright ownership.
+#
+# This program and the accompanying materials are made available under the
+# terms of the Eclipse Public License 2.0 which is available at
+# http://www.eclipse.org/legal/epl-2.0
+#
+# SPDX-License-Identifier: EPL-2.0
+name: Release and publish Helm chart
+
+env:
+  VERSION_HELM: "v3.13.3"
+on:
+  workflow_dispatch:
+    inputs:
+      chartVersion:
+        description: 'Helm chart version'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Helm
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: ${{ env.VERSION_HELM }}
+
+      - name: Helm | Login
+        shell: bash
+        run: echo ${{ secrets.DOCKER_HUB_TOKEN }} | helm registry login -u eclipsedittobot --password-stdin registry-1.docker.io
+
+      - name: Helm | Package
+        shell: bash
+        env:
+          CHART_VERSION: ${{ inputs.chartVersion }}
+        run: helm package deployment/helm/ditto --dependency-update --version "$CHART_VERSION"
+
+      - name: Helm | Push
+        shell: bash
+        env:
+          CHART_VERSION: ${{ inputs.chartVersion }}
+        run: helm push "ditto-${CHART_VERSION}.tgz" oci://registry-1.docker.io/eclipse
+
+      - name: Helm | Logout
+        shell: bash
+        run: helm registry logout registry-1.docker.io
+
+      - name: Helm | Output
+        id: output
+        shell: bash
+        env:
+          CHART_VERSION: ${{ inputs.chartVersion }}
+        run: echo "image=registry-1.docker.io/eclipse/ditto:${CHART_VERSION}" >> $GITHUB_OUTPUT

@@ -1,0 +1,147 @@
+name: Sync Multigres Proto
+on:
+  repository_dispatch:
+    types: [proto-updated]
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: Full multigres commit SHA to sync
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: sync-proto
+  cancel-in-progress: false
+
+jobs:
+  update-dependency:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      upstream-sha: ${{ steps.vars.outputs.upstream_sha }}
+      previous-sha: ${{ steps.previous.outputs.sha }}
+      trigger-source: ${{ steps.vars.outputs.trigger_source }}
+      pull-request-number: ${{ steps.create-pr.outputs.pull-request-number }}
+      pull-request-url: ${{ steps.create-pr.outputs.pull-request-url }}
+    steps:
+      - name: Resolve requested SHA
+        id: vars
+        env:
+          DISPATCH_SHA: ${{ github.event.client_payload.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          MANUAL_SHA: ${{ inputs.sha }}
+        run: |
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            sha="$MANUAL_SHA"
+            trigger_source="manual workflow dispatch"
+          else
+            sha="$DISPATCH_SHA"
+            trigger_source="repository dispatch"
+          fi
+
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo "bad SHA"; exit 1; }
+          {
+            echo "upstream_sha=$sha"
+            echo "short_sha=${sha:0:7}"
+            echo "trigger_source=$trigger_source"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Generate GitHub App token for reading upstream
+        id: upstream-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.MULTIGRES_BOT_APP_ID }}
+          private-key: ${{ secrets.MULTIGRES_BOT_APP_PRIVATE_KEY }}
+          owner: multigres
+          repositories: multigres
+          permission-contents: read
+
+      - name: Generate GitHub App token for creating a PR
+        id: operator-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.MULTIGRES_BOT_APP_ID }}
+          private-key: ${{ secrets.MULTIGRES_BOT_APP_PRIVATE_KEY }}
+          owner: multigres
+          repositories: multigres-operator
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Validate SHA is on main
+        env:
+          SHA: ${{ steps.vars.outputs.upstream_sha }}
+          GH_TOKEN: ${{ steps.upstream-token.outputs.token }}
+        run: |
+          # confirm SHA is ancestor of multigres/main
+          gh api "repos/multigres/multigres/compare/main...$SHA" --jq '.status' \
+            | grep -qE '^(identical|behind)$' || { echo "SHA not on main"; exit 1; }
+
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          token: ${{ steps.operator-token.outputs.token }}
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Read current multigres revision
+        id: previous
+        env:
+          GH_TOKEN: ${{ steps.upstream-token.outputs.token }}
+        run: |
+          version="$(go list -m -f '{{.Version}}' github.com/multigres/multigres)"
+          revision="${version##*-}"
+          sha="$(gh api "repos/multigres/multigres/commits/$revision" --jq '.sha')"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+      - name: Update multigres dependency
+        env:
+          GOPRIVATE: "github.com/multigres/*"
+          SHA: ${{ steps.vars.outputs.upstream_sha }}
+          TOKEN: ${{ steps.upstream-token.outputs.token }}
+        run: |
+          git config --global url."https://x-access-token:${TOKEN}@github.com/".insteadOf "https://github.com/"
+          go get github.com/multigres/multigres@"$SHA"
+          go mod tidy
+
+      - name: Create pull request
+        id: create-pr
+        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
+        with:
+          token: ${{ steps.operator-token.outputs.token }}
+          commit-message: "chore(deps): bump multigres to ${{ steps.vars.outputs.short_sha }}"
+          title: "chore(deps): sync multigres proto to ${{ steps.vars.outputs.short_sha }}"
+          body: |
+            Automated proto dependency sync.
+
+            - Previous revision: [`${{ steps.previous.outputs.sha }}`](https://github.com/multigres/multigres/commit/${{ steps.previous.outputs.sha }})
+            - New revision: [`${{ steps.vars.outputs.upstream_sha }}`](https://github.com/multigres/multigres/commit/${{ steps.vars.outputs.upstream_sha }})
+            - Upstream changes: [compare revisions](https://github.com/multigres/multigres/compare/${{ steps.previous.outputs.sha }}...${{ steps.vars.outputs.upstream_sha }})
+            - Trigger: ${{ steps.vars.outputs.trigger_source }}
+
+            This PR updates the proto dependency only. Runtime image defaults remain unchanged and are promoted separately after canary validation (#586).
+          branch: chore/sync-proto-${{ steps.vars.outputs.short_sha }}
+          base: main
+          delete-branch: true
+
+  report-proto-sync-failure:
+    name: Report proto sync failure
+    if: failure() && needs.update-dependency.outputs.upstream-sha != ''
+    needs: update-dependency
+    permissions:
+      actions: read
+      issues: write
+    uses: ./.github/workflows/proto-sync-reporting.yaml
+    with:
+      upstream-sha: ${{ needs.update-dependency.outputs.upstream-sha }}
+      previous-sha: ${{ needs.update-dependency.outputs.previous-sha }}
+      stage: sync-creation
+      result: ${{ needs.update-dependency.result }}
+      trigger-source: ${{ needs.update-dependency.outputs.trigger-source }}
+      pull-request-number: ${{ needs.update-dependency.outputs.pull-request-number }}
+      pull-request-url: ${{ needs.update-dependency.outputs.pull-request-url }}

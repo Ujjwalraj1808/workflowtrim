@@ -1,0 +1,68 @@
+name: All Green
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+  schedule:
+    - cron: 0 4 * * *
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref == 'refs/heads/master' && github.run_id || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  all-green:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+    steps:
+      - uses: DataDog/dd-octo-sts-action@c85802a58e202b7e764b5441e4378c76043c8108 # v1.0.5
+        id: octo-sts
+        with:
+          scope: DataDog/dd-trace-js
+          policy: all-green
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            .github
+            scripts
+      - uses: ./.github/actions/node
+        with:
+          version: active
+      - run: yarn add @actions/core @actions/github octokit
+      - uses: ./.github/actions/dd-sts-api-key
+        id: dd-sts
+      - uses: ./.github/actions/datadog-ci
+      - name: Exclude All Green from Green CI metrics
+        run: datadog-ci tag --level pipeline --tags green_ci.excluded:true
+        env:
+          DATADOG_API_KEY: ${{ steps.dd-sts.outputs.api_key }}
+          DATADOG_SITE: datadoghq.com
+      - run: pip install --quiet codecov-cli
+      # Polls sibling workflows and, as soon as each one reaches a final state, downloads its
+      # artifacts, merges its reports, and uploads its junit/coverage to Datadog and Codecov —
+      # instead of waiting for every workflow to finish before downloading or uploading anything.
+      # Both Datadog and Codecov get the same merged lcov — Codecov's own cross-session merge for a
+      # shared file has been observed overwriting rather than summing when more than one session
+      # reports it, so it's merged into one report per run before upload instead.
+      # `master-coverage` is the flag `.codecov.yml` gates `codecov/patch` on; attached only on PRs
+      # targeting master so release-branch PRs auto-pass. The SHA/PR are passed explicitly because
+      # All Green checks out the merge ref, not the head the other workflows reported coverage for.
+      # No Codecov token: the repo uploads tokenless (a token would have to be an org secret, which
+      # forks can't read).
+      - run: node scripts/all-green.mjs
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          DD_API_KEY: ${{ steps.dd-sts.outputs.api_key }}
+          DELAY: ${{ github.run_attempt == 1 && '2.5' || '0' }} # 2.5 minutes on first attempt, no delay on reruns
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          GITHUB_PR_NUMBER: ${{ github.event.pull_request.number }}
+          GITHUB_TOKEN: ${{ steps.octo-sts.outputs.token }}
+          HEAD_BRANCH: ${{ github.head_ref || github.ref_name }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          POLLING_INTERVAL: 0.5
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          RETRIES: 30
+          RUN_ATTEMPT: ${{ github.run_attempt }}

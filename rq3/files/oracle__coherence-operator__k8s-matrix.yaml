@@ -1,0 +1,166 @@
+# Copyright 2020, 2024, Oracle Corporation and/or its affiliates.  All rights reserved.
+# Licensed under the Universal Permissive License v 1.0 as shown at
+# http://oss.oracle.com/licenses/upl.
+
+# ---------------------------------------------------------------------------
+# Coherence Operator GitHub Actions K8s Certification build.
+# ---------------------------------------------------------------------------
+name: K8s Certification
+
+on:
+  workflow_dispatch:
+  push:
+    branches-ignore:
+    - gh-pages
+    - 1.0.0
+    - 2.x
+    - 3.x
+  pull_request:
+    types:
+      - opened
+      - synchronize
+      - committed
+    branches-ignore:
+    - gh-pages
+    - 1.0.0
+    - 2.x
+    - 3.x
+
+env:
+  MAVEN_USER: ${{ secrets.MAVEN_USER }}
+  MAVEN_PASSWORD: ${{ secrets.MAVEN_PASSWORD }}
+  LOAD_KIND: true
+  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  SKIP_SPRING_CNBP: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        matrixName:
+          - v1.36
+          - v1.35
+          - v1.34
+          - v1.33
+          - v1.32
+          - v1.31
+          - v1.30
+          - v1.29
+        include:
+          # These top matrix entries use node images published with kind v0.32.0,
+          # keeping CI coverage aligned with the locally pinned kind binary.
+          - matrixName: v1.36
+            k8s: kindest/node:v1.36.1@sha256:3489c7674813ba5d8b1a9977baea8a6e553784dab7b84759d1014dbd78f7ebd5
+            kindCommand: kind-calico
+            runNetTests: true
+          - matrixName: v1.35
+            k8s: kindest/node:v1.35.5@sha256:ce977ae6d65918d0b58a5f8b5e940429c2ce42fa3a5619ec2bbc60b949c0ac95
+            kindCommand: kind-calico
+            runNetTests: true
+          - matrixName: v1.34
+            k8s: kindest/node:v1.34.8@sha256:02722c2dedddcfc00febf5d27fbeb9b7b2c14294c82109ff4a85d89ac9ba3256
+            kindCommand: kind-calico
+            runNetTests: true
+          - matrixName: v1.33
+            k8s: kindest/node:v1.33.12@sha256:3f5c8443c620245e4d355cfe09e96a91ead32ceaa569d3f1ca9edf0cb2fe2ff4
+            kindCommand: kind-calico
+            runNetTests: true
+          - matrixName: v1.32
+            k8s: kindest/node:v1.32.8@sha256:abd489f042d2b644e2d033f5c2d900bc707798d075e8186cb65e3f1367a9d5a1
+            kindCommand: kind-calico
+            runNetTests: true
+          - matrixName: v1.31
+            k8s: kindest/node:v1.31.12@sha256:0f5cc49c5e73c0c2bb6e2df56e7df189240d83cf94edfa30946482eb08ec57d2
+            kindCommand: kind-calico
+            runNetTests: true
+          - matrixName: v1.30
+            k8s: kindest/node:v1.30.13@sha256:397209b3d947d154f6641f2d0ce8d473732bd91c87d9575ade99049aa33cd648
+            kindCommand: kind-calico
+            runNetTests: true
+          - matrixName: v1.29
+            k8s: kindest/node:v1.29.12@sha256:62c0672ba99a4afd7396512848d6fc382906b8f33349ae68fb1dbfe549f70dec
+            kindCommand: kind-calico
+            runNetTests: true
+
+    steps:
+    - uses: actions/checkout@v5
+      with:
+        fetch-depth: 0
+
+#   This step will free up disc space on the runner by removing
+#   lots of things that we do not need.
+    - name: disc
+      shell: bash
+      run: |
+        echo "Listing 100 largest packages"
+        dpkg-query -Wf '${Installed-Size}\t${Package}\n' | sort -n | tail -n 100
+        df -h
+        echo "Removing large packages"
+        sudo apt-get remove -y '^dotnet-.*' || true
+        sudo apt-get remove -y '^llvm-.*' || true
+        sudo apt-get remove -y 'monodoc-http' || true
+        sudo apt-get remove -y 'php.*' || true
+        sudo apt-get remove -y azure-cli google-cloud-sdk hhvm google-chrome-stable firefox powershell mono-devel || true
+        sudo apt-get autoremove -y || true
+        sudo apt-get clean
+        df -h
+        echo "Removing large directories"
+        rm -rf /usr/share/dotnet/
+        sudo rm -rf /usr/local/lib/android
+        df -h
+
+    - name: Set up JDK
+      uses: oracle-actions/setup-java@v1
+      with:
+        website: oracle.com
+        release: 21
+
+    - name: Cache Go Modules
+      uses: actions/cache@v5
+      with:
+        path: ~/go/pkg/mod
+        key: ${{ runner.os }}-go-mods-${{ hashFiles('**/go.sum') }}
+        restore-keys: |
+          ${{ runner.os }}-go-mods-
+
+    - name: Cache Maven packages
+      uses: actions/cache@v5
+      with:
+        path: ~/.m2
+        key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
+        restore-keys: ${{ runner.os }}-m2
+
+    - name: Edit DNS Resolve
+      shell: bash
+      run: |
+        sudo chown -R runner:runner /run/systemd/resolve/stub-resolv.conf
+        sudo echo nameserver 8.8.8.8 > /run/systemd/resolve/stub-resolv.conf
+
+    - name: Start KinD Cluster
+      shell: bash
+      run: |
+        echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u $ --password-stdin
+        make ${{ matrix.kindCommand }} KIND_IMAGE=${{ matrix.k8s }} CALICO_TIMEOUT=600s
+        kubectl version
+        kubectl get nodes
+        docker pull gcr.io/distroless/java
+        docker pull gcr.io/distroless/java11-debian11
+        docker pull gcr.io/distroless/java17-debian11
+        docker pull gcr.io/distroless/java17-debian12
+        docker pull gcr.io/distroless/java21-debian12
+
+    - name: Certification Tests
+      shell: bash
+      run: |
+        export RUN_NET_TEST=${{ matrix.runNetTests }}
+        ./hack/k8s-certification.sh
+
+    - uses: actions/upload-artifact@v6
+      if: ${{ failure() || cancelled() }}
+      with:
+        name: test-output-${{ matrix.matrixName }}
+        path: build/_output/test-logs
+        if-no-files-found: ignore

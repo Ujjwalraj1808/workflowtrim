@@ -1,0 +1,104 @@
+name: 🧪 Node.js SDK Tests
+
+permissions:
+  id-token: write
+  contents: read
+  checks: write
+
+on:
+  workflow_dispatch:
+
+  pull_request:
+    branches:
+      - '*'
+    types:
+      - opened
+      - reopened
+      - synchronize
+      - ready_for_review
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  # No `paths:` filter here on purpose: a required check gated by a
+  # workflow-level `paths:` filter never posts a status when skipped and
+  # blocks merging forever. A job-level `if:` skip reports "success"
+  # instead, so the path check moves here and gates test-nodejs-sdk below.
+  changes:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      nodejs: ${{ steps.filter.outputs.nodejs }}
+    steps:
+      - name: 🧱 Checkout
+        uses: actions/checkout@v7
+      - name: 🔍 Detect relevant changes
+        if: github.event_name == 'pull_request'
+        uses: dorny/paths-filter@v4
+        id: filter
+        with:
+          filters: |
+            nodejs:
+              - '.github/workflows/tests-nodejs-sdk.yml'
+              - 'src/sdks/nodejs/**'
+              - 'tests/sdks/nodejs/**'
+
+  test-nodejs-sdk:
+    needs: changes
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'workflow_dispatch' || (needs.changes.outputs.nodejs == 'true' && !github.event.pull_request.draft) }}
+    timeout-minutes: 10
+    env:
+      LOCALSTACK_AUTH_TOKEN: ${{ secrets.LOCALSTACK_AUTH_TOKEN }}
+
+    steps:
+      - name: 🧱 Checkout repository
+        uses: actions/checkout@v7
+
+      - name: 📦 Install pnpm
+        uses: pnpm/action-setup@v6
+
+      - name: 🛠️ Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "22.x"
+          cache: "pnpm"
+
+      - name: 📦 Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: 🪙 Collect Coins (Configure AWS credentials)
+        if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork }}
+        uses: aws-actions/configure-aws-credentials@v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: 🌟 Format check
+        run: pnpm biome check src/sdks/nodejs/src/ tests/sdks/nodejs/ && pnpm biome format src/sdks/nodejs/src/ tests/sdks/nodejs/
+
+      - name: 🏗️ Build
+        run: cd src/sdks/nodejs && pnpm build
+
+      - name: 🍄 Run tests
+        run: cd tests/sdks/nodejs && pnpm vitest run --reporter=verbose --reporter=junit --outputFile=${{ github.workspace }}/test-results.xml
+        env:
+          TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE: /var/run/docker.sock
+          DOCKER_HOST: unix:///var/run/docker.sock
+
+      - name: 📊 Test Results Reporter
+        uses: dorny/test-reporter@v3
+        if: always()
+        with:
+          name: Node.js SDK Test Results
+          path: test-results.xml
+          reporter: jest-junit
+          only-summary: "false"
+          list-suites: "all"
+          list-tests: "all"
+          max-annotations: "10"
+          fail-on-error: "true"

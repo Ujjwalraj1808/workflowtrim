@@ -1,0 +1,52 @@
+name: Bugfix Regression Guard
+
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize, ready_for_review, labeled, unlabeled]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  regression-test-required:
+    name: Require regression tests for bugfix PRs
+    runs-on: ubuntu-latest
+    if: github.event.pull_request.draft == false
+    steps:
+      - name: Validate bugfix test coverage
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+            const labels = (pr.labels || []).map((l) => l.name.toLowerCase());
+            if (labels.includes('checklist-exception')) {
+              core.notice('Bypassing bugfix regression guard due to checklist-exception label.');
+              return;
+            }
+
+            const title = (pr.title || '').toLowerCase();
+            const isBugfix = title.startsWith('fix') || labels.includes('bug') || labels.includes('bugfix');
+            if (!isBugfix) {
+              core.notice('PR is not classified as bugfix; skipping regression guard.');
+              return;
+            }
+
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: pr.number,
+              per_page: 100,
+            });
+
+            const testPattern = /(\/__tests__\/|\.test\.|\.spec\.|\/test\/|\/tests\/)/i;
+            const hasTestChange = files.some((f) => testPattern.test(f.filename));
+
+            if (!hasTestChange) {
+              core.setFailed([
+                'Bugfix PRs must include regression test changes.',
+                'No changed test files were detected in this PR.',
+                'Add/update at least one test that fails before the fix and passes after.',
+                'If this is an intentional exception, apply label: checklist-exception',
+              ].join('\n'));
+            }

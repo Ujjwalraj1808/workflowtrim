@@ -1,0 +1,91 @@
+name: Licenses Update
+
+on:
+  push:
+    branches: ['master']
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  licenses-update:
+    name: Update Licenses
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: licenses-update
+    steps:
+      - name: Create spacewave-ci app token
+        id: spacewave_ci_app_token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.SPACEWAVE_CI_APP_CLIENT_ID }}
+          private-key: ${{ secrets.SPACEWAVE_CI_APP_PRIVATE_KEY }}
+          owner: s4wave
+          repositories: spacewave
+          permission-contents: write
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          token: ${{ steps.spacewave_ci_app_token.outputs.token }}
+
+      - name: Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.27.1'
+          cache: false
+
+      - name: Cache trusted Go dependencies
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: trusted-go-${{ github.job }}-${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+
+      - name: Prune superseded Go dependency caches
+        uses: ./.github/actions/prune-go-cache
+
+      - uses: oven-sh/setup-bun@v2
+
+      - name: Install Bun dependencies
+        run: bun install --frozen-lockfile --ignore-scripts
+
+      - name: Cache aptre tools
+        uses: actions/cache@v6
+        with:
+          path: ./.tools
+          key: trusted-licenses-update-${{ runner.os }}-aptre-tools-${{ hashFiles('**/go.sum') }}
+
+      - name: Setup aptre tools and vendor
+        run: |
+          go mod vendor
+          bun run setup
+
+      - name: Generate licenses
+        run: bun run licenses
+
+      - name: Commit, verify determinism, push
+        run: |
+          if git diff --quiet -- app/licenses/; then
+            echo "app/licenses/ is clean; nothing to commit."
+            exit 0
+          fi
+
+          git config user.name "spacewave-ci[bot]"
+          git config user.email "277994435+spacewave-ci[bot]@users.noreply.github.com"
+          git add app/licenses/
+          git commit -s -m "chore(licenses): update generated license data"
+
+          bun run licenses
+          if ! git diff --quiet -- app/licenses/; then
+            echo "Non-deterministic license generation: app/licenses/ is dirty after a second 'bun run licenses'."
+            git --no-pager diff -- app/licenses/
+            exit 1
+          fi
+
+          git push origin HEAD:master

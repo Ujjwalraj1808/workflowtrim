@@ -1,0 +1,599 @@
+name: Agent Evals
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  schedule:
+    - cron: "0 10 * * 1"   # Weekly Monday 10:00 UTC — live routing eval
+  workflow_dispatch:
+    inputs:
+      run_routing:
+        description: "Run Loom behavioral evals (live + trajectory, non-blocking)"
+        required: false
+        default: "true"
+      run_tapestry_execution:
+        description: "Run Tapestry execution-contract evals (live, non-blocking)"
+        required: false
+        default: "true"
+
+jobs:
+  deterministic-evals:
+    name: Full Deterministic Eval Suite
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Run full deterministic eval suite
+        run: bun run eval --suite prompt-contracts --baseline evals/baselines/prompt-contracts.json --fail-on-regression
+
+      - name: Run smoke baseline comparison
+        run: bun run eval --suite prompt-smoke --baseline evals/baselines/prompt-smoke.json --fail-on-regression
+
+      - name: Verify eval coverage
+        run: bun run eval:coverage
+
+      - name: Upload eval artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: eval-artifacts
+          path: .weave/evals/
+          if-no-files-found: ignore
+
+  detect-routing-changes:
+    name: Detect Routing Eval Changes
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
+    outputs:
+      routing_changed: ${{ steps.check.outputs.changed }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check for routing eval changes
+        id: check
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE=${{ github.event.pull_request.base.sha }}
+          else
+            BASE=${{ github.event.before }}
+          fi
+
+          python3 - "$BASE" <<'PY'
+          import os
+          import subprocess
+          import sys
+          from pathlib import PurePosixPath
+
+          base = sys.argv[1]
+          changed_files = subprocess.check_output(
+            ["git", "diff", "--name-only", base, "HEAD"],
+            text=True,
+          ).splitlines()
+
+          patterns = [
+            "src/agents/loom/default.ts",
+            "src/agents/loom/prompt-composer.ts",
+            "evals/suites/agent-routing.jsonc",
+            "evals/suites/agent-routing-identity.jsonc",
+            "evals/suites/agent-routing-intent.jsonc",
+            "evals/suites/agent-trajectory.jsonc",
+            "evals/suites/tapestry-review-trajectory.jsonc",
+            "evals/suites/tapestry-delegation-routing.jsonc",
+            "evals/suites/tapestry-delegation-trajectory.jsonc",
+            "evals/cases/loom/**/*.jsonc",
+            "evals/cases/trajectory/**/*.jsonc",
+            "evals/cases/tapestry/delegation-routing/**/*.jsonc",
+            "evals/scenarios/loom-*.jsonc",
+            "evals/scenarios/tapestry-post-execution-review.jsonc",
+            "evals/scenarios/tapestry-delegates-to-*.jsonc",
+            "evals/scenarios/tapestry-overlapping-patterns-first-match.jsonc",
+            "evals/scenarios/tapestry-no-pattern-category-explicit-only.jsonc",
+            "evals/rubrics/*.md",
+            "src/features/evals/**/*.ts",
+            "script/eval.ts",
+            "script/eval-trend-report.ts",
+            ".github/workflows/evals.yml",
+          ]
+
+          matched = [
+            path for path in changed_files
+            if any(PurePosixPath(path).match(pattern) for pattern in patterns)
+          ]
+
+          github_output = open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8")
+          if matched:
+            github_output.write("changed=true\n")
+            print("Routing-related files changed:")
+            for path in matched:
+              print(f"- {path}")
+          else:
+            github_output.write("changed=false\n")
+            print("No routing-related files changed")
+          github_output.close()
+          PY
+
+      - name: Explain routing change detection result
+        if: always()
+        run: |
+          if [ "${{ steps.check.outputs.changed }}" = "true" ]; then
+            echo "Routing-related files changed — will trigger live routing evals"
+          else
+            echo "No routing-related files changed"
+          fi
+
+  detect-tapestry-execution-changes:
+    name: Detect Tapestry Execution Eval Changes
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
+    outputs:
+      tapestry_execution_changed: ${{ steps.check.outputs.changed }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check for Tapestry execution eval changes
+        id: check
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE=${{ github.event.pull_request.base.sha }}
+          else
+            BASE=${{ github.event.before }}
+          fi
+
+          python3 - "$BASE" <<'PY'
+          import os
+          import subprocess
+          import sys
+          from pathlib import PurePosixPath
+
+          base = sys.argv[1]
+          changed_files = subprocess.check_output(
+            ["git", "diff", "--name-only", base, "HEAD"],
+            text=True,
+          ).splitlines()
+
+          patterns = [
+            "src/agents/tapestry/default.ts",
+            "src/agents/tapestry/prompt-composer.ts",
+            "evals/suites/tapestry-execution-contracts.jsonc",
+            "evals/cases/tapestry/execution-contract/**/*.jsonc",
+            "src/features/evals/**/*.ts",
+            "script/eval.ts",
+            "script/eval-trend-report.ts",
+            ".github/workflows/evals.yml",
+          ]
+
+          matched = [
+            path for path in changed_files
+            if any(PurePosixPath(path).match(pattern) for pattern in patterns)
+          ]
+
+          github_output = open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8")
+          if matched:
+            github_output.write("changed=true\n")
+            print("Tapestry execution-related files changed:")
+            for path in matched:
+              print(f"- {path}")
+          else:
+            github_output.write("changed=false\n")
+            print("No Tapestry execution-related files changed")
+          github_output.close()
+          PY
+
+      - name: Explain Tapestry execution change detection result
+        if: always()
+        run: |
+          if [ "${{ steps.check.outputs.changed }}" = "true" ]; then
+            echo "Tapestry execution-related files changed — will trigger execution-contract evals"
+          else
+            echo "No Tapestry execution-related files changed"
+          fi
+
+  agent-routing:
+    name: Agent Behavioral Evals (${{ matrix.target.name }} / ${{ matrix.suite.id }})
+    needs: [detect-routing-changes]
+    if: >-
+      always() && (
+        github.event_name == 'schedule' ||
+        (github.event_name == 'workflow_dispatch' && inputs.run_routing == 'true') ||
+        (
+          needs.detect-routing-changes.outputs.routing_changed == 'true' &&
+          github.event_name != 'pull_request'
+        )
+      )
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        suite:
+          - id: agent-routing-identity
+          - id: agent-routing-intent
+          - id: agent-trajectory
+          - id: tapestry-review-trajectory
+          - id: tapestry-delegation-routing
+          - id: tapestry-delegation-trajectory
+        target:
+          - name: OpenRouter / openai/gpt-4o-mini
+            provider: openrouter
+            model: openai/gpt-4o-mini
+            model_key: openrouter/openai/gpt-4o-mini
+            artifact_name: openrouter-openai-gpt-4o-mini
+          - name: OpenRouter / openai/gpt-5.4
+            provider: openrouter
+            model: openai/gpt-5.4
+            model_key: openrouter/openai/gpt-5.4
+            artifact_name: openrouter-openai-gpt-5-4
+          - name: OpenRouter / moonshotai/kimi-k2.6
+            provider: openrouter
+            model: moonshotai/kimi-k2.6
+            model_key: openrouter/moonshotai/kimi-k2.6
+            artifact_name: openrouter-moonshotai-kimi-k2-6
+          - name: OpenRouter / anthropic/claude-opus-4.6
+            provider: openrouter
+            model: anthropic/claude-opus-4.6
+            model_key: openrouter/anthropic/claude-opus-4.6
+            artifact_name: openrouter-anthropic-claude-opus-4-6
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Run agent behavioral eval
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          EVAL_PROVIDER: ${{ matrix.target.provider }}
+          EVAL_MODEL: ${{ matrix.target.model }}
+          EVAL_MATRIX: ${{ format('{{"suite":"{0}","provider":"{1}","model":"{2}","model_key":"{3}","artifact_name":"{4}"}}', matrix.suite.id, matrix.target.provider, matrix.target.model, matrix.target.model_key, matrix.target.artifact_name) }}
+          EVAL_SUITE: ${{ matrix.suite.id }}
+          RUN_PATH: .weave/evals/runs/${{ matrix.target.artifact_name }}-${{ matrix.suite.id }}.json
+        run: bun run eval --suite "$EVAL_SUITE" --provider "$EVAL_PROVIDER" --model "$EVAL_MODEL" --output "$RUN_PATH"
+
+      - name: Upload behavioral eval artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: behavioral-eval-run-${{ matrix.target.artifact_name }}-${{ matrix.suite.id }}
+          path: |
+            .weave/evals/
+            .weave/evals/runs/${{ matrix.target.artifact_name }}-${{ matrix.suite.id }}.json
+          if-no-files-found: ignore
+
+  agent-routing-fanin:
+    name: Agent Behavioral Fan-In
+    needs: [agent-routing]
+    if: always() && !cancelled() && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.ref_name }}
+          fetch-depth: 0
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Download behavioral eval run artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: behavioral-eval-run-*
+          path: .artifacts/behavioral-runs
+          merge-multiple: false
+
+      - name: Merge run artifacts into canonical JSONL
+        run: |
+          python3 - <<'PY'
+          import json
+          from copy import deepcopy
+          from pathlib import Path
+
+          results_dir = Path('evals/results')
+          results_dir.mkdir(parents=True, exist_ok=True)
+
+          suite_paths = {
+            'agent-routing-identity': results_dir / 'agent-routing-identity.jsonl',
+            'agent-routing-intent': results_dir / 'agent-routing-intent.jsonl',
+            'agent-trajectory': results_dir / 'agent-trajectory.jsonl',
+            'tapestry-review-trajectory': results_dir / 'tapestry-review-trajectory.jsonl',
+            'tapestry-delegation-routing': results_dir / 'tapestry-delegation-routing.jsonl',
+            'tapestry-delegation-trajectory': results_dir / 'tapestry-delegation-trajectory.jsonl',
+          }
+
+          runs_by_suite = {suite_id: {} for suite_id in suite_paths}
+
+          for suite_id, jsonl_path in suite_paths.items():
+            if not jsonl_path.exists():
+              continue
+            for line in jsonl_path.read_text().splitlines():
+              line = line.strip()
+              if not line:
+                continue
+              parsed = json.loads(line)
+              run_id = parsed.get('runId')
+              if run_id:
+                runs_by_suite[suite_id][run_id] = parsed
+
+          for path in sorted(Path('.artifacts/behavioral-runs').glob('**/*.json')):
+            parsed = json.loads(path.read_text())
+            run_id = parsed.get('runId')
+            suite_id = parsed.get('suiteId')
+            if run_id and suite_id in runs_by_suite:
+              runs_by_suite[suite_id][run_id] = parsed
+
+          for suite_id, jsonl_path in suite_paths.items():
+            ordered = sorted(
+              runs_by_suite[suite_id].values(),
+              key=lambda run: (run.get('startedAt', ''), run.get('runId', '')),
+            )
+            with jsonl_path.open('w', encoding='utf-8') as fh:
+              for run in ordered:
+                fh.write(json.dumps(run, separators=(',', ':')) + '\n')
+
+          legacy_path = results_dir / 'agent-routing.jsonl'
+          legacy_runs_by_id = {}
+
+          if legacy_path.exists():
+            for line in legacy_path.read_text().splitlines():
+              line = line.strip()
+              if not line:
+                continue
+              parsed = json.loads(line)
+              run_id = parsed.get('runId')
+              if run_id:
+                legacy_runs_by_id[run_id] = parsed
+
+          for run in runs_by_suite['agent-routing-identity'].values():
+            run_id = run.get('runId')
+            if not run_id:
+              continue
+            legacy_run = deepcopy(run)
+            legacy_run['suiteId'] = 'agent-routing'
+            suite_metadata = dict(legacy_run.get('suiteMetadata') or {})
+            suite_metadata['title'] = 'Agent Routing (Legacy)'
+            suite_metadata.setdefault('routingKind', 'identity')
+            suite_metadata.setdefault('familyId', 'loom-routing')
+            suite_metadata.setdefault('familyTitle', 'Loom Routing')
+            suite_metadata.setdefault('viewId', 'identity')
+            suite_metadata.setdefault('viewTitle', 'Identity')
+            legacy_run['suiteMetadata'] = suite_metadata
+            legacy_runs_by_id[run_id] = legacy_run
+
+          ordered_legacy = sorted(
+            legacy_runs_by_id.values(),
+            key=lambda run: (run.get('startedAt', ''), run.get('runId', '')),
+          )
+          with legacy_path.open('w', encoding='utf-8') as fh:
+            for run in ordered_legacy:
+              fh.write(json.dumps(run, separators=(',', ':')) + '\n')
+          PY
+
+      - name: Generate per-model trend reports
+        if: always()
+        continue-on-error: true
+        run: |
+          for suite in agent-routing-identity agent-routing-intent agent-trajectory tapestry-review-trajectory tapestry-delegation-routing tapestry-delegation-trajectory; do
+            bun run script/eval-trend-report.ts --suite "$suite" --model-key openrouter/openai/gpt-4o-mini --check --threshold 0.80
+            bun run script/eval-trend-report.ts --suite "$suite" --model-key openrouter/openai/gpt-5.4 --check --threshold 0.80
+            bun run script/eval-trend-report.ts --suite "$suite" --model-key openrouter/moonshotai/kimi-k2.6 --check --threshold 0.80
+            bun run script/eval-trend-report.ts --suite "$suite" --model-key openrouter/anthropic/claude-opus-4.6 --check --threshold 0.80
+          done
+
+      - name: Commit canonical behavioral history
+        if: github.ref == 'refs/heads/main' && always()
+        run: |
+          git add evals/results/agent-routing-identity.jsonl evals/results/agent-routing-intent.jsonl evals/results/agent-trajectory.jsonl evals/results/agent-routing.jsonl evals/results/tapestry-review-trajectory.jsonl evals/results/tapestry-delegation-routing.jsonl evals/results/tapestry-delegation-trajectory.jsonl
+          if git diff --cached --quiet; then
+            echo "No behavioral history changes to commit"
+            exit 0
+          fi
+          git -c user.name='github-actions[bot]' -c user.email='github-actions[bot]@users.noreply.github.com' commit -m "chore(evals): update behavioral trend results [skip ci]"
+          git -c user.name='github-actions[bot]' -c user.email='github-actions[bot]@users.noreply.github.com' pull --rebase origin "${GITHUB_REF_NAME}"
+          git push origin HEAD:"${GITHUB_REF_NAME}"
+
+      - name: Upload merged behavioral artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: behavioral-eval-artifacts
+          path: |
+            .weave/evals/
+            evals/results/agent-routing-identity.jsonl
+            evals/results/agent-routing-intent.jsonl
+            evals/results/agent-trajectory.jsonl
+            evals/results/agent-routing.jsonl
+            evals/results/tapestry-review-trajectory.jsonl
+            evals/results/tapestry-delegation-routing.jsonl
+            evals/results/tapestry-delegation-trajectory.jsonl
+          if-no-files-found: ignore
+
+  tapestry-execution-contracts:
+    name: Tapestry Execution Contracts (${{ matrix.target.name }})
+    needs: [detect-tapestry-execution-changes]
+    if: >-
+      always() && (
+        github.event_name == 'schedule' ||
+        (github.event_name == 'workflow_dispatch' && inputs.run_tapestry_execution == 'true') ||
+        (
+          needs.detect-tapestry-execution-changes.outputs.tapestry_execution_changed == 'true' &&
+          github.event_name != 'pull_request'
+        )
+      )
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - name: OpenRouter / openai/gpt-5.4
+            provider: openrouter
+            model: openai/gpt-5.4
+            model_key: openrouter/openai/gpt-5.4
+            artifact_name: openrouter-openai-gpt-5-4
+          - name: OpenRouter / moonshotai/kimi-k2.6
+            provider: openrouter
+            model: moonshotai/kimi-k2.6
+            model_key: openrouter/moonshotai/kimi-k2.6
+            artifact_name: openrouter-moonshotai-kimi-k2-6
+          - name: OpenRouter / anthropic/claude-sonnet-4.6
+            provider: openrouter
+            model: anthropic/claude-sonnet-4.6
+            model_key: openrouter/anthropic/claude-sonnet-4.6
+            artifact_name: openrouter-anthropic-claude-sonnet-4-6
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Run Tapestry execution-contract eval
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          EVAL_PROVIDER: ${{ matrix.target.provider }}
+          EVAL_MODEL: ${{ matrix.target.model }}
+          EVAL_MATRIX: ${{ format('{{"suite":"{0}","provider":"{1}","model":"{2}","model_key":"{3}","artifact_name":"{4}"}}', 'tapestry-execution-contracts', matrix.target.provider, matrix.target.model, matrix.target.model_key, matrix.target.artifact_name) }}
+          EVAL_SUITE: tapestry-execution-contracts
+          RUN_PATH: .weave/evals/runs/${{ matrix.target.artifact_name }}-tapestry-execution-contracts.json
+        run: bun run eval --suite "$EVAL_SUITE" --provider "$EVAL_PROVIDER" --model "$EVAL_MODEL" --output "$RUN_PATH"
+
+      - name: Upload Tapestry execution eval artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: tapestry-execution-eval-run-${{ matrix.target.artifact_name }}
+          path: |
+            .weave/evals/
+            .weave/evals/runs/${{ matrix.target.artifact_name }}-tapestry-execution-contracts.json
+          if-no-files-found: ignore
+
+  tapestry-execution-fanin:
+    name: Tapestry Execution Fan-In
+    needs: [tapestry-execution-contracts]
+    if: always() && !cancelled() && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.ref_name }}
+          fetch-depth: 0
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Download Tapestry execution eval artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: tapestry-execution-eval-run-*
+          path: .artifacts/tapestry-execution-runs
+          merge-multiple: false
+
+      - name: Merge execution-contract runs into canonical JSONL
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          results_dir = Path('evals/results')
+          results_dir.mkdir(parents=True, exist_ok=True)
+
+          jsonl_path = results_dir / 'tapestry-execution-contracts.jsonl'
+          runs_by_id = {}
+
+          if jsonl_path.exists():
+            for line in jsonl_path.read_text().splitlines():
+              line = line.strip()
+              if not line:
+                continue
+              parsed = json.loads(line)
+              run_id = parsed.get('runId')
+              if run_id:
+                runs_by_id[run_id] = parsed
+
+          for path in sorted(Path('.artifacts/tapestry-execution-runs').glob('**/*.json')):
+            parsed = json.loads(path.read_text())
+            run_id = parsed.get('runId')
+            suite_id = parsed.get('suiteId')
+            if run_id and suite_id == 'tapestry-execution-contracts':
+              runs_by_id[run_id] = parsed
+
+          ordered = sorted(
+            runs_by_id.values(),
+            key=lambda run: (run.get('startedAt', ''), run.get('runId', '')),
+          )
+          with jsonl_path.open('w', encoding='utf-8') as fh:
+            for run in ordered:
+              fh.write(json.dumps(run, separators=(',', ':')) + '\n')
+          PY
+
+      - name: Generate Tapestry execution trend reports
+        if: always()
+        continue-on-error: true
+        run: |
+          bun run script/eval-trend-report.ts --suite tapestry-execution-contracts --model-key openrouter/openai/gpt-5.4 --check --threshold 0.80
+          bun run script/eval-trend-report.ts --suite tapestry-execution-contracts --model-key openrouter/moonshotai/kimi-k2.6 --check --threshold 0.80
+          bun run script/eval-trend-report.ts --suite tapestry-execution-contracts --model-key openrouter/anthropic/claude-sonnet-4.6 --check --threshold 0.80
+
+      - name: Commit Tapestry execution history
+        if: github.ref == 'refs/heads/main' && always()
+        run: |
+          git add evals/results/tapestry-execution-contracts.jsonl
+          if git diff --cached --quiet; then
+            echo "No Tapestry execution history changes to commit"
+            exit 0
+          fi
+          git -c user.name='github-actions[bot]' -c user.email='github-actions[bot]@users.noreply.github.com' commit -m "chore(evals): update tapestry execution trend results [skip ci]"
+          git -c user.name='github-actions[bot]' -c user.email='github-actions[bot]@users.noreply.github.com' pull --rebase origin "${GITHUB_REF_NAME}"
+          git push origin HEAD:"${GITHUB_REF_NAME}"
+
+      - name: Upload merged Tapestry execution artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: tapestry-execution-eval-artifacts
+          path: |
+            .weave/evals/
+            evals/results/tapestry-execution-contracts.jsonl
+          if-no-files-found: ignore

@@ -1,0 +1,103 @@
+name: Deploy Edge Worker
+
+# Production deploys ride release publish — the same cadence as the app
+# image (deploy.yml). The two share a wire contract
+# (app/services/edge_cache/contract.py ⇄ edge/spoo-edge-cache/contract/),
+# so deploying the worker on merge while the app waits for a release
+# would open a contract-skew window. Releases without edge changes
+# redeploy the same worker code — idempotent and cheap.
+# PRs touching edge/** run checks only; beta deploys are manual
+# (workflow_dispatch → environment=beta).
+#
+# NOTE: the FIRST deploy to a new environment must be run locally, not
+# here — wrangler auto-provisions the KV namespace and writes its id
+# back into wrangler.jsonc, and a CI runner's write is lost. See
+# edge/spoo-edge-cache/README.md "Provisioning".
+
+on:
+  release:
+    types: [published]
+  pull_request:
+    paths:
+      - "edge/spoo-edge-cache/**"
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment"
+        type: choice
+        options:
+          - beta
+          - production
+        default: beta
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: edge/spoo-edge-cache
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: edge/spoo-edge-cache/package-lock.json
+
+      - name: Install
+        run: npm ci
+
+      - name: Generated types are current
+        run: npx wrangler types --check --strict-vars=false
+
+      - name: Typecheck
+        run: npx tsc --noEmit
+
+      - name: Worker tests (workerd)
+        run: npx vitest run
+
+      - name: Build validates
+        run: npx wrangler deploy --dry-run --env production
+
+  deploy:
+    needs: check
+    # PRs only run checks; deploys happen on main pushes and dispatches.
+    # Routes were detached on 2026-10-07; a deploy would re-attach them.
+    if: github.event_name != 'pull_request' && vars.EDGE_CACHE_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    concurrency: deploy-edge
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: edge/spoo-edge-cache/package-lock.json
+
+      # wrangler-action runs the wrangler from node_modules — without
+      # this install the runner falls back to a stray global wrangler
+      # in the wrong directory.
+      - name: Install
+        run: npm ci
+        working-directory: edge/spoo-edge-cache
+
+      - name: Deploy
+        uses: cloudflare/wrangler-action@v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: edge/spoo-edge-cache
+          command: deploy --env ${{ github.event_name == 'workflow_dispatch' && inputs.environment || 'production' }}

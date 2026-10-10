@@ -1,0 +1,33 @@
+name: coverage
+on:
+  push:
+    branches: ['main']
+    paths-ignore:
+      - "docs/**"
+      - "**.md"
+  pull_request:
+    paths-ignore:
+      - "docs/**"
+      - "**.md"
+permissions: read-all
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        persist-credentials: false
+    - name: Install Go
+      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+      with:
+        go-version: 1.27
+        cache: true
+    - name: Check Coverage
+      run: |
+        go test -covermode=atomic -coverprofile='unfiltered_coverage.cov' `go list ./... | grep -v -f .test_ignore.txt`
+        grep -v -f .test_ignore.txt unfiltered_coverage.cov > coverage.cov
+    - name: Coveralls Parallel
+      uses: coverallsapp/github-action@8d6379e14d29928660c4ba802d8e85393440b329
+      with:
+        file: 'coverage.cov'

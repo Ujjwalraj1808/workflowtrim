@@ -1,0 +1,48 @@
+name: EDGAR Prices Daily (Polygon increment)
+
+# US 주가 일증분 — Polygon(Massive) grouped-daily 1콜/날짜로 그날 전 US 종목 OHLC →
+# edgar/prices/recent.parquet 누적 + prices-snapshot-us.json 빌드(게이트). gov buildGovPriceData 대칭.
+# 백필(Yahoo 전체이력 base)은 edgarPricesBackfill 별 워크플로. 런타임이 company(base)+recent(tail) 머지.
+
+on:
+  schedule:
+    - cron: '0 23 * * *'   # 매일 UTC 23:00 — 미국 EOD 정착 후(무료티어 당일 403 회피, lookbackDays 가 정착일 커버)
+  workflow_dispatch:
+    inputs:
+      lookbackDays:
+        description: '최근 평일 N일 grouped 수집 (gap 보정)'
+        default: '7'
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: hf-edgar-prices
+  cancel-in-progress: false
+
+jobs:
+  daily:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+      - name: Set up Python
+        run: uv python install 3.12
+      - name: Install dependencies
+        run: uv sync
+      - name: Polygon daily increment → recent + snapshot
+        run: |
+          uv run python -X utf8 -c "
+          from dartlab.pipeline.stages.edgarPrices import runEdgarPricesDaily
+          res = runEdgarPricesDaily(lookbackDays=int('${{ github.event.inputs.lookbackDays || '7' }}'), upload=True)
+          print('ok', res.report.ok, 'skip', res.report.skip, 'err', res.report.err)
+          if res.report.failures:
+              print('FAILURES', res.report.failures[:5])
+          "
+        env:
+          POLYGON_API_KEY: ${{ secrets.POLYGON_API_KEY }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          DARTLAB_DATA_DIR: ${{ github.workspace }}/data

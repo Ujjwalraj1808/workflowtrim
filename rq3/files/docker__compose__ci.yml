@@ -1,0 +1,400 @@
+name: ci
+
+permissions:
+  contents: read # to fetch code (actions/checkout)
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  push:
+    branches:
+      - 'main'
+    tags:
+      - 'v*'
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      debug_enabled:
+        description: 'To run with tmate enter "debug_enabled"'
+        required: false
+        default: "false"
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - lint
+          - validate-go-mod
+          - validate-headers
+          - validate-docs
+          - validate-mocks
+          - relay-lint
+          - relay-test
+    steps:
+      -
+        name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      -
+        name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@594f3bf4285d9ea8dc53c9a0c9c4092420091003 # v4.4.0
+      -
+        name: Run
+        run: |
+          make ${{ matrix.target }}
+
+  binary:
+    uses: docker/github-builder/.github/workflows/bake.yml@58cb9f5b71b1836d6f690c1e95effdeb9b98cb8a # v1.17.0
+    permissions:
+      contents: read # same as global permission
+      id-token: write # for signing attestation(s) with GitHub OIDC Token
+    with:
+      runner: amd64
+      artifact-name: compose
+      artifact-upload: true
+      cache: true
+      cache-scope: binary
+      target: release
+      output: local
+      sbom: true
+      sign: ${{ github.event_name != 'pull_request' }}
+
+  binary-finalize:
+    runs-on: ubuntu-latest
+    needs:
+      - binary
+    steps:
+      -
+        name: Download artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: /tmp/compose-output
+          name: ${{ needs.binary.outputs.artifact-name }}
+      -
+        name: Rename provenance and sbom
+        run: |
+          for pdir in /tmp/compose-output/*/; do
+            (
+              cd "$pdir"
+              binname=$(find . -name 'docker-compose-*')
+              filename=$(basename "${binname%.exe}")
+              mv "provenance.json" "${filename}.provenance.json"
+              mv "sbom-binary.spdx.json" "${filename}.sbom.json"
+              find . -name 'sbom*.json' -exec rm {} \;
+              if [ -f "provenance.sigstore.json" ]; then
+                mv "provenance.sigstore.json" "${filename}.sigstore.json"
+              fi
+            )
+          done
+          mkdir -p "./bin/release"
+          mv /tmp/compose-output/**/* "./bin/release/"
+      -
+        name: Create checksum file
+        working-directory: ./bin/release
+        run: |
+          find . -type f -print0 | sort -z | xargs -r0 shasum -a 256 -b | sed 's# \*\./# *#' > $RUNNER_TEMP/checksums.txt
+          shasum -a 256 -U -c $RUNNER_TEMP/checksums.txt
+          mv $RUNNER_TEMP/checksums.txt .
+          cat checksums.txt | while read sum file; do
+            if [[ "${file#\*}" == docker-compose-* && "${file#\*}" != *.provenance.json && "${file#\*}" != *.sbom.json && "${file#\*}" != *.sigstore.json ]]; then
+              echo "$sum $file" > ${file#\*}.sha256
+            fi
+          done
+      -
+        name: List artifacts
+        run: |
+          tree -nh ./bin/release
+      -
+        name: Check artifacts
+        run: |
+          find bin/release -type f -exec file -e ascii -- {} +
+      -
+        name: Upload artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release
+          path: ./bin/release/*
+          if-no-files-found: error
+
+  bin-image-test:
+    if: github.event_name == 'pull_request'
+    uses: docker/github-builder/.github/workflows/bake.yml@58cb9f5b71b1836d6f690c1e95effdeb9b98cb8a # v1.17.0
+    with:
+      runner: amd64
+      target: image-cross
+      cache: true
+      cache-scope: bin-image-test
+      output: image
+      push: false
+      sbom: true
+      set-meta-labels: true
+      meta-images: |
+        compose-bin
+      meta-tags: |
+        type=ref,event=pr
+      meta-bake-target: meta-helper
+
+  relay-image-test:
+    if: github.event_name == 'pull_request'
+    uses: docker/github-builder/.github/workflows/bake.yml@58cb9f5b71b1836d6f690c1e95effdeb9b98cb8a # v1.17.0
+    with:
+      runner: amd64
+      target: relay-image-cross
+      cache: true
+      cache-scope: relay-image-test
+      output: image
+      push: false
+      sbom: true
+      set-meta-labels: true
+      meta-images: |
+        compose-relay
+      meta-tags: |
+        type=ref,event=pr
+      meta-bake-target: meta-helper
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      -
+        name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@594f3bf4285d9ea8dc53c9a0c9c4092420091003 # v4.4.0
+      -
+        name: Test
+        uses: docker/bake-action@018cb6412ab401ebaa809aa5f85966b74628600f # v7.4.0
+        with:
+          targets: test
+          set: |
+            *.cache-from=type=gha,scope=test
+            *.cache-to=type=gha,scope=test
+      -
+        name: Gather coverage data
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: coverage-data-unit
+          path: bin/coverage/unit/
+          if-no-files-found: error
+      - 
+        name: Unit Test Summary
+        uses: test-summary/action@37b508cfee6d4d080eedd00b5bb240a6a784a6a5 # v2.6
+        with:
+          paths: bin/coverage/unit/report.xml       
+        if: always()
+
+  e2e:
+    runs-on: ubuntu-latest
+    name: e2e (${{ matrix.mode }}, ${{ matrix.channel }}, ${{ matrix.store }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # current stable, both image store backends: several digest-identity
+          # bugs only manifest on one of them (graphdriver vs containerd)
+          - mode: plugin
+            engine: 29
+            channel: stable
+            store: graphdriver
+          - mode: plugin
+            engine: 29
+            channel: stable
+            store: containerd
+          - mode: standalone
+            engine: 29
+            channel: stable
+            store: graphdriver
+          - mode: standalone
+            engine: 29
+            channel: stable
+            store: containerd
+
+          # old stable (latest major - 1)
+          - mode: plugin
+            engine: 28
+            channel: oldstable
+            store: graphdriver
+          - mode: standalone
+            engine: 28
+            channel: oldstable
+            store: graphdriver
+    steps:
+      - name: Prepare
+        run: |
+          mode=${{ matrix.mode }}
+          engine=${{ matrix.engine }}
+          store=${{ matrix.store }}
+          echo "MODE_ENGINE_PAIR=${mode}-${engine}-${store}" >> $GITHUB_ENV
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Docker ${{ matrix.engine }}
+        run: |
+          sudo systemctl stop docker.service
+          sudo apt-get purge docker-ce docker-ce-cli containerd.io docker-compose-plugin docker-ce-rootless-extras docker-buildx-plugin
+          sudo apt-get install curl
+          curl -fsSL https://test.docker.com -o get-docker.sh
+          sudo sh ./get-docker.sh --version ${{ matrix.engine }}
+
+      - name: Check Docker Version
+        run: docker --version
+
+      - name: Enable containerd image store
+        if: ${{ matrix.store == 'containerd' }}
+        run: |
+          sudo mkdir -p /etc/docker
+          if [ -s /etc/docker/daemon.json ]; then
+            jq -s '.[0] * .[1]' /etc/docker/daemon.json <(echo '{"features": {"containerd-snapshotter": true}}') \
+              | sudo tee /etc/docker/daemon.json.new > /dev/null
+            sudo mv /etc/docker/daemon.json.new /etc/docker/daemon.json
+          else
+            echo '{"features": {"containerd-snapshotter": true}}' | sudo tee /etc/docker/daemon.json > /dev/null
+          fi
+          sudo systemctl restart docker.service
+          docker info -f '{{json .DriverStatus}}' | grep -q io.containerd.snapshotter.v1
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@594f3bf4285d9ea8dc53c9a0c9c4092420091003 # v4.4.0
+
+      - name: Set up Docker Model
+        run: |
+          sudo apt-get install docker-model-plugin
+          docker model version
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: '.go-version'
+          check-latest: true
+          cache: true
+
+      - name: Build example provider
+        run: make example-provider
+
+      - name: Build
+        uses: docker/bake-action@018cb6412ab401ebaa809aa5f85966b74628600f # v7.4.0
+        with:
+          source: .
+          targets: binary-with-coverage
+          set: |
+            *.cache-from=type=gha,scope=binary-linux-amd64
+            *.cache-from=type=gha,scope=binary-e2e-${{ matrix.mode }}
+            *.cache-to=type=gha,scope=binary-e2e-${{ matrix.mode }},mode=max
+        env:
+          BUILD_TAGS: e2e
+
+      - name: Setup tmate session
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.debug_enabled }}
+        uses: mxschmitt/action-tmate@35b54afac29c97fb54faba5b513f8fbd1882f113 # v3.24
+        with:
+          limit-access-to-actor: true
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Test plugin mode
+        if: ${{ matrix.mode == 'plugin' }}
+        run: |
+          rm -rf ./bin/coverage/e2e
+          mkdir -p ./bin/coverage/e2e
+          make e2e-compose GOCOVERDIR=bin/coverage/e2e TEST_FLAGS="-v"
+
+      - name: Gather coverage data
+        if: ${{ matrix.mode == 'plugin' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: coverage-data-e2e-${{ env.MODE_ENGINE_PAIR }}
+          path: bin/coverage/e2e/
+          if-no-files-found: error
+
+      - name: Test standalone mode
+        if: ${{ matrix.mode == 'standalone' }}
+        run: |
+          rm -f /usr/local/bin/docker-compose
+          cp bin/build/docker-compose /usr/local/bin
+          make e2e-compose-standalone
+
+      - name: e2e Test Summary
+        uses: test-summary/action@37b508cfee6d4d080eedd00b5bb240a6a784a6a5 # v2.6
+        with:
+          paths: /tmp/report/report.xml       
+        if: always()
+
+  coverage:
+    runs-on: ubuntu-latest
+    needs:
+      - test
+      - e2e
+    steps:
+      # codecov won't process the report without the source code available
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: '.go-version'
+          check-latest: true
+      - name: Download unit test coverage
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: coverage-data-unit
+          path: coverage/unit
+          merge-multiple: true
+      - name: Download E2E test coverage
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: coverage-data-e2e-*
+          path: coverage/e2e
+          merge-multiple: true
+      - name: Merge coverage reports
+        run: |
+          go tool covdata textfmt -i=./coverage/unit,./coverage/e2e -o ./coverage.txt
+      - name: Store coverage report in GitHub Actions
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: go-covdata-txt
+          path: ./coverage.txt
+          if-no-files-found: error
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        with:
+          files: ./coverage.txt
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write # to create a release (softprops/action-gh-release)
+    runs-on: ubuntu-latest
+    needs:
+      - binary-finalize
+    steps:
+      -
+        name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      -
+        name: Download artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: ./bin/release
+          name: release
+      -
+        # inspect what was actually downloaded from the artifact store —
+        # this is what gets attached to the release
+        name: List artifacts
+        run: |
+          tree -nh ./bin/release
+      -
+        name: Check artifacts
+        run: |
+          find bin/release -type f -exec file -e ascii -- {} +
+      -
+        name: GitHub Release
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          files: ./bin/release/*
+          generate_release_notes: true
+          draft: true
+          # never replace assets already uploaded to an existing release
+          # (softprops updates an existing release for the tag instead of failing)
+          overwrite_files: false
+          token: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,132 @@
+name: Auto Release
+
+on:
+  schedule:
+    # 每日北京时间 0:00（= UTC 16:00，GitHub Actions 的 cron 使用 UTC）
+    - cron: "0 16 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: auto-release
+  cancel-in-progress: true
+
+jobs:
+  release:
+    if: ${{ github.repository_owner == 'AliceJump' }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          # 不持久化 github.token，避免 git push 仍以 github-actions[bot] 认证
+          persist-credentials: false
+
+      - name: Check changes in deploy.txt paths since last tag
+        id: check
+        run: |
+          set -euo pipefail
+
+          # deploy.txt 每行一个「发版关注路径」（目录或文件），支持 CRLF，空行忽略
+          mapfile -t paths < deploy.txt
+          watched=()
+          for line in "${paths[@]}"; do
+            line=${line%$'\r'}
+            [ -z "$line" ] && continue
+            watched+=("$line")
+          done
+          echo "watched paths: ${watched[*]}"
+
+          # 找到最新的 vX.Y.Z tag
+          last_tag=$(git tag -l 'v[0-9]*.[0-9]*.[0-9]*' | sort -V | tail -n 1 || true)
+          echo "last_tag=${last_tag:-<none>}"
+          echo "last_tag=$last_tag" >> "$GITHUB_OUTPUT"
+
+          if [ "${#watched[@]}" -eq 0 ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "latest_commit=" >> "$GITHUB_OUTPUT"
+            echo "no watched paths in deploy.txt; skip release"
+            exit 0
+          fi
+
+          # 找出关注路径中「最后一次修改的 commit」。
+          # 以 Git 历史顺序（git log 输出顺序）为准，不依赖 Unix timestamp；
+          # 多个关注路径 / 同一路径多次修改 / 文件或目录均由此统一处理。
+          # 有历史 tag：只看 last_tag..HEAD；无历史 tag（首次发版）：看全部历史。
+          if [ -z "$last_tag" ]; then
+            latest_commit=$(git log --topo-order --format=%H -- "${watched[@]}" | head -n 1 || true)
+          else
+            latest_commit=$(git log --topo-order --format=%H "$last_tag"..HEAD -- "${watched[@]}" | head -n 1 || true)
+          fi
+
+          if [ -z "$latest_commit" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "latest_commit=" >> "$GITHUB_OUTPUT"
+            echo "no changes in watched paths; skip release"
+            exit 0
+          fi
+
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+          echo "latest_commit=$latest_commit" >> "$GITHUB_OUTPUT"
+
+      - name: Compute next version
+        id: version
+        if: steps.check.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          last_tag="${{ steps.check.outputs.last_tag }}"
+          if [ -z "$last_tag" ]; then
+            next="v0.0.1"
+          else
+            version="${last_tag#v}"
+            if [[ "$version" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+) ]]; then
+              major="${BASH_REMATCH[1]}"
+              minor="${BASH_REMATCH[2]}"
+              patch="${BASH_REMATCH[3]}"
+            else
+              echo "invalid last_tag format: $last_tag" >&2
+              exit 1
+            fi
+            if [ "$patch" -ge 99 ]; then
+              patch=0
+              minor=$((minor + 1))
+            else
+              patch=$((patch + 1))
+            fi
+            next="v${major}.${minor}.${patch}"
+          fi
+          echo "next=$next" >> "$GITHUB_OUTPUT"
+
+      - name: Generate GitHub App token for tag creation
+        id: app-token
+        if: steps.check.outputs.changed == 'true'
+        uses: actions/create-github-app-token@v1
+        with:
+          # App ID 是公开信息，放明文 variable 即可（Settings → Variables）
+          app-id: ${{ vars.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          # 仅给本仓库安装的 release bot 发 token
+          owner: AliceJump
+          repositories: ok-end-field
+
+      - name: Create and push version tag
+        if: steps.check.outputs.changed == 'true'
+        env:
+          APP_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          next="${{ steps.version.outputs.next }}"
+          target="${{ steps.check.outputs.latest_commit }}"
+          git config user.name "alicejump-release-bot[bot]"
+          git config user.email "alicejump-release-bot[bot]@users.noreply.github.com"
+          # tag 必须指向关注路径最后一次修改的 commit（latest_commit），而不是 HEAD
+          git tag -a "$next" "$target" -m "$next"
+          # 显式用 App token 认证推送（checkout 已 persist-credentials: false，
+          # 若直接 git push origin 会因无凭据失败），App token 在 tag ruleset 豁免列表中
+          git push "https://x-access-token:${APP_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "$next"
+          echo "Released $next -> $target"
+          # App token 推送的 tag 会触发 build.yml 的 push 事件（GITHUB_TOKEN 不会，这是
+          # 之前用 repository_dispatch 的原因），因此不再需要手动 dispatch

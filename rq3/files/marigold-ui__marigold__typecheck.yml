@@ -1,0 +1,32 @@
+name: Typecheck
+
+on: ['push']
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  typecheck:
+    name: Typecheck
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      CI: true
+    steps:
+      # Setup
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6.1.0 # Uses version from package.json#packageManager
+      - name: Setup Node (using .node-version)
+        uses: actions/setup-node@v6
+        with:
+          node-version-file: '.node-version'
+          cache: 'pnpm'
+      - name: Install dependencies
+        run: pnpm install
+      - name: Build packages
+        run: pnpm build
+
+      # Action
+      - name: Typecheck
+        run: pnpm typecheck

@@ -1,0 +1,2202 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, labeled]
+  workflow_dispatch:
+    inputs:
+      force_encoding_worker_deploy:
+        # Manual override for the encoding-worker deploy gate (see "Decide
+        # encoding-worker deploy" in deploy-backend). Dispatch on main re-runs
+        # package-build + deploy-backend; with this ticked the GCE worker is
+        # blue-green redeployed even if no worker code changed.
+        description: "Force a blue-green redeploy of the GCE encoding worker"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  id-token: write
+
+concurrency:
+  group: "ci-${{ github.ref }}"
+  cancel-in-progress: true
+
+jobs:
+  # ============================================
+  # PATH FILTERING - Determine what changed
+  # Only needed for PRs (main branch skips tests)
+  # ============================================
+
+  changes:
+    name: "Detect Changes"
+    runs-on: ubuntu-latest
+    if: github.ref != 'refs/heads/main'
+    outputs:
+      frontend: ${{ steps.filter.outputs.frontend }}
+      backend: ${{ steps.filter.outputs.backend }}
+      package: ${{ steps.filter.outputs.package }}
+      infra: ${{ steps.filter.outputs.infra }}
+      deps: ${{ steps.filter.outputs.deps }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            frontend:
+              - 'frontend/**'
+            backend:
+              - 'backend/**'
+            package:
+              - 'karaoke_gen/**'
+              - 'lyrics_transcriber_temp/**'
+              - 'tests/**'
+            infra:
+              - 'infrastructure/**'
+            deps:
+              - 'poetry.lock'
+              # CI config changes (runners, setup steps) must exercise the
+              # package/backend test jobs they affect.
+              - '.github/workflows/ci.yml'
+
+      - name: Summary
+        run: |
+          echo "### Change Detection Results" >> $GITHUB_STEP_SUMMARY
+          echo "| Area | Changed |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|---------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Frontend | ${{ steps.filter.outputs.frontend }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Backend | ${{ steps.filter.outputs.backend }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Package | ${{ steps.filter.outputs.package }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Infrastructure | ${{ steps.filter.outputs.infra }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Dependencies | ${{ steps.filter.outputs.deps }} |" >> $GITHUB_STEP_SUMMARY
+
+  # ============================================
+  # FRONTEND TESTS (PRs only - main skips tests)
+  # ============================================
+
+  frontend-lint:
+    name: "Frontend - Lint (Rules of Hooks)"
+    runs-on: ubuntu-latest
+    needs: changes
+    if: github.ref != 'refs/heads/main' && needs.changes.outputs.frontend == 'true'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js with caching
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        working-directory: frontend
+        run: npm ci --legacy-peer-deps
+
+      - name: Run ESLint
+        working-directory: frontend
+        run: npm run lint
+
+  translation-check:
+    name: "Translation Validation"
+    runs-on: ubuntu-latest
+    needs: changes
+    if: github.ref != 'refs/heads/main' && needs.changes.outputs.frontend == 'true'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Validate frontend translations (key parity)
+        run: |
+          python frontend/scripts/validate-translations.py --messages-dir frontend/messages --keys-only || echo "::warning::Frontend translation validation failed — run translate.py to fix"
+
+      - name: Validate backend translations (key parity)
+        run: python frontend/scripts/validate-translations.py --messages-dir backend/translations --keys-only
+
+  frontend-unit-tests:
+    name: "Frontend - Unit Tests"
+    runs-on: ubuntu-latest
+    needs: changes
+    if: github.ref != 'refs/heads/main' && needs.changes.outputs.frontend == 'true'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js with caching
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        working-directory: frontend
+        run: npm ci --legacy-peer-deps
+
+      - name: Run unit tests with coverage
+        working-directory: frontend
+        run: npm run test:ci
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-coverage
+          path: frontend/coverage/
+          retention-days: 7
+
+  frontend-e2e-smoke:
+    name: "Frontend - E2E Smoke (~2 min)"
+    runs-on: ubuntu-latest
+    needs: changes
+    # Quick smoke tests run on every PR with frontend changes
+    if: github.ref != 'refs/heads/main' && needs.changes.outputs.frontend == 'true'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js with caching
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        working-directory: frontend
+        run: npm ci --legacy-peer-deps
+
+      - name: Install Playwright browsers
+        working-directory: frontend
+        run: npx playwright install --with-deps chromium
+
+      - name: Run smoke tests only
+        working-directory: frontend
+        run: npx playwright test smoke.spec.ts --project=chromium --reporter=line
+
+      # Offline (fixture pages + stub LLM) tests for the self-healing Stripe
+      # Checkout runner used by the daily production E2E.
+      - name: Run self-healing Stripe runner tests
+        working-directory: frontend
+        run: npx playwright test --config=playwright.selfheal.config.ts --reporter=line
+
+      - name: Upload Playwright report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-smoke-report
+          path: frontend/playwright-report/
+          retention-days: 7
+
+  frontend-e2e-full:
+    name: "Frontend - E2E Full"
+    runs-on: ubuntu-latest
+    needs: changes
+    # Full E2E suite only runs when PR has 'e2e' label (on-demand)
+    if: >-
+      github.ref != 'refs/heads/main' &&
+      needs.changes.outputs.frontend == 'true' &&
+      contains(github.event.pull_request.labels.*.name, 'e2e')
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js with caching
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        working-directory: frontend
+        run: npm ci --legacy-peer-deps
+
+      - name: Install Playwright browsers
+        working-directory: frontend
+        run: npx playwright install --with-deps chromium
+
+      - name: Run full E2E tests
+        working-directory: frontend
+        run: npx playwright test --reporter=list -x
+
+      - name: Upload Playwright report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: frontend/playwright-report/
+          retention-days: 7
+
+  # Happy Path Production Test - runs the comprehensive real-user test against prod
+  frontend-e2e-happy-path:
+    name: "Frontend - E2E Happy Path (Production)"
+    runs-on: ubuntu-latest
+    needs: changes
+    # Only runs when PR has 'e2e-happy-path' label
+    if: >-
+      github.ref != 'refs/heads/main' &&
+      contains(github.event.pull_request.labels.*.name, 'e2e-happy-path')
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        working-directory: frontend
+        run: npm ci --legacy-peer-deps
+
+      - name: Install Playwright browsers
+        working-directory: frontend
+        run: npx playwright install --with-deps chromium
+
+      - name: Create test-results directory
+        working-directory: frontend
+        run: mkdir -p test-results
+
+      - name: Refresh E2E session token
+        id: refresh_token
+        run: |
+          RESPONSE=$(curl -sf --connect-timeout 5 --max-time 30 -X POST \
+            "https://api.nomadkaraoke.com/api/admin/users/e2e-test-runner@nomadkaraoke.com/impersonate" \
+            -H "X-Admin-Token: ${{ secrets.E2E_ADMIN_TOKEN }}" \
+            -H "Content-Type: application/json")
+          TOKEN=$(echo "$RESPONSE" | python3 -c 'import json,sys; print(json.load(sys.stdin)["session_token"])')
+          echo "::add-mask::$TOKEN"
+          echo "token=$TOKEN" >> $GITHUB_OUTPUT
+
+      - name: Run Happy Path Production Test
+        working-directory: frontend
+        env:
+          TESTMAIL_API_KEY: ${{ secrets.TESTMAIL_API_KEY }}
+          TESTMAIL_NAMESPACE: ${{ secrets.TESTMAIL_NAMESPACE }}
+          E2E_TEST_TOKEN: ${{ steps.refresh_token.outputs.token }}
+          E2E_ADMIN_TOKEN: ${{ secrets.E2E_ADMIN_TOKEN }}
+          E2E_BYPASS_KEY: ${{ secrets.E2E_BYPASS_KEY }}
+        run: |
+          echo "Starting E2E Happy Path Test against Production"
+          echo "Time: $(date)"
+          npx playwright test happy-path-real-user.spec.ts \
+            --config=playwright.production.config.ts \
+            --project=chromium \
+            --reporter=list \
+            --timeout=3600000
+
+      - name: Scrub secrets from artifacts (public repo)
+        id: scrub
+        if: always()
+        working-directory: frontend
+        env:
+          E2E_ADMIN_TOKEN: ${{ secrets.E2E_ADMIN_TOKEN }}
+          TESTMAIL_API_KEY: ${{ secrets.TESTMAIL_API_KEY }}
+          E2E_BYPASS_KEY: ${{ secrets.E2E_BYPASS_KEY }}
+          E2E_TEST_TOKEN: ${{ steps.refresh_token.outputs.token }}
+        run: node e2e/scripts/scrub-artifacts.mjs test-results playwright-report
+
+      - name: Upload test artifacts
+        if: always() && steps.scrub.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-happy-path-results
+          path: |
+            frontend/test-results/
+            frontend/playwright-report/
+          retention-days: 30
+
+  frontend-build:
+    name: "Frontend - Build"
+    runs-on: ubuntu-latest
+    needs: changes
+    if: github.ref != 'refs/heads/main' && needs.changes.outputs.frontend == 'true'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js with caching
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        working-directory: frontend
+        run: npm ci --legacy-peer-deps
+
+      - name: Build frontend
+        working-directory: frontend
+        env:
+          NEXT_PUBLIC_API_URL: https://api.nomadkaraoke.com
+        run: npm run build
+
+  # ============================================
+  # PACKAGE TESTS (PRs only - main skips tests)
+  # ============================================
+
+  package-unit-tests:
+    name: "Package - Unit Tests (70% coverage)"
+    runs-on: ubuntu-latest
+    needs: changes
+    if: github.ref != 'refs/heads/main' && (needs.changes.outputs.package == 'true' || needs.changes.outputs.deps == 'true')
+    steps:
+      - name: Free disk space (only if low)
+        # GitHub-hosted runners (free for this public repo) currently have ~86 GB
+        # free, but only ~14 GB is documented. The poetry venv (CUDA torch wheels)
+        # plus poetry's download cache need ~20 GB, so if the image ever shrinks,
+        # drop preinstalled SDKs we never use. Skipped (0s) when space is ample;
+        # the rm takes ~1 min.
+        run: |
+          df -h /
+          AVAIL_GB=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
+          if [ "$AVAIL_GB" -lt 30 ]; then
+            sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+              /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+            df -h /
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install Poetry
+        uses: snok/install-poetry@v1
+        with:
+          virtualenvs-create: true
+          virtualenvs-in-project: true
+
+      - name: Cache Poetry dependencies
+        uses: actions/cache@v4
+        with:
+          path: .venv
+          key: venv-package-hosted-${{ runner.os }}-py3.13-${{ hashFiles('poetry.lock') }}
+          restore-keys: |
+            venv-package-hosted-${{ runner.os }}-py3.13-
+
+      - name: Install dependencies
+        run: poetry install --with dev
+
+      - name: Install system dependencies
+        run: |
+          # Google's cloud-sdk apt mirror intermittently serves a Packages index
+          # whose checksum doesn't match its Release file ("Hash Sum mismatch").
+          # Clear the lists cache and retry to ride out mirror desyncs (same
+          # hardening as the emulator job's Firestore-emulator install).
+          for attempt in 1 2 3 4 5; do
+            sudo rm -rf /var/lib/apt/lists/*
+            # fonts-noto-core/-cjk: Hebrew, Arabic and CJK glyphs for the CJK/RTL karaoke
+            # render tests (tests/unit/lyrics_transcriber/output/test_ass_render_highlight.py),
+            # matching the fonts in the backend image and encoding worker.
+            if sudo apt-get update -y && sudo apt-get install -y ffmpeg fonts-noto-core fonts-noto-cjk; then
+              break
+            fi
+            echo "apt install attempt ${attempt} failed (likely a transient Hash Sum mismatch); retrying in 15s..."
+            sleep 15
+          done
+          dpkg -s ffmpeg fonts-noto-core fonts-noto-cjk >/dev/null 2>&1
+
+      - name: Cache spaCy model
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/spacy
+          key: spacy-en_core_web_sm-${{ runner.os }}
+
+      - name: Install spaCy language models
+        run: poetry run python -m spacy download en_core_web_sm
+
+      - name: Run unit tests
+        run: |
+          poetry run pytest tests/unit/ -v --cov=karaoke_gen --cov-report=xml --cov-report=term-missing --cov-fail-under=69
+
+      - name: Upload coverage reports
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: ./coverage.xml
+          flags: unittests
+          name: codecov-umbrella
+
+  package-integration-tests:
+    name: "Package - Integration Tests"
+    runs-on: ubuntu-latest
+    needs: changes
+    if: github.ref != 'refs/heads/main' && (needs.changes.outputs.package == 'true' || needs.changes.outputs.deps == 'true')
+    steps:
+      - name: Free disk space (only if low)
+        # GitHub-hosted runners (free for this public repo) currently have ~86 GB
+        # free, but only ~14 GB is documented. The poetry venv (CUDA torch wheels)
+        # plus poetry's download cache need ~20 GB, so if the image ever shrinks,
+        # drop preinstalled SDKs we never use. Skipped (0s) when space is ample;
+        # the rm takes ~1 min.
+        run: |
+          df -h /
+          AVAIL_GB=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
+          if [ "$AVAIL_GB" -lt 30 ]; then
+            sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+              /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+            df -h /
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install Poetry
+        uses: snok/install-poetry@v1
+        with:
+          virtualenvs-create: true
+          virtualenvs-in-project: true
+
+      - name: Cache Poetry dependencies
+        uses: actions/cache@v4
+        with:
+          path: .venv
+          key: venv-package-hosted-${{ runner.os }}-py3.13-${{ hashFiles('poetry.lock') }}
+          restore-keys: |
+            venv-package-hosted-${{ runner.os }}-py3.13-
+
+      - name: Install dependencies
+        run: poetry install --with dev
+
+      - name: Install system dependencies
+        run: |
+          # Google's cloud-sdk apt mirror intermittently serves a Packages index
+          # whose checksum doesn't match its Release file ("Hash Sum mismatch").
+          # Clear the lists cache and retry to ride out mirror desyncs (same
+          # hardening as the emulator job's Firestore-emulator install).
+          for attempt in 1 2 3 4 5; do
+            sudo rm -rf /var/lib/apt/lists/*
+            if sudo apt-get update -y && sudo apt-get install -y ffmpeg; then
+              break
+            fi
+            echo "apt install attempt ${attempt} failed (likely a transient Hash Sum mismatch); retrying in 15s..."
+            sleep 15
+          done
+          dpkg -s ffmpeg >/dev/null 2>&1
+
+      - name: Cache spaCy model
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/spacy
+          key: spacy-en_core_web_sm-${{ runner.os }}
+
+      - name: Install spaCy language models
+        run: poetry run python -m spacy download en_core_web_sm
+
+      - name: Run integration tests
+        run: poetry run pytest tests/integration/ -v
+
+  package-build-test:
+    name: "Package - Build & Install (Test)"
+    runs-on: ubuntu-latest
+    needs: [changes, package-unit-tests, package-integration-tests]
+    if: >-
+      github.ref != 'refs/heads/main' && always() &&
+      (needs.package-unit-tests.result == 'success' || needs.package-unit-tests.result == 'skipped') &&
+      (needs.package-integration-tests.result == 'success' || needs.package-integration-tests.result == 'skipped') &&
+      (needs.changes.outputs.package == 'true' || needs.changes.outputs.deps == 'true')
+    steps:
+      - name: Free disk space (only if low)
+        # GitHub-hosted runners (free for this public repo) currently have ~86 GB
+        # free, but only ~14 GB is documented. The poetry venv (CUDA torch wheels)
+        # plus poetry's download cache need ~20 GB, so if the image ever shrinks,
+        # drop preinstalled SDKs we never use. Skipped (0s) when space is ample;
+        # the rm takes ~1 min.
+        run: |
+          df -h /
+          AVAIL_GB=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
+          if [ "$AVAIL_GB" -lt 30 ]; then
+            sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+              /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+            df -h /
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install Poetry
+        uses: snok/install-poetry@v1
+        with:
+          virtualenvs-create: true
+          virtualenvs-in-project: true
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci --legacy-peer-deps
+
+      - name: Build frontend into the package
+        # The Next.js static export (karaoke_gen/nextjs_frontend/out) is gitignored
+        # (#876) and bundled into the wheel via pyproject `include`. Build it here,
+        # BEFORE `poetry build`, so the wheel contains the CLI local-review UI.
+        # node_modules is already installed above, so this just builds + copies.
+        # `make build-frontend` fails loudly if the frontend build fails.
+        run: make build-frontend
+
+      - name: Build package
+        # Wheel-only: we ship a universal py3-none-any wheel. The sdist bundles
+        # the 33-locale Next.js static export (~50 MB) as dead weight and pushed
+        # the PyPI project over its 10 GB cap. pip always installs from the wheel.
+        run: poetry build --format wheel
+
+      - name: Verify frontend is bundled in the wheel
+        # Guard against silently shipping a frontend-less wheel.
+        run: python scripts/verify_wheel_frontend.py dist/*.whl
+
+      - name: Test package installation
+        run: |
+          pip install dist/*.whl
+          python -m karaoke_gen.utils.gen_cli --help
+
+  # ============================================
+  # BACKEND TESTS (PRs only - main skips tests)
+  # ============================================
+
+  backend-unit-tests:
+    name: "Backend - Unit Tests"
+    runs-on: ubuntu-latest
+    needs: changes
+    if: github.ref != 'refs/heads/main' && (needs.changes.outputs.backend == 'true' || needs.changes.outputs.package == 'true' || needs.changes.outputs.deps == 'true')
+    steps:
+      - name: Free disk space (only if low)
+        # GitHub-hosted runners (free for this public repo) currently have ~86 GB
+        # free, but only ~14 GB is documented. The poetry venv (CUDA torch wheels)
+        # plus poetry's download cache need ~20 GB, so if the image ever shrinks,
+        # drop preinstalled SDKs we never use. Skipped (0s) when space is ample;
+        # the rm takes ~1 min.
+        run: |
+          df -h /
+          AVAIL_GB=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
+          if [ "$AVAIL_GB" -lt 30 ]; then
+            sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+              /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+            df -h /
+          fi
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install Poetry
+        uses: snok/install-poetry@v1
+        with:
+          virtualenvs-create: true
+          virtualenvs-in-project: true
+
+      - name: Cache Poetry dependencies
+        uses: actions/cache@v4
+        with:
+          path: .venv
+          key: venv-backend-hosted-${{ runner.os }}-py3.13-${{ hashFiles('poetry.lock') }}
+          restore-keys: |
+            venv-backend-hosted-${{ runner.os }}-py3.13-
+
+      - name: Install dependencies
+        run: poetry install
+
+      - name: Cache spaCy model
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/spacy
+          key: spacy-en_core_web_sm-${{ runner.os }}
+
+      - name: Install spaCy language models
+        run: poetry run python -m spacy download en_core_web_sm
+
+      - name: Run all backend unit tests
+        env:
+          GOOGLE_CLOUD_PROJECT: test-project
+          GCS_BUCKET_NAME: test-bucket
+          FIRESTORE_COLLECTION: jobs
+          ENVIRONMENT: test
+        run: |
+          poetry run pytest \
+            backend/tests/ \
+            --ignore=backend/tests/emulator \
+            -v --tb=short
+
+  backend-emulator-tests:
+    name: "Backend - Emulator Integration Tests"
+    runs-on: ubuntu-latest
+    needs: changes
+    if: github.ref != 'refs/heads/main' && (needs.changes.outputs.backend == 'true' || needs.changes.outputs.package == 'true' || needs.changes.outputs.deps == 'true')
+    steps:
+      - name: Free disk space (only if low)
+        # GitHub-hosted runners (free for this public repo) currently have ~86 GB
+        # free, but only ~14 GB is documented. The poetry venv (CUDA torch wheels)
+        # plus poetry's download cache need ~20 GB, so if the image ever shrinks,
+        # drop preinstalled SDKs we never use. Skipped (0s) when space is ample;
+        # the rm takes ~1 min.
+        run: |
+          df -h /
+          AVAIL_GB=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
+          if [ "$AVAIL_GB" -lt 30 ]; then
+            sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+              /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+            df -h /
+          fi
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install Poetry
+        uses: snok/install-poetry@v1
+        with:
+          virtualenvs-create: true
+          virtualenvs-in-project: true
+
+      - name: Cache Poetry dependencies
+        uses: actions/cache@v4
+        with:
+          path: .venv
+          key: venv-backend-hosted-${{ runner.os }}-py3.13-${{ hashFiles('poetry.lock') }}
+          restore-keys: |
+            venv-backend-hosted-${{ runner.os }}-py3.13-
+
+      - name: Set up Java 21 (required by Firestore emulator)
+        uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: "21"
+
+      - name: Install Firestore emulator
+        run: |
+          # Ensure Google Cloud SDK apt source is present (ephemeral runner images
+          # may not ship it pre-installed). Idempotent.
+          if ! grep -rq "packages.cloud.google.com" /etc/apt/sources.list.d/ 2>/dev/null; then
+            echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" | \
+              sudo tee /etc/apt/sources.list.d/google-cloud-sdk.list
+            curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg | \
+              sudo gpg --dearmor --yes -o /usr/share/keyrings/cloud.google.gpg
+          fi
+          # Google's cloud-sdk apt mirror intermittently serves a Packages index
+          # whose checksum doesn't match its Release file ("Hash Sum mismatch"),
+          # and a stale runner apt-lists cache triggers the same error. Clearing
+          # the cache forces a fresh fetch; retry to ride out mirror desyncs.
+          for attempt in 1 2 3 4 5; do
+            sudo rm -rf /var/lib/apt/lists/*
+            if sudo apt-get update -y && \
+               sudo apt-get install -y google-cloud-cli-firestore-emulator; then
+              break
+            fi
+            echo "apt install attempt ${attempt} failed (likely a transient Hash Sum mismatch); retrying in 15s..."
+            sleep 15
+          done
+          dpkg -s google-cloud-cli-firestore-emulator >/dev/null 2>&1
+
+      - name: Install dependencies
+        run: poetry install
+
+      - name: Wait for Docker to be available
+        run: |
+          # Self-hosted runners may still be initializing Docker on boot.
+          # Wait up to 60s for the docker command and daemon to be ready.
+          for i in $(seq 1 12); do
+            if command -v docker &>/dev/null && docker info &>/dev/null 2>&1; then
+              echo "Docker is ready"
+              exit 0
+            fi
+            echo "Waiting for Docker... (attempt $i/12)"
+            sleep 5
+          done
+          echo "ERROR: Docker not available after 60s"
+          echo "PATH=$PATH"
+          which docker 2>&1 || echo "docker binary not found"
+          exit 1
+
+      - name: Pull GCS emulator image
+        run: docker pull fsouza/fake-gcs-server:latest
+
+      - name: Run emulator integration tests
+        run: |
+          chmod +x scripts/*.sh
+          ./scripts/run-emulator-tests.sh
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-test-results
+          path: backend/htmlcov/
+          retention-days: 7
+
+  backend-lint:
+    name: "Backend - Code Quality"
+    runs-on: ubuntu-latest
+    needs: changes
+    if: github.ref != 'refs/heads/main' && (needs.changes.outputs.backend == 'true' || needs.changes.outputs.package == 'true')
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Run validation (syntax check only)
+        run: |
+          python -m py_compile backend/main.py backend/config.py
+          echo "Basic syntax validation passed"
+
+  # ============================================
+  # CI GATE - Required status check for PRs
+  # Only runs on PRs, not on main
+  # ============================================
+
+  ci-gate:
+    name: "CI Gate"
+    runs-on: ubuntu-latest
+    # frontend-e2e-smoke IS required - fast smoke tests catch critical regressions
+    # frontend-lint IS required - catches React hooks violations that cause runtime crashes
+    # frontend-e2e-happy-path is required ONLY when 'e2e-happy-path' label is present
+    # frontend-e2e-full is optional (requires 'e2e' label) so not enforced here
+    needs: [frontend-lint, frontend-unit-tests, frontend-e2e-smoke, frontend-build, package-unit-tests, package-integration-tests, backend-unit-tests, backend-emulator-tests, backend-lint, frontend-e2e-happy-path, translation-check]
+    if: github.ref != 'refs/heads/main' && always()
+    steps:
+      - name: Check results
+        run: |
+          # Check all always-required jobs
+          results=(
+            "${{ needs.frontend-lint.result }}"
+            "${{ needs.frontend-unit-tests.result }}"
+            "${{ needs.frontend-e2e-smoke.result }}"
+            "${{ needs.frontend-build.result }}"
+            "${{ needs.package-unit-tests.result }}"
+            "${{ needs.package-integration-tests.result }}"
+            "${{ needs.backend-unit-tests.result }}"
+            "${{ needs.backend-emulator-tests.result }}"
+            "${{ needs.backend-lint.result }}"
+          )
+          for result in "${results[@]}"; do
+            if [[ "$result" == "failure" || "$result" == "cancelled" ]]; then
+              echo "❌ CI failed"
+              exit 1
+            fi
+          done
+
+          # Translation check: warn but don't block (pre-existing placeholder issues)
+          translation_result="${{ needs.translation-check.result }}"
+          if [[ "$translation_result" == "failure" ]]; then
+            echo "⚠️  Translation validation failed — run translate.py to fix"
+          elif [[ "$translation_result" == "success" ]]; then
+            echo "✅ Translation validation passed"
+          fi
+
+          # E2E Happy Path: enforced when 'e2e-happy-path' label is on the PR
+          e2e_result="${{ needs.frontend-e2e-happy-path.result }}"
+          has_label="${{ contains(github.event.pull_request.labels.*.name, 'e2e-happy-path') }}"
+          if [[ "$has_label" == "true" ]]; then
+            if [[ "$e2e_result" != "success" ]]; then
+              echo "❌ E2E Happy Path is required (label present) but result is: $e2e_result"
+              exit 1
+            fi
+            echo "✅ E2E Happy Path passed (required by label)"
+          else
+            echo "ℹ️  E2E Happy Path skipped (no label)"
+          fi
+
+          echo "✅ CI passed"
+
+  # ============================================
+  # DEPLOYMENTS (main branch only)
+  # Tests already passed on PR, so we skip them here
+  # ============================================
+
+  package-build:
+    name: "Package - Build"
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    steps:
+      - name: Free disk space (only if low)
+        # GitHub-hosted runners (free for this public repo) currently have ~86 GB
+        # free, but only ~14 GB is documented. The poetry venv (CUDA torch wheels)
+        # plus poetry's download cache need ~20 GB, so if the image ever shrinks,
+        # drop preinstalled SDKs we never use. Skipped (0s) when space is ample;
+        # the rm takes ~1 min.
+        run: |
+          df -h /
+          AVAIL_GB=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
+          if [ "$AVAIL_GB" -lt 30 ]; then
+            sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+              /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+            df -h /
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install Poetry
+        uses: snok/install-poetry@v1
+        with:
+          virtualenvs-create: true
+          virtualenvs-in-project: true
+
+      - name: Cache Poetry dependencies
+        uses: actions/cache@v4
+        with:
+          path: .venv
+          key: venv-package-hosted-${{ runner.os }}-py3.13-${{ hashFiles('poetry.lock') }}
+          restore-keys: |
+            venv-package-hosted-${{ runner.os }}-py3.13-
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci --legacy-peer-deps
+
+      - name: Build frontend into the package
+        # The Next.js static export (karaoke_gen/nextjs_frontend/out) is gitignored
+        # (#876) and bundled into the wheel via pyproject `include`. Build it here,
+        # BEFORE `poetry build`, so the shipped wheel contains the CLI local-review
+        # UI. node_modules is already installed above, so this just builds + copies.
+        # `make build-frontend` fails loudly if the frontend build fails.
+        run: make build-frontend
+
+      - name: Build package
+        # Wheel-only: we publish a universal py3-none-any wheel to PyPI. The
+        # sdist bundled the 33-locale Next.js static export (~50 MB/release) as
+        # dead weight and pushed the project over PyPI's 10 GB storage cap.
+        # pip always installs from the wheel; nothing builds karaoke-gen from
+        # source (the GCE encoding worker pulls the wheel from GCS).
+        run: poetry build --format wheel
+
+      - name: Verify frontend is bundled in the wheel
+        # Loud guard against shipping a frontend-less wheel to PyPI / the GCE worker.
+        run: python scripts/verify_wheel_frontend.py dist/*.whl
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: package-dist
+          path: dist/
+          retention-days: 1
+
+  package-publish:
+    name: "Deploy - Publish to PyPI"
+    runs-on: ubuntu-latest
+    needs: [package-build]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install Poetry
+        uses: snok/install-poetry@v1
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: package-dist
+          path: dist/
+
+      - name: Extract version
+        id: extract_version
+        run: |
+          VERSION=$(poetry version --short)
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "📋 Extracted version: $VERSION"
+
+      - name: Check if tag exists
+        id: check_tag
+        run: |
+          VERSION="${{ steps.extract_version.outputs.version }}"
+          if git ls-remote --tags origin | grep -q "refs/tags/v$VERSION$"; then
+            echo "tag_exists=true" >> $GITHUB_OUTPUT
+            echo "🏷️  Tag v$VERSION already exists, skipping release"
+          else
+            echo "tag_exists=false" >> $GITHUB_OUTPUT
+            echo "✨ Tag v$VERSION does not exist, proceeding with release"
+          fi
+
+      - name: Publish to PyPI
+        if: steps.check_tag.outputs.tag_exists == 'false'
+        run: |
+          echo "📦 Publishing the following files to PyPI:"
+          ls -la dist/
+          echo "🚀 Publishing to PyPI..."
+          poetry config pypi-token.pypi ${{ secrets.PYPI_API_TOKEN }}
+          poetry publish
+
+      - name: Create Git Tag
+        if: steps.check_tag.outputs.tag_exists == 'false'
+        run: |
+          git config user.name github-actions
+          git config user.email github-actions@github.com
+          git tag -a "v${{ steps.extract_version.outputs.version }}" -m "Release v${{ steps.extract_version.outputs.version }}"
+          git push https://${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }} "v${{ steps.extract_version.outputs.version }}"
+
+      - name: Create GitHub Release
+        if: steps.check_tag.outputs.tag_exists == 'false'
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: "v${{ steps.extract_version.outputs.version }}"
+          name: "v${{ steps.extract_version.outputs.version }}"
+          body: |
+            ## Changes in v${{ steps.extract_version.outputs.version }}
+
+            This release was automatically created from the main branch.
+
+            ### Installation
+            ```bash
+            pip install karaoke-gen==${{ steps.extract_version.outputs.version }}
+            ```
+
+            ### Assets
+            - Python package published to PyPI
+            - Frontend deployed to Cloudflare Pages at gen.nomadkaraoke.com
+
+            For detailed changes, see the commit history.
+          draft: false
+          prerelease: false
+          files: |
+            dist/*.whl
+
+  deploy-frontend:
+    name: "Deploy - Frontend (Cloudflare Pages)"
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js with caching
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      # ===== Build Unified Frontend (Next.js) =====
+      # NOTE: Lyrics review and instrumental review UIs were consolidated into
+      # the main Next.js frontend (PR #267, Jan 2025). The unified frontend
+      # serves all three UIs from a single codebase at:
+      # - / (main app)
+      # - /app/jobs/{id}/lyrics (lyrics review)
+      # - /app/jobs/{id}/instrumental (instrumental review)
+      - name: Capture build metadata
+        id: frontend-meta
+        run: |
+          echo "sha=${GITHUB_SHA::8}" >> $GITHUB_OUTPUT
+          PR_NUM=$(git log -1 --format=%s | grep -oP '\(#\K[0-9]+' | head -1 || echo "")
+          if [ -n "$PR_NUM" ]; then
+            PR_TITLE=$(gh pr view "$PR_NUM" --json title -q .title 2>/dev/null || echo "")
+          else
+            PR_NUM=""
+            PR_TITLE=""
+          fi
+          # The backend deploy splices PR_TITLE into the comma-delimited
+          # `gcloud run deploy --set-env-vars "...,PR_TITLE=..."` (inside a
+          # double-quoted shell string): a comma in a PR title broke the v0.261.2
+          # deploy. Commas → ';', drop newlines and shell-active chars.
+          PR_TITLE=$(printf '%s' "$PR_TITLE" | tr ',' ';' | tr -d '\n\r"`$\\')
+          echo "pr_number=${PR_NUM}" >> $GITHUB_OUTPUT
+          echo "pr_title=${PR_TITLE}" >> $GITHUB_OUTPUT
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci --legacy-peer-deps
+
+      # ===== Consumer Build (gen.nomadkaraoke.com) =====
+      - name: Build frontend (consumer)
+        working-directory: frontend
+        env:
+          NEXT_PUBLIC_API_URL: https://api.nomadkaraoke.com
+          NEXT_PUBLIC_COMMIT_SHA: ${{ steps.frontend-meta.outputs.sha }}
+          NEXT_PUBLIC_PR_NUMBER: ${{ steps.frontend-meta.outputs.pr_number }}
+          NEXT_PUBLIC_PR_TITLE: ${{ steps.frontend-meta.outputs.pr_title }}
+          NEXT_PUBLIC_BUILD_TIME: ${{ github.event.head_commit.timestamp }}
+        run: npm run build
+
+      - name: Deploy consumer to Cloudflare Pages
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: pages deploy frontend/out --project-name=karaoke-gen --branch=main
+
+      # ===== Tenant Portal Build (vocalstar.nomadkaraoke.com, singa.nomadkaraoke.com, etc.) =====
+      # Separate build with NEXT_PUBLIC_TENANT_PORTAL=true which tree-shakes
+      # consumer marketing content and renders TenantLandingPage at root.
+      # The Cloudflare Pages Function (frontend/functions/) injects tenant config at the edge.
+      - name: Build frontend (tenant portal)
+        working-directory: frontend
+        env:
+          NEXT_PUBLIC_API_URL: https://api.nomadkaraoke.com
+          NEXT_PUBLIC_TENANT_PORTAL: "true"
+          NEXT_PUBLIC_COMMIT_SHA: ${{ steps.frontend-meta.outputs.sha }}
+          NEXT_PUBLIC_PR_NUMBER: ${{ steps.frontend-meta.outputs.pr_number }}
+          NEXT_PUBLIC_PR_TITLE: ${{ steps.frontend-meta.outputs.pr_title }}
+          NEXT_PUBLIC_BUILD_TIME: ${{ github.event.head_commit.timestamp }}
+        run: npm run build
+
+      - name: Deploy tenant portal to Cloudflare Pages
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: frontend
+          command: pages deploy out --project-name=karaoke-gen-tenant --branch=main
+
+  # NOTE: buy-site was consolidated into the main frontend (PR #122, Dec 2024)
+  # Landing page and payment flow are now at gen.nomadkaraoke.com (root)
+  # buy.nomadkaraoke.com subdomain has been deleted
+
+  deploy-backend:
+    name: "Deploy - Backend (Cloud Run)"
+    needs: [package-build]
+    # GitHub-hosted (free for this public repo). Docker images are built in
+    # Cloud Build us-central1 (see "Build and push images" below), so nothing
+    # large is pulled from Artifact Registry to this runner.
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      base_rebuilt: ${{ steps.check-base.outputs.needs_rebuild }}
+      version: ${{ steps.version_check.outputs.version }}
+    env:
+      REGISTRY: us-central1-docker.pkg.dev
+      PROJECT_ID: nomadkaraoke
+      REPOSITORY: karaoke-repo
+      BASE_IMAGE_NAME: karaoke-backend-base
+      APP_IMAGE_NAME: karaoke-backend
+      # GPU image for audio worker (L4 in us-east4)
+      GPU_REGISTRY: us-east4-docker.pkg.dev
+      GPU_REPOSITORY: karaoke-backend-gpu
+      GPU_BASE_IMAGE_NAME: karaoke-backend-gpu-base
+      GPU_APP_IMAGE_NAME: karaoke-backend
+      # CPU app image copy for the latency-critical CPU jobs (audio-download,
+      # lyrics-transcription, bulk-search) in us-east4, where Cloud Run Jobs start
+      # in ~15s instead of 2-5 min. Lives in the existing us-east4 repo so the jobs
+      # pull same-region; only changed app layers cross regions on each push.
+      CPU_JOBS_REGISTRY: us-east4-docker.pkg.dev
+      CPU_JOBS_REPOSITORY: karaoke-backend-gpu
+      CPU_JOBS_IMAGE_NAME: karaoke-backend-cpu
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install Poetry
+        uses: snok/install-poetry@v1
+
+      - name: Extract version
+        id: version_check
+        run: |
+          VERSION=$(poetry version --short)
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "📋 Current version: $VERSION"
+          echo "🚀 Deploying on every push to main"
+
+      - name: Capture build metadata
+        id: build-meta
+        run: |
+          echo "sha=${GITHUB_SHA::8}" >> $GITHUB_OUTPUT
+          # For squash-merge commits, PR number is in the commit message as (#NNN)
+          PR_NUM=$(git log -1 --format=%s | grep -oP '\(#\K[0-9]+' | head -1 || echo "")
+          if [ -n "$PR_NUM" ]; then
+            PR_TITLE=$(gh pr view "$PR_NUM" --json title -q .title 2>/dev/null || echo "")
+          else
+            PR_NUM=""
+            PR_TITLE=""
+          fi
+          # The backend deploy splices PR_TITLE into the comma-delimited
+          # `gcloud run deploy --set-env-vars "...,PR_TITLE=..."` (inside a
+          # double-quoted shell string): a comma in a PR title broke the v0.261.2
+          # deploy. Commas → ';', drop newlines and shell-active chars.
+          PR_TITLE=$(printf '%s' "$PR_TITLE" | tr ',' ';' | tr -d '\n\r"`$\\')
+          echo "pr_number=${PR_NUM}" >> $GITHUB_OUTPUT
+          echo "pr_title=${PR_TITLE}" >> $GITHUB_OUTPUT
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Authenticate to Google Cloud (Workload Identity)
+        id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          version: "latest"
+
+      # ============================================
+      # Blue-Green Deploy to GCE Encoding Worker
+      #
+      # This pattern ensures zero-downtime deployments:
+      # 1. Upload wheel + startup.sh + version manifest to GCS
+      # 2. Read blue-green config from Firestore
+      # 3. Start secondary VM, wait for health + version match
+      # 4. Deep health check: submit a real encode test
+      # 5. Swap primary/secondary in Firestore (atomic transaction)
+      # 6. Drain and stop old primary
+      #
+      # See infrastructure/encoding-worker/README.md for details
+      # ============================================
+
+      - name: Download wheel artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: package-dist
+          path: dist/
+
+      - name: Deploy to GCS
+        run: |
+          VERSION="${{ steps.version_check.outputs.version }}"
+          BUCKET="gs://karaoke-gen-storage-${{ env.PROJECT_ID }}"
+
+          echo "Deploying encoding worker v${VERSION}..."
+
+          # 1. Find the wheel file
+          WHEEL_FILE=$(ls dist/*.whl | head -1)
+          if [ -z "$WHEEL_FILE" ]; then
+            echo "::error::No wheel file found in dist/"
+            exit 1
+          fi
+          echo "Found wheel: $WHEEL_FILE"
+
+          # 2. Upload wheel to FIXED path (atomic via temp file)
+          # This eliminates version sorting - always use karaoke_gen-current.whl
+          echo "Uploading wheel to fixed path..."
+          gsutil cp "$WHEEL_FILE" "${BUCKET}/wheels/karaoke_gen-current.whl.tmp"
+          gsutil mv "${BUCKET}/wheels/karaoke_gen-current.whl.tmp" \
+                    "${BUCKET}/wheels/karaoke_gen-current.whl"
+
+          # Also keep versioned copy for rollback/debugging
+          gsutil cp "$WHEEL_FILE" "${BUCKET}/wheels/"
+
+          # 3. Upload startup.sh (allows logic changes without image rebuild)
+          echo "Uploading startup.sh..."
+          gsutil cp infrastructure/encoding-worker/startup.sh \
+                    "${BUCKET}/encoding-worker/startup.sh"
+
+          # 4. Write version manifest for verification
+          echo "Writing version manifest..."
+          echo "${VERSION}" | gsutil cp - "${BUCKET}/encoding-worker/version.txt"
+
+          echo "GCS deployment complete"
+
+      - name: Install Firestore client
+        # Pinned to the app's version. google-cloud-firestore 2.29.0 (2026-08-24)
+        # percent-encodes the default database id, so the config read below fails
+        # with "400 Invalid database id %28default%29" — an unpinned install broke
+        # every backend deploy after 2.29.0 shipped. Keep in sync with pyproject.
+        run: pip install 'google-cloud-firestore==2.26.0'
+
+      - name: Read Firestore config
+        id: config
+        run: |
+          python3 << 'PYEOF'
+          import json, os
+          from google.cloud import firestore
+          db = firestore.Client(project="nomadkaraoke")
+          doc = db.collection("config").document("encoding-worker").get()
+          if not doc.exists:
+              print("::error::Encoding worker config not found in Firestore")
+              raise SystemExit(1)
+          data = doc.to_dict()
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              for key in ["primary_vm", "primary_ip", "primary_version",
+                          "secondary_vm", "secondary_ip",
+                          "active_override_vm", "active_override_ip", "active_override_zone"]:
+                  # `or ''`: a key stored as null must be empty, not the string
+                  # "None" (which later steps would treat as a real VM name).
+                  f.write(f"{key}={data.get(key) or ''}\n")
+              f.write(f"deploy_in_progress={str(data.get('deploy_in_progress', False)).lower()}\n")
+              # capacity_state is a map — emit as single-line JSON so the green
+              # selection step can demote recently-stocked-out machine types.
+              f.write(f"capacity_state={json.dumps(data.get('capacity_state') or {})}\n")
+          print(f"Config: primary={data.get('primary_vm')}, secondary={data.get('secondary_vm')}, "
+                f"active_override={data.get('active_override_vm')}")
+          PYEOF
+
+      # Gate the blue-green worker deploy on worker-affecting changes. It boots a
+      # fresh green VM + runs a real test encode, which used to happen on EVERY
+      # push to main (~5x/day) even for frontend/backend-only changes. The wheel,
+      # startup.sh and version.txt above are still uploaded every time, so any
+      # worker that cold-boots (they idle-stop after 5 min) runs the latest code.
+      # Diff base = the version the serving worker was last validated at (not
+      # github.event.before), so a cancelled/skipped deploy can never lose a
+      # worker change. Any doubt → deploy (fail open).
+      - name: Decide encoding-worker deploy
+        id: worker_gate
+        env:
+          FORCE: ${{ github.event_name == 'workflow_dispatch' && inputs.force_encoding_worker_deploy == true }}
+          SERVING_VERSION: ${{ steps.config.outputs.primary_version }}
+          OVERRIDE_VM: ${{ steps.config.outputs.active_override_vm }}
+        run: |
+          mapfile -t PATHS < <(grep -v '^\s*#' infrastructure/encoding-worker/worker_code_paths.txt | grep -v '^\s*$')
+          DEPLOY=true
+          if [ "$FORCE" = "true" ]; then
+            REASON="manual override (workflow_dispatch force_encoding_worker_deploy)"
+          elif [ -n "$OVERRIDE_VM" ] && [ "$OVERRIDE_VM" != "None" ]; then
+            REASON="capacity override $OVERRIDE_VM is serving — refresh it"
+          elif [ -z "$SERVING_VERSION" ] || [ "$SERVING_VERSION" = "None" ]; then
+            REASON="serving worker version unknown"
+          elif ! git fetch --no-tags --depth=1 origin "refs/tags/v${SERVING_VERSION}:refs/tags/v${SERVING_VERSION}"; then
+            REASON="tag v${SERVING_VERSION} not fetchable"
+          elif ! CHANGED=$(git diff --name-only "v${SERVING_VERSION}" HEAD -- "${PATHS[@]}"); then
+            REASON="git diff against v${SERVING_VERSION} failed"
+          elif [ -z "$CHANGED" ]; then
+            DEPLOY=false
+            REASON="no worker-affecting changes since serving v${SERVING_VERSION}"
+          else
+            REASON="worker-affecting changes since v${SERVING_VERSION}"
+            echo "Changed worker paths:"; echo "$CHANGED" | head -50
+          fi
+          echo "deploy=${DEPLOY}" >> "$GITHUB_OUTPUT"
+          echo "Encoding-worker blue-green deploy: ${DEPLOY} (${REASON})"
+          echo "### Encoding worker deploy: ${DEPLOY}" >> "$GITHUB_STEP_SUMMARY"
+          echo "${REASON}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Wait for concurrent deploy
+        if: steps.worker_gate.outputs.deploy == 'true' && steps.config.outputs.deploy_in_progress == 'true'
+        run: |
+          echo "Another deploy is in progress, waiting..."
+          python3 << 'PYEOF'
+          import time
+          from google.cloud import firestore
+          db = firestore.Client(project="nomadkaraoke")
+          for i in range(20):
+              time.sleep(30)
+              doc = db.collection("config").document("encoding-worker").get()
+              if not doc.to_dict().get("deploy_in_progress", False):
+                  print("Concurrent deploy finished, proceeding")
+                  break
+          else:
+              print("::error::Timed out waiting for concurrent deploy (10 min)")
+              raise SystemExit(1)
+          PYEOF
+
+      - name: Set deploy in progress
+        if: steps.worker_gate.outputs.deploy == 'true'
+        run: |
+          python3 << 'PYEOF'
+          from datetime import datetime, timezone
+          from google.cloud import firestore
+          db = firestore.Client(project="nomadkaraoke")
+          db.collection("config").document("encoding-worker").update({
+              "deploy_in_progress": True,
+              "deploy_in_progress_since": datetime.now(timezone.utc).isoformat(),
+          })
+          print("Set deploy_in_progress=true")
+          PYEOF
+
+      # Capacity-aware green (staging) target. us-central1 is often in a c4d Spot
+      # stockout, so the c4d secondary can't start and the serving worker is an n2
+      # fallback recorded as active_override. We validate the new wheel on a FRESH
+      # green — the c4d secondary if it starts, else a different n2 fallback (never
+      # the current override, so it keeps serving) — then promote the green. See
+      # infrastructure/encoding-worker/deploy_promote.py.
+      - name: Select & start green target
+        id: green
+        if: steps.worker_gate.outputs.deploy == 'true'
+        # Never hard-fail the whole backend deploy just because no encoding
+        # worker could be validated — emit green_ok=false and let the gated
+        # health/encode/promote steps skip while the Cloud Run deploy proceeds.
+        continue-on-error: true
+        run: |
+          python3 << 'PYEOF'
+          import json, os, subprocess, sys, time
+          sys.path.insert(0, "infrastructure/encoding-worker")
+          import deploy_promote
+
+          try:
+              capacity_state = json.loads(os.environ.get("CAPACITY_STATE") or "{}")
+          except Exception:
+              capacity_state = {}
+          config = {
+              "primary_vm": os.environ.get("PRIMARY_VM") or None,
+              "primary_ip": os.environ.get("PRIMARY_IP") or None,
+              "secondary_vm": os.environ.get("SECONDARY_VM") or None,
+              "secondary_ip": os.environ.get("SECONDARY_IP") or None,
+              "secondary_zone": "us-central1-c",
+              "active_override_vm": os.environ.get("OVERRIDE_VM") or None,
+              "capacity_state": capacity_state,
+          }
+          raw = subprocess.run(
+              ["gcloud", "secrets", "versions", "access", "latest",
+               "--secret=encoding-worker-fallback-vms", "--project=nomadkaraoke"],
+              capture_output=True, text=True)
+          try:
+              fallbacks = json.loads(raw.stdout) if raw.returncode == 0 and raw.stdout.strip() else []
+          except Exception as e:
+              print(f"::warning::Could not parse fallback VM secret: {e}")
+              fallbacks = []
+
+          candidates = deploy_promote.select_green_candidates(config, fallbacks)
+          print("Green candidates (in order):", [f"{c['vm']}({c['kind']})" for c in candidates])
+
+          def vm_status(vm, zone):
+              r = subprocess.run(
+                  ["gcloud", "compute", "instances", "describe", vm,
+                   f"--zone={zone}", "--project=nomadkaraoke", "--format=value(status)"],
+                  capture_output=True, text=True)
+              return r.stdout.strip()
+
+          green = None
+          started = []  # every VM we issued `start` to — so we can stop losers
+          for c in candidates:
+              vm, zone = c["vm"], c["zone"]
+              print(f"Trying green candidate: {vm} ({zone}, kind={c['kind']})")
+              subprocess.run(["gcloud", "compute", "instances", "start", vm,
+                              f"--zone={zone}", "--project=nomadkaraoke"], check=False)
+              started.append((vm, zone))
+              for i in range(12):
+                  st = vm_status(vm, zone)
+                  print(f"  {vm} status={st} ({i+1}/12)")
+                  if st == "RUNNING":
+                      green = c
+                      break
+                  time.sleep(10)
+              if green:
+                  break
+
+          # Stop every candidate we started but did NOT select, so a slow-booting
+          # loser can't come up later unmanaged (and billed) after the deploy.
+          selected_vm = green["vm"] if green else None
+          for vm, zone in started:
+              if vm != selected_vm:
+                  print(f"Stopping unselected candidate {vm} ({zone})")
+                  subprocess.run(["gcloud", "compute", "instances", "stop", vm,
+                                  f"--zone={zone}", "--project=nomadkaraoke"], check=False)
+
+          started_fresh = "true"
+          inplace_failed = False
+          if green is None:
+              # Last resort: no separate green could start. Restart the current
+              # serving override in place (accepts a brief blip; auto-resubmit
+              # covers any in-flight render). If there's no override either, fail.
+              ov = os.environ.get("OVERRIDE_VM")
+              if ov:
+                  zone = os.environ.get("OVERRIDE_ZONE") or "us-central1-f"
+                  print(f"::warning::No separate green could start; restarting serving override {ov} in place")
+                  subprocess.run(["gcloud", "compute", "instances", "stop", ov,
+                                  f"--zone={zone}", "--project=nomadkaraoke"], check=False)
+                  for _ in range(18):
+                      if vm_status(ov, zone) in ("TERMINATED", "STOPPED", ""):
+                          break
+                      time.sleep(5)
+                  subprocess.run(["gcloud", "compute", "instances", "start", ov,
+                                  f"--zone={zone}", "--project=nomadkaraoke"], check=False)
+                  final_status = ""
+                  for _ in range(18):
+                      final_status = vm_status(ov, zone)
+                      if final_status == "RUNNING":
+                          break
+                      time.sleep(10)
+                  # Record it either way so rollback can recover it (we stopped it,
+                  # so if it didn't come back we must be able to start it again).
+                  green = {"vm": ov, "ip": os.environ.get("OVERRIDE_IP"),
+                           "zone": zone, "kind": "fallback"}
+                  started_fresh = "false"  # it's the serving worker — never stop on rollback
+                  if final_status != "RUNNING":
+                      inplace_failed = True
+                      print(f"::error::In-place restart of {ov} did not reach RUNNING (status={final_status or 'unknown'})")
+              else:
+                  print("::error::No green target could be started and no active override exists")
+
+          def _out(**kv):
+              with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+                  for k, v in kv.items():
+                      f.write(f"{k}={v}\n")
+
+          # green_ok gates the downstream health/encode/promote steps. A missing
+          # green, a green with no IP, or an in-place restart that didn't come back
+          # RUNNING is "not ok" — the deploy skips the encoding-worker promote but
+          # does NOT fail; when a serving override is involved we still emit its
+          # vm/zone so the (always-run) rollback step can recover it.
+          if green is None:
+              _out(green_ok="false")
+              print("::warning::No green target selected; skipping encoding-worker promote")
+          elif not green.get("ip") or inplace_failed:
+              _out(green_ok="false", green_vm=green["vm"], green_zone=green["zone"],
+                   green_started_fresh=started_fresh)
+              reason = "has no IP" if not green.get("ip") else "did not return to RUNNING"
+              print(f"::error::Green {green['vm']} {reason}; skipping promote")
+          else:
+              _out(green_ok="true", green_vm=green["vm"], green_ip=green["ip"],
+                   green_zone=green["zone"], green_kind=green["kind"],
+                   green_started_fresh=started_fresh)
+              print(f"Green: {green['vm']} ({green['zone']}, kind={green['kind']}, started_fresh={started_fresh})")
+          PYEOF
+        env:
+          PRIMARY_VM: ${{ steps.config.outputs.primary_vm }}
+          PRIMARY_IP: ${{ steps.config.outputs.primary_ip }}
+          SECONDARY_VM: ${{ steps.config.outputs.secondary_vm }}
+          SECONDARY_IP: ${{ steps.config.outputs.secondary_ip }}
+          OVERRIDE_VM: ${{ steps.config.outputs.active_override_vm }}
+          OVERRIDE_IP: ${{ steps.config.outputs.active_override_ip }}
+          OVERRIDE_ZONE: ${{ steps.config.outputs.active_override_zone }}
+          CAPACITY_STATE: ${{ steps.config.outputs.capacity_state }}
+
+      - name: Wait for service health
+        id: health
+        if: steps.green.outputs.green_ok == 'true'
+        continue-on-error: true
+        run: |
+          SECONDARY_IP="${{ steps.green.outputs.green_ip }}"
+          EXPECTED_VERSION="${{ steps.version_check.outputs.version }}"
+          HEALTH_URL="http://${SECONDARY_IP}:8080/health"
+
+          echo "Waiting for service at $HEALTH_URL..."
+          for i in $(seq 1 18); do
+            RESPONSE=$(curl -sf --connect-timeout 3 --max-time 5 "$HEALTH_URL" 2>/dev/null || echo "")
+            if [ -n "$RESPONSE" ]; then
+              WHEEL_VERSION=$(echo "$RESPONSE" | jq -r '.wheel_version // empty')
+              echo "Health: version=$WHEEL_VERSION"
+              if [ "$WHEEL_VERSION" = "$EXPECTED_VERSION" ]; then
+                echo "Version matches! Service is healthy."
+                echo "healthy=true" >> $GITHUB_OUTPUT
+                exit 0
+              fi
+            fi
+            echo "Attempt $i/18 - waiting 10s..."
+            sleep 10
+          done
+
+          echo "::error::Service did not become healthy within 3 minutes"
+          echo "healthy=false" >> $GITHUB_OUTPUT
+          exit 1
+
+      - name: Deep health check - real encode test
+        if: steps.health.outputs.healthy == 'true'
+        id: encode-test
+        continue-on-error: true
+        run: |
+          SECONDARY_IP="${{ steps.green.outputs.green_ip }}"
+          API_KEY=$(gcloud secrets versions access latest \
+            --secret=encoding-worker-api-key --project=nomadkaraoke)
+
+          DEPLOY_TEST_PATH="gs://karaoke-gen-storage-nomadkaraoke/deploy-test"
+
+          echo "Uploading test assets to GCS..."
+          gsutil cp infrastructure/encoding-worker/test-assets/test-preview.ass \
+            "${DEPLOY_TEST_PATH}/test-preview.ass"
+          gsutil cp infrastructure/encoding-worker/test-assets/test-audio.flac \
+            "${DEPLOY_TEST_PATH}/test-audio.flac"
+
+          echo "Submitting test encode to $SECONDARY_IP..."
+          HTTP_CODE=$(curl -s --connect-timeout 5 --max-time 30 \
+            -o /tmp/encode-response.json -w '%{http_code}' \
+            -X POST "http://${SECONDARY_IP}:8080/encode-preview" \
+            -H "X-API-Key: $API_KEY" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"job_id\": \"deploy-health-check\",
+              \"ass_gcs_path\": \"${DEPLOY_TEST_PATH}/test-preview.ass\",
+              \"audio_gcs_path\": \"${DEPLOY_TEST_PATH}/test-audio.flac\",
+              \"output_gcs_path\": \"${DEPLOY_TEST_PATH}/output-preview.mp4\"
+            }") || HTTP_CODE="000"
+          RESPONSE=$(cat /tmp/encode-response.json 2>/dev/null || echo "{}")
+
+          echo "Encode response (HTTP $HTTP_CODE): $RESPONSE"
+          if [ "$HTTP_CODE" != "200" ] && [ "$HTTP_CODE" != "202" ]; then
+            echo "::error::Encode request failed with HTTP $HTTP_CODE"
+            echo "passed=false" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+
+          STATUS=$(echo "$RESPONSE" | jq -r '.status // "unknown"')
+
+          if [ "$STATUS" != "accepted" ] && [ "$STATUS" != "cached" ] && [ "$STATUS" != "in_progress" ]; then
+            echo "::error::Encode test failed with status: $STATUS"
+            echo "passed=false" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+
+          for i in $(seq 1 12); do
+            sleep 5
+            JOB_STATUS=$(curl -s --connect-timeout 3 --max-time 10 \
+              "http://${SECONDARY_IP}:8080/status/deploy-health-check" \
+              -H "X-API-Key: $API_KEY" 2>/dev/null | jq -r '.status // "unknown"' 2>/dev/null) || JOB_STATUS="unknown"
+            echo "Encode status: $JOB_STATUS (attempt $i/12)"
+            if [ "$JOB_STATUS" = "complete" ]; then
+              echo "Encode test passed!"
+              echo "passed=true" >> $GITHUB_OUTPUT
+              gsutil rm -f gs://karaoke-gen-storage-nomadkaraoke/deploy-test/** || true
+              exit 0
+            elif [ "$JOB_STATUS" = "failed" ]; then
+              echo "::error::Encode test failed"
+              echo "passed=false" >> $GITHUB_OUTPUT
+              exit 1
+            fi
+          done
+
+          echo "::error::Encode test timed out after 60s"
+          echo "passed=false" >> $GITHUB_OUTPUT
+          exit 1
+
+      - name: Rollback on failure
+        # always() so the deploy_in_progress flag is ALWAYS cleared, even when the
+        # green step found no worker (its downstream steps skip, but the flag was
+        # already set). Skips only on a fully successful promote (passed == true).
+        if: always() && steps.worker_gate.outputs.deploy == 'true' && steps.encode-test.outputs.passed != 'true'
+        run: |
+          GREEN_VM="${{ steps.green.outputs.green_vm }}"
+          GREEN_ZONE="${{ steps.green.outputs.green_zone }}"
+          STARTED_FRESH="${{ steps.green.outputs.green_started_fresh }}"
+          # Only stop a green we started fresh. If green is the serving override
+          # (last-resort in-place restart), leave it running — it's serving
+          # known-good code and stopping it would take production down.
+          if [ "$STARTED_FRESH" = "true" ] && [ -n "$GREEN_VM" ]; then
+            echo "Stopping fresh green $GREEN_VM ($GREEN_ZONE) due to failed deploy"
+            gcloud compute instances stop "$GREEN_VM" \
+              --zone="$GREEN_ZONE" --project=nomadkaraoke || true
+          elif [ -n "$GREEN_VM" ] && [ -n "$GREEN_ZONE" ]; then
+            # Serving override (last-resort in-place restart). We stopped it during
+            # the restart, so if it isn't RUNNING we must bring it back — otherwise
+            # production stays down after a failed deploy.
+            echo "Green is the serving worker; ensuring $GREEN_VM is RUNNING"
+            STATUS=$(gcloud compute instances describe "$GREEN_VM" \
+              --zone="$GREEN_ZONE" --project=nomadkaraoke --format='value(status)' 2>/dev/null || echo "")
+            if [ "$STATUS" != "RUNNING" ]; then
+              echo "::warning::Serving worker $GREEN_VM is '${STATUS:-unknown}'; starting it back up"
+              gcloud compute instances start "$GREEN_VM" \
+                --zone="$GREEN_ZONE" --project=nomadkaraoke || true
+            fi
+          else
+            echo "No green VM recorded; nothing to stop or recover"
+          fi
+
+          python3 -c "
+          from google.cloud import firestore
+          db = firestore.Client(project='nomadkaraoke')
+          db.collection('config').document('encoding-worker').update({
+              'deploy_in_progress': False,
+              'deploy_in_progress_since': None,
+          })
+          print('Cleared deploy_in_progress flag')
+          " || true
+
+      # Promote the validated green to serving. For a c4d secondary green this is
+      # the classic primary/secondary swap (and clears any stale override); for a
+      # fallback green it becomes the active_override. Then drain + stop whatever
+      # VM(s) the promote plan says are no longer serving. See deploy_promote.py.
+      - name: Promote green to serving
+        if: steps.encode-test.outputs.passed == 'true'
+        timeout-minutes: 25
+        env:
+          GREEN_VM: ${{ steps.green.outputs.green_vm }}
+          GREEN_IP: ${{ steps.green.outputs.green_ip }}
+          GREEN_ZONE: ${{ steps.green.outputs.green_zone }}
+          GREEN_KIND: ${{ steps.green.outputs.green_kind }}
+          NEW_VERSION: ${{ steps.version_check.outputs.version }}
+          PRIMARY_VM: ${{ steps.config.outputs.primary_vm }}
+          PRIMARY_IP: ${{ steps.config.outputs.primary_ip }}
+          PRIMARY_VERSION: ${{ steps.config.outputs.primary_version }}
+          OVERRIDE_VM: ${{ steps.config.outputs.active_override_vm }}
+          OVERRIDE_IP: ${{ steps.config.outputs.active_override_ip }}
+          OVERRIDE_ZONE: ${{ steps.config.outputs.active_override_zone }}
+        run: |
+          python3 << 'PYEOF'
+          import json, os, subprocess, sys, time, urllib.request
+          from datetime import datetime, timezone
+          sys.path.insert(0, "infrastructure/encoding-worker")
+          import deploy_promote
+          from google.cloud import firestore
+
+          green = {"vm": os.environ["GREEN_VM"], "ip": os.environ["GREEN_IP"],
+                   "zone": os.environ["GREEN_ZONE"], "kind": os.environ["GREEN_KIND"]}
+          config = {
+              "primary_vm": os.environ.get("PRIMARY_VM") or None,
+              "primary_ip": os.environ.get("PRIMARY_IP") or None,
+              "primary_version": os.environ.get("PRIMARY_VERSION") or None,
+              "primary_zone": "us-central1-c",
+              "active_override_vm": os.environ.get("OVERRIDE_VM") or None,
+              "active_override_ip": os.environ.get("OVERRIDE_IP") or None,
+              "active_override_zone": os.environ.get("OVERRIDE_ZONE") or None,
+          }
+          now = datetime.now(timezone.utc).isoformat()
+          plan = deploy_promote.promote_plan(green, config, now=now, version=os.environ["NEW_VERSION"])
+
+          db = firestore.Client(project="nomadkaraoke")
+          db.collection("config").document("encoding-worker").update(plan["firestore_updates"])
+          print("Applied config update:", json.dumps(plan["firestore_updates"], default=str))
+          print(f"Green {green['vm']} ({green['kind']}) is now serving")
+
+          def active_jobs(ip):
+              # /health is unauthenticated; None == "unknown / maybe busy".
+              if not ip:
+                  return None
+              try:
+                  with urllib.request.urlopen(f"http://{ip}:8080/health", timeout=5) as r:
+                      return json.load(r).get("active_jobs")
+              except Exception:
+                  return None
+
+          def vm_status(vm, zone):
+              r = subprocess.run(
+                  ["gcloud", "compute", "instances", "describe", vm,
+                   f"--zone={zone}", "--project=nomadkaraoke", "--format=value(status)"],
+                  capture_output=True, text=True)
+              return r.stdout.strip()
+
+          # Drain (bounded) then stop each VM the plan retired. A non-RUNNING target
+          # is already gone — stop it (idempotent) without waiting. For a RUNNING one
+          # we wait for a confirmed 0 active_jobs so we never stop mid-render (#908
+          # resubmit would cover a loss, but we still avoid it). The drain budget is
+          # SHARED across all targets (one 20-min deadline, not per-target) so a slow
+          # or unreachable target can't stretch the step to N×20 min; the step also
+          # has a hard timeout-minutes. New renders already route to the promoted green.
+          deadline = time.monotonic() + 1200
+          for tgt in plan["drain_and_stop"]:
+              vm, ip, zone = tgt["vm"], tgt.get("ip"), tgt.get("zone")
+              if not vm or not zone:
+                  print(f"::warning::Skipping drain/stop with incomplete target: {tgt}")
+                  continue
+              status = vm_status(vm, zone)
+              if status != "RUNNING" or not ip:
+                  why = f"status={status or 'unknown'}" if status != "RUNNING" else "no IP to probe"
+                  print(f"{vm} ({why}); stopping without drain")
+                  subprocess.run(["gcloud", "compute", "instances", "stop", vm,
+                                  f"--zone={zone}", "--project=nomadkaraoke"], check=False)
+                  continue
+              print(f"Draining {vm} ({zone}) before stop...")
+              n = active_jobs(ip)
+              while n != 0 and time.monotonic() < deadline:
+                  time.sleep(15)
+                  n = active_jobs(ip)
+                  print(f"  {vm} active_jobs={n} ({int(deadline - time.monotonic())}s budget left)")
+              if n == 0:
+                  print(f"Drain confirmed for {vm}; stopping")
+              else:
+                  print(f"::warning::Drain budget exhausted for {vm} (last={n}); stopping anyway")
+              subprocess.run(["gcloud", "compute", "instances", "stop", vm,
+                              f"--zone={zone}", "--project=nomadkaraoke"], check=False)
+          PYEOF
+
+      # Safety net: the deploy_in_progress lock is set unconditionally earlier, and
+      # both Rollback (on failure) and Promote (on success) clear it — but if the
+      # Promote step itself errors or hits its timeout, neither runs. This always()
+      # step guarantees the lock is released so the next deploy doesn't stall 10 min
+      # in "Wait for concurrent deploy". Idempotent with the other clears.
+      - name: Clear encoding-worker deploy lock
+        if: always() && steps.worker_gate.outputs.deploy == 'true'
+        run: |
+          python3 -c "
+          from google.cloud import firestore
+          db = firestore.Client(project='nomadkaraoke')
+          db.collection('config').document('encoding-worker').update({
+              'deploy_in_progress': False,
+              'deploy_in_progress_since': None,
+          })
+          print('Ensured deploy_in_progress is cleared')
+          " || true
+
+      - name: Configure Docker for Artifact Registry
+        run: |
+          gcloud auth configure-docker ${{ env.REGISTRY }} --quiet
+          gcloud auth configure-docker ${{ env.GPU_REGISTRY }} --quiet
+
+      # ============================================
+      # Image builds run in Cloud Build (us-central1), not on this runner.
+      #
+      # This job runs on a free GitHub-hosted runner. The app images are built
+      # FROM large bases in us-central1 AR (CPU ~4.2 GB, GPU ~13 GB compressed);
+      # pulling those to a GitHub-hosted runner is GCP internet egress
+      # (~$0.12/GB → ~$2/deploy, far more than the old self-hosted build VM).
+      # Cloud Build in us-central1 pulls them same-region (free) and the
+      # e2-standard-2 default pool is in the 2,500 build-min/month free tier
+      # (~7 min/deploy, CPU+GPU built in parallel). Only the hash checks below
+      # (manifest + ~10KB config blob) touch AR from here.
+      # See infrastructure/cloudbuild/build-backend-images.sh.
+      # ============================================
+
+      - name: Calculate base image hash
+        id: base-hash
+        run: |
+          # Hash both poetry.lock AND Dockerfile.base - rebuild if either changes
+          CURRENT_HASH=$(cat poetry.lock backend/Dockerfile.base | sha256sum | cut -d' ' -f1)
+          echo "hash=$CURRENT_HASH" >> $GITHUB_OUTPUT
+          echo "📋 Base content hash: $CURRENT_HASH"
+
+      - name: Check if base image exists and is current
+        id: check-base
+        run: |
+          BASE_IMAGE="${{ env.REGISTRY }}/${{ env.PROJECT_ID }}/${{ env.REPOSITORY }}/${{ env.BASE_IMAGE_NAME }}:latest"
+
+          # Fetch hash label directly from registry (10KB config blob, not full image)
+          EXISTING_HASH=""
+
+          # Get the manifest (small JSON, ~1KB) - includes config digest
+          MANIFEST=$(docker manifest inspect $BASE_IMAGE 2>/dev/null || echo "")
+          CONFIG_DIGEST=$(echo "$MANIFEST" | jq -r '.config.digest // ""' 2>/dev/null || echo "")
+
+          if [ -n "$CONFIG_DIGEST" ] && [ "$CONFIG_DIGEST" != "null" ] && [ "$CONFIG_DIGEST" != "" ]; then
+            echo "📋 Found manifest, config digest: $CONFIG_DIGEST"
+
+            # Fetch just the config blob (~10KB) to get labels - much faster than pulling full image
+            TOKEN=$(gcloud auth print-access-token)
+            CONFIG_JSON=$(curl -sL -H "Authorization: Bearer $TOKEN" \
+              "https://${{ env.REGISTRY }}/v2/${{ env.PROJECT_ID }}/${{ env.REPOSITORY }}/${{ env.BASE_IMAGE_NAME }}/blobs/$CONFIG_DIGEST" 2>/dev/null)
+
+            EXISTING_HASH=$(echo "$CONFIG_JSON" | jq -r '.config.Labels["base.content.hash"] // .config.Labels["poetry.lock.hash"] // ""' 2>/dev/null || echo "")
+            echo "📋 Registry base image hash: $EXISTING_HASH"
+          else
+            echo "⚠️ No existing base image found in registry - will build"
+          fi
+
+          if [ "${{ steps.base-hash.outputs.hash }}" != "$EXISTING_HASH" ]; then
+            echo "🔄 Base image needs rebuild (poetry.lock or Dockerfile.base changed)"
+            echo "   Current: ${{ steps.base-hash.outputs.hash }}"
+            echo "   Registry: $EXISTING_HASH"
+            echo "needs_rebuild=true" >> $GITHUB_OUTPUT
+          else
+            echo "✅ Base image is up to date"
+            echo "needs_rebuild=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Calculate GPU base image hash
+        id: gpu-base-hash
+        run: |
+          # Hash Dockerfile.gpu-base + poetry.lock (resolved deps that affect GPU image)
+          # Using poetry.lock instead of pyproject.toml so that version-only bumps
+          # (which don't change dependencies) don't trigger expensive GPU base rebuilds
+          CURRENT_HASH=$(cat backend/Dockerfile.gpu-base poetry.lock | sha256sum | cut -d' ' -f1)
+          echo "hash=$CURRENT_HASH" >> $GITHUB_OUTPUT
+          echo "📋 GPU base content hash: $CURRENT_HASH"
+
+      - name: Check if GPU base image exists and is current
+        id: check-gpu-base
+        run: |
+          WANT_HASH="${{ steps.gpu-base-hash.outputs.hash }}"
+          GPU_BASE_IMAGE="${{ env.REGISTRY }}/${{ env.PROJECT_ID }}/${{ env.REPOSITORY }}/${{ env.GPU_BASE_IMAGE_NAME }}:latest"
+
+          # Read the base.content.hash label without pulling the image
+          # (manifest ~1KB + config blob ~10KB). The GPU base lives in
+          # us-central1 (karaoke-repo), next to Cloud Build. The one-time copy
+          # from the legacy us-east4 location was removed: it ran via
+          # `buildx imagetools create` on THIS runner, which on a GitHub-hosted
+          # runner would stream ~13 GB through internet egress.
+          host="${GPU_BASE_IMAGE%%/*}"
+          path="${GPU_BASE_IMAGE#*/}"
+          path="${path%:*}"
+          MANIFEST=$(docker manifest inspect "$GPU_BASE_IMAGE" 2>/dev/null || echo "")
+          # A base copied with `buildx imagetools create` is a single-entry
+          # index — follow it to the image manifest.
+          CHILD=$(echo "$MANIFEST" | jq -r '.manifests[0].digest // ""' 2>/dev/null || echo "")
+          if [ -n "$CHILD" ] && [ "$CHILD" != "null" ]; then
+            MANIFEST=$(docker manifest inspect "${GPU_BASE_IMAGE%:*}@${CHILD}" 2>/dev/null || echo "")
+          fi
+          DIGEST=$(echo "$MANIFEST" | jq -r '.config.digest // ""' 2>/dev/null || echo "")
+          EXISTING_HASH=""
+          if [ -n "$DIGEST" ] && [ "$DIGEST" != "null" ]; then
+            EXISTING_HASH=$(curl -sL -H "Authorization: Bearer $(gcloud auth print-access-token)" \
+              "https://${host}/v2/${path}/blobs/${DIGEST}" 2>/dev/null \
+              | jq -r '.config.Labels["base.content.hash"] // ""' 2>/dev/null || echo "")
+          fi
+          echo "📋 Registry GPU base image hash: ${EXISTING_HASH:-<none>}"
+
+          if [ -n "$EXISTING_HASH" ] && [ "$EXISTING_HASH" = "$WANT_HASH" ]; then
+            echo "✅ GPU base image is up to date"
+            echo "needs_rebuild=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "🔄 GPU base image needs rebuild (Dockerfile.gpu-base or poetry.lock changed)"
+            echo "   Current: $WANT_HASH"
+            echo "   Registry: $EXISTING_HASH"
+            echo "needs_rebuild=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build and push images (Cloud Build us-central1)
+        id: images
+        env:
+          BUILD_BASE: ${{ steps.check-base.outputs.needs_rebuild }}
+          BUILD_GPU_BASE: ${{ steps.check-gpu-base.outputs.needs_rebuild }}
+          BASE_HASH: ${{ steps.base-hash.outputs.hash }}
+          GPU_BASE_HASH: ${{ steps.gpu-base-hash.outputs.hash }}
+          VERSION: ${{ steps.version_check.outputs.version }}
+        run: |
+          set -euo pipefail
+          # Normal deploy: app layers only → free-tier e2-standard-2 (~7 min,
+          # measured). A base rebuild (≈monthly, on poetry.lock / Dockerfile.*base
+          # changes) gets a bigger paid machine + disk + timeout.
+          if [ "$BUILD_BASE" = "true" ] || [ "$BUILD_GPU_BASE" = "true" ]; then
+            MACHINE_ARGS=(--machine-type=e2-highcpu-8 --disk-size=300 --timeout=7200s)
+            echo "🔄 Base rebuild needed (cpu=$BUILD_BASE gpu=$BUILD_GPU_BASE) → e2-highcpu-8"
+          else
+            MACHINE_ARGS=(--disk-size=150 --timeout=3600s)
+          fi
+
+          # Minimal build context (what the Dockerfiles COPY + the build script).
+          SRC="$RUNNER_TEMP/backend-image-src.tgz"
+          tar -czf "$SRC" backend karaoke_gen lyrics_transcriber_temp \
+            pyproject.toml poetry.lock README.md LICENSE .dockerignore \
+            infrastructure/cloudbuild
+
+          BUILD_ID=$(gcloud builds submit "$SRC" \
+            --region=us-central1 \
+            --project=${{ env.PROJECT_ID }} \
+            --config=infrastructure/cloudbuild/backend-images.yaml \
+            "${MACHINE_ARGS[@]}" \
+            --substitutions="_SHA=${{ github.sha }},_VERSION=${VERSION},_RUN_ID=${{ github.run_id }},_BUILD_BASE=${BUILD_BASE},_BASE_HASH=${BASE_HASH},_BUILD_GPU_BASE=${BUILD_GPU_BASE},_GPU_BASE_HASH=${GPU_BASE_HASH}" \
+            --async --format='value(id)')
+          # Recorded before waiting so the cancel step below can stop the build
+          # if this job is cancelled (ci concurrency cancels superseded deploys;
+          # an orphaned build would otherwise still push :latest tags).
+          echo "$BUILD_ID" > "$RUNNER_TEMP/cloudbuild_id"
+          echo "build_id=$BUILD_ID" >> "$GITHUB_OUTPUT"
+          echo "☁️ Cloud Build: https://console.cloud.google.com/cloud-build/builds;region=us-central1/${BUILD_ID}?project=${{ env.PROJECT_ID }}"
+
+          # Stream logs (returns when the build finishes), then check status.
+          gcloud builds log "$BUILD_ID" --region=us-central1 --project=${{ env.PROJECT_ID }} --stream \
+            || echo "::warning::log streaming ended early; checking build status"
+          # Tolerate transient API errors: a failed poll must not abort the
+          # step (the cancel step below would then kill a healthy build).
+          FAILS=0
+          while true; do
+            if ! STATUS=$(gcloud builds describe "$BUILD_ID" --region=us-central1 \
+              --project=${{ env.PROJECT_ID }} --format='value(status)'); then
+              FAILS=$((FAILS + 1))
+              if [ "$FAILS" -ge 5 ]; then
+                echo "::error::Cannot read Cloud Build $BUILD_ID status"
+                exit 1
+              fi
+              sleep 15
+              continue
+            fi
+            FAILS=0
+            case "$STATUS" in
+              QUEUED|PENDING|WORKING) sleep 15 ;;
+              *) break ;;
+            esac
+          done
+          echo "Cloud Build status: $STATUS"
+          if [ "$STATUS" != "SUCCESS" ]; then
+            echo "::error::Cloud Build $BUILD_ID finished with status $STATUS"
+            exit 1
+          fi
+
+      - name: Cancel Cloud Build if this job did not finish
+        if: always() && steps.images.outcome != 'success' && steps.images.outcome != 'skipped'
+        run: |
+          ID_FILE="$RUNNER_TEMP/cloudbuild_id"
+          [ -s "$ID_FILE" ] || exit 0
+          gcloud builds cancel "$(cat "$ID_FILE")" --region=us-central1 \
+            --project=${{ env.PROJECT_ID }} --quiet || true
+
+      - name: Pre-import CPU image for us-east4 jobs
+        # A new image digest costs a one-time ~2.5 min "Container image import" on
+        # its FIRST execution in a region (measured 2026-09-29); later executions
+        # of any job using that digest start in ~8s. audio-download-job runs
+        # :latest (just pushed), so a no-op execution now performs the import
+        # while the service deploy + smoke test run, instead of on the first
+        # customer download. Async on purpose: the import overlaps the rest of
+        # the deploy. Non-fatal: worst case the first download pays the import.
+        run: |
+          gcloud run jobs execute audio-download-job \
+            --region us-east4 \
+            --project ${{ env.PROJECT_ID }} \
+            --args="python,-c,pass" \
+            --async \
+            --quiet \
+            || echo "::warning::us-east4 CPU image pre-import execution failed to start (non-fatal)"
+
+      # ============================================
+      # Deploy to Cloud Run
+      # ============================================
+      # EDGE-SECURITY: the `edge-origin-secret` Secret Manager secret is
+      # referenced in --set-secrets below (created 2026-07-20; has a value).
+      # EDGE_AUTH_MODE=enforce (in --set-env-vars) means the backend rejects
+      # requests to public routes that lack the Cloudflare-injected X-Edge-Auth
+      # header — i.e. direct-to-origin traffic bypassing the edge (health/root
+      # exempt). Cutover done 2026-07-20; validated via prod E2E with 0 blocked
+      # legit callers. To disable, set EDGE_AUTH_MODE=off here and redeploy.
+      # R3/R4 — traffic-gated service canary.
+      # Deploy the new revision with NO traffic and a `candidate` tag, smoke the
+      # tagged candidate URL, then migrate 100% traffic only on pass. If the
+      # smoke fails we simply don't migrate: traffic stays on the prior revision,
+      # so a bad revision serves 0% instead of 100% (auto-revert by default).
+      # NOTE: this protects only the Cloud Run *service*. The Cloud Run *jobs*
+      # updated below cannot traffic-split, so they rely on the daily E2E run +
+      # the codified `scripts/rollback.sh` (R2).
+      - name: Deploy to Cloud Run (candidate revision, no traffic)
+        id: deploy_candidate
+        run: |
+          VERSION="${{ steps.version_check.outputs.version }}"
+          IMAGE="${{ env.REGISTRY }}/${{ env.PROJECT_ID }}/${{ env.REPOSITORY }}/${{ env.APP_IMAGE_NAME }}:${{ github.sha }}"
+
+          # Capture the revision currently serving traffic so we can name it in
+          # logs / the failure message (it's what we auto-revert to on a failed
+          # smoke — no action needed since we deploy --no-traffic).
+          PREV_REVISION=$(gcloud run services describe karaoke-backend \
+            --region us-central1 \
+            --format='value(status.traffic[0].revisionName)' 2>/dev/null || echo "")
+          echo "prev_revision=$PREV_REVISION" >> "$GITHUB_OUTPUT"
+
+          echo "🚀 Deploying candidate revision to Cloud Run (no traffic)..."
+          echo "Image: $IMAGE"
+          echo "Version: $VERSION"
+          echo "Previously-serving revision: ${PREV_REVISION:-<unknown>}"
+
+          # --concurrency 32 (was 80 → 16 → 32): at 80 a 10-tab burst all
+          # landed on the single min-instance and wedged its then-blocking
+          # event loop ("no available instance" aborts, 2026-09-18). 16 fixed
+          # that but overshot once the loop was made non-blocking: every burst
+          # forced scale-out, and each overflow request waited out a ~16s app
+          # cold start (2026-09-22 16-tab test: warm instance served in 1.2s,
+          # freshly-spawned ones in 16-19s). 32 + --min-instances 2 gave 64
+          # warm slots; min-instances was cut to 1 on 2026-09-26 and to 0 on
+          # 2026-10-01 (GCP cost cuts, ~$24/mo idle min-instance charge; Andrew
+          # accepts a ~15s cold start on the first request after idle). In
+          # practice the 60s /api/health uptime check and the */10 Cloud
+          # Scheduler jobs keep an instance warm most of the time — with
+          # --cpu-throttling (request-based billing) a warm-but-idle non-min
+          # instance costs nothing. Concurrency stays far below the wedge-era 80. --clear-vpc-connector: the
+          # serverless VPC connector was deleted (flacfetch is public now).
+          gcloud run deploy karaoke-backend \
+            --image $IMAGE \
+            --no-traffic \
+            --tag candidate \
+            --region us-central1 \
+            --platform managed \
+            --allow-unauthenticated \
+            --memory 2Gi \
+            --cpu 2 \
+            --cpu-boost \
+            --cpu-throttling \
+            --execution-environment gen2 \
+            --timeout 1800 \
+            --concurrency 32 \
+            --max-instances 20 \
+            --min-instances 0 \
+            --clear-vpc-connector \
+            --set-env-vars "GOOGLE_CLOUD_PROJECT=${{ env.PROJECT_ID }},GCS_BUCKET_NAME=karaoke-gen-storage-${{ env.PROJECT_ID }},FIRESTORE_COLLECTION=jobs,ENVIRONMENT=production,KARAOKE_GEN_VERSION=$VERSION,DEFAULT_DROPBOX_PATH=/MediaUnsynced/Karaoke/Tracks-Organized,DEFAULT_GDRIVE_FOLDER_ID=1laRKAyxo0v817SstfM5XkpbWiNKNAMSX,ENABLE_CLOUD_TASKS=true,CLOUD_RUN_SERVICE_URL=https://api.nomadkaraoke.com,GCP_REGION=us-central1,DEFAULT_ENABLE_YOUTUBE_UPLOAD=true,DEFAULT_BRAND_PREFIX=NOMAD,DEFAULT_PRIVATE_DROPBOX_PATH=/MediaUnsynced/Karaoke/Tracks-NonPublished,DEFAULT_PRIVATE_BRAND_PREFIX=NOMADNP,USE_GCE_ENCODING=true,USE_GCE_PREVIEW_ENCODING=true,ENABLE_PUSH_NOTIFICATIONS=true,USE_CLOUD_RUN_JOBS_FOR_VIDEO=true,USE_CLOUD_RUN_JOBS_FOR_RENDER=true,EMAIL_PROVIDER=postmark,AUTO_CORRECT_MODEL=claude-opus-5-5,AUTO_CORRECT_COMPARE_MODELS=claude-opus-5-5;gemini-3.8-flash,AUTO_CORRECT_PROACTIVE_ENABLED=true,AUTO_APPROVAL_BACKING_KEEP_ENABLED=true,COMMUNITY_DAILY_PICK_ENABLED=true,STORAGE_RETENTION_DRY_RUN=false,STORAGE_RETENTION_MAX_JOBS_PER_RUN=50,EDGE_AUTH_MODE=enforce,COMMIT_SHA=${{ steps.build-meta.outputs.sha }},PR_NUMBER=${{ steps.build-meta.outputs.pr_number }},PR_TITLE=${{ steps.build-meta.outputs.pr_title }}" \
+            --set-secrets "ANTHROPIC_API_KEY=anthropic-api-key:latest,GEMINI_API_KEY=gemini-api-key:latest,AUDIOSHAKE_API_TOKEN=audioshake-api-key:latest,GENIUS_API_TOKEN=genius-api-key:latest,SPOTIFY_COOKIE_SP_DC=spotify-cookie:latest,RAPIDAPI_KEY=rapidapi-key:latest,DEFAULT_DISCORD_WEBHOOK_URL=discord-releases-webhook:latest,ADMIN_TOKENS=admin-tokens:latest,RED_API_KEY=red-api-key:latest,RED_API_URL=red-api-url:latest,OPS_API_KEY=ops-api-key:latest,OPS_API_URL=ops-api-url:latest,FLACFETCH_API_URL=flacfetch-api-url:latest,FLACFETCH_API_KEY=flacfetch-api-key:latest,POSTMARK_SERVER_TOKEN=postmark-server-token:latest,STRIPE_SECRET_KEY=stripe-secret-key:latest,STRIPE_WEBHOOK_SECRET=stripe-webhook-secret:latest,LANGFUSE_PUBLIC_KEY=langfuse-public-key:latest,LANGFUSE_SECRET_KEY=langfuse-secret-key:latest,LANGFUSE_HOST=langfuse-host:latest,ENCODING_WORKER_URL=encoding-worker-url:latest,ENCODING_WORKER_API_KEY=encoding-worker-api-key:latest,ENCODING_WORKER_FALLBACK_VMS=encoding-worker-fallback-vms:latest,VAPID_PUBLIC_KEY=vapid-public-key:latest,VAPID_PRIVATE_KEY=vapid-private-key:latest,E2E_BYPASS_KEY=e2e-bypass-key:latest,GDRIVE_VALIDATOR_URL=gdrive-validator-url:latest,EDGE_ORIGIN_SECRET=edge-origin-secret:latest,KARAOKEHUNT_FORWARDER_SECRET=karaokehunt-forwarder-secret:latest,KJBOX_PARTNER_SECRET=kjbox-partner-secret:latest"
+
+      # R3/R4 — smoke the tagged candidate revision BEFORE it serves any traffic.
+      - name: Smoke candidate revision
+        run: |
+          EXPECTED_VERSION="${{ steps.version_check.outputs.version }}"
+
+          # The `candidate` tag gives the new (0%-traffic) revision its own URL.
+          CANDIDATE_URL=$(gcloud run services describe karaoke-backend \
+            --region us-central1 \
+            --format='json' | jq -r '.status.traffic[] | select(.tag=="candidate") | .url' | head -1)
+
+          if [ -z "$CANDIDATE_URL" ] || [ "$CANDIDATE_URL" = "null" ]; then
+            echo "❌ Could not resolve the candidate revision URL — aborting before traffic migration."
+            exit 1
+          fi
+          echo "Candidate URL: $CANDIDATE_URL"
+
+          # Health check on the candidate only (traffic still on prior revision).
+          curl -f --connect-timeout 5 --max-time 30 "$CANDIDATE_URL/api/health" || {
+            echo "❌ Candidate health check failed — NOT migrating traffic (prior revision keeps serving)."
+            exit 1
+          }
+
+          # Version check with retries (new revision may take a moment to be routable).
+          MAX_RETRIES=6
+          RETRY_DELAY=10
+          for i in $(seq 1 $MAX_RETRIES); do
+            echo "Checking candidate version (attempt $i/$MAX_RETRIES)..."
+            CAND_VERSION=$(curl -sf --connect-timeout 5 --max-time 30 "$CANDIDATE_URL/api/health/detailed" | jq -r '.version // empty')
+            if [ "$CAND_VERSION" = "$EXPECTED_VERSION" ]; then
+              echo "✅ Candidate serving expected version: $CAND_VERSION"
+              break
+            fi
+            echo "⚠️  Candidate version: deployed=$CAND_VERSION expected=$EXPECTED_VERSION"
+            if [ $i -lt $MAX_RETRIES ]; then
+              sleep $RETRY_DELAY
+            else
+              echo "❌ Candidate never reported the expected version — NOT migrating traffic."
+              echo "   Prior revision '${{ steps.deploy_candidate.outputs.prev_revision }}' keeps serving 100%."
+              exit 1
+            fi
+          done
+
+      - name: Migrate 100% traffic to candidate
+        run: |
+          echo "✅ Candidate passed smoke — migrating 100% traffic to the new revision."
+          gcloud run services update-traffic karaoke-backend \
+            --region us-central1 \
+            --to-latest
+
+      - name: Update Cloud Run Jobs with new image
+        # NOTE: Cloud Run *Jobs* cannot traffic-split or canary — this is an
+        # image-only, all-or-nothing update picked up on each job's next
+        # invocation. There is no per-revision smoke here; the jobs rely on the
+        # daily E2E run and the codified `scripts/rollback.sh` (R2) for recovery
+        # if a bad image reaches them.
+        run: |
+          GPU_IMAGE="${{ env.GPU_REGISTRY }}/${{ env.PROJECT_ID }}/${{ env.GPU_REPOSITORY }}/${{ env.GPU_APP_IMAGE_NAME }}:${{ github.sha }}"
+          CPU_JOBS_IMAGE="${{ env.CPU_JOBS_REGISTRY }}/${{ env.PROJECT_ID }}/${{ env.CPU_JOBS_REPOSITORY }}/${{ env.CPU_JOBS_IMAGE_NAME }}:${{ github.sha }}"
+
+          echo "📦 Updating Cloud Run Jobs..."
+
+          # Video encoding job (CPU, us-east4; also runs render_video_worker)
+          gcloud run jobs update video-encoding-job \
+            --image "$CPU_JOBS_IMAGE" \
+            --region us-east4 \
+            --project ${{ env.PROJECT_ID }} \
+            --quiet
+
+          # Lyrics transcription job (CPU, us-east4 — see CPU_JOBS_REGION in
+          # backend/config.py). The us-east4 job is created by Pulumi, so
+          # `pulumi up` must run BEFORE merging a change that introduces it. audio-download-job and bulk-search-job track the
+          # :latest tag pushed above, so they need no update here.
+          # NOTE: image-only update. Adding --update-secrets here crashed gcloud
+          # ("Invalid secret path ... in annotation") because this job's existing
+          # secrets are stored via Cloud Run secret *aliases* that --update-secrets
+          # re-validates and rejects. Proactive auto-correct env/secret
+          # (AUTO_CORRECT_PROACTIVE_ENABLED + ANTHROPIC_API_KEY) must be wired by a
+          # method that handles the alias format (see proactive-autocorrect plan
+          # doc); until then the proactive flag stays unset and the worker's
+          # _run_proactive_auto_correct() returns early (no-op).
+          gcloud run jobs update lyrics-transcription-job \
+            --image "$CPU_JOBS_IMAGE" \
+            --region us-east4 \
+            --project ${{ env.PROJECT_ID }} \
+            --quiet
+
+          # Storage-retention job (CPU, us-east4): pin to this commit's image so
+          # the deletion code (generation-pinned deletes + audit log) always
+          # matches the API that starts it.
+          gcloud run jobs update storage-retention-job \
+            --image "$CPU_JOBS_IMAGE" \
+            --region us-east4 \
+            --project ${{ env.PROJECT_ID }} \
+            --quiet
+
+          # Audio separation job (GPU, us-east4) — uses GPU image
+          gcloud run jobs update audio-separation-job \
+            --image "$GPU_IMAGE" \
+            --region us-east4 \
+            --project ${{ env.PROJECT_ID }} \
+            --quiet
+
+          echo "✅ Cloud Run Jobs updated"
+
+      - name: Verify deployment and version
+        run: |
+          EXPECTED_VERSION="${{ steps.version_check.outputs.version }}"
+          SERVICE_URL=$(gcloud run services describe karaoke-backend \
+            --region us-central1 \
+            --format 'value(status.url)')
+
+          echo "Service URL: $SERVICE_URL"
+          echo "Expected version: $EXPECTED_VERSION"
+
+          # Wait for new revision to be ready
+          echo "Waiting for new revision to be ready..."
+          sleep 15
+
+          # Basic health check
+          curl -f --connect-timeout 5 --max-time 30 "$SERVICE_URL/api/health" || exit 1
+          echo "✅ Service is healthy"
+
+          # Version verification with retries (Cloud Run may take time to route to new revision)
+          MAX_RETRIES=6
+          RETRY_DELAY=10
+          for i in $(seq 1 $MAX_RETRIES); do
+            echo "Checking deployed version (attempt $i/$MAX_RETRIES)..."
+            DEPLOYED_VERSION=$(curl -sf --connect-timeout 5 --max-time 30 "$SERVICE_URL/api/health/detailed" | jq -r '.version // empty')
+
+            if [ "$DEPLOYED_VERSION" = "$EXPECTED_VERSION" ]; then
+              echo "✅ Version verified: $DEPLOYED_VERSION"
+              break
+            else
+              echo "⚠️  Version mismatch: deployed=$DEPLOYED_VERSION, expected=$EXPECTED_VERSION"
+              if [ $i -lt $MAX_RETRIES ]; then
+                echo "   Retrying in ${RETRY_DELAY}s..."
+                sleep $RETRY_DELAY
+              else
+                echo "❌ Version verification failed after $MAX_RETRIES attempts"
+                exit 1
+              fi
+            fi
+          done
+
+      - name: Summary
+        if: success()
+        run: |
+          echo "🎉 Deployment successful!"
+          echo "Version: ${{ steps.version_check.outputs.version }}"
+          echo "Commit: ${{ github.sha }}"
+          echo "Branch: ${{ github.ref_name }}"
+          echo "Run: ${{ github.run_number }}"
+          echo ""
+          echo "📊 Images built in Cloud Build us-central1: ${{ steps.images.outputs.build_id }}"
+
+  # NOTE: Pulumi infrastructure deploys are done locally, not in CI.
+  # CI runners run on the infrastructure Pulumi manages, creating a circular
+  # dependency. Always run `pulumi up` locally before merging infra PRs.
+  # See docs/LESSONS-LEARNED.md for details.

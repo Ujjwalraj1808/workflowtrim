@@ -1,0 +1,154 @@
+name: Deploy to GitHub Pages
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'operator/docs/**'
+      - 'operator/hack/genref/**'
+      - 'operator/hack/generate-llms-txt.sh'
+      - 'operator/api/**'
+      - 'operator/config/samples/**'
+      - 'operator/Makefile'
+  pull_request:
+    paths:
+      - 'operator/docs/**'
+      - 'operator/hack/genref/**'
+      - 'operator/hack/generate-llms-txt.sh'
+      - 'operator/api/**'
+      - 'operator/config/samples/**'
+      - 'operator/Makefile'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+  issues: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  # Build and verify documentation on PRs
+  build-docs:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7
+        with:
+          go-version-file: operator/go.mod
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7
+        with:
+          node-version: '24'
+
+      - name: Install npm dependencies
+        working-directory: ./operator/docs
+        run: npm ci
+
+      - name: Install Hugo
+        uses: peaceiris/actions-hugo@2752ce1d29631191ea3f27c23495fa06139a5b78  # v3
+        with:
+          hugo-version: 'latest'
+          extended: true
+
+      - name: Generate API Reference
+        working-directory: ./operator
+        run: |
+          make generate-docs
+
+      - name: Build with Hugo
+        working-directory: ./operator/docs
+        env:
+          GITHUB_OWNER: ${{ github.repository_owner }}
+          REPO_NAME: ${{ github.event.repository.name }}
+        run: |
+          ../../.github/scripts/configure-hugo-baseurl.sh config.yaml
+          hugo --minify
+
+      - name: Check build output
+        run: |
+          if [ ! -d "./operator/docs/public" ]; then
+            echo "Error: Hugo build failed - public directory not found"
+            exit 1
+          fi
+          echo "✓ Documentation built successfully"
+          echo "Note: GitHub Pages doesn't support PR previews. The documentation will be deployed after merging to main."
+
+  # Deploy to GitHub Pages on main branch
+  deploy:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7
+        with:
+          go-version-file: operator/go.mod
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7
+        with:
+          node-version: '24'
+
+      - name: Install npm dependencies
+        working-directory: ./operator/docs
+        run: npm ci
+
+      - name: Install Hugo
+        uses: peaceiris/actions-hugo@2752ce1d29631191ea3f27c23495fa06139a5b78  # v3
+        with:
+          hugo-version: 'latest'
+          extended: true
+
+      - name: Generate API Reference
+        working-directory: ./operator
+        run: |
+          make generate-docs
+
+      - name: Build with Hugo
+        working-directory: ./operator/docs
+        env:
+          GITHUB_OWNER: ${{ github.repository_owner }}
+          REPO_NAME: ${{ github.event.repository.name }}
+          GITHUB_PAGES_DOMAIN: konflux-ci.dev
+        run: |
+          ../../.github/scripts/configure-hugo-baseurl.sh config.yaml
+          hugo --minify
+
+      - name: Setup Pages
+        uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d  # v6
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9  # v5
+        with:
+          path: './operator/docs/public'
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346  # v5
+
+      - name: Notify on failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          WORKFLOW_NAME: Deploy to GitHub Pages
+        run: |
+          .github/scripts/create-or-update-issue.sh \
+            "⚠️ GitHub Pages Deploy Failed" \
+            "The Deploy to GitHub Pages workflow failed while publishing documentation from **main**. The live docs site may not have been updated."

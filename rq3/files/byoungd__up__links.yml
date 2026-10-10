@@ -1,0 +1,77 @@
+name: Scheduled External Link Check
+
+on:
+  schedule:
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  links:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Verify catalog and project entry points
+        run: |
+          set -euo pipefail
+          {
+            grep -rhoE 'https://(book|movie)\.douban\.com/[^) >]+' docs/threads || true
+            printf '%s\n' https://token.love/ https://ku0.com/
+          } | while IFS= read -r url; do
+              [ -z "$url" ] && continue
+              curl --fail --location --http1.1 --compressed \
+                --retry 3 --retry-delay 5 --connect-timeout 15 --max-time 45 \
+                -A 'Mozilla/5.0 (compatible; Life-Level-Guide-Link-Check/1.0)' \
+                -o /dev/null "$url"
+              done
+      - name: Guard retired failure URLs
+        run: |
+          set -euo pipefail
+          if grep -REni 'scholarspace\.manoa\.hawaii\.edu|doi\.org/10\.64152/10125/66973|10\.1076/edre\.7\.1\.403\.3989|web\.archive\.org/web/20160424221725' \
+            ATTRIBUTIONS.md docs README.md; then
+            echo 'A retired URL from the 193-197 failure series has returned.' >&2
+            exit 1
+          fi
+      - name: Extract external links
+        run: node scripts/extract-external-links.mjs > .external-links.md
+      - uses: lycheeverse/lychee-action@v2.9.0
+        with:
+          args: >-
+            --no-progress
+            --accept 200..=399,403,418,429
+            --max-retries 3
+            --retry-wait-time 5
+            --timeout 30
+            --max-redirects 20
+            --user-agent "Mozilla/5.0 (compatible; Life-Level-Guide-Link-Check/1.0)"
+            --exclude-path node_modules
+            --exclude "^(file://|/|error:)"
+            --exclude "^https://(book|movie)\.douban\.com/"
+            --exclude "^https://(token\.love|ku0\.com)/"
+            --exclude "https://localhost"
+            --exclude "https://byoungd\.github\.io/up"
+            .external-links.md
+          fail: true
+      - name: Close stale external-link failure issues
+        if: success()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh issue list --repo "${{ github.repository }}" --state open --label automation --limit 100 --json number,title \
+            --jq '.[] | select(.title == "Scheduled external-link check failed") | .number' \
+            | while IFS= read -r issue; do
+                [ -n "$issue" ] || continue
+                gh issue close "$issue" --repo "${{ github.repository }}" \
+                  --comment "The latest scheduled link check passed, so this stale automation issue is now closed."
+              done
+      - uses: peter-evans/create-issue-from-file@v6
+        if: failure()
+        with:
+          title: "Scheduled external-link check failed"
+          content-filepath: ./lychee/out.md
+          labels: broken-link,automation

@@ -1,0 +1,120 @@
+name: DART New Stocks Sync
+
+# KindList 에 새로 들어온 종목이 recent 공시 동기화에 걸리지 않아도
+# finance/report 기본 parquet 은 반드시 bootstrap 한다.
+
+on:
+  workflow_run:
+    workflows: ["Update KindList"]
+    types: [completed]
+  schedule:
+    - cron: '0 1 * * 1-5'  # UTC 01:00 = KST 10:00, KindList 갱신 이후
+  workflow_dispatch:
+    inputs:
+      categories:
+        description: 'finance,report 중 쉼표 구분'
+        default: 'finance,report'
+        type: string
+      limit:
+        description: '카테고리별 최대 신규 종목 수 (0은 제한 없음)'
+        default: '50'
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  sync-new-stocks:
+    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    # job 레벨 concurrency 를 쓴다. 워크플로 레벨은 run 생성 즉시 큐를 점유하고, GitHub 은 그룹당
+    # pending 을 1 개만 유지해 새 트리거가 오면 기존 pending 을 취소한다(cancel-in-progress 무관).
+    # 2026-08 사고: hf-dart-push 대기 중이던 run 8 건이 job 0 개인 채 취소됐다. job 레벨이면
+    # if 로 skip 되는 job 은 큐에 진입조차 하지 않는다.
+    concurrency:
+      group: hf-dart-push
+      cancel-in-progress: false
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Smoke import (fail fast on src regression)
+        run: uv run python -c "import dartlab; print('dartlab', getattr(dartlab, '__version__', 'dev'))"
+
+      - name: Restore finance cache
+        uses: actions/cache/restore@v5
+        with:
+          path: data/dart/finance
+          key: dartlab-data-finance-new-${{ github.run_id }}
+          restore-keys: dartlab-data-finance-
+
+      - name: Restore report cache
+        uses: actions/cache/restore@v5
+        with:
+          path: data/dart/report
+          key: dartlab-data-report-new-${{ github.run_id }}
+          restore-keys: dartlab-data-report-
+
+      - name: Sync KindList new stocks
+        run: uv run python -X utf8 .github/scripts/sync/syncNewStocks.py
+        env:
+          DART_API_KEYS: ${{ secrets.DART_API_KEYS }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          NEW_STOCK_CATEGORIES: ${{ github.event.inputs.categories || 'finance,report' }}
+          NEW_STOCK_LIMIT: ${{ github.event.inputs.limit || '50' }}
+          SYNC_STATE_SCOPE: new-stocks
+
+      - name: Upload to HuggingFace (finance)
+        if: hashFiles('dist/changed_finance.txt') != ''
+        run: |
+          if [ -s dist/changed_finance.txt ]; then
+            cp dist/changed_finance.txt dist/changed.txt
+            uv run python .github/scripts/sync/uploadData.py --target hf
+          fi
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          SYNC_CATEGORY: finance
+
+      # 접수 원장: 신규 상장 부트스트랩도 공시 내용을 처음 본 시각이다. 일일 동기화와 같은 스텝이고
+      # 원장 실패가 업로드와 캐시 저장을 막지 않도록 격리한다.
+      - name: Build and upload finance receipt ledger
+        if: hashFiles('dist/changed_finance.txt') != ''
+        continue-on-error: true
+        run: uv run python -X utf8 -m dartlab.pipeline.financeReceipts --out-dir dist/financeReceipts --upload
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+
+      - name: Upload to HuggingFace (report)
+        if: hashFiles('dist/changed_report.txt') != ''
+        run: |
+          if [ -s dist/changed_report.txt ]; then
+            cp dist/changed_report.txt dist/changed.txt
+            uv run python .github/scripts/sync/uploadData.py --target hf
+          fi
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          SYNC_CATEGORY: report
+
+      - name: Save finance cache
+        if: always()
+        uses: actions/cache/save@v5
+        with:
+          path: data/dart/finance
+          key: dartlab-data-finance-new-${{ github.run_id }}
+
+      - name: Save report cache
+        if: always()
+        uses: actions/cache/save@v5
+        with:
+          path: data/dart/report
+          key: dartlab-data-report-new-${{ github.run_id }}

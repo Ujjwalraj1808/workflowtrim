@@ -1,0 +1,942 @@
+name: Tool smoke (nightly)
+
+# Live tool + LSP smoke harness (#209). Unlike CI (push/PR, deterministic), this
+# installs and SPAWNS real tools/LSP servers and drives pi-lens's real dispatch
+# path against per-language fixtures — so it's slow and network-dependent, hence
+# nightly + manual only, never a per-PR gate.
+#
+# The harness exits nonzero on genuine infra failures (timeout / exception /
+# server_error) AND on a genuine installer defect: an ensureTool failure for a
+# strategy whose toolchain this runner has (npm always, since the harness
+# itself runs under Node; pip/gem when confirmed present) reports ✗ and DOES
+# fail the run (#2638/#2661 — a dead/renamed npm package used to report the
+# same ⚠ a missing toolchain does, and sat unnoticed for months). A tool that
+# is declined/skipped by policy, genuinely lacks its toolchain on this runner,
+# or hit a transient/offline registry condition (no network, a registry 5xx)
+# reports ⚠ and does NOT fail the run — the printed report still shows the ⚠
+# counts for review.
+
+# Write scopes (#4077): GitHub permissions are job-scoped, so every job that
+# runs the smoke, the rollup or the bench holds read scopes only and runs on a
+# dispatch from ANY ref. Each write sits in its own small job, guarded to the
+# schedule or master, that takes the producer's result as an artifact or a job
+# output: `test-history-publish` (contents: write), `test-history-notify`,
+# `tool-smoke-notify` and `snapshot-persist-notify` (issues: write) and
+# `tool-smoke-prs` (contents and pull-requests: write).
+
+on:
+  schedule:
+    - cron: '0 6 * * *' # daily 06:00 UTC
+  workflow_dispatch:
+
+jobs:
+  test-history-rollup:
+    name: Roll up durable unit-test history
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    # History is a nightly concern. In particular, a PR must never become red
+    # because its historical artifacts are unavailable or a data-branch push
+    # loses a race with another bot. This job only downloads and rolls up, so a
+    # dispatch on any ref may run it; the data-branch push and the red-night
+    # issue are the guarded writer jobs below (#4030 F1: a branch dispatch once
+    # reached the push with unreviewed rollup code).
+    runs-on: ubuntu-latest
+    # #4030: bounds a hang against GitHub's 360-min default. Measured from a
+    # dev host: listing plus 194 ZIPs took 361 s (about 1.7 s a ZIP), and the
+    # rollup of 191 new parts 3.4 s. At the nightly cap (100 shard-era runs,
+    # about 400 ZIPs) that is about 11 min; the PR body quotes the runner's
+    # own time from a branch dispatch.
+    timeout-minutes: 30
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: true
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: '22'
+      # The publish step checks out the data branch over this tree, so the
+      # scripts every later step runs are staged first, from this ref.
+      - name: Read the history watermark
+        id: watermark
+        run: |
+          set -euo pipefail
+          cp -r scripts "$RUNNER_TEMP/history-scripts"
+          git fetch origin data/test-history || true
+          prior="$RUNNER_TEMP/test-history-prior.ndjson"
+          # Day lines, or (one time, #4030) the raw journal they migrate from.
+          git show origin/data/test-history:history/test-daily.ndjson > "$prior" 2>/dev/null \
+            || git show origin/data/test-history:history/test-results.ndjson > "$prior" 2>/dev/null \
+            || : > "$prior"
+          since="$(node "$RUNNER_TEMP/history-scripts/test-history-rollup.mjs" --print-watermark --history "$prior")"
+          echo "watermark: ${since:-none}"
+          echo "since=${since}" >> "$GITHUB_OUTPUT"
+      - name: Download unit-test result artifacts
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SINCE: ${{ steps.watermark.outputs.since }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/test-history-artifacts"
+          # #4030: incremental ingest. Whole CI runs newer than the watermark,
+          # at most 100 a night, oldest first; 5xx responses retry.
+          node "$RUNNER_TEMP/history-scripts/download-test-history-artifacts.mjs" \
+            --repository "$GITHUB_REPOSITORY" \
+            --since "$SINCE" \
+            --output-dir "$RUNNER_TEMP/test-history-artifact-zips"
+          for zip in "$RUNNER_TEMP"/test-history-artifact-zips/*.zip; do
+            [ -e "$zip" ] || continue
+            artifact_id="$(basename "$zip" .zip)"
+            mkdir -p "$RUNNER_TEMP/test-history-artifacts/$artifact_id"
+            unzip -q "$zip" -d "$RUNNER_TEMP/test-history-artifacts/$artifact_id"
+          done
+      # Runs on every ref, so a branch dispatch proves the rollup without
+      # touching the data branch. Its output is never published.
+      - name: Roll up test history
+        run: |
+          set -euo pipefail
+          dry="$RUNNER_TEMP/test-history-dry.ndjson"
+          cp "$RUNNER_TEMP/test-history-prior.ndjson" "$dry"
+          node "$RUNNER_TEMP/history-scripts/test-history-rollup.mjs" \
+            --artifact-dir "$RUNNER_TEMP/test-history-artifacts" \
+            --history "$dry" --summary "$RUNNER_TEMP/test-history-dry-summary.json"
+      # The hand-off to `test-history-publish` (#4077). The manifest keeps the
+      # artifact non-empty on a night with no new results, so the writer's
+      # download only fails on a real error.
+      - name: Record the ingest manifest
+        env:
+          SINCE: ${{ steps.watermark.outputs.since }}
+        run: printf 'since=%s\n' "$SINCE" > "$RUNNER_TEMP/test-history-ingest.txt"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: test-history-ingest
+          path: |
+            ${{ runner.temp }}/test-history-artifacts
+            ${{ runner.temp }}/test-history-ingest.txt
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 1
+
+  # The only writer of data/test-history, and only from master code (#4077:
+  # contents: write and nothing else). Each attempt re-rolls onto the tip it is
+  # about to push over; the part ledger makes that re-roll exactly-once.
+  # timeout-minutes: three attempts of a 3.4 s rollup plus a push, far under
+  # the 30 the download-heavy rollup job above needs.
+  test-history-publish:
+    name: Publish test history to the data branch
+    needs: test-history-rollup
+    if: github.event_name == 'schedule' || github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: true
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: '22'
+      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        with:
+          name: test-history-ingest
+          path: ${{ runner.temp }}
+      # The publish step checks out the data branch over this tree, so the
+      # scripts every later step runs are staged first, from this ref.
+      - name: Stage the rollup scripts
+        run: cp -r scripts "$RUNNER_TEMP/history-scripts"
+      - name: Publish data branch
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          prior="$RUNNER_TEMP/test-history-prior.ndjson"
+          # A night with no new CI artifacts uploads no file from this directory
+          # and upload-artifact drops an empty one (#4076 verify r3 F1); the
+          # rollup exits 2 on a missing --artifact-dir.
+          mkdir -p "$RUNNER_TEMP/test-history-artifacts"
+          for attempt in 1 2 3; do
+            echo "test-history push attempt ${attempt}/3"
+            git fetch origin data/test-history || true
+            git show origin/data/test-history:history/test-daily.ndjson > "$prior" 2>/dev/null \
+              || git show origin/data/test-history:history/test-results.ndjson > "$prior" 2>/dev/null \
+              || : > "$prior"
+            GITHUB_STEP_SUMMARY='' node "$RUNNER_TEMP/history-scripts/test-history-rollup.mjs" \
+              --artifact-dir "$RUNNER_TEMP/test-history-artifacts" \
+              --history "$prior" --summary "$RUNNER_TEMP/test-history-summary.json"
+            if git show-ref --verify --quiet refs/remotes/origin/data/test-history; then
+              git checkout -f -B data/test-history origin/data/test-history
+            else
+              git checkout --orphan data/test-history
+              git rm -rf . >/dev/null 2>&1 || true
+            fi
+            mkdir -p history
+            cp "$prior" history/test-daily.ndjson
+            cp "$RUNNER_TEMP/test-history-summary.json" history/summary.json
+            # The raw journal is migrated into the day lines above; its last
+            # version stays in this branch's history.
+            git rm -q --ignore-unmatch history/test-results.ndjson
+            git add history
+            git -c user.name='pi-lens nightly' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m 'chore(nightly): append test history' || true
+            if git push origin HEAD:data/test-history; then exit 0; fi
+          done
+          echo 'data/test-history push lost three consecutive races' >&2
+          exit 1
+
+  # #4030 detection retrospective: six red nights went unalerted because the
+  # tool-smoke notifier reads only its own job. Same shared CLI, label and scope
+  # as the drift jobs below (a branch dispatch must not touch issues): a red
+  # rollup or publish files or refreshes the issue, a green pair closes it, a
+  # cancelled one leaves it. `continue-on-error`: tracker maintenance must not
+  # mask the rollup's own verdict.
+  test-history-notify:
+    name: Notify on test-history rollup red
+    needs: [test-history-rollup, test-history-publish]
+    if: always() && (github.event_name == 'schedule' || github.ref == 'refs/heads/master')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    continue-on-error: true
+    permissions:
+      contents: read
+      issues: write # the red-night tracking issue (#4030 detection retrospective)
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: '22'
+      - name: Notify on test-history rollup red (file/update/close tracking issue)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ROLLUP_RESULT: ${{ needs.test-history-rollup.result }}
+          PUBLISH_RESULT: ${{ needs.test-history-publish.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          TITLE='nightly: test-history rollup red'
+          cli=scripts/upsert-tracking-issue.mjs
+          if [ "$ROLLUP_RESULT" = failure ] || [ "$PUBLISH_RESULT" = failure ]; then
+            body="$RUNNER_TEMP/test-history-red.md"
+            # shellcheck disable=SC2016  # backticks are literal Markdown in the issue body
+            printf 'The `Roll up durable unit-test history` or `Publish test history to the data branch` job failed: %s\n\n`data/test-history` did not advance, so the shard weights, flake candidates and the pre-push history selector read stale data (#4030).\n' "$RUN_URL" > "$body"
+            gh label create nightly-drift --color B60205 --description 'Nightly automated drift finding' || true
+            node "$cli" --title "$TITLE" --label nightly-drift --body-file "$body"
+          elif [ "$ROLLUP_RESULT" = success ] && [ "$PUBLISH_RESULT" = success ]; then
+            node "$cli" --title "$TITLE" --label nightly-drift --clean --close-when-clean
+          fi
+
+  # Read-only (#4077): this job spawns real tools and LSP servers and runs on a
+  # dispatch from any ref. What the old job wrote, `tool-smoke-prs` and
+  # `tool-smoke-notify` below write from the artifacts and outputs this one
+  # publishes. `pull-requests: read` is the promotion step's `gh pr list`.
+  tool-smoke:
+    name: Live tool + LSP smoke
+    runs-on: ubuntu-latest
+    # refs #3123: bounds a hang against GitHub's 360-min default.
+    # Measured max over last 10 successful master runs: 855s (14m15s); sized at
+    # ~2x + margin.
+    timeout-minutes: 35
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      tool_layer: ${{ steps.tool_layer.outcome }}
+      lsp_handshake: ${{ steps.lsp_handshake.outcome }}
+      lsp_gate: ${{ steps.lsp_gate.outcome }}
+      lens_full: ${{ steps.lens_full.outcome }}
+      format_layer: ${{ steps.format_layer.outcome }}
+      resolution_layer: ${{ steps.resolution_layer.outcome }}
+      docs_changed: ${{ steps.docs_diff.outputs.changed }}
+      promoted: ${{ steps.idle_promote.outputs.promoted }}
+    # The installer hits the GitHub REST API to resolve release assets.
+    # Unauthenticated = 60 req/hr per IP, exhausted on shared-IP runners.
+    # The auto-provided token raises this to 5000 req/hr; the installer sends it
+    # ONLY to api.github.com, never the asset CDN.
+    #
+    # PI_LENS_HOME/PILENS_DATA_DIR (#2670 review F1): job-level, so the EIGHT
+    # `--install` steps below share one tool tree/bin dir across the job
+    # instead of each `withScratchHome()` pin minting its own empty one per
+    # step — without this, each script re-pulls every managed tool from
+    # scratch (measured against the last full nightly, run 32817692457: the
+    # shared cache made the format step ~9s; per-step scratch homes would add
+    # ~10min across the job and 4-5x the release-asset downloads on this
+    # shared-IP runner). A bare `/tmp` path, not `${{ runner.temp }}`: the
+    # `runner` context is unavailable at job-level `env:` (actionlint: "context
+    # \"runner\" is not allowed here"), and this runner's whole VM — `/tmp`
+    # included — is destroyed after the job either way, so this never becomes
+    # a second `~/.pi-lens` some other step relies on persisting.
+    # `withScratchHome`'s "already pinned" branch is a no-op against an
+    # explicit PI_LENS_HOME, so this is the ONLY change these steps need.
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      PI_LENS_HOME: /tmp/pi-lens-home
+      PILENS_DATA_DIR: /tmp/pi-lens-home
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: '22'
+
+      # Python provides pip for the pip-distributed tools (ruff, yamllint,
+      # sqlfluff, mypy). GitHub-release tools (shellcheck/shfmt/hadolint/taplo/
+      # tflint/terraform-ls/rust-analyzer) are fetched by the harness's own
+      # --install; ubuntu-latest ships rustup/cargo so rust-analyzer can load.
+      # yamllint disable-line rule:line-length
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+
+      # Toolchain-gated languages. go/rust(rustup)/pwsh/.NET ship on Ubuntu;
+      # these set up the rest. All best-effort: a setup failure must NOT red the
+      # nightly (the harness already treats an unavailable tool as ⚠, not a
+      # failure), so each is continue-on-error.
+      # yamllint disable-line rule:line-length
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        continue-on-error: true
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: ruby/setup-ruby@14594264cd68ce8a2345dd349bc3d138a4ef85c8 # v1
+        continue-on-error: true
+        with:
+          ruby-version: '3.3'
+      - uses: dart-lang/setup-dart@6afc89df92d6eb3834022f73cd65adc8cdfcb92d # v1.8.1
+        continue-on-error: true
+      - uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 # 2.37.2
+        continue-on-error: true
+        with:
+          php-version: '8.3'
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        continue-on-error: true
+      - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1
+        continue-on-error: true
+        with:
+          otp-version: '27'
+          elixir-version: '1.18'
+          gleam-version: '1'
+
+      # fish-lsp requires the fish executable to start its server. This is
+      # runner provisioning, so keep the distro package unpinned like the
+      # dependency installs below (`npm install --no-audit --no-fund`) and the
+      # same runner setup in grammar-health.yml and compat-smoke.yml. The
+      # The fish-lsp npm package follows the registry policy for npm LSP
+      # servers: its package identity is tested, but its version floats unless
+      # a host compatibility floor requires a pin. This pin policy only
+      # applies to the runner's distro prerequisite (#3374).
+      - name: Install fish for fish-lsp
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes fish
+
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Build dist
+        run: npm run build:dist
+
+      # #3939: the official Docker server has no installer-registry entry. Keep
+      # this release pinned to the GitHub asset digest, install it under the
+      # runner's disposable TMPDIR, and add only that directory to PATH so the
+      # real LSP client can measure it in the fixture/capability/idle lanes.
+      - name: Install official Docker language server v0.20.1
+        run: |
+          set -euo pipefail
+          case "$(uname -m)" in
+            x86_64) asset="docker-language-server-linux-amd64-v0.20.1"; digest="01907aa5b0eae11e44cffea0a993d08aa155542a9af570295dd1dff39e67692a" ;;
+            aarch64|arm64) asset="docker-language-server-linux-arm64-v0.20.1"; digest="bd56c7815e0a22cfb708669f3d5e817de91d9b54039ff7e52867142a132ad8d7" ;;
+            *) echo "unsupported runner architecture: $(uname -m)" >&2; exit 1 ;;
+          esac
+          dest="$RUNNER_TEMP/pi-lens-docker-language-server"
+          mkdir -p "$dest/bin"
+          curl --fail --location --proto '=https' --proto-redir '=https' --silent --show-error \
+            "https://github.com/docker/docker-language-server/releases/download/v0.20.1/$asset" \
+            --output "$dest/bin/docker-language-server"
+          printf '%s  %s\n' "$digest" "$dest/bin/docker-language-server" | sha256sum --check --status
+          chmod +x "$dest/bin/docker-language-server"
+          echo "$dest/bin" >> "$GITHUB_PATH"
+          "$dest/bin/docker-language-server" --version
+
+      # `id:` + a captured log (#2723): this is one of the six steps whose
+      # outcome can actually turn the job red (no continue-on-error), so the
+      # final notify step below needs both this step's `outcome` and its raw
+      # log text (for the ✗ row detail) to build a useful tracking-issue
+      # body. `tee` still streams to the Actions log unchanged.
+      #
+      # `set -o pipefail` is LOAD-BEARING, not documentation (#2723 review
+      # F4 — corrects a wrong claim this comment used to make): GitHub's
+      # default shell for a `run:` step that declares no `shell:` key is
+      # `bash -e {0}` — WITHOUT pipefail (`-eo pipefail` is only what an
+      # EXPLICIT `shell: bash` gets). Without this line, `node
+      # scripts/smoke-tools.mjs ... | tee logfile`'s exit code is `tee`'s
+      # (almost always 0), never the node process's — a genuinely red layer
+      # would report `outcome: success` to the notify step below, and
+      # `layersGenuinelyClean` (scripts/lib/tool-smoke-drift.mjs) is the
+      # notify step's own cheap backstop against exactly that: it refuses to
+      # close the tracker when a layer's raw outcome says "success" but its
+      # own parsed summary still shows a failure. Pinned by
+      # tests/config/tool-smoke-notify-gate.test.ts, mutation-proofed by
+      # deleting this exact line.
+      - name: Tool layer (install + run each tool through real dispatch)
+        id: tool_layer
+        run: |
+          set -o pipefail
+          node scripts/smoke-tools.mjs --install --verbose 2>&1 | tee "$RUNNER_TEMP/tool-smoke-tool-layer.log"
+
+      - name: LSP handshake layer (install + spawn + initialize each server)
+        id: lsp_handshake
+        run: |
+          set -o pipefail
+          node scripts/smoke-tools.mjs --lsp --install --verbose 2>&1 | tee "$RUNNER_TEMP/tool-smoke-lsp-handshake.log"
+
+      # Gating diagnostic layer (#2780, recurrence #2776): the handshake above
+      # proves initialize only. This row family drives the real lsp_diagnostics
+      # handler against every installed primary fixture and requires a finding
+      # in its PRIMARY bucket. A server-authored source cannot make an
+      # auxiliary finding look like primary coverage.
+      - name: LSP diagnostics clean-gate (primary finding per installed server)
+        id: lsp_gate
+        timeout-minutes: 30
+        run: |
+          set -o pipefail
+          node scripts/smoke-tools.mjs --lsp-gate --install --verbose 2>&1 | tee "$RUNNER_TEMP/tool-smoke-lsp-gate.log"
+
+      # #3401: the matrix refresh keeps its expiry/hysteresis bookkeeping in
+      # docs/lsp-capability-matrix.md. This checkout is master, and the refresh
+      # PR below is force-rebuilt from master every night, so an unmerged
+      # `bot/lsp-docs-refresh` would otherwise lose that bookkeeping nightly.
+      # Start the night from the bot branch's doc when it is ahead of master and
+      # built on master's current doc; otherwise keep master's (absent branch,
+      # squash-merged, hand-edited since). Fail-open: any error leaves master's
+      # doc and the step exits 0. Scoped like the refresh-PR job (schedule or master), so a branch
+      # dispatch never swaps a PR branch's own doc for the bot's. Closing the
+      # bot PR unmerged does NOT reset the bookkeeping (the branch is kept,
+      # `delete-branch: false`, and keeps seeding); only deleting
+      # `bot/lsp-docs-refresh` does. `timeout-minutes` bounds a hung fetch,
+      # which `continue-on-error` does not.
+      - name: Seed the capability matrix from the last unmerged refresh
+        if: github.event_name == 'schedule' || github.ref == 'refs/heads/master'
+        continue-on-error: true
+        timeout-minutes: 2
+        run: node scripts/seed-matrix-from-bot-branch.mjs
+
+      # Diagnostic-mode matrix (#240): spawn each server and record its
+      # advertised mode (pull vs push) — the first cut of the affirmative-clean
+      # -signal classification (docs/lsp-capability-matrix.md). Best-effort: the
+      # script always exits 0 and a server whose toolchain is absent reports
+      # "unavailable", so this never reds the nightly. MERGES into the doc — a
+      # server this ubuntu host couldn't spawn keeps its prior (dev-box) row (#390).
+      - name: LSP capability matrix (characterize diagnostic mode per server)
+        continue-on-error: true
+        run: node scripts/characterize-lsp.mjs --install
+
+      # Clean-signal probe (#460): among PUSH-mode servers, split Tier 2
+      # (publishes a versioned set on a clean scan — free affirmative signal) from
+      # Tier 3 (version-less/silent — the budget-wait case, #458). Merges into the
+      # same matrix's clean-behavior column (same dev/ci src + merge-guard as
+      # characterize). Best-effort: always exits 0, per-server hard timeouts.
+      # #529: also compares each observed clean-behavior against wait-policy
+      # /strategies.ts's hand-set `silentOnClean` marker and logs any mismatch to this step's
+      # output + a "## silentOnClean drift" footnote in the matrix doc — telemetry
+      # only, NEVER a build/CI gate (this step's own continue-on-error covers the
+      # probe already; the drift check can't fail the job either way).
+      - name: LSP clean-signal probe (Tier 2 vs 3 among push servers) + silentOnClean drift check
+        continue-on-error: true
+        env:
+          PILENS_PUB_DEBUG: "1"
+        run: node scripts/probe-clean-signal.mjs --install
+
+      # Server capability inventory (#390 item 1): regenerate
+      # docs/servercapabilities.md (mode + ws-pull + nav/edit ops + raw caps) —
+      # previously never run anywhere, so its ws-pull column (#389) stayed stale.
+      # Merges over the prior doc (keeps servers absent on this host).
+      - name: LSP server capability inventory (regenerate docs/servercapabilities.md)
+        continue-on-error: true
+        run: node scripts/server-capabilities.mjs --install
+
+      # #3645: per-server idle-eviction cost and safety, so each server's
+      # `idleEviction` declaration in clients/lsp/server.ts is made from
+      # evidence. Spawns every registry server on its smoke fixture, lets the
+      # real idle timer release it, respawns it, and regenerates
+      # docs/lsp-idle-eviction.md (stable columns only, so the refresh PR below
+      # does not open nightly on measurement noise). Changes no server's policy. The
+      # script stops starting servers after 10 minutes and marks the rest
+      # `budget-exhausted`; its own worst case (10 min + one slow server) sits
+      # under this 15-minute step bound, and both under the job's 35.
+      # continue-on-error: an absent toolchain is `unavailable` and never red;
+      # the step exits 1 only when the registry declares `transparent` a
+      # server this run vetoes, which shows as a failed step and an
+      # `::error::` annotation without failing the job.
+      - name: LSP idle-eviction measurement (regenerate docs/lsp-idle-eviction.md)
+        continue-on-error: true
+        timeout-minutes: 15
+        run: node scripts/measure-lsp-idle-eviction.mjs --install --budget-seconds 600 --summary "$RUNNER_TEMP/lsp-idle-eviction-summary.json" --drift-body "$RUNNER_TEMP/lsp-idle-eviction-drift.md" --drift-state "$RUNNER_TEMP/lsp-idle-eviction-drift-state"
+
+      # #3989: act on the measurement's `proposal` rows. Advances the per-server
+      # consecutive-night memory in docs/lsp-capability-matrix.md's refresh-state
+      # block (so the docs-refresh PR below carries it, and the seed step above
+      # restores it each night) and, for a server that meets the promotion rule
+      # (scripts/lib/lsp-idle-eviction-promote.mjs: two consecutive eligible
+      # nights, idle RSS floor, cold-start cap, hold list), flips its
+      # `idleEviction: "unmeasured"` line and moves its id in the registry
+      # test's class pin (#3952) in the working tree. Only the
+      # promotion PR step in `tool-smoke-prs` commits that edit; the docs-refresh PR's
+      # add-paths never include it. A missing summary (measurement crashed or
+      # timed out) clears the memory and promotes nothing. Scoped like the PR
+      # job: a branch dispatch must not edit sources or open PRs.
+      - name: Promote idle-eviction candidates (night memory + working-tree edit)
+        id: idle_promote
+        if: always() && (github.event_name == 'schedule' || github.ref == 'refs/heads/master')
+        continue-on-error: true
+        timeout-minutes: 2
+        run: |
+          set -uo pipefail
+          # F4 (#3989): the servers of promotion PRs closed unmerged, read from the
+          # `idle-evict-set` marker in their bodies, so a PR a maintainer closed is
+          # not re-created nightly. `--state closed` also lists MERGED PRs, so the
+          # filter keeps only unmerged ones. `--app github-actions` keeps the lookup to PRs
+          # this workflow's own token opened (`--head` cannot take owner:branch, so
+          # a fork PR with the same branch name would otherwise match). The job's GITHUB_TOKEN already holds
+          # `pull-requests: write`; this only reads. A failed listing leaves no
+          # file, which the script reads as "unknown" and promotes nothing.
+          gh pr list --app github-actions --head bot/lsp-idle-evict-promote --state closed --limit 30 --json body,mergedAt --jq '.[] | select(.mergedAt == null) | .body' > "$RUNNER_TEMP/lsp-idle-eviction-rejected.txt" || rm -f "$RUNNER_TEMP/lsp-idle-eviction-rejected.txt"
+          node scripts/promote-lsp-idle-eviction.mjs --summary "$RUNNER_TEMP/lsp-idle-eviction-summary.json" --body "$RUNNER_TEMP/lsp-idle-eviction-promote.md" --rejected "$RUNNER_TEMP/lsp-idle-eviction-rejected.txt"
+
+      - name: Check LSP docs refresh diff
+        id: docs_diff
+        run: node scripts/check-generated-docs-diff.mjs
+
+      # The hand-off to `tool-smoke-prs` (#4077), staged where the old PR steps
+      # ran, before any later layer can touch the tree: the files the docs-refresh
+      # and promotion PRs would commit, at their repository paths, plus the
+      # promotion PR's body. Staged on every ref so a branch dispatch proves the
+      # hand-off too; only the writer job's guard keeps a branch from acting on it.
+      - name: Stage the refresh-PR inputs
+        if: always() && (steps.docs_diff.outputs.changed == 'true' || steps.idle_promote.outputs.promoted == 'true')
+        env:
+          DOCS_CHANGED: ${{ steps.docs_diff.outputs.changed }}
+          PROMOTED: ${{ steps.idle_promote.outputs.promoted }}
+        run: |
+          set -euo pipefail
+          stage="$RUNNER_TEMP/pr-inputs"
+          mkdir -p "$stage/files"
+          if [ "$DOCS_CHANGED" = true ]; then
+            cp --parents docs/lsp-capability-matrix.md docs/servercapabilities.md docs/lsp-idle-eviction.md "$stage/files/"
+          fi
+          if [ "$PROMOTED" = true ]; then
+            cp --parents clients/lsp/server.ts tests/config/lsp-idle-eviction-reasons.json tests/config/lsp-idle-eviction-registry.test.ts .changelog/3989-lsp-idle-eviction-promote.md "$stage/files/"
+            cp "$RUNNER_TEMP/lsp-idle-eviction-promote.md" "$stage/idle-eviction-promote.md"
+          fi
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always() && (steps.docs_diff.outputs.changed == 'true' || steps.idle_promote.outputs.promoted == 'true')
+        with:
+          name: tool-smoke-pr-inputs
+          path: ${{ runner.temp }}/pr-inputs
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 1
+
+      - name: Format layer (select + reformat through formatter pipeline)
+        id: format_layer
+        run: |
+          set -o pipefail
+          node scripts/smoke-tools.mjs --format --install --verbose 2>&1 | tee "$RUNNER_TEMP/tool-smoke-format-layer.log"
+
+      # Nightly `lens_diagnostics mode=full` row (#2780): the clean gate above
+      # drives `lsp_diagnostics`; this drives `lens_diagnostics`, the default
+      # agent tool whose verdict shaping mirrors it, over ONE cheap seeded
+      # fixture with `mode=full refreshRunners=cheap`. It requires a fresh
+      # LSP-sweep PRIMARY finding, so a divergence between the two handlers'
+      # verdict shaping reds the nightly. One row, not per server: the clean
+      # gate already owns the per-server provenance question. It follows the
+      # best-effort layers and Format so a red full-mode row does not hide them.
+      - name: lens_diagnostics mode=full row (LSP primary finding)
+        id: lens_full
+        timeout-minutes: 15
+        run: |
+          set -o pipefail
+          node scripts/smoke-tools.mjs --lens-full --install --verbose 2>&1 | tee "$RUNNER_TEMP/tool-smoke-lens-full.log"
+
+      # Resolution layer (#1513): every layer above proves a tool RAN, none
+      # proves WHICH binary the resolvers picked, so a dropped venv /
+      # vendor/bin / node_modules/.bin rung fell through to PATH or an install
+      # unseen. This plants stub executables in a scratch project's project-
+      # local bin dirs and asserts the production resolvers return those paths
+      # (and the dispatch-runner venv rung reports `rung: "venv"`). No install,
+      # no network, no spawn of a real tool: `time node scripts/smoke-tools.mjs
+      # --resolution` is 0.19s locally, so the 5 minute cap is only a hang
+      # bound, far under the job's 35. Gating like the
+      # layers it sits beside (own id + log for the notifier below);
+      # `set -o pipefail` is load-bearing for the same reason as on every
+      # layer above. Adds no permission: it runs under the job's existing ones.
+      - name: Resolution layer (project-local venv / vendor/bin / node_modules/.bin)
+        id: resolution_layer
+        timeout-minutes: 5
+        run: |
+          set -o pipefail
+          node scripts/smoke-tools.mjs --resolution --verbose 2>&1 | tee "$RUNNER_TEMP/tool-smoke-resolution-layer.log"
+
+      # #3319: PR analyses cover only their diff, so a master-only SonarCloud
+      # quality regression otherwise stays invisible to the merge train. Keep
+      # this as a real gate, but let the script classify SonarCloud transport
+      # outages as visible fail-open warnings. `always()` ensures the master
+      # read happens even when an earlier smoke layer already failed; the
+      # final notifier job still runs after either result.
+      # Reads MASTER's gate, so it is meaningful only on the schedule and on
+      # master itself: a branch dispatch (a PR's exact-head nightly) must not
+      # go red on master's Sonar state. Same scoping as the drift notifier
+      # job below (#3346/#3352).
+      - name: SonarCloud master quality gate
+        id: sonar_master_gate
+        if: always() && (github.event_name == 'schedule' || github.ref == 'refs/heads/master')
+        run: node scripts/sonar-master-gate.mjs
+
+      # The hand-off to `tool-smoke-notify` (#4077). Staged on every ref and
+      # outcome so a branch dispatch proves the hand-off too; only the writer
+      # job's guard keeps a branch from acting on it.
+      #
+      # The notifier inputs: the six layer logs, the idle-eviction drift state
+      # and body, and the clean-signal drift summary, flat in one directory the
+      # writer downloads over its own `$RUNNER_TEMP`. `staged.txt` keeps the
+      # artifact non-empty when the job failed before any layer wrote a log.
+      - name: Stage the notifier inputs
+        if: always()
+        run: |
+          set -uo pipefail
+          stage="$RUNNER_TEMP/notify-inputs"
+          mkdir -p "$stage"
+          cp -f "$RUNNER_TEMP"/tool-smoke-*.log "$RUNNER_TEMP"/lsp-idle-eviction-drift* "$stage/" 2>/dev/null || true
+          summary="$(node --input-type=module -e "import { DRIFT_SUMMARY_PATH } from './scripts/lib/clean-signal.mjs'; process.stdout.write(DRIFT_SUMMARY_PATH)")"
+          cp -f "$summary" "$stage/pilens-clean-signal-drift-summary.json" 2>/dev/null || true
+          echo "staged by ${GITHUB_JOB}" > "$stage/staged.txt"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: tool-smoke-notify-inputs
+          path: ${{ runner.temp }}/notify-inputs
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 1
+
+  # The refresh PRs (#4077): the only job with `contents: write` and
+  # `pull-requests: write`. It overlays the artifact's files on a fresh checkout
+  # of the guarded ref and runs the same two create-pull-request steps with the
+  # same `add-paths` (#390 item 2, #3989). Skipped when neither PR has anything
+  # to carry.
+  tool-smoke-prs:
+    name: Open refresh PRs
+    needs: tool-smoke
+    if: always() && (github.event_name == 'schedule' || github.ref == 'refs/heads/master') && (needs.tool-smoke.outputs.docs_changed == 'true' || needs.tool-smoke.outputs.promoted == 'true')
+    runs-on: ubuntu-latest
+    # Two create-pull-request calls (a push and an API call each).
+    timeout-minutes: 10
+    permissions:
+      contents: write # commit-back branch for the LSP-docs refresh PR (#390)
+      pull-requests: write # open/update the auto-refresh PR (#390)
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        with:
+          name: tool-smoke-pr-inputs
+          path: ${{ runner.temp }}/pr-inputs
+      - name: Overlay the regenerated files
+        run: cp -r "$RUNNER_TEMP/pr-inputs/files/." .
+
+      # Commit-back (#390 item 2): the three steps above regenerate the LSP docs
+      # in-place. master has required checks the schedule's GITHUB_TOKEN can't
+      # bypass, so we open/UPDATE a single auto-PR (fixed branch, force-pushed each
+      # run) instead of pushing to master. Docs change rarely (only when a server's
+      # caps/tier change), so this is low-noise. No-ops when nothing changed.
+      - name: Open/update LSP-docs refresh PR
+        if: needs.tool-smoke.outputs.docs_changed == 'true'
+        continue-on-error: true
+        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          branch: bot/lsp-docs-refresh
+          base: master
+          add-paths: |
+            docs/lsp-capability-matrix.md
+            docs/servercapabilities.md
+            docs/lsp-idle-eviction.md
+          commit-message: 'docs(nightly): refresh LSP capability docs'
+          title: 'docs(nightly): refresh LSP capability docs (refs #3217)'
+          body: |
+            Automated refresh of the LSP capability docs from the nightly tool-smoke run.
+
+            - `docs/lsp-capability-matrix.md` — `mode` (characterize-lsp) + `clean-behavior` (probe-clean-signal, Tier 2 vs 3) columns (#460) + a `## silentOnClean drift` footnote (#529, telemetry only — never a gate)
+            - `docs/servercapabilities.md` — advertised capability inventory incl. ws-pull (#389)
+            - `docs/lsp-idle-eviction.md` — per-server idle-eviction safety (#3645): stable columns only (result, reason, respawn, coverage; timings live in the run log). Unlike the two docs above it is regenerated in full each night, not merged: a server the runner cannot spawn reads `unavailable`. A declared-versus-measured finding there is for a maintainer to act on in a follow-up; this refresh changes no policy
+
+            The two matrix docs above are **merged**, never blind-overwritten: a
+            server this ubuntu host couldn't spawn keeps its prior (dev-box)
+            classification, so the nightly can't regress a richer run (#390).
+            `docs/lsp-idle-eviction.md` is the exception: it is regenerated in
+            full, so a server this host cannot spawn reads `unavailable`.
+
+            Refs #460, #390, #529.
+
+            This PR is created with the repository `GITHUB_TOKEN`, which cannot
+            trigger workflow runs. After the bot opens or updates it, a
+            maintainer must close and reopen the PR to arm CI.
+          delete-branch: false
+
+      # #3989: ONE draft bot PR (own branch, never `bot/lsp-docs-refresh`, whose
+      # body promises no policy change) carrying the promotion edit. Same token
+      # and job permissions as the docs-refresh PR above; nothing widened. Never
+      # auto-merged: the bot cannot arm CI, and a maintainer reviews the table.
+      - name: Open/update idle-eviction promotion PR
+        if: needs.tool-smoke.outputs.promoted == 'true'
+        continue-on-error: true
+        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          branch: bot/lsp-idle-evict-promote
+          base: master
+          draft: true
+          add-paths: |
+            clients/lsp/server.ts
+            tests/config/lsp-idle-eviction-reasons.json
+            tests/config/lsp-idle-eviction-registry.test.ts
+            .changelog/3989-lsp-idle-eviction-promote.md
+          commit-message: 'perf(lsp): promote measured idle-eviction servers (refs #3989)'
+          title: 'perf(lsp): promote measured idle-eviction servers (refs #3989)'
+          body-path: ${{ runner.temp }}/pr-inputs/idle-eviction-promote.md
+          delete-branch: false
+
+  # The tracking-issue writers (#4077): the only job here with `issues: write`
+  # beside the snapshot notifier below. Every step is `continue-on-error`, and
+  # so is the job, so tracker maintenance never changes the nightly's own
+  # conclusion (acceptance #5 of #2723). The three notifiers run in the order
+  # the old job ran them, each against the inputs its producer staged.
+  tool-smoke-notify:
+    name: Notify on tool-smoke drift
+    needs: tool-smoke
+    if: always() && (github.event_name == 'schedule' || github.ref == 'refs/heads/master')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    continue-on-error: true
+    permissions:
+      contents: read
+      issues: write # file/update/close the drift tracking issues (#529/#594/#2723/#3645)
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: '22'
+      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        with:
+          name: tool-smoke-notify-inputs
+          path: ${{ runner.temp }}
+
+      # #594: make a genuine #529 drift finding ACTIONABLE instead of it only
+      # living in the probe step's stdout + the docs-diff footnote, where
+      # nobody has a reason to look. Reads the JSON summary the probe step just
+      # wrote and files/updates a SINGLE persistent tracking issue (fixed
+      # `nightly-drift` label + title, never a new issue per night) when there
+      # IS a finding, or closes a prior open one when the drift has resolved.
+      # Reuses this job's GITHUB_TOKEN via `gh` — no new auth plumbing. Best-effort:
+      # never fails the job either way (continue-on-error, plus the script's
+      # own internal try/catch — same "always exit 0, telemetry only" contract
+      # as the probe itself).
+      - name: Notify on silentOnClean drift (file/update/close tracking issue)
+        continue-on-error: true
+        run: node scripts/notify-clean-signal-drift.mjs --summary "$RUNNER_TEMP/pilens-clean-signal-drift-summary.json"
+
+      # #3645: make a server the registry evicts but the measurement vetoes
+      # ACTIONABLE (the #594 shape: a finding only in a step log or a doc diff
+      # has nobody reading it). One persistent tracking issue, refreshed while
+      # the drift lasts and closed only when EVERY transparent server measured
+      # eligible (state `clean`); a transparent server that was unavailable,
+      # timed out or had no baseline is `unknown`, and a missing state file (the
+      # measurement crashed or never ran) is not "clean" either, so both leave
+      # the issue as it is. Scoped like the other
+      # tracking-issue writers: a branch dispatch must not touch issues.
+      - name: Notify on idle-eviction drift (file/update/close tracking issue)
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          TITLE='nightly: LSP idle-eviction drift (declared transparent, measured vetoed)'
+          STATE=$(cat "$RUNNER_TEMP/lsp-idle-eviction-drift-state" 2>/dev/null || echo missing)
+          if [ "$STATE" = drift ]; then
+            gh label create nightly-drift --color B60205 --description 'Nightly automated drift finding' || true
+            node scripts/upsert-tracking-issue.mjs --title "$TITLE" --label nightly-drift --body-file "$RUNNER_TEMP/lsp-idle-eviction-drift.md"
+          elif [ "$STATE" = clean ]; then
+            node scripts/upsert-tracking-issue.mjs --title "$TITLE" --label nightly-drift --clean --close-when-clean
+          fi
+
+      # #2723: the ONLY tracking-issue writer this workflow had before this
+      # step (`Notify on silentOnClean drift` above) sits behind the LSP
+      # handshake layer with `continue-on-error: true` but no `if: always()`,
+      # so GitHub skips it — and everything after it — exactly when an
+      # earlier step fails, i.e. exactly when a human most needs to hear
+      # about it (13 consecutive red nights, 2026-08-26 -> 2026-09-07, with
+      # no automated notice). That notifier is also scoped to something
+      # unrelated (silentOnClean telemetry, never the job verdict) — see
+      # scripts/lib/drift-issue.mjs's module doc. THIS step is a second,
+      # independent notifier scoped to the job's actual pass/fail verdict,
+      # placed last and gated on `if: always()` so it runs on every outcome,
+      # mirroring install-smoke.yml's `Notify install drift` step. Reads the
+      # six gating layers' outcomes + captured logs (the only six steps
+      # above without `continue-on-error`, so the only six whose outcome
+      # can turn the job red) — see scripts/lib/tool-smoke-drift.mjs's module
+      # doc. GITHUB_TOKEN is inherited from this job's own env (`issues:
+      # write` already granted at job level, #529/#594). Best-effort:
+      # continue-on-error PLUS the script's own internal try/catch (always
+      # exits 0) — filing/updating/closing an issue must never change the
+      # nightly's own conclusion (acceptance #5).
+      - name: Notify on tool-smoke red (file/update/close tracking issue)
+        continue-on-error: true
+        env:
+          TOOL_LAYER_OUTCOME: ${{ needs.tool-smoke.outputs.tool_layer }}
+          TOOL_LAYER_LOG: ${{ runner.temp }}/tool-smoke-tool-layer.log
+          LSP_HANDSHAKE_OUTCOME: ${{ needs.tool-smoke.outputs.lsp_handshake }}
+          LSP_HANDSHAKE_LOG: ${{ runner.temp }}/tool-smoke-lsp-handshake.log
+          LSP_GATE_OUTCOME: ${{ needs.tool-smoke.outputs.lsp_gate }}
+          LSP_GATE_LOG: ${{ runner.temp }}/tool-smoke-lsp-gate.log
+          LENS_FULL_OUTCOME: ${{ needs.tool-smoke.outputs.lens_full }}
+          LENS_FULL_LOG: ${{ runner.temp }}/tool-smoke-lens-full.log
+          FORMAT_LAYER_OUTCOME: ${{ needs.tool-smoke.outputs.format_layer }}
+          FORMAT_LAYER_LOG: ${{ runner.temp }}/tool-smoke-format-layer.log
+          RESOLUTION_LAYER_OUTCOME: ${{ needs.tool-smoke.outputs.resolution_layer }}
+          RESOLUTION_LAYER_LOG: ${{ runner.temp }}/tool-smoke-resolution-layer.log
+          # #2723 review F3: a job failure BEFORE the six tracked layers
+          # even start (checkout, a best-effort setup action, npm install,
+          # build:dist — twelve steps, none of which set an *_OUTCOME above)
+          # leaves all six "skipped", identically to a genuine
+          # cancellation. The smoke job's own result (`needs.tool-smoke.result`,
+          # what `job.status` was before #4077) disambiguates: "failure" only
+          # when a non-continue-on-error step actually failed somewhere in it.
+          JOB_STATUS: ${{ needs.tool-smoke.result }}
+        run: node scripts/notify-tool-smoke-red.mjs
+
+  # #3916 (recurrence of #3789): the project-snapshot persist bench, run nightly
+  # so a change that puts a clone back on the worker persist path reds master
+  # instead of surfacing as a user's RSS report. Its own job, not a step of
+  # `tool-smoke`: the bench measures process RSS, and a job that has just
+  # spawned dozens of language servers is not a quiet baseline. Permissions are
+  # narrower than `tool-smoke`'s (no contents/pull-requests write): the only
+  # write is the tracking issue, through the same shared CLI as the
+  # idle-eviction drift step above. The verdict, its (PROVISIONAL) threshold and
+  # the measurements behind it are in scripts/check-snapshot-persist-ratio.mjs.
+  # The verdict is the median of five independent bench invocations (each a
+  # fresh child process per mode, `--persists 1` so only persist 0 and one
+  # spare run). Bounds: one invocation is ~9 s on a dev box and ~45 s on the
+  # hosted runner's first measurement (run 37585228762, six persists); five of
+  # the shorter runs sit well inside the 10-minute bench step, which sits inside
+  # the 20-minute job, so a hang costs one bounded step.
+  snapshot-persist-bench:
+    name: Snapshot persist RSS ratio
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Read-only (#4077): a dispatch on any ref runs the bench; the tracking
+    # issue is `snapshot-persist-notify`'s, from the state and body staged below.
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: '22'
+      # --ignore-scripts: the bench needs the compiled clients/ only, never the
+      # `prepare` grammar download; `npm run build` below is the explicit build.
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund --ignore-scripts
+      - name: Build
+        run: npm run build
+      - name: Bench snapshot persist (worker vs sync, 5 independent samples)
+        id: bench
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          for i in 1 2 3 4 5; do
+            node scripts/bench-snapshot-persist.mjs --persists 1 --label "nightly-$i" --out "$RUNNER_TEMP/snapshot-persist-bench-$i.json" > /dev/null
+          done
+      # Exits 1 on drift and 2 on an unusable measurement (this job goes red
+      # either way); always writes the state file and, for both, the issue body
+      # the notifier below reads. Runs after a failed bench too (a missing
+      # report is the unusable case), but not after a failed install or build.
+      - name: Check median worker/sync RSS ratio against the committed threshold
+        if: ${{ !cancelled() && steps.bench.outcome != 'skipped' }}
+        env:
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -uo pipefail
+          node scripts/check-snapshot-persist-ratio.mjs --report "$RUNNER_TEMP/snapshot-persist-bench-1.json" --report "$RUNNER_TEMP/snapshot-persist-bench-2.json" --report "$RUNNER_TEMP/snapshot-persist-bench-3.json" --report "$RUNNER_TEMP/snapshot-persist-bench-4.json" --report "$RUNNER_TEMP/snapshot-persist-bench-5.json" --body "$RUNNER_TEMP/snapshot-persist-drift.md" --state "$RUNNER_TEMP/snapshot-persist-drift-state" --run-url "$RUN_URL" | tee "$RUNNER_TEMP/snapshot-persist-check.log"
+          CODE=${PIPESTATUS[0]}
+          grep -h '^snapshot-persist ratio:' "$RUNNER_TEMP/snapshot-persist-check.log" >> "$GITHUB_STEP_SUMMARY" || true
+          exit "$CODE"
+      # The hand-off to `snapshot-persist-notify` (#4077): the state and the
+      # issue body the check step wrote. `staged.txt` keeps the artifact
+      # non-empty when the check never ran (a missing state leaves the issue as
+      # it is).
+      - name: Stage the notifier inputs
+        if: always()
+        run: |
+          set -uo pipefail
+          stage="$RUNNER_TEMP/snapshot-persist-notify-inputs"
+          mkdir -p "$stage"
+          cp -f "$RUNNER_TEMP/snapshot-persist-drift-state" "$RUNNER_TEMP/snapshot-persist-drift.md" "$stage/" 2>/dev/null || true
+          echo "staged by ${GITHUB_JOB}" > "$stage/staged.txt"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: snapshot-persist-notify-inputs
+          path: ${{ runner.temp }}/snapshot-persist-notify-inputs
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 1
+
+  # Same shared CLI and label as the idle-eviction drift step; the only writer of
+  # the snapshot-persist tracking issue (#4077), scoped to the schedule or master
+  # like every tracking-issue writer here (a branch dispatch must not touch
+  # issues). `drift` and `error` (an unusable measurement, with its reason in
+  # the body) file or refresh the issue, `clean` closes it, and a missing
+  # state (the check step never ran) leaves it as it is.
+  snapshot-persist-notify:
+    name: Notify on snapshot-persist drift
+    needs: snapshot-persist-bench
+    if: always() && (github.event_name == 'schedule' || github.ref == 'refs/heads/master')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    continue-on-error: true
+    permissions:
+      contents: read
+      issues: write # file/update/close the snapshot-persist drift tracking issue
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: '22'
+      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        with:
+          name: snapshot-persist-notify-inputs
+          path: ${{ runner.temp }}
+      - name: Notify on snapshot-persist drift (file/update/close tracking issue)
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TITLE='nightly: snapshot persist RSS drift (worker vs sync ratio)'
+          STATE=$(cat "$RUNNER_TEMP/snapshot-persist-drift-state" 2>/dev/null || echo missing)
+          if [ "$STATE" = drift ] || [ "$STATE" = error ]; then
+            gh label create nightly-drift --color B60205 --description 'Nightly automated drift finding' || true
+            node scripts/upsert-tracking-issue.mjs --title "$TITLE" --label nightly-drift --body-file "$RUNNER_TEMP/snapshot-persist-drift.md"
+          elif [ "$STATE" = clean ]; then
+            node scripts/upsert-tracking-issue.mjs --title "$TITLE" --label nightly-drift --clean --close-when-clean
+          fi

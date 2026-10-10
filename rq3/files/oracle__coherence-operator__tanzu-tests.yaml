@@ -1,0 +1,145 @@
+# Copyright 2019, 2024, Oracle Corporation and/or its affiliates.  All rights reserved.
+# Licensed under the Universal Permissive License v 1.0 as shown at
+# http://oss.oracle.com/licenses/upl.
+
+# ---------------------------------------------------------------------------
+# Coherence Operator GitHub Actions Tanzu Compatibility Tests.
+# ---------------------------------------------------------------------------
+name: Tanzu Tests
+
+on:
+  workflow_dispatch:
+  push:
+    branches-ignore:
+    - gh-pages
+    - 1.0.0
+    - 2.x
+    - 3.x
+  pull_request:
+    types:
+      - opened
+      - synchronize
+      - committed
+    branches-ignore:
+    - gh-pages
+    - 1.0.0
+    - 2.x
+    - 3.x
+
+env:
+  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  SKIP_SPRING_CNBP: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        tanzuVersion:
+        - latest
+
+    steps:
+    - uses: actions/checkout@v5
+      with:
+        fetch-depth: 0
+
+    #   This step will free up disc space on the runner by removing
+    #   lots of things that we do not need.
+    - name: disc
+      shell: bash
+      run: |
+        echo "Listing 100 largest packages"
+        dpkg-query -Wf '${Installed-Size}\t${Package}\n' | sort -n | tail -n 100
+        df -h
+        echo "Removing large packages"
+        sudo apt-get remove -y '^dotnet-.*' || true
+        sudo apt-get remove -y '^llvm-.*' || true
+        sudo apt-get remove -y 'monodoc-http' || true
+        sudo apt-get remove -y 'php.*' || true
+        sudo apt-get remove -y azure-cli google-cloud-sdk hhvm google-chrome-stable firefox powershell mono-devel || true
+        sudo apt-get autoremove -y || true
+        sudo apt-get clean
+        df -h
+        echo "Removing large directories"
+        rm -rf /usr/share/dotnet/
+        sudo rm -rf /usr/local/lib/android
+        df -h
+
+    - name: Set up JDK
+      uses: oracle-actions/setup-java@v1
+      with:
+        website: oracle.com
+        release: 21
+
+    - name: Cache Go Modules
+      uses: actions/cache@v5
+      with:
+        path: ~/go/pkg/mod
+        key: ${{ runner.os }}-go-mods-${{ hashFiles('**/go.sum') }}
+        restore-keys: |
+          ${{ runner.os }}-go-mods-
+
+    - name: Cache Maven packages
+      uses: actions/cache@v5
+      with:
+        path: ~/.m2
+        key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
+        restore-keys: ${{ runner.os }}-m2
+
+    - name: Edit DNS Resolve
+      shell: bash
+      run: |
+        sudo chown -R runner:runner /run/systemd/resolve/stub-resolv.conf
+        sudo echo nameserver 8.8.8.8 > /run/systemd/resolve/stub-resolv.conf
+
+    - name: Install Tanzu Community
+      shell: bash
+      run: |
+        echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u $ --password-stdin
+        make get-tanzu
+        make tanzu-create-cluster
+
+    - name: Pull Base Images
+      shell: bash
+      run: |
+        docker pull gcr.io/distroless/java
+        docker pull gcr.io/distroless/java11-debian11
+        docker pull gcr.io/distroless/java17-debian11
+        docker pull gcr.io/distroless/java17-debian12
+        docker pull gcr.io/distroless/java21-debian12
+
+    - name: Build
+      shell: bash
+      run: |
+        make all
+        make push-ttl-operator-images
+        make tanzu-ttl-repo
+
+    - name: Tanzu Tests
+      shell: bash
+      run: |
+        export OPERATOR_NAMESPACE=coherence
+        make reset-namespace
+        make tanzu-ttl-install-repo
+        make tanzu-install
+        sleep 20
+        make wait-for-deploy
+        make create-ssl-secrets
+        make kind-load
+        make run-certification OPERATOR_NAMESPACE=coherence
+
+    - uses: actions/upload-artifact@v6
+      if: ${{ failure() || cancelled() }}
+      with:
+        name: tanzu-artifacts
+        path: build/_output/tanzu
+        if-no-files-found: ignore
+
+    - uses: actions/upload-artifact@v6
+      if: ${{ failure() || cancelled() }}
+      with:
+        name: test-output
+        path: build/_output/test-logs
+        if-no-files-found: ignore

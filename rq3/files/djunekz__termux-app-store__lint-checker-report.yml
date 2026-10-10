@@ -1,0 +1,125 @@
+name: Lint PR Reporter (Label & Comment)
+
+on:
+  workflow_run:
+    workflows: ["Lint PR Checker"]
+    types:
+      - completed
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    if: github.event.workflow_run.conclusion == 'success' || github.event.workflow_run.conclusion == 'failure'
+    name: Add label & comment on PR
+
+    steps:
+      - name: Download report artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: pr-report
+          path: /tmp/pr-report
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ github.event.workflow_run.id }}
+
+      - name: Read report
+        id: report
+        run: |
+          PR_NUMBER=$(cat /tmp/pr-report/pr_number.txt)
+          OVERALL_STATUS=$(cat /tmp/pr-report/overall_status.txt)
+
+          {
+            echo "pr_number=$PR_NUMBER"
+            echo "overall_status=$OVERALL_STATUS"
+            echo "lint_details<<EOF"
+            cat /tmp/pr-report/lint_details.txt
+            echo "EOF"
+            echo "validation_details<<EOF"
+            cat /tmp/pr-report/validation_details.txt
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Remove old labels
+        continue-on-error: true
+        uses: actions-ecosystem/action-remove-labels@2ce5d41b4b6aa8503e285553f75ed56e0a40bae0
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          number: ${{ steps.report.outputs.pr_number }}
+          labels: |
+            checker-approved
+            checker-failed
+
+      - name: Add review-approved label
+        if: steps.report.outputs.overall_status == '0'
+        uses: actions-ecosystem/action-add-labels@18f1af5e3544586314bbe15c0273249c770b2daf
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          number: ${{ steps.report.outputs.pr_number }}
+          labels: |
+            checker-approved
+            needs-review
+
+      - name: Add review-failed label
+        if: steps.report.outputs.overall_status == '1'
+        uses: actions-ecosystem/action-add-labels@18f1af5e3544586314bbe15c0273249c770b2daf
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          number: ${{ steps.report.outputs.pr_number }}
+          labels: |
+            checker-failed
+
+      - name: Comment - Validation Failed
+        if: steps.report.outputs.overall_status == '1'
+        uses: marocchino/sticky-pull-request-comment@5770ad5eb8f42dd2c4f34da00c94c5381e49af88
+        with:
+          header: lint-validation
+          number: ${{ steps.report.outputs.pr_number }}
+          message: |
+            # ❌ Build Script Validation Failed
+
+            Your `build.sh` file(s) failed automated validation checks.
+
+            ${{ steps.report.outputs.lint_details }}
+
+            ${{ steps.report.outputs.validation_details }}
+
+            ## 🔧 How to Fix
+            1. **Check syntax errors** - Ensure all bash syntax is valid
+            2. **Verify SRCURL** - Ensure the URL is correct and accessible
+            3. **Update SHA256** - Download the file and compute the correct hash:
+               ```bash
+               curl -L "YOUR_SRCURL" -o file.tar.gz
+               sha256sum file.tar.gz
+               ```
+            4. **Add required fields**:
+               - `TERMUX_PKG_VERSION` (required)
+               - `TERMUX_PKG_SRCURL` (required)
+               - `TERMUX_PKG_SHA256` (required)
+               - `TERMUX_PKG_LICENSE` (recommended)
+               - `TERMUX_PKG_HOMEPAGE` (recommended)
+
+            Push new commits to automatically re-run validation.
+
+      - name: Comment - Validation Passed
+        if: steps.report.outputs.overall_status == '0'
+        uses: marocchino/sticky-pull-request-comment@5770ad5eb8f42dd2c4f34da00c94c5381e49af88
+        with:
+          header: lint-validation
+          number: ${{ steps.report.outputs.pr_number }}
+          message: |
+            # ✅ Build Script Validation Passed
+
+            Your `build.sh` file(s) have passed all automated checks:
+
+            - ✅ Bash syntax is correct
+            - ✅ All required TERMUX_PKG_* variables are defined
+            - ✅ SRCURL is valid and reachable
+            - ✅ SHA256 checksum verified successfully
+
+            **Label `checker-approved` has been added automatically.**
+
+            Thank you for your contribution! 🎉

@@ -1,0 +1,435 @@
+# Copyright 2026 Goldman Sachs
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: Release
+
+env:
+  CI_DEPLOY_USERNAME: ${{ secrets.CI_DEPLOY_USERNAME }}
+  CI_DEPLOY_PASSWORD: ${{ secrets.CI_DEPLOY_PASSWORD }}
+  CI_GPG_PASSPHRASE: ${{ secrets.CI_GPG_PASSPHRASE }}
+  DOCKER_USERNAME: finos
+  DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      releaseVersion:
+        description: "New release version"
+        required: true
+      dryRun:
+        description: "Upload and validate bundles, then drop them without publishing to Central"
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  # workflow_dispatch inputs cannot be validated at submission time, so this
+  # runs first and everything else gates on it. Central is immutable: a
+  # duplicate version would otherwise only surface at the final upload, after
+  # the tag has already been pushed and the full build and test matrix has run.
+  validate:
+    name: Check Release Version Is Unused
+    runs-on: ubuntu-latest
+    env:
+      RELEASE_VERSION: ${{ github.event.inputs.releaseVersion }}
+    steps:
+      - name: Check version format
+        run: |
+          if ! [[ "$RELEASE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Release version '$RELEASE_VERSION' is not of the form MAJOR.MINOR.PATCH"
+            exit 1
+          fi
+
+      - name: Check release tag does not already exist
+        env:
+          TAG: ${{ github.event.repository.name }}-${{ github.event.inputs.releaseVersion }}
+        run: |
+          if git ls-remote --exit-code --tags "https://github.com/${{ github.repository }}.git" "refs/tags/$TAG" ; then
+            echo "::error::Tag $TAG already exists -- version $RELEASE_VERSION has already been released (or a failed release was not cleaned up)"
+            exit 1
+          fi
+
+      - name: Check version is not already on Maven Central
+        # Guards the case where the tag was deleted (e.g. by release cleanup)
+        # but artifacts still made it to Central, which cannot be overwritten.
+        run: |
+          url="https://repo1.maven.org/maven2/org/finos/legend/engine/legend-engine/${RELEASE_VERSION}/legend-engine-${RELEASE_VERSION}.pom"
+          http_status=$(curl -s -o /dev/null -w '%{http_code}' "$url")
+          if [ "$http_status" = "200" ]; then
+            echo "::error::Version $RELEASE_VERSION is already published on Maven Central: $url"
+            exit 1
+          elif [ "$http_status" != "404" ]; then
+            echo "::warning::Unexpected HTTP $http_status from Maven Central while checking $url -- continuing"
+          fi
+
+  build:
+    name: Prepare Release Artifacts
+    runs-on: ubuntu-latest-16-cores
+    needs:
+      - validate
+    outputs:
+      testMatrix: ${{ steps.testMatrix.outputs.testMatrix }}
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v6
+        with:
+          token: ${{ secrets.FINOS_GITHUB_TOKEN }}
+          persist-credentials: false
+
+      - name: Set up Maven Central
+        uses: actions/setup-java@v5
+        with:
+          distribution: "zulu"
+          java-version: 17
+          server-id: central
+          server-username: CI_DEPLOY_USERNAME
+          server-password: CI_DEPLOY_PASSWORD
+          gpg-private-key: ${{ secrets.CI_GPG_PRIVATE_KEY }}
+          gpg-passphrase: CI_GPG_PASSPHRASE
+
+      - name: Collect Workflow Telemetry
+        uses: runforesight/workflow-telemetry-action@v1
+        with:
+          theme: dark
+
+      - name: Cache Maven dependencies
+        uses: actions/cache@v5
+        env:
+          cache-name: cache-mvn-deps
+        with:
+          path: ~/.m2/repository
+          # Keep the restore-keys list narrow on purpose.
+          key: ${{ runner.os }}-build-${{ env.cache-name }}-${{ hashFiles('**/pom.xml') }}
+          restore-keys: |
+            ${{ runner.os }}-build-${{ env.cache-name }}-
+
+      - name: Download deps and plugins
+        run: mvn de.qaware.maven:go-offline-maven-plugin:resolve-dependencies
+
+      - name: Purge stale legend-engine artifacts from local Maven repo
+        run: rm -rf ~/.m2/repository/org/finos/legend/engine
+
+      - name: Build release
+        env:
+          RELEASE_VERSION: ${{ github.event.inputs.releaseVersion }}
+          MAVEN_OPTS: -Xmx36g
+        run: mvn -B -e -T3 -DskipTests -Dorg.slf4j.simpleLogger.showThreadName=true -Drevision="${RELEASE_VERSION}" install -P release,docker,pct-cloud-test
+
+      - name: Verify the release artifacts carry the release version
+        env:
+          RELEASE_VERSION: ${{ github.event.inputs.releaseVersion }}
+        run: |
+          set -euo pipefail
+          if find ~/.m2/repository/org/finos/legend/engine -path "*/${RELEASE_VERSION}/*" -name '*.pom' | xargs grep -l '\${revision}'; then
+            echo "::error::A pom still contains \${revision}; flatten-maven-plugin did not run."
+            exit 1
+          fi
+          count="$(find ~/.m2/repository/org/finos/legend/engine -path "*/${RELEASE_VERSION}/*" -name '*.pom' | wc -l)"
+          echo "${count} poms resolved to ${RELEASE_VERSION}"
+          [ "${count}" -gt 0 ]
+
+      - name: Upload build output
+        uses: actions/upload-artifact@v7
+        with:
+          name: build-output
+          # Upload per-module target/ directories produced by the release
+          # build. Test jobs re-checkout the same commit from git.
+          path: |
+            ~/**/target/
+            !~/**/target/*.jar
+          retention-days: 1
+          overwrite: true
+          include-hidden-files: true
+          if-no-files-found: error
+
+      - name: Upload m2 repository
+        uses: actions/upload-artifact@v7
+        with:
+          name: m2-repo
+          path: ~/.m2/repository/org/finos/legend/engine/
+          retention-days: 1
+          overwrite: true
+          if-no-files-found: error
+
+      - name: Purge engine artifacts before cache save
+        # actions/cache's post-job save snapshots ~/.m2/repository at the
+        # end of the job. We don't want the just-built engine jars in that
+        # snapshot.
+        if: always()
+        run: rm -rf ~/.m2/repository/org/finos/legend/engine
+
+      - name: Set Test Matrix
+        id: testMatrix
+        run: echo "testMatrix=$(jq -c . < .github/workflows/resources/modulesToTest.json)" >> $GITHUB_OUTPUT
+
+      - name: Upload CI Event
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: event-file
+          path: ${{ github.event_path }}
+
+  test:
+    name: Run Unit Tests
+    runs-on: ubuntu-latest
+    needs:
+      - build
+
+    steps:
+      - name: Checkout release commit
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Before Test
+        uses: ./.github/workflows/actions/before-test
+
+      - name: Excluded Modules
+        id: modulesToExclude
+        run: echo EXCLUSION_MODULES=`jq -c '.include | map(.modules) | flatten | map("!org.finos.legend.engine:" + .) | join(",")' ./.github/workflows/resources/modulesToTest.json` >> $GITHUB_OUTPUT
+
+      - name: Test
+        env:
+          MAVEN_OPTS: "-Xmx1g"
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          JDK_JAVA_OPTIONS: "--add-opens=java.base/java.nio=org.apache.arrow.memory.core,ALL-UNNAMED"
+          RELEASE_VERSION: ${{ github.event.inputs.releaseVersion }}
+        run: |
+          mvn -B -e surefire:test -pl ${{ steps.modulesToExclude.outputs.EXCLUSION_MODULES }} -P release,docker,pct-cloud-test -T2 -DargLine="-Xmx6g" -Dsurefire.reports.directory=${GITHUB_WORKSPACE}/surefire-reports-aggregate -Drevision="${RELEASE_VERSION}"
+
+      - name: Upload Test Results
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-results
+          path: ${{ github.workspace }}/surefire-reports-aggregate/*.xml
+
+  test-modules:
+    name: Test Module - ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    needs:
+      - build
+
+    strategy:
+      fail-fast: false
+      matrix: ${{fromJson(needs.build.outputs.testMatrix)}}
+
+    steps:
+      - name: Checkout release commit
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Before Test
+        uses: ./.github/workflows/actions/before-test
+
+      - name: Included Modules
+        id: modulesToInclude
+        env:
+          MODULES: ${{ toJSON(matrix.modules) }}
+        run: |
+          echo INCLUSION_MODULES=`jq -c 'map("org.finos.legend.engine:" + .) | join(",")' <<< $MODULES` >> $GITHUB_OUTPUT
+
+      - name: Test
+        env:
+          MAVEN_OPTS: "-Xmx1g"
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          JDK_JAVA_OPTIONS: "--add-opens=java.base/java.nio=org.apache.arrow.memory.core,ALL-UNNAMED"
+          RELEASE_VERSION: ${{ github.event.inputs.releaseVersion }}
+        run: |
+          mvn -B -e surefire:test -pl ${{ steps.modulesToInclude.outputs.INCLUSION_MODULES }} -P release,docker,pct-cloud-test -T2 -DargLine="-Xmx6g" -Dsurefire.reports.directory=${GITHUB_WORKSPACE}/surefire-reports-aggregate -Drevision="${RELEASE_VERSION}"
+
+      - name: Upload Test Results
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-results-${{ matrix.name }}
+          path: ${{ github.workspace }}/surefire-reports-aggregate/*.xml
+
+  release:
+    name: Create and Publish Release Bundle
+    runs-on: ubuntu-latest
+    # Raw Portal responses land here and are uploaded with the bundle report:
+    # validation errors are far too large to survive the Actions log.
+    env:
+      CENTRAL_STATUS_DIR: ${{ github.workspace }}/central-publishing/status
+    needs:
+      - build
+      - test
+      - test-modules
+    steps:
+
+      - name: Checkout release commit
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          token: ${{ secrets.FINOS_GITHUB_TOKEN }}
+          fetch-depth: 1
+          persist-credentials: true
+
+      - name: Configure git
+        run: |
+          git config --global user.email "37706051+finos-admin@users.noreply.github.com"
+          git config --global user.name "FINOS Administrator"
+
+      - name: Create and push git tag
+        if: ${{ github.event.inputs.dryRun != 'true' }}
+        env:
+          TAG: ${{ github.event.repository.name }}-${{ github.event.inputs.releaseVersion }}
+        run: |
+          set -euo pipefail
+          git tag "${TAG}"
+          git push origin "refs/tags/${TAG}"
+
+      - name: Download m2 repository for publishing
+        uses: actions/download-artifact@v8
+        with:
+          name: m2-repo
+          path: ~/.m2/repository/org/finos/legend/engine
+
+      # The full artifact set is over 1.7GB, well past the Portal's 1GiB
+      # per-bundle cap, which nginx rejects with a bare "413 Payload Too Large"
+      # before the API sees it. So it ships as several bundles -- but Central
+      # validates each deployment independently and has to resolve every POM's
+      # <parent> to build an effective POM. A parent sitting in a sibling
+      # bundle is resolvable from neither, which is how 4.139.1 failed.
+      #
+      # Hence two waves. Wave 1 is every coordinate that is somebody's parent
+      # (a few hundred KB of aggregator POMs) and is published first; wave 2 is
+      # everything else and resolves its parents from Central.
+      - name: Stage and split bundles
+        env:
+          RELEASE_VERSION: ${{ github.event.inputs.releaseVersion }}
+        run: |
+          .github/scripts/stage-and-split.sh \
+            ~/.m2/repository/org/finos/legend/engine "$RELEASE_VERSION" "$PWD"
+          cat central-publishing/bundle-report.md >> "$GITHUB_STEP_SUMMARY"
+          : > deployment-ids.txt
+          : > bundle-deployments.tsv
+          {
+            echo
+            echo "### Central deployments"
+            echo
+            echo "| Bundle | Upload size | Deployment ID |"
+            echo "|---|---:|---|"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload wave 1 (parent POMs)
+        env:
+          RELEASE_VERSION: ${{ github.event.inputs.releaseVersion }}
+        run: .github/scripts/upload-wave.sh wave1 "$RELEASE_VERSION"
+
+      - name: Validate wave 1
+        run: .github/scripts/await-wave.sh wave1-ids.txt VALIDATED
+
+      # Wave 2 cannot validate until these are resolvable, so a dry run stops
+      # here: there is no way to rehearse wave 2 without really publishing
+      # wave 1, and Central is immutable.
+      - name: Publish wave 1
+        if: ${{ github.event.inputs.dryRun != 'true' }}
+        run: |
+          while read -r id; do
+            .github/scripts/central-publish.sh publish "$id" < /dev/null
+          done < wave1-ids.txt
+          .github/scripts/await-wave.sh wave1-ids.txt PUBLISHED
+
+      # Reaching PUBLISHED on the Portal is not the same as being readable on
+      # repo1, and it is the read side that wave 2's validation resolves against.
+      - name: Wait for wave 1 to be readable on Central
+        if: ${{ github.event.inputs.dryRun != 'true' }}
+        env:
+          RELEASE_VERSION: ${{ github.event.inputs.releaseVersion }}
+        run: |
+          awk -F'\t' '$1 ~ /^wave1-bundle-/ { n = split($2, p, "/"); print p[n - 1] }' \
+            central-publishing/bundle-contents.tsv | sort -u > wave1-coords.txt
+          echo "waiting for $(wc -l < wave1-coords.txt) parent coordinates"
+          while read -r artifact; do
+            .github/scripts/central-publish.sh await-central "$artifact" "$RELEASE_VERSION" < /dev/null
+          done < wave1-coords.txt
+
+      - name: Upload wave 2
+        if: ${{ github.event.inputs.dryRun != 'true' }}
+        env:
+          RELEASE_VERSION: ${{ github.event.inputs.releaseVersion }}
+        run: .github/scripts/upload-wave.sh wave2 "$RELEASE_VERSION"
+
+      # Every wave-2 bundle must validate before any is published: publishing
+      # bundle 1 and then finding bundle 3 invalid leaves a partial release,
+      # and nothing on Central can be changed or withdrawn.
+      - name: Validate wave 2
+        if: ${{ github.event.inputs.dryRun != 'true' }}
+        run: .github/scripts/await-wave.sh wave2-ids.txt VALIDATED
+
+      - name: Publish wave 2
+        if: ${{ github.event.inputs.dryRun != 'true' }}
+        run: |
+          while read -r id; do
+            .github/scripts/central-publish.sh publish "$id" < /dev/null
+          done < wave2-ids.txt
+          .github/scripts/await-wave.sh wave2-ids.txt PUBLISHED
+
+      - name: Compute and set next SNAPSHOT
+        if: ${{ github.event.inputs.dryRun != 'true' }}
+        env:
+          RELEASE_VERSION: ${{ github.event.inputs.releaseVersion }}
+        run: |
+          set -euo pipefail
+          IFS=. read -r major minor patch <<< "${RELEASE_VERSION}"
+          nextSnapshot="${major}.${minor}.$((patch + 1))-SNAPSHOT"
+          git fetch origin "${GITHUB_REF_NAME}"
+          git checkout -B "${GITHUB_REF_NAME}" "origin/${GITHUB_REF_NAME}"
+          sed -i "s|<revision>.*</revision>|<revision>${nextSnapshot}</revision>|" pom.xml
+          git add pom.xml
+          git commit -m "Bump version to ${nextSnapshot}"
+          git push origin "${GITHUB_REF_NAME}"
+
+      - name: Note that a dry run stops after wave 1
+        if: ${{ github.event.inputs.dryRun == 'true' }}
+        env:
+          RELEASE_VERSION: ${{ github.event.inputs.releaseVersion }}
+        run: |
+          echo "Dry run: wave 1 validated and will be dropped. Wave 2 was not"
+          echo "uploaded -- it can only validate once wave 1 is really published."
+          echo "Note: the build job's docker profile already pushed the ${RELEASE_VERSION}-tagged image; that push is not dry."
+
+      # Kept even when the release fails: sizes, the bundle-to-deployment
+      # mapping and the raw Portal responses are exactly what a post-mortem
+      # needs, and the runner is gone by then.
+      - name: Upload bundle size report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: central-bundle-report
+          path: |
+            central-publishing/bundle-report.md
+            central-publishing/*.tsv
+            central-publishing/status/*.json
+            bundle-deployments.tsv
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Drop unpublished deployments
+        if: ${{ always() && (failure() || cancelled() || github.event.inputs.dryRun == 'true') }}
+        run: |
+          [ -s deployment-ids.txt ] || exit 0
+          while read -r id; do
+            .github/scripts/central-publish.sh cleanup "$id" < /dev/null
+          done < deployment-ids.txt

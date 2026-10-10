@@ -1,0 +1,45 @@
+name: Build
+
+on:
+    push:
+        branches: ["**"]
+        tags-ignore: ["**"]
+    release:
+        types: [published]
+    workflow_dispatch:
+
+jobs:
+    build:
+        runs-on: ubuntu-latest
+
+        steps:
+            - uses: actions/checkout@v4
+
+            - name: Setup Java JDK
+              uses: actions/setup-java@v4
+              with:
+                  java-version: 25
+                  distribution: temurin
+
+            - name: Gradle Wrapper Validation
+              uses: gradle/actions/wrapper-validation@v4
+
+            - name: Setup Gradle
+              uses: gradle/actions/setup-gradle@v4
+              with:
+                cache-read-only: false
+
+            - name: Gradle Build
+              run: ./gradlew build
+
+            - name: Upload Artifacts
+              uses: actions/upload-artifact@v4
+              with:
+                name: noxesium-artifacts
+                path: "**/build/libs/*.jar"
+
+            - name: Publish
+              run: ./gradlew publish
+              env:
+                  NOXCREW_MAVEN_PUBLIC_USERNAME: ${{ secrets.NOXCREW_MAVEN_PUBLIC_USERNAME }}
+                  NOXCREW_MAVEN_PUBLIC_PASSWORD: ${{ secrets.NOXCREW_MAVEN_PUBLIC_PASSWORD }}

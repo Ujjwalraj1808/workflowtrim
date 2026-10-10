@@ -1,0 +1,176 @@
+name: CI
+
+# Push to main or a version tag reuses a successful CI run for the same git
+# tree (dest-into-main PR). Re-running the suite on the merge/tag SHA is a
+# second flake lottery on identical bytes, and this repo has no installer
+# adopt path to recover a red tag. Pull requests always run. A
+# conflict-resolution tree with no match fails closed and runs the matrix.
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  reuse-green-tree:
+    runs-on: ubuntu-latest
+    outputs:
+      skip_suite: ${{ steps.gate.outputs.skip_suite }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Skip the suite when this push tree is already green
+        id: gate
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 scripts/ci_skip_if_green.py
+
+  test:
+    needs: reuse-green-tree
+    if: needs.reuse-green-tree.outputs.skip_suite != 'true'
+    runs-on: ${{ matrix.os }}
+    # Linux and macOS stay unsharded here. Windows is the sharded
+    # test-windows job below and remains a required green leg.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python-version: ["3.9", "3.12"]
+        exclude:
+          # Keep the matrix lean: exercise the full OS spread on the current
+          # Python, and the version spread on Linux. (3.9 + macOS is covered
+          # transitively by 3.12 on macOS and 3.9 on Linux.)
+          - os: macos-latest
+            python-version: "3.9"
+    defaults:
+      run:
+        # GitHub provides bash on macOS/Linux; Windows shards use Git Bash
+        # in test-windows so heredoc steps stay identical.
+        shell: bash
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+      - name: Install optional Node dependencies
+        run: npm install --package-lock=false --no-audit
+      - name: Smoke check Cursor runner syntax
+        run: npm run smoke:cursor-runner
+      - name: Run Python tests
+        run: python -m unittest discover -s tests -v
+      - name: Smoke check CLI metadata
+        run: |
+          python -m puppetmaster --help
+          python -m puppetmaster adapters
+      - name: Run doctor
+        run: python -m puppetmaster doctor
+      - name: Run SQLite demo
+        run: python -m puppetmaster run "CI enterprise workflow" --config examples/enterprise-workflow.json
+      - name: Smoke check memory retrieval
+        run: python -m puppetmaster run "CI memory reuse independent workers" --config examples/memory-reuse.json
+      - name: Smoke check daily-driver CLI
+        run: |
+          python -m puppetmaster last
+          python -m puppetmaster logs
+          python -m puppetmaster diff
+          python -m puppetmaster rerun --config examples/enterprise-workflow.json
+          python -m puppetmaster crash-demo
+          python -m puppetmaster clean --completed
+      - name: Check README links
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import re
+          import sys
+
+          readme = Path("README.md").read_text(encoding="utf-8")
+          missing = []
+          for match in re.finditer(r"\[[^\]]+\]\(([^)]+)\)", readme):
+              target = match.group(1)
+              if target.startswith(("http://", "https://", "#")):
+                  continue
+              if not Path(target).exists():
+                  missing.append(target)
+          if missing:
+              print("missing README links:", ", ".join(missing))
+              sys.exit(1)
+          print("README local links ok")
+          PY
+
+  test-windows:
+    needs: reuse-green-tree
+    if: needs.reuse-green-tree.outputs.skip_suite != 'true'
+    # CI_WINDOWS_RUNNER is an optional hosted-runner swap. Unset, this job
+    # stays on GitHub-hosted windows-latest so CI never queues on a missing
+    # label. Set the repo variable later if a hosted Windows runner is added.
+    runs-on: ${{ vars.CI_WINDOWS_RUNNER || 'windows-latest' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+      - name: Install optional Node dependencies
+        run: npm install --package-lock=false --no-audit
+      - name: Smoke check Cursor runner syntax
+        run: npm run smoke:cursor-runner
+      - name: Run Python tests (shard ${{ matrix.shard }}/4)
+        env:
+          UNITTEST_SHARD: ${{ matrix.shard }}/4
+        run: python -m tests.ci_shard
+      - name: Smoke check CLI metadata
+        if: ${{ matrix.shard == 1 }}
+        run: |
+          python -m puppetmaster --help
+          python -m puppetmaster adapters
+      - name: Run doctor
+        if: ${{ matrix.shard == 1 }}
+        run: python -m puppetmaster doctor
+      - name: Run SQLite demo
+        if: ${{ matrix.shard == 1 }}
+        run: python -m puppetmaster run "CI enterprise workflow" --config examples/enterprise-workflow.json
+      - name: Smoke check memory retrieval
+        if: ${{ matrix.shard == 1 }}
+        run: python -m puppetmaster run "CI memory reuse independent workers" --config examples/memory-reuse.json
+      - name: Smoke check daily-driver CLI
+        if: ${{ matrix.shard == 1 }}
+        run: |
+          python -m puppetmaster last
+          python -m puppetmaster logs
+          python -m puppetmaster diff
+          python -m puppetmaster rerun --config examples/enterprise-workflow.json
+          python -m puppetmaster crash-demo
+          python -m puppetmaster clean --completed
+      - name: Check README links
+        if: ${{ matrix.shard == 1 }}
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import re
+          import sys
+
+          readme = Path("README.md").read_text(encoding="utf-8")
+          missing = []
+          for match in re.finditer(r"\[[^\]]+\]\(([^)]+)\)", readme):
+              target = match.group(1)
+              if target.startswith(("http://", "https://", "#")):
+                  continue
+              if not Path(target).exists():
+                  missing.append(target)
+          if missing:
+              print("missing README links:", ", ".join(missing))
+              sys.exit(1)
+          print("README local links ok")
+          PY

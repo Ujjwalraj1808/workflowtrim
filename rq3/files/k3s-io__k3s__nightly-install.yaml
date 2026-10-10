@@ -1,0 +1,137 @@
+name: Nightly Tests
+on:
+  schedule:
+    - cron: "0 0 * * 1-5"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  install-test:
+    name: Install
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        channel: [stable, latest]
+        vm: [alma-10, fedora, opensuse-leap, ubuntu-2404]
+      max-parallel: 4
+    defaults:
+      run:
+        working-directory: tests/install/${{ matrix.vm }}
+    env:
+      INSTALL_K3S_CHANNEL: ${{ matrix.channel }}
+    steps:
+      - name: Remove Unnecessary Tools
+        working-directory: /
+        run: |
+          sudo rm -rf \
+            /home/linuxbrew \
+            /home/packer \
+            /opt/az \
+            /opt/microsoft \
+            /usr/lib/firefox \
+            /usr/lib/google-cloud-sdk \
+            /usr/local/julia* \
+            /usr/local/share/boost \
+            /usr/local/share/chromium \
+            /usr/local/share/powershell \
+            /usr/share/az* \
+            /usr/share/dotnet \
+            /usr/share/miniconda \
+            /usr/share/swift
+          df -khl
+      - name: "Checkout"
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with: {fetch-depth: 1}
+      - name: Set up vagrant and libvirt
+        uses: ./.github/actions/vagrant-setup
+      - name: "Vagrant Cache"
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+             ~/.vagrant.d/boxes
+          key: vagrant-box-${{ matrix.vm }}
+        id: vagrant-cache
+      - name: "Vagrant Plugin(s)"
+        run: vagrant plugin install vagrant-k3s vagrant-reload
+      - name: "Vagrant Up ⏩ Install K3s"
+        run: vagrant up --no-tty
+      - name: "⏳ Node"
+        run: vagrant provision --provision-with=k3s-wait-for-node
+      - name: "⏳ CoreDNS"
+        run: vagrant provision --provision-with=k3s-wait-for-coredns
+      - name: "⏳ Local Storage"
+        run: vagrant provision --provision-with=k3s-wait-for-local-storage
+        continue-on-error: true
+      - name: "⏳ Metrics Server"
+        run: vagrant provision --provision-with=k3s-wait-for-metrics-server
+        continue-on-error: true
+      - name: "⏳ Traefik"
+        run: vagrant provision --provision-with=k3s-wait-for-traefik
+        continue-on-error: true
+      - name: "k3s-status"
+        run: vagrant provision --provision-with=k3s-status
+      - name: "k3s-procps"
+        run: vagrant provision --provision-with=k3s-procps
+  build:
+    uses: ./.github/workflows/build-k3s.yaml
+    with:
+      upload-image: true
+  conf-test:
+    name: Conformance
+    runs-on: ${{ github.repository_owner == 'k3s-io' && matrix.suite == 'parallel' && 'cncf-ubuntu-8-32-x86' || 'ubuntu-24.04' }}
+    needs: build
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        db: [sqlite, etcd, mysql, postgres]
+        suite: [serial, parallel]
+    steps:
+      - name: Remove Unnecessary Tools
+        if: runner.environment == 'github-hosted'
+        working-directory: /
+        run: |
+          sudo rm -rf \
+            /home/linuxbrew \
+            /home/packer \
+            /opt/az \
+            /opt/microsoft \
+            /usr/lib/firefox \
+            /usr/lib/google-cloud-sdk \
+            /usr/local/julia* \
+            /usr/local/share/boost \
+            /usr/local/share/chromium \
+            /usr/local/share/powershell \
+            /usr/share/az* \
+            /usr/share/dotnet \
+            /usr/share/miniconda \
+            /usr/share/swift
+          df -khl
+      - name: "Checkout"
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with: {fetch-depth: 1}
+      - name: "Download K3s image"
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: k3s-amd64
+          path: ./dist/artifacts
+      - name: Set up Docker
+        uses: docker/setup-docker-action@77e84dbf09b47d1e29270283c22f16145aa85ca1 # v5.4.0
+        with:
+          version: type=image,tag=29
+          set-host: true
+      - name: Install Go
+        uses: ./.github/actions/setup-go
+      - name: Load and set K3s image
+        run: |
+          chmod +x ./dist/artifacts/k3s
+          docker image load -i ./dist/artifacts/k3s-image.tar
+          IMAGE_TAG=$(docker image ls --format '{{.Repository}}:{{.Tag}}' | grep 'rancher/k3s')
+          echo "K3S_IMAGE=$IMAGE_TAG" >> $GITHUB_ENV
+      - name: Run ${{ matrix.db }} ${{ matrix.suite}} Conformance Test
+        run: go test -timeout=45m ./tests/docker/conformance/conformance_test.go -k3sImage="$K3S_IMAGE" -db ${{ matrix.db }} ${{ matrix.suite == 'serial' && '-serial' || '' }} -ginkgo.v -ci
+

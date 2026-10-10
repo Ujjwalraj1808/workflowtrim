@@ -1,0 +1,150 @@
+name: Move closed milestone items
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_milestone:
+        description: Milestone that currently owns the closed items
+        required: true
+        type: string
+      target_milestone:
+        description: Milestone that should receive the closed items
+        required: true
+        type: string
+      skip_unmerged_prs:
+        description: Skip pull requests that were closed without being merged
+        required: false
+        default: true
+        type: boolean
+  workflow_call:
+    inputs:
+      source_milestone:
+        description: Milestone that currently owns the closed items
+        required: true
+        type: string
+      target_milestone:
+        description: Milestone that should receive the closed items
+        required: true
+        type: string
+      skip_unmerged_prs:
+        description: Skip pull requests that were closed without being merged
+        required: false
+        default: true
+        type: boolean
+    secrets:
+      ISSUE_PR_TOKEN:
+        required: true
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+jobs:
+  move-closed-items:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Move closed items to target milestone
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          SOURCE_MILESTONE: ${{ inputs.source_milestone }}
+          TARGET_MILESTONE: ${{ inputs.target_milestone }}
+          SKIP_UNMERGED_PRS: ${{ inputs.skip_unmerged_prs }}
+        with:
+          github-token: ${{ secrets.ISSUE_PR_TOKEN }}
+          script: |
+            const sourceTitle = (process.env.SOURCE_MILESTONE ?? '').trim();
+            const targetTitle = (process.env.TARGET_MILESTONE ?? '').trim();
+            // default-on: only an explicit "false" opts into moving unmerged pull requests
+            const skipUnmergedPRs = process.env.SKIP_UNMERGED_PRS !== 'false';
+
+            if (sourceTitle.length === 0 || targetTitle.length === 0) {
+              throw new Error('Both source_milestone and target_milestone must be non-empty.');
+            }
+
+            if (sourceTitle === targetTitle) {
+              throw new Error('source_milestone and target_milestone must be different.');
+            }
+
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+
+            async function listMilestones() {
+              return github.paginate(github.rest.issues.listMilestones, {
+                owner,
+                repo,
+                state: 'all',
+                per_page: 100,
+              });
+            }
+
+            function findMilestoneByTitle(milestones, title) {
+              return milestones.find((milestone) => milestone.title === title);
+            }
+
+            let milestones = await listMilestones();
+
+            const sourceMilestone = findMilestoneByTitle(milestones, sourceTitle);
+            if (!sourceMilestone) {
+              core.warning(`Source milestone "${sourceTitle}" was not found — skipping.`);
+              return;
+            }
+
+            let targetMilestone = findMilestoneByTitle(milestones, targetTitle);
+            if (!targetMilestone) {
+              const createdMilestone = await github.rest.issues.createMilestone({
+                owner,
+                repo,
+                title: targetTitle,
+              });
+              targetMilestone = createdMilestone.data;
+              core.info(`Created target milestone "${targetTitle}" (#${targetMilestone.number}).`);
+            } else if (targetMilestone.state !== 'open') {
+              const reopenedMilestone = await github.rest.issues.updateMilestone({
+                owner,
+                repo,
+                milestone_number: targetMilestone.number,
+                state: 'open',
+              });
+              targetMilestone = reopenedMilestone.data;
+              core.info(`Reopened target milestone "${targetTitle}" (#${targetMilestone.number}).`);
+            }
+
+            const closedItems = await github.paginate(github.rest.issues.listForRepo, {
+              owner,
+              repo,
+              state: 'closed',
+              milestone: String(sourceMilestone.number),
+              per_page: 100,
+            });
+
+            const isUnmergedPR = (item) => Boolean(item.pull_request) && !item.pull_request.merged_at;
+            const skippedItems = skipUnmergedPRs ? closedItems.filter(isUnmergedPR) : [];
+            const itemsToMove = skipUnmergedPRs ? closedItems.filter((item) => !isUnmergedPR(item)) : closedItems;
+
+            if (skippedItems.length > 0) {
+              const numbers = skippedItems.map((item) => `#${item.number}`).join(', ');
+              core.info(`Skipped ${skippedItems.length} unmerged pull request(s): ${numbers}.`);
+            }
+
+            if (itemsToMove.length === 0) {
+              core.notice(`No closed items to move in milestone "${sourceTitle}".`);
+              return;
+            }
+
+            for (const item of itemsToMove) {
+              await github.rest.issues.update({
+                owner,
+                repo,
+                issue_number: item.number,
+                milestone: targetMilestone.number,
+              });
+
+              const itemType = item.pull_request ? 'pull request' : 'issue';
+              core.info(`Moved ${itemType} #${item.number} to milestone "${targetTitle}".`);
+            }
+
+            core.notice(
+              `Moved ${itemsToMove.length} closed item(s) from "${sourceTitle}" to "${targetTitle}".`,
+            );

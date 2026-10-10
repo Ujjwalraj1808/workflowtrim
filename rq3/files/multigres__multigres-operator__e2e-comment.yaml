@@ -1,0 +1,170 @@
+name: E2E (comment trigger)
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  pull-requests: write
+  statuses: write
+
+jobs:
+  check-comment:
+    name: Check trigger
+    if: >-
+      github.event.issue.pull_request &&
+      contains(github.event.comment.body, '/e2e')
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.pr.outputs.sha }}
+      ref: ${{ steps.pr.outputs.ref }}
+    steps:
+      - name: Check permissions
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const { data: perm } = await github.rest.repos.getCollaboratorPermissionLevel({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              username: context.payload.comment.user.login,
+            });
+            const allowed = ['admin', 'write'];
+            if (!allowed.includes(perm.permission)) {
+              core.setFailed(`User ${context.payload.comment.user.login} does not have write access`);
+            }
+
+      - name: Add reaction
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            await github.rest.reactions.createForIssueComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: context.payload.comment.id,
+              content: 'rocket',
+            });
+
+      - name: Get PR details
+        id: pr
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const { data: pr } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number,
+            });
+            if (!pr.mergeable) {
+              core.setFailed(`PR #${context.issue.number} has merge conflicts — resolve them before running e2e tests`);
+              return;
+            }
+            core.setOutput('sha', pr.head.sha);
+            // Use the merge ref so tests run against the merged result
+            core.setOutput('ref', `refs/pull/${context.issue.number}/merge`);
+
+      - name: Set commit status to pending
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha: '${{ steps.pr.outputs.sha }}',
+              state: 'pending',
+              context: 'e2e-tests',
+              description: 'E2E tests triggered by /e2e comment',
+              target_url: `${process.env.GITHUB_SERVER_URL}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+            });
+
+  e2e-build:
+    name: E2E build
+    needs: check-comment
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      ref: ${{ steps.source.outputs.ref }}
+      tests: ${{ steps.source.outputs.tests }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.check-comment.outputs.ref }}
+          persist-credentials: false
+      - name: Record source and discover test packages
+        id: source
+        shell: bash
+        run: |
+          # Every test job must use the exact source used to build the image,
+          # even if the PR's merge ref changes while the workflow is running.
+          echo "ref=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          tests=$(find test/e2e/shared -name '*_test.go' -exec dirname {} \; |
+            sort -u | sed 's|^test/e2e/shared/||' |
+            jq -Rsc 'split("\n") | map(select(length > 0))')
+          jq -e 'length > 0 and all(.[]; test("^[a-z0-9][a-z0-9_-]*$"))' <<< "$tests"
+          echo "tests=$tests" >> "$GITHUB_OUTPUT"
+      - name: Build operator image
+        run: make container
+      - name: Save operator image
+        run: docker save "$(make -s print-img)" -o /tmp/operator-image.tar
+      - name: Upload operator image
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: operator-image
+          path: /tmp/operator-image.tar
+          retention-days: 1
+
+  e2e:
+    name: "E2E (${{ matrix.test }})"
+    needs: e2e-build
+    strategy:
+      fail-fast: false
+      matrix:
+        test: ${{ fromJSON(needs.e2e-build.outputs.tests) }}
+    permissions:
+      contents: read
+    uses: ./.github/workflows/_reusable-e2e.yaml
+    with:
+      ref: ${{ needs.e2e-build.outputs.ref }}
+      test-spec: ${{ matrix.test }}
+      mode: shared
+      operator-image-artifact: operator-image
+
+  report:
+    name: Report status
+    needs: [check-comment, e2e]
+    if: always() && needs.check-comment.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      statuses: write
+      pull-requests: write
+    steps:
+      - name: Set commit status
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const state = '${{ needs.e2e.result }}' === 'success' ? 'success' : 'failure';
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha: '${{ needs.check-comment.outputs.sha }}',
+              state,
+              context: 'e2e-tests',
+              description: state === 'success' ? 'E2E tests passed' : 'E2E tests failed',
+              target_url: `${process.env.GITHUB_SERVER_URL}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+            });
+
+      - name: Comment result on PR
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const result = '${{ needs.e2e.result }}';
+            const icon = result === 'success' ? '✅' : '❌';
+            const runUrl = `${process.env.GITHUB_SERVER_URL}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: `${icon} **E2E tests ${result}** — [View run](${runUrl})`,
+            });

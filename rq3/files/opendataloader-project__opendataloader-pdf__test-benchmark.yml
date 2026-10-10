@@ -1,0 +1,200 @@
+name: Test & Benchmark
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'java/**'
+      - 'python/**'
+      - 'node/**'
+      - 'scripts/**'
+      - 'verification/**'
+      - 'samples/**'
+      - '.github/workflows/**'
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+
+      - name: Build & Test All
+        run: ./scripts/build-all.sh
+
+      - name: Install opendataloader-pdf CLI
+        # --system installs into the setup-python interpreter; without it (or an
+        # active venv) `uv pip install` aborts with "No virtual environment found".
+        run: uv pip install --system ./python/opendataloader-pdf/dist/*.whl
+
+      - name: Run CLI verification
+        # ci-verify.py writes its own markdown table to $GITHUB_STEP_SUMMARY,
+        # so no separate summary step is needed here.
+        run: python verification/ci-verify.py
+
+      - name: Upload verification report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: verification-report-ci
+          path: verification/verification-report-ci.txt
+          retention-days: 7
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v7
+        with:
+          files: java/opendataloader-pdf-core/target/site/jacoco/jacoco.xml
+          fail_ci_if_error: false
+          token: ${{ secrets.CODECOV_TOKEN }}
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: java-build
+          path: java/opendataloader-pdf-cli/target/*.jar
+          retention-days: 1
+
+  benchmark:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: java-build
+          path: java/opendataloader-pdf-cli/target/
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Run benchmark
+        run: ./scripts/bench.sh --skip-build --check-regression
+
+      - name: Benchmark summary
+        if: always()
+        run: |
+          python3 << 'PYEOF'
+          import json, os, sys
+          from pathlib import Path
+
+          eval_path = Path("/tmp/opendataloader-bench/prediction/opendataloader/evaluation.json")
+          thresh_path = Path("/tmp/opendataloader-bench/thresholds.json")
+
+          summary_file = os.environ.get("GITHUB_STEP_SUMMARY", "/dev/null")
+
+          if not eval_path.exists() or not thresh_path.exists():
+              with open(summary_file, "a") as f:
+                  f.write("## Benchmark Results\n\nBenchmark did not produce evaluation results.\n")
+              sys.exit(0)
+
+          try:
+              with open(eval_path) as f:
+                  eval_data = json.load(f)
+              with open(thresh_path) as f:
+                  thresholds = json.load(f)
+          except json.JSONDecodeError as e:
+              with open(summary_file, "a") as f:
+                  f.write(f"## Benchmark Results\n\nFailed to parse results: {e}\n")
+              sys.exit(0)
+
+          scores = eval_data.get("metrics", {}).get("score", {})
+          table_detection = eval_data.get("table_detection", {})
+          speed = eval_data.get("speed", {})
+          triage = eval_data.get("triage", {})
+          tol = thresholds.get("regression_tolerance", 0)
+
+          rows = []
+
+          for key, label, src in [
+              ("nid", "NID", scores.get("nid_mean")),
+              ("teds", "TEDS", scores.get("teds_mean")),
+              ("mhs", "MHS", scores.get("mhs_mean")),
+              ("table_detection_f1", "Table Detection F1", table_detection.get("f1")),
+          ]:
+              t = thresholds.get(key)
+              if src is not None and t is not None:
+                  effective = t - tol
+                  status = "✅" if src >= effective else "❌"
+                  rows.append(f"| {label} | {src:.4f} | ≥ {effective:.2f} | {status} |")
+
+          elapsed = speed.get("elapsed_per_doc")
+          elapsed_thresh = thresholds.get("elapsed_per_doc")
+          if elapsed is not None and elapsed_thresh is not None:
+              status = "✅" if elapsed <= elapsed_thresh else "❌"
+              rows.append(f"| Speed | {elapsed:.2f}s/doc | ≤ {elapsed_thresh}s/doc | {status} |")
+
+          if triage:
+              tr_recall = triage.get("recall")
+              tr_thresh = thresholds.get("triage_recall")
+              if tr_recall is not None and tr_thresh is not None:
+                  effective = tr_thresh - tol
+                  status = "✅" if tr_recall >= effective else "❌"
+                  rows.append(f"| Triage Recall | {tr_recall:.4f} | ≥ {effective:.2f} | {status} |")
+
+              tr_fn = triage.get("fn_count")
+              tr_fn_max = thresholds.get("triage_fn_max")
+              if tr_fn is not None and tr_fn_max is not None:
+                  status = "✅" if tr_fn <= tr_fn_max else "❌"
+                  rows.append(f"| Triage FN | {tr_fn} | ≤ {tr_fn_max} | {status} |")
+
+          with open(summary_file, "a") as f:
+              f.write("## Benchmark Results\n\n")
+              f.write("| Metric | Score | Threshold | Status |\n")
+              f.write("|--------|-------|-----------|--------|\n")
+              for row in rows:
+                  f.write(row + "\n")
+
+              if not rows:
+                  f.write("| (no metrics found) | | | |\n")
+          PYEOF
+
+      - name: Upload evaluation results
+        uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: benchmark-results
+          path: /tmp/opendataloader-bench/prediction/opendataloader/evaluation.json

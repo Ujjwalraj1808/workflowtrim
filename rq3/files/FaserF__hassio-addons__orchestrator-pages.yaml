@@ -1,0 +1,66 @@
+name: "🚀 Generate & Deploy Pages"
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - "**/config.yaml"
+      - ".scripts/generate_docs.py"
+      - "docs/**"
+  workflow_dispatch:
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-deploy:
+    if: "!contains(github.event.head_commit.message, '[skip-pages]') && !contains(github.event.head_commit.message, '[start-autofix]') && !contains(github.event.head_commit.message, 'chore: auto-fix linting issues')"
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+    steps:
+      - name: ⬇️ Checkout Repo
+        uses: actions/checkout@v7
+      - name: 🐍 Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+
+      - name: 📦 Install Dependencies
+        run: pip install pyyaml
+
+      - name: 📄 Generate Docs
+        run: python .scripts/generate_docs.py
+
+      - name: 🔄 Pull latest changes (Handle non-fast-forward)
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git pull --rebase --autostash origin master
+
+      - name: 🚀 Commit Changes (Optional but good for history)
+        uses: stefanzweifel/git-auto-commit-action@v7
+        with:
+          commit_message: "docs: auto-update index.html [skip ci]"
+          file_pattern: "docs/index.html"
+
+      - name: 🏗️ Setup Pages
+        uses: actions/configure-pages@v6
+
+      - name: 📤 Upload artifact
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: './docs'
+
+      - name: 🚀 Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v5

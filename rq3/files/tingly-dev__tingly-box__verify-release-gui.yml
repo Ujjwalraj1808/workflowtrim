@@ -1,0 +1,107 @@
+name: Verify Release GUI
+
+run-name: >-
+  🔍 Verify GUI release ${{ inputs.tag }}
+
+# Post-release verification of the desktop GUI assets on a release. The CLI has
+# its own (verify-release-cli.yml); the two pipelines are independent. Checks the
+# attached assets without rebuilding (release-gui.yml already builds, installs and
+# ldd-checks the packages):
+#
+#   tingly-box-gui-macos-arm64.zip    TinglyBox.app, arm64 Mach-O
+#   tingly-box-gui-windows-amd64.zip  tingly-box-gui.exe, x86-64 PE
+#   tingly-box-gui-linux-amd64.deb    package tingly-box-gui, /usr/bin/tingly-box-gui
+#   tingly-box-gui-linux-amd64.rpm    RPM package
+#   tingly-box-gui-linux-{amd64,arm64}.zip
+#                                     tingly-box-gui ELF for that arch, GTK3 / WebKitGTK 4.1 (npm)
+#
+# Called by release-gui.yml after it attaches the packages. Can also be run by hand.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to verify (e.g., v1.0.0)'
+        required: true
+        type: string
+  workflow_call:
+    inputs:
+      tag:
+        description: 'Release tag to verify'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  verify-gui-assets:
+    name: Verify GUI Packages
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download GUI release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          mkdir -p assets
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --pattern 'tingly-box-gui-*' \
+            --pattern 'checksums-gui.txt' \
+            --dir assets
+          ls -lh assets/
+
+      # `sha256sum -c` fails on a missing file; the count guards an incomplete release.
+      - name: Verify checksums
+        working-directory: assets
+        run: |
+          [ "$(ls tingly-box-gui-* | wc -l)" -eq 6 ] || { echo "❌ expected 6 GUI packages"; ls; exit 1; }
+          sha256sum -c checksums-gui.txt
+
+      - name: Verify package contents
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          cd assets
+          # macOS: the app bundle with an arm64 executable.
+          unzip -q -o tingly-box-gui-macos-arm64.zip -d mac
+          file mac/TinglyBox.app/Contents/MacOS/tingly-box-gui | tee /dev/stderr | grep -qE 'Mach-O 64-bit.*arm64'
+          # Windows: the exe at the zip's top level (what the npm shim extracts).
+          unzip -q -o tingly-box-gui-windows-amd64.zip -d win
+          file win/tingly-box-gui.exe | tee /dev/stderr | grep -qE 'PE32\+ executable.*x86-64'
+          # Linux deb: right package, the GUI binary (never the CLI's name),
+          # the launcher entry, and a version that matches the tag.
+          [ "$(dpkg-deb -f tingly-box-gui-linux-amd64.deb Package)" = "tingly-box-gui" ]
+          dpkg-deb -c tingly-box-gui-linux-amd64.deb | tee deb-contents.txt
+          grep -qE ' \./usr/bin/tingly-box-gui$' deb-contents.txt
+          grep -q 'dev.tingly.box.desktop' deb-contents.txt
+          if grep -qE ' \./usr/bin/tingly-box$' deb-contents.txt; then
+            echo "❌ the deb ships /usr/bin/tingly-box, which belongs to the CLI"; exit 1
+          fi
+          # Same mapping as build/linux/Taskfile.yml: strip v, '-' becomes '~'.
+          # Non-release tags become 0.0.0~..., so only compare for vX.Y.Z[-pre].
+          if [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9]+)?$ ]]; then
+            WANT="${TAG#v}"; WANT="${WANT//-/\~}"
+            GOT="$(dpkg-deb -f tingly-box-gui-linux-amd64.deb Version)"
+            [ "$GOT" = "$WANT" ] || { echo "❌ deb version $GOT, expected $WANT"; exit 1; }
+          fi
+          # Linux rpm: an RPM, not a renamed deb.
+          file tingly-box-gui-linux-amd64.rpm | tee /dev/stderr | grep -q 'RPM'
+          # Linux zip: the GTK3 binary at the top level (what the npm shim
+          # extracts), executable, linked against GTK3 / WebKitGTK 4.1 and not
+          # the GTK4 stack the deb/rpm use.
+          for arch in amd64 arm64; do
+            case "$arch" in
+              amd64) WANT_ELF='x86-64' ;;
+              arm64) WANT_ELF='ARM aarch64' ;;
+            esac
+            unzip -q -o "tingly-box-gui-linux-$arch.zip" -d "linux-$arch"
+            file "linux-$arch/tingly-box-gui" | tee /dev/stderr | grep -qE "ELF 64-bit.*$WANT_ELF"
+            [ -x "linux-$arch/tingly-box-gui" ] || { echo "❌ $arch zip entry is not executable"; exit 1; }
+            NEEDED="$(readelf -d "linux-$arch/tingly-box-gui" | grep NEEDED)"
+            echo "$NEEDED" | grep -q 'libgtk-3.so.0'
+            echo "$NEEDED" | grep -q 'libwebkit2gtk-4.1.so.0'
+            if echo "$NEEDED" | grep -qE 'libgtk-4|libwebkitgtk-6'; then
+              echo "❌ the $arch Linux zip links the GTK4 stack"; exit 1
+            fi
+          done

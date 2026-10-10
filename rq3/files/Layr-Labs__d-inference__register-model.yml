@@ -1,0 +1,179 @@
+name: Register Model
+
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch:
+    inputs:
+      model_id:
+        description: Model ID, for example mlx-community/foo
+        required: true
+      version:
+        description: Manifest version
+        required: true
+      display_name:
+        description: Human-readable display name
+        required: true
+      family:
+        description: Model family
+        required: false
+        default: ''
+      architecture:
+        description: Architecture description
+        required: false
+        default: ''
+      quantization:
+        description: Quantization
+        required: true
+      capabilities_csv:
+        description: Comma-separated capabilities (OpenRouter features, e.g. tools,reasoning,json_mode). Leave empty and opt in per model to avoid overstating capabilities.
+        required: false
+        default: ""
+      required_provider_capabilities:
+        description: Comma-separated provider capabilities required to serve this model (for example apple_m5,mlx_nax). Leave empty unless the model requires them.
+        required: false
+        default: ""
+      max_context_length:
+        description: Maximum context length
+        required: true
+      max_output_length:
+        description: Maximum output length
+        required: true
+      min_ram_gb:
+        description: Minimum RAM in GB
+        required: true
+      description:
+        description: Model description
+        required: false
+        default: ''
+      runtime_parameters_json:
+        description: Runtime parameters JSON object
+        required: false
+        default: '{}'
+      hugging_face_artifact_json:
+        description: Optional exact public HF artifact JSON (repo_id, full commit revision, optional path_prefix); null keeps R2 only.
+        required: false
+        default: 'null'
+      metadata_json:
+        description: Metadata JSON object
+        required: false
+        default: '{}'
+      input_price:
+        description: Input price in micro-USD per 1M tokens (e.g. 15000 = $0.015)
+        required: true
+        type: number
+      output_price:
+        description: Output price in micro-USD per 1M tokens (e.g. 70000 = $0.070)
+        required: true
+        type: number
+      cache_read_price:
+        description: Optional price for prompt tokens served from a provider's prefix cache (OpenRouter input_cache_read), micro-USD per 1M tokens, 0..input_price. Empty = half the input price, and clears any rate previously set for this model.
+        required: false
+        default: ''
+      promote:
+        description: Promote this version after registration
+        required: false
+        default: false
+        type: boolean
+      coordinator_url:
+        description: Coordinator base URL
+        required: false
+        default: https://api.darkbloom.dev
+
+jobs:
+  register:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - name: Build registration payload
+        env:
+          MODEL_ID: ${{ inputs.model_id }}
+          VERSION: ${{ inputs.version }}
+          DISPLAY_NAME: ${{ inputs.display_name }}
+          FAMILY: ${{ inputs.family }}
+          ARCHITECTURE: ${{ inputs.architecture }}
+          QUANTIZATION: ${{ inputs.quantization }}
+          CAPABILITIES_CSV: ${{ inputs.capabilities_csv }}
+          REQUIRED_PROVIDER_CAPABILITIES: ${{ inputs.required_provider_capabilities }}
+          MAX_CONTEXT_LENGTH: ${{ inputs.max_context_length }}
+          MAX_OUTPUT_LENGTH: ${{ inputs.max_output_length }}
+          MIN_RAM_GB: ${{ inputs.min_ram_gb }}
+          DESCRIPTION: ${{ inputs.description }}
+          RUNTIME_PARAMETERS_JSON: ${{ inputs.runtime_parameters_json }}
+          HUGGING_FACE_ARTIFACT_JSON: ${{ inputs.hugging_face_artifact_json }}
+          METADATA_JSON: ${{ inputs.metadata_json }}
+          PROMOTE: ${{ inputs.promote }}
+          INPUT_PRICE: ${{ inputs.input_price }}
+          OUTPUT_PRICE: ${{ inputs.output_price }}
+          CACHE_READ_PRICE: ${{ inputs.cache_read_price }}
+        run: |
+          jq -n \
+            --arg model_id "$MODEL_ID" \
+            --arg version "$VERSION" \
+            --arg display_name "$DISPLAY_NAME" \
+            --arg family "$FAMILY" \
+            --arg architecture "$ARCHITECTURE" \
+            --arg quantization "$QUANTIZATION" \
+            --arg capabilities_csv "$CAPABILITIES_CSV" \
+            --arg required_provider_capabilities_csv "$REQUIRED_PROVIDER_CAPABILITIES" \
+            --argjson max_context_length "$MAX_CONTEXT_LENGTH" \
+            --argjson max_output_length "$MAX_OUTPUT_LENGTH" \
+            --argjson min_ram_gb "$MIN_RAM_GB" \
+            --arg description "$DESCRIPTION" \
+            --argjson runtime_parameters "$RUNTIME_PARAMETERS_JSON" \
+            --argjson hugging_face_artifact "${HUGGING_FACE_ARTIFACT_JSON:-null}" \
+            --argjson metadata "$METADATA_JSON" \
+            --argjson promote "$PROMOTE" \
+            --argjson input_price "$INPUT_PRICE" \
+            --argjson output_price "$OUTPUT_PRICE" \
+            --arg cache_read_price "$CACHE_READ_PRICE" \
+            '
+            def required_provider_capabilities:
+              gsub("^\\s+|\\s+$"; "") as $trimmed
+              | if $trimmed == "" then
+                  []
+                else
+                  ($trimmed | split(",") | map(gsub("^\\s+|\\s+$"; ""))) as $values
+                  | if ($values | all(. != "" and test("^[a-z][a-z0-9_]*$"))) then
+                      reduce $values[] as $value
+                        ([]; if index($value) then . else . + [$value] end)
+                    else
+                      error("required_provider_capabilities must be comma-separated lowercase capability names")
+                    end
+                end;
+
+            {
+              model_id: $model_id,
+              version: $version,
+              display_name: $display_name,
+              family: $family,
+              architecture: $architecture,
+              quantization: $quantization,
+              max_context_length: $max_context_length,
+              max_output_length: $max_output_length,
+              min_ram_gb: $min_ram_gb,
+              capabilities: ($capabilities_csv | split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(length > 0))),
+              required_provider_capabilities: ($required_provider_capabilities_csv | required_provider_capabilities),
+              description: $description,
+              runtime_parameters: $runtime_parameters,
+              hugging_face_artifact: $hugging_face_artifact,
+              metadata: $metadata,
+              promote: $promote,
+              input_price: $input_price,
+              output_price: $output_price
+            }
+            + (($cache_read_price | gsub("^\\s+|\\s+$"; "")) as $crp
+               | if $crp == "" then {} else {cache_read_price: ($crp | tonumber)} end)' > payload.json
+          jq . payload.json
+
+      - name: Register model with coordinator
+        env:
+          COORDINATOR_URL: ${{ inputs.coordinator_url }}
+          MODEL_REGISTRY_PUBLISHING_KEY: ${{ secrets.MODEL_REGISTRY_PUBLISHING_KEY }}
+        run: |
+          test -n "$MODEL_REGISTRY_PUBLISHING_KEY"
+          curl -fsS \
+            -H "Authorization: Bearer ${MODEL_REGISTRY_PUBLISHING_KEY}" \
+            -H "Content-Type: application/json" \
+            --data @payload.json \
+            "${COORDINATOR_URL%/}/v1/admin/models/register"

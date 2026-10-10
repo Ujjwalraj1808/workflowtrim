@@ -1,0 +1,45 @@
+name: Orchestrator Registry Prune
+
+# Manual workflow to prune Docker registry
+# Removes old container image versions, keeping only the most recent ones
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run mode (only show what would be deleted, don't actually delete)"
+        required: false
+        default: false
+        type: boolean
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  prune-registry:
+    name: 🧹 Prune Docker Registry
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: ⤵️ Check out code
+        uses: actions/checkout@v7
+      - name: 🐍 Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+
+      - name: 📦 Install Python Dependencies
+        run: pip install requests pyyaml --quiet
+
+      - name: 🗑️ Prune Docker Registry
+        run: python3 .scripts/prune_registry.py
+        env:
+          GITHUB_TOKEN: ${{ secrets.PAT || secrets.GITHUB_TOKEN }} # Needs delete:packages scope
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+          DRY_RUN: ${{ github.event.inputs.dry_run == 'true' && 'true' || 'false' }}

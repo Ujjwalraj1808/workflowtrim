@@ -1,0 +1,50 @@
+name: OWASP Dependency Check
+
+on:
+  #pull_request:
+  workflow_dispatch:
+  #push:
+  #  branches:
+  #    - main
+  #    - master
+  #schedule:
+  #  - cron: '0 6 * * 1'
+
+jobs:
+  dependency-check:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      security-events: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build Project
+        uses: actions/setup-java@v5
+        with:
+          java-version: '25'
+          distribution: 'temurin'
+
+      - name: Write Gradle secrets
+        run: |
+          mkdir -p ~/.gradle
+          cat <<EOF > ~/.gradle/gradle.properties
+          ossIndexUsername=${{ secrets.OSS_INDEX_USERNAME }}
+          ossIndexPassword=${{ secrets.OSS_INDEX_PASSWORD }}
+          nvdKey=${{ secrets.NVD_KEY }}
+          EOF
+
+      - name: Run OWASP Dependency-Check
+        timeout-minutes: 10
+        run: ./gradlew --no-parallel --no-configuration-cache dependencyCheckAggregate --no-daemon --console=plain --info -PdependencyCheckSkipProjects=:fkq-test-utils
+
+      - name: Upload test reports
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-reports
+          path: "**/build/reports/*"
+          retention-days: 5

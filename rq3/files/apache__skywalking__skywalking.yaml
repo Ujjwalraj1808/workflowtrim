@@ -1,0 +1,1245 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: CI
+
+on:
+  pull_request:
+  schedule:
+    - cron: "0 18 * * *" # TimeZone: UTC 0
+
+concurrency:
+  group: skywalking-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  SW_AGENT_JDK_VERSION: 8
+  MAVEN_OPTS: -Dhttp.keepAlive=false -Dmaven.wagon.http.pool=false -Dmaven.wagon.httpconnectionManager.ttlSeconds=120
+  SEGMENT_DOWNLOAD_TIMEOUT_MINS: 5 # Cache restore timeout
+
+jobs:
+  license-header:
+    if: (github.event_name == 'schedule' && github.repository == 'apache/skywalking') || (github.event_name != 'schedule')
+    name: License header
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+          persist-credentials: false
+      - name: Check license header
+        uses: apache/skywalking-eyes@5b7ee1731d036b5aac68f8bd3fc9e6f98ada082e
+
+  code-style:
+    if: (github.event_name == 'schedule' && github.repository == 'apache/skywalking') || (github.event_name != 'schedule')
+    name: Code style
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+          persist-credentials: false
+      - name: Check code style
+        run: ./mvnw -B -q clean checkstyle:check
+
+  dependency-license:
+    if: |
+      ( always() && ! cancelled() ) &&
+      ((github.event_name == 'schedule' && github.repository == 'apache/skywalking') || needs.changes.outputs.pom == 'true')
+    name: Dependency licenses
+    needs: [changes]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+          persist-credentials: false
+      - uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: "11"
+          cache: "maven"
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.17"
+      - name: Check Dependencies Licenses
+        run: |
+          go install github.com/apache/skywalking-eyes/cmd/license-eye@5b7ee1731d036b5aac68f8bd3fc9e6f98ada082e
+          ./mvnw flatten:flatten install -Dmaven.test.skip -Dcheckstyle.skip -Dgpg.skip -q
+          license-eye -v debug dependency resolve --summary ./dist-material/release-docs/LICENSE.tpl || exit 1
+          if [ ! -z "$(git diff -U0 ./dist-material/release-docs/LICENSE)" ]; then
+            echo "LICENSE file is not updated correctly"
+            git diff -U0 ./dist-material/release-docs/LICENSE
+            exit 1
+          fi
+
+  sanity-check:
+    if: ( always() && ! cancelled() ) && (github.event_name == 'schedule' && github.repository == 'apache/skywalking') || (github.event_name != 'schedule')
+    name: Sanity check results
+    needs: [license-header, code-style, dependency-license]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check results
+        run: |
+          [[ ${{ needs.license-header.result }} == 'success' ]] || exit 1;
+          [[ ${{ needs.code-style.result }} == 'success' ]] || exit 1;
+          [[ ${{ needs.dependency-license.result }} == 'success' ]] || [[ ${{ needs.dependency-license.result }} == 'skipped' ]] || exit 1;
+
+  changes:
+    # Check if anything related to Actual code / CI(functional testing) is changed
+    # set outputs for other jobs to access for if conditions
+    runs-on: ubuntu-latest
+    # To prevent error when there's no base branch
+    if: github.event_name != 'schedule'
+    timeout-minutes: 10
+    outputs:
+      oap: ${{ steps.filter.outputs.oap }}
+      pom: ${{ steps.filter.outputs.pom }}
+    steps:
+      - uses: actions/checkout@v6 # required for push event
+        with:
+          fetch-depth: 0
+          submodules: true
+          persist-credentials: false
+      - name: Filter
+        id: filter
+        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+        with:
+          list-files: 'shell'
+          predicate-quantifier: 'every'
+          filters: |
+            oap:
+            - '!**/*.md'
+            - '!**/*.txt'
+            - '!.asf.yaml'
+            - '!.dlc.json'
+            - '!.gitignore'
+            - '!.licenserc.yaml'
+            - '!codeStyle.xml'
+            - '!HEADER'
+            - '!LICENSE'
+            - '!NOTICE'
+            - '!docs/**'
+            - '!.github/workflows/codeql.yaml'
+            - '!.github/ISSUE_TEMPLATE/**'
+            - '!.github/PULL_REQUEST_TEMPLATE'
+            - '!dist-material/release-docs/**'
+            - '!component-libraries.yml'
+            pom:
+            - '**/pom.xml'
+      - name: List all modified files
+        if: steps.filter.outputs.oap == 'true' || steps.filter.outputs.pom == 'true' || steps.filter.outputs.pom == 'true'
+        run: |
+          echo "Files that have changed or modified:"
+          echo "OAP: ${{ steps.filter.outputs.oap_files }}"
+          echo "POM: ${{ steps.filter.outputs.pom_files }}"
+
+  dist-tar:
+    if: |
+      ( always() && ! cancelled() ) &&
+      ((github.event_name == 'schedule' && github.repository == 'apache/skywalking') || needs.changes.outputs.oap == 'true')
+    name: Build dist tar
+    needs: [changes]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+          persist-credentials: false
+      - uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: "11"
+          cache: "maven"
+      - name: Build distribution tar
+        run: |
+          ./mvnw clean flatten:flatten install javadoc:javadoc -B -q -Pall \
+            -Dmaven.test.skip \
+            -Dcheckstyle.skip \
+            -Dgpg.skip
+      - name: Verify builds are reproducible
+        run: ./mvnw -Dmaven.test.skip clean flatten:flatten verify artifact:compare -Pall -Dgpg.skip
+      - uses: actions/upload-artifact@v4
+        name: Upload distribution tar
+        with:
+          name: dist
+          path: dist
+
+  docker:
+    if: |
+      ( always() && ! cancelled() ) &&
+      ((github.event_name == 'schedule' && github.repository == 'apache/skywalking') || needs.changes.outputs.oap == 'true')
+    name: Docker images
+    needs: [sanity-check, dist-tar, changes]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      matrix:
+        java-version: [11, 17, 25]
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        name: Download distribution tar
+        with:
+          name: dist
+          path: dist
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ matrix.java-version }}
+      - name: Build and save docker images
+        env:
+          SW_OAP_BASE_IMAGE: eclipse-temurin:${{ matrix.java-version }}-jre
+        run: |
+          make docker.all || make docker.all
+          docker save -o docker-images-skywalking-oap.tar skywalking/oap:latest
+      - name: Upload docker images
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-images-${{ matrix.java-version }}
+          path: docker-images-skywalking-*.tar
+
+  unit-test:
+    if: |
+      ( always() && ! cancelled() ) &&
+      ((github.event_name == 'schedule' && github.repository == 'apache/skywalking') || needs.changes.outputs.oap == 'true')
+    name: Unit test
+    needs: [sanity-check, changes]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-14, windows-latest]
+        java-version: [11]
+        include:
+          - os: ubuntu-latest
+            java-version: 17
+          - os: ubuntu-latest
+            java-version: 21
+          - os: ubuntu-latest
+            java-version: 25
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+          persist-credentials: false
+      - name: Cache maven repository
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository
+          key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
+          restore-keys: ${{ runner.os }}-maven-
+      - uses: actions/setup-java@v4
+        with:
+          java-version: ${{ matrix.java-version }}
+          distribution: temurin
+      - name: Unit test
+        run: ./mvnw clean test -q -B -D"checkstyle.skip" || ./mvnw clean test -q -B -D"checkstyle.skip"
+
+  integration-test:
+    if: |
+      ( always() && ! cancelled() ) &&
+      ((github.event_name == 'schedule' && github.repository == 'apache/skywalking') || needs.changes.outputs.oap == 'true')
+    name: Integration test
+    needs: [sanity-check, changes]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      matrix:
+        java-version: [11, 17, 21, 25]
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+          persist-credentials: false
+      - name: Cache maven repository
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository
+          key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
+          restore-keys: ${{ runner.os }}-maven-
+      - uses: actions/setup-java@v4
+        with:
+          java-version: ${{ matrix.java-version }}
+          distribution: temurin
+      - name: Integration test
+        run: |
+          # Exclude slow integration tests (run in slow-integration-test). Runtime-rule
+          # and BanyanDB storage CRUD are verified end-to-end in the dedicated e2e cases
+          # (see test/e2e-v2/cases/runtime-rule/ and test/e2e-v2/cases/banyandb).
+          ./mvnw -B clean integration-test -Dcheckstyle.skip -DskipUTs=true -DexcludedGroups=slow || \
+          ./mvnw -B clean integration-test -Dcheckstyle.skip -DskipUTs=true -DexcludedGroups=slow
+
+  # Slow tests
+  slow-integration-test:
+    if: |
+      ( always() && ! cancelled() ) &&
+      ((github.event_name == 'schedule' && github.repository == 'apache/skywalking') || needs.changes.outputs.oap == 'true')
+    name: Slow Integration Tests
+    needs: [sanity-check, changes]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      matrix:
+        test:
+          - name: ElasticSearch / OpenSearch
+            class: org.apache.skywalking.library.elasticsearch.ElasticSearchIT
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+          persist-credentials: false
+      - name: Cache maven repository
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository
+          key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
+          restore-keys: ${{ runner.os }}-maven-
+      - uses: actions/setup-java@v4
+        with:
+          java-version: 11
+          distribution: temurin
+      - name: ${{ matrix.test.name }}
+        run: |
+          ./mvnw -B clean integration-test -Dcheckstyle.skip -DskipUTs=true -Dit.test=${{ matrix.test.class }} -Dfailsafe.failIfNoSpecifiedTests=false || \
+          ./mvnw -B clean integration-test -Dcheckstyle.skip -DskipUTs=true -Dit.test=${{ matrix.test.class }} -Dfailsafe.failIfNoSpecifiedTests=false
+
+  e2e-test:
+    if: |
+      ( always() && ! cancelled() ) &&
+      ((github.event_name == 'schedule' && github.repository == 'apache/skywalking') || needs.changes.outputs.oap == 'true')
+    name: ${{ matrix.test.name }}
+    needs: [docker, dist-tar]
+    runs-on: ${{ matrix.test.runs-on || 'ubuntu-latest' }}
+    timeout-minutes: 60
+    env:
+      OTEL_COLLECTOR_VERSION: 0.102.1
+    strategy:
+      fail-fast: false
+      matrix:
+        test:
+          - name: Cluster ZK ES
+            config: test/e2e-v2/cases/cluster/zk/es/e2e.yaml
+          - name: Cluster ZK BanyanDB
+            config: test/e2e-v2/cases/cluster/zk/banyandb/e2e.yaml
+
+          - name: Agent NodeJS Backend
+            config: test/e2e-v2/cases/nodejs/e2e.yaml
+          - name: Agent Golang
+            config: test/e2e-v2/cases/go/e2e.yaml
+          - name: Agent NodeJS Frontend
+            config: test/e2e-v2/cases/browser/e2e.yaml
+          - name: Agent NodeJS Frontend ES
+            config: test/e2e-v2/cases/browser/es/e2e.yaml
+          - name: Agent NodeJS Frontend ES Sharding
+            config: test/e2e-v2/cases/browser/es/es-sharding/e2e.yaml
+          - name: Agent PHP
+            config: test/e2e-v2/cases/php/e2e.yaml
+          - name: Agent Python
+            config: test/e2e-v2/cases/python/e2e.yaml
+          - name: Agent Lua
+            config: test/e2e-v2/cases/lua/e2e.yaml
+
+          - name: BanyanDB
+            config: test/e2e-v2/cases/storage/banyandb/e2e.yaml
+          - name: BanyanDB TLS
+            config: test/e2e-v2/cases/storage/banyandb/tls/e2e.yaml
+          - name: BanyanDB Auth Rotation
+            config: test/e2e-v2/cases/storage/banyandb/auth-rotation/e2e.yaml
+          - name: BanyanDB CA Rotation
+            config: test/e2e-v2/cases/storage/banyandb/ca-rotation/e2e.yaml
+          # Trace retention pipeline. Each pair is a controlled drop/keep experiment on one
+          # schema: identical data and thresholds, differing only by a keepTagRules entry, so
+          # a regression in either direction is attributable. They need the BanyanDB
+          # "-plugins" host and "-plugins-carrier" images, which are published only for the
+          # SW_BANYANDB_COMMIT pinned in test/e2e-v2/script/env.
+          - name: BanyanDB Trace Pipeline SW
+            config: test/e2e-v2/cases/storage/banyandb/pipeline-plugin/sw/e2e.yaml
+          - name: BanyanDB Trace Pipeline SW Keep
+            config: test/e2e-v2/cases/storage/banyandb/pipeline-plugin/sw-keep/e2e.yaml
+          - name: BanyanDB Trace Pipeline Zipkin
+            config: test/e2e-v2/cases/storage/banyandb/pipeline-plugin/zipkin/e2e.yaml
+          - name: BanyanDB Trace Pipeline Zipkin Keep
+            config: test/e2e-v2/cases/storage/banyandb/pipeline-plugin/zipkin-keep/e2e.yaml
+          - name: BanyanDB monitoring
+            config: test/e2e-v2/cases/banyandb/e2e.yaml
+          # The meter_banyandb_trace_sampling_* rules, which the case above cannot cover: its
+          # cluster runs no sampler plugins, so the wire families never register. Needs the
+          # BanyanDB "-plugins" host and "-plugins-carrier" images, published only for the
+          # SW_BANYANDB_COMMIT pinned in test/e2e-v2/script/env.
+          - name: BanyanDB trace sampling monitoring
+            config: test/e2e-v2/cases/banyandb/trace-sampling/e2e.yaml
+          - name: Storage MySQL
+            config: test/e2e-v2/cases/storage/mysql/e2e.yaml
+          - name: Storage PostgreSQL
+            config: test/e2e-v2/cases/storage/postgres/e2e.yaml
+          - name: Storage ES 8.18.8
+            config: test/e2e-v2/cases/storage/es/e2e.yaml
+            env: ES_VERSION=8.18.8
+          - name: Storage ES 9.3.0
+            config: test/e2e-v2/cases/storage/es/e2e.yaml
+            env: ES_VERSION=9.3.0
+          - name: Storage OpenSearch 2.4.0
+            config: test/e2e-v2/cases/storage/opensearch/e2e.yaml
+            env: OPENSEARCH_VERSION=2.4.0
+          - name: Storage OpenSearch 2.8.0
+            config: test/e2e-v2/cases/storage/opensearch/e2e.yaml
+            env: OPENSEARCH_VERSION=2.8.0
+          - name: Storage OpenSearch 3.0.0
+            config: test/e2e-v2/cases/storage/opensearch/e2e.yaml
+            env: OPENSEARCH_VERSION=3.0.0
+          - name: Storage ES Sharding 8.18.8
+            config: test/e2e-v2/cases/storage/es/es-sharding/e2e.yaml
+            env: ES_VERSION=8.18.8
+
+          - name: Inspect API BanyanDB
+            config: test/e2e-v2/cases/inspect/banyandb/e2e.yaml
+          - name: Inspect API PostgreSQL
+            config: test/e2e-v2/cases/inspect/postgresql/e2e.yaml
+          - name: Inspect API Elasticsearch 8.18.8
+            config: test/e2e-v2/cases/inspect/elasticsearch/e2e.yaml
+            env: ES_VERSION=8.18.8
+
+          - name: Runtime Rule MAL Storage BanyanDB
+            config: test/e2e-v2/cases/runtime-rule/mal-storage/banyandb/e2e.yaml
+          - name: Runtime Rule MAL Storage PostgreSQL
+            config: test/e2e-v2/cases/runtime-rule/mal-storage/postgresql/e2e.yaml
+          - name: Runtime Rule MAL Storage Elasticsearch 8.18.8
+            config: test/e2e-v2/cases/runtime-rule/mal-storage/elasticsearch/e2e.yaml
+            env: ES_VERSION=8.18.8
+          - name: Runtime Rule LAL Hot-Update
+            config: test/e2e-v2/cases/runtime-rule/lal/e2e.yaml
+          - name: Runtime Rule Cluster (kind)
+            config: test/e2e-v2/cases/runtime-rule/cluster/e2e.yaml
+            runs-on: ubuntu-24.04
+          - name: Runtime Rule Meter Hot-Update
+            config: test/e2e-v2/cases/runtime-rule/meter/e2e.yaml
+          - name: DSL Debug API — MAL
+            config: test/e2e-v2/cases/dsl-debugging/mal/e2e.yaml
+          - name: DSL Debug API — OAL
+            config: test/e2e-v2/cases/dsl-debugging/oal/e2e.yaml
+          - name: DSL Debug API — LAL block
+            config: test/e2e-v2/cases/dsl-debugging/lal-block/e2e.yaml
+          - name: DSL Debug API — LAL statement
+            config: test/e2e-v2/cases/dsl-debugging/lal-statement/e2e.yaml
+
+          - name: Alarm ES
+            config: test/e2e-v2/cases/alarm/es/e2e.yaml
+          - name: Alarm ES Sharding
+            config: test/e2e-v2/cases/alarm/es/es-sharding/e2e.yaml
+          - name: Alarm MySQL
+            config: test/e2e-v2/cases/alarm/mysql/e2e.yaml
+          - name: Alarm PostgreSQL
+            config: test/e2e-v2/cases/alarm/postgres/e2e.yaml
+          - name: Alarm BanyanDB
+            config: test/e2e-v2/cases/alarm/banyandb/e2e.yaml
+
+          - name: Baseline-driven Alarm ES
+            config: test/e2e-v2/cases/baseline/es/e2e.yaml
+          - name: Baseline-driven Alarm ES Sharding
+            config: test/e2e-v2/cases/baseline/es/es-sharding/e2e.yaml
+          - name: Baseline-driven Alarm BanyanDB
+            config: test/e2e-v2/cases/baseline/banyandb/e2e.yaml
+
+          - name: TTL ES 8.18.8
+            config: test/e2e-v2/cases/ttl/es/e2e.yaml
+            env: ES_VERSION=8.18.8
+
+          - name: Event BanyanDB
+            config: test/e2e-v2/cases/event/banyandb/e2e.yaml
+          - name: Event ES
+            config: test/e2e-v2/cases/event/es/e2e.yaml
+          - name: Event MySQL
+            config: test/e2e-v2/cases/event/mysql/e2e.yaml
+
+          - name: Log MySQL
+            config: test/e2e-v2/cases/log/mysql/e2e.yaml
+          - name: Log PostgreSQL
+            config: test/e2e-v2/cases/log/postgres/e2e.yaml
+          - name: Log ES 8.18.8
+            config: test/e2e-v2/cases/log/es/e2e.yaml
+            env: ES_VERSION=8.18.8
+          - name: Log ES 8.18.8 Sharding
+            config: test/e2e-v2/cases/log/es/es-sharding/e2e.yaml
+            env: ES_VERSION=8.18.8
+          - name: Log BanyanDB
+            config: test/e2e-v2/cases/log/banyandb/e2e.yaml
+          - name: AI Agent Conversations BanyanDB
+            config: test/e2e-v2/cases/ai-agent/banyandb/e2e.yaml
+          - name: AI Agent Conversations ES 8.18.8
+            config: test/e2e-v2/cases/ai-agent/es/e2e.yaml
+            env: ES_VERSION=8.18.8
+          - name: AI Agent Conversations MySQL
+            config: test/e2e-v2/cases/ai-agent/mysql/e2e.yaml
+          - name: AI Agent Conversations Postgres
+            config: test/e2e-v2/cases/ai-agent/postgres/e2e.yaml
+
+          - name: Log FluentBit ES 8.18.8
+            config: test/e2e-v2/cases/log/fluent-bit/e2e.yaml
+            env: ES_VERSION=8.18.8
+
+          - name: Trace Profiling BanyanDB
+            config: test/e2e-v2/cases/profiling/trace/banyandb/e2e.yaml
+          - name: Trace Profiling ES
+            config: test/e2e-v2/cases/profiling/trace/es/e2e.yaml
+          - name: Trace Profiling ES Sharding
+            config: test/e2e-v2/cases/profiling/trace/es/es-sharding/e2e.yaml
+          - name: Trace Profiling MySQL
+            config: test/e2e-v2/cases/profiling/trace/mysql/e2e.yaml
+          - name: Trace Profiling Postgres
+            config: test/e2e-v2/cases/profiling/trace/postgres/e2e.yaml
+          - name: Trace Profiling OpenSearch 2.4.0
+            config: test/e2e-v2/cases/profiling/trace/opensearch/e2e.yaml
+            env: OPENSEARCH_VERSION=2.4.0
+          - name: Go Trace Profiling
+            config: test/e2e-v2/cases/profiling/trace/go/e2e.yaml
+
+          - name: eBPF Profiling On CPU BanyanDB
+            config: test/e2e-v2/cases/profiling/ebpf/oncpu/banyandb/e2e.yaml
+            docker:
+              base: test/e2e-v2/cases/profiling/ebpf/oncpu/
+              file: Dockerfile.sqrt
+              name: test/oncpu:test
+          - name: eBPF Profiling On CPU ES
+            config: test/e2e-v2/cases/profiling/ebpf/oncpu/es/e2e.yaml
+            docker:
+              base: test/e2e-v2/cases/profiling/ebpf/oncpu/
+              file: Dockerfile.sqrt
+              name: test/oncpu:test
+          - name: eBPF Profiling On CPU ES Sharding
+            config: test/e2e-v2/cases/profiling/ebpf/oncpu/es/es-sharding/e2e.yaml
+            docker:
+              base: test/e2e-v2/cases/profiling/ebpf/oncpu/
+              file: Dockerfile.sqrt
+              name: test/oncpu:test
+          - name: eBPF Profiling Off CPU
+            config: test/e2e-v2/cases/profiling/ebpf/offcpu/e2e.yaml
+            docker:
+              base: test/e2e-v2/cases/profiling/ebpf/offcpu/
+              file: Dockerfile.file
+              name: test/offcpu:test
+            runs-on: ubuntu-24.04
+
+          - name: eBPF Profiling Network BanyanDB
+            config: test/e2e-v2/cases/profiling/ebpf/network/banyandb/e2e.yaml
+            docker:
+              base: test/e2e-v2/cases/profiling/ebpf/network/
+              file: Dockerfile.service
+              name: test/network:test
+          - name: eBPF Profiling Network ES
+            config: test/e2e-v2/cases/profiling/ebpf/network/es/e2e.yaml
+            docker:
+              base: test/e2e-v2/cases/profiling/ebpf/network/
+              file: Dockerfile.service
+              name: test/network:test
+          - name: eBPF Profiling Network ES Sharding
+            config: test/e2e-v2/cases/profiling/ebpf/network/es/es-sharding/e2e.yaml
+            docker:
+              base: test/e2e-v2/cases/profiling/ebpf/network/
+              file: Dockerfile.service
+              name: test/network:test
+
+          - name: Continuous Profiling BanyanDB
+            config: test/e2e-v2/cases/profiling/ebpf/continuous/banyandb/e2e.yaml
+            docker:
+              base: test/e2e-v2/cases/profiling/ebpf/continuous/
+              file: Dockerfile.sqrt
+              name: test/continuous:test
+          - name: Continuous Profiling ES
+            config: test/e2e-v2/cases/profiling/ebpf/continuous/es/e2e.yaml
+            docker:
+              base: test/e2e-v2/cases/profiling/ebpf/continuous/
+              file: Dockerfile.sqrt
+              name: test/continuous:test
+          - name: Continuous Profiling Sharding ES
+            config: test/e2e-v2/cases/profiling/ebpf/continuous/es/es-sharding/e2e.yaml
+            docker:
+              base: test/e2e-v2/cases/profiling/ebpf/continuous/
+              file: Dockerfile.sqrt
+              name: test/continuous:test
+
+          # eBPF Access Log
+          - name: eBPF Access Log BanyanDB
+            config: test/e2e-v2/cases/profiling/ebpf/access_log/banyandb/e2e.yaml
+          - name: eBPF Access Log ES
+            config: test/e2e-v2/cases/profiling/ebpf/access_log/es/e2e.yaml
+          - name: eBPF Access Log ES Sharding
+            config: test/e2e-v2/cases/profiling/ebpf/access_log/es/es-sharding/e2e.yaml
+
+          - name: Kafka Basic
+            config: test/e2e-v2/cases/kafka/simple-so11y/e2e.yaml
+          - name: Kafka Profiling
+            config: test/e2e-v2/cases/kafka/profile/e2e.yaml
+          - name: Kafka Meter
+            config: test/e2e-v2/cases/kafka/meter/e2e.yaml
+          - name: Kafka Log
+            config: test/e2e-v2/cases/kafka/log/e2e.yaml
+
+          - name: Istio Metrics Service ES 1.21.0
+            config: test/e2e-v2/cases/istio/metrics/e2e.yaml
+            env: |
+              ISTIO_VERSION=1.21.0
+              KUBERNETES_VERSION=28
+          - name: Istio Metrics Service ES 1.22.0
+            config: test/e2e-v2/cases/istio/metrics/e2e.yaml
+            env: |
+              ISTIO_VERSION=1.22.0
+              KUBERNETES_VERSION=28
+          - name: Istio Metrics Service ES 1.23.0
+            config: test/e2e-v2/cases/istio/metrics/e2e.yaml
+            env: |
+              ISTIO_VERSION=1.23.0
+              KUBERNETES_VERSION=28
+          - name: Istio Metrics Service ES 1.24.0
+            config: test/e2e-v2/cases/istio/metrics/e2e.yaml
+            env: |
+              ISTIO_VERSION=1.24.0
+              KUBERNETES_VERSION=28
+          - name: Istio Metrics Service ES 1.25.0
+            config: test/e2e-v2/cases/istio/metrics/e2e.yaml
+            env: |
+              ISTIO_VERSION=1.25.0
+              KUBERNETES_VERSION=28
+          - name: Istio Metrics Service ES 1.26.0
+            config: test/e2e-v2/cases/istio/metrics/e2e.yaml
+            env: |
+              ISTIO_VERSION=1.26.0
+              KUBERNETES_VERSION=28
+          - name: Istio Metrics Service ES 1.27.0
+            config: test/e2e-v2/cases/istio/metrics/e2e.yaml
+            env: |
+              ISTIO_VERSION=1.27.0
+              KUBERNETES_VERSION=28
+          - name: Istio Metrics Service ES 1.28.0
+            config: test/e2e-v2/cases/istio/metrics/e2e.yaml
+            env: |
+              ISTIO_VERSION=1.28.0
+              KUBERNETES_VERSION=28
+          - name: Istio Metrics Service ES 1.29.0
+            config: test/e2e-v2/cases/istio/metrics/e2e.yaml
+            env: |
+              ISTIO_VERSION=1.29.0
+              KUBERNETES_VERSION=28
+          - name: Istio Metrics Service BanyanDB 1.29.0
+            config: test/e2e-v2/cases/istio/metrics/banyandb/e2e.yaml
+            env: |
+              ISTIO_VERSION=1.29.0
+              KUBERNETES_VERSION=28
+
+          - name: Rover with Istio Process 1.28.0
+            config: test/e2e-v2/cases/rover/process/istio/e2e.yaml
+            env: |
+              ISTIO_VERSION=1.28.0
+              KUBERNETES_VERSION=28
+            runs-on: ubuntu-24.04
+
+          - name: Satellite
+            config: test/e2e-v2/cases/satellite/native-protocols/e2e.yaml
+          - name: Auth
+            config: test/e2e-v2/cases/simple/auth/e2e.yaml
+          - name: SSL
+            config: test/e2e-v2/cases/simple/ssl/e2e.yaml
+          - name: mTLS
+            config: test/e2e-v2/cases/simple/mtls/e2e.yaml
+          - name: Virtual Gateway
+            config: test/e2e-v2/cases/gateway/e2e.yaml
+          - name: Meter
+            config: test/e2e-v2/cases/meter/e2e.yaml
+          - name: VM Zabbix
+            config: test/e2e-v2/cases/vm/zabbix/e2e.yaml
+          - name: VM Prometheus
+            config: test/e2e-v2/cases/vm/prometheus-node-exporter/e2e.yaml
+          - name: VM OpenTelemetry Hostmetrics
+            config: test/e2e-v2/cases/vm/otel-hostmetrics/e2e.yaml
+            env: OTEL_COLLECTOR_CONTRIB_VERSION=0.158.0
+          - name: VM Telegraf
+            config: test/e2e-v2/cases/vm/telegraf/e2e.yaml
+          - name: So11y
+            config: test/e2e-v2/cases/so11y/e2e.yaml
+          - name: MySQL Prometheus and slowsql
+            config: test/e2e-v2/cases/mysql/mysql-slowsql/e2e.yaml
+          - name: PostgreSQL Prometheus
+            config: test/e2e-v2/cases/postgresql/postgres-exporter/e2e.yaml
+          - name: MariaDB Prometheus and slowsql
+            config: test/e2e-v2/cases/mariadb/mariadb-slowsql/e2e.yaml
+
+          - name: Zipkin ES
+            config: test/e2e-v2/cases/zipkin/es/e2e.yaml
+          - name: Zipkin ES Sharding
+            config: test/e2e-v2/cases/zipkin/es/es-sharding/e2e.yaml
+          - name: Zipkin MySQL
+            config: test/e2e-v2/cases/zipkin/mysql/e2e.yaml
+          - name: Zipkin Postgres
+            config: test/e2e-v2/cases/zipkin/postgres/e2e.yaml
+          - name: Zipkin Kafka
+            config: test/e2e-v2/cases/zipkin/kafka/e2e.yaml
+          - name: Zipkin BanyanDB
+            config: test/e2e-v2/cases/zipkin/banyandb/e2e.yaml
+          - name: Virtual GenAI
+            config: test/e2e-v2/cases/virtual-genai/e2e.yaml
+          - name: OTLP Virtual GenAI
+            config: test/e2e-v2/cases/otlp-virtual-genai/e2e.yaml
+          - name: OTLP Virtual GenAI Native
+            config: test/e2e-v2/cases/otlp-virtual-genai/native/e2e.yaml
+          - name: Zipkin Virtual GenAI
+            config: test/e2e-v2/cases/zipkin-virtual-genai/e2e.yaml
+          - name: iOS Monitoring
+            config: test/e2e-v2/cases/ios/e2e.yaml
+          - name: WeChat Mini Program Monitoring
+            config: test/e2e-v2/cases/miniprogram/wechat/e2e.yaml
+          - name: Alipay Mini Program Monitoring
+            config: test/e2e-v2/cases/miniprogram/alipay/e2e.yaml
+
+          - name: Nginx
+            config: test/e2e-v2/cases/nginx/e2e.yaml
+          - name: APISIX metrics
+            config: test/e2e-v2/cases/apisix/otel-collector/e2e.yaml
+          - name: Exporter Kafka
+            config: test/e2e-v2/cases/exporter/kafka/e2e.yaml
+          - name: Virtual MQ
+            config: test/e2e-v2/cases/virtual-mq/e2e.yaml
+          - name: AWS Cloud EKS
+            config: test/e2e-v2/cases/aws/eks/e2e.yaml
+          - name: Windows
+            config: test/e2e-v2/cases/win/e2e.yaml
+          - name: AWS Cloud S3
+            config: test/e2e-v2/cases/aws/s3/e2e.yaml
+          - name: AWS Cloud DynamoDB
+            config: test/e2e-v2/cases/aws/dynamodb/e2e.yaml
+          - name: PromQL Service
+            config: test/e2e-v2/cases/promql/e2e.yaml
+          - name: LogQL Service
+            config: test/e2e-v2/cases/logql/e2e.yaml
+          - name: TraceQL Service Zipkin
+            config: test/e2e-v2/cases/traceql/zipkin/e2e.yaml
+          - name: TraceQL Service SkyWalking
+            config: test/e2e-v2/cases/traceql/skywalking/e2e.yaml
+          - name: AWS API Gateway
+            config: test/e2e-v2/cases/aws/api-gateway/e2e.yaml
+          - name: Redis Prometheus and Log Collecting
+            config: test/e2e-v2/cases/redis/redis-exporter/e2e.yaml
+          - name: Elasticsearch
+            config: test/e2e-v2/cases/elasticsearch/e2e.yaml
+          - name: MongoDB
+            config: test/e2e-v2/cases/mongodb/e2e.yaml
+          - name: RabbitMQ
+            config: test/e2e-v2/cases/rabbitmq/e2e.yaml
+          - name: Kafka
+            config: test/e2e-v2/cases/kafka/kafka-monitoring/e2e.yaml
+          - name: MQE Service
+            config: test/e2e-v2/cases/mqe/e2e.yaml
+          - name: Pulsar and BookKeeper
+            config: test/e2e-v2/cases/pulsar/e2e.yaml
+          - name: RocketMQ
+            config: test/e2e-v2/cases/rocketmq/e2e.yaml
+          - name: ClickHouse
+            config: test/e2e-v2/cases/clickhouse/clickhouse-prometheus-endpoint/e2e.yaml
+          - name: ActiveMQ
+            config: test/e2e-v2/cases/activemq/e2e.yaml
+          - name: Kong
+            config: test/e2e-v2/cases/kong/e2e.yaml
+          - name: Flink
+            config: test/e2e-v2/cases/flink/e2e.yaml
+          - name: Airflow
+            config: test/e2e-v2/cases/airflow/mock/e2e.yaml
+          - name: Airflow Cluster
+            config: test/e2e-v2/cases/airflow/cluster/e2e.yaml
+
+          - name: OTLP Trace
+            config: test/e2e-v2/cases/otlp-traces/e2e.yaml
+          - name: OTLP Trace Native BanyanDB
+            config: test/e2e-v2/cases/otlp-traces/native/banyandb/e2e.yaml
+          - name: OTLP Trace Native ES
+            config: test/e2e-v2/cases/otlp-traces/native/es/e2e.yaml
+          - name: OTLP Trace Native MySQL
+            config: test/e2e-v2/cases/otlp-traces/native/mysql/e2e.yaml
+
+          - name: UI Management BanyanDB
+            config: test/e2e-v2/cases/ui-management/banyandb/e2e.yaml
+
+          - name: Cilium Service
+            config: test/e2e-v2/cases/cilium/e2e.yaml
+
+          - name: Async Profiler ES
+            config: test/e2e-v2/cases/profiling/async-profiler/es/e2e.yaml
+          - name: Async Profiler BanyanDB
+            config: test/e2e-v2/cases/profiling/async-profiler/banyandb/e2e.yaml
+          - name: Async Profiler MySQL
+            config: test/e2e-v2/cases/profiling/async-profiler/mysql/e2e.yaml
+
+          - name: Pprof ES
+            config: test/e2e-v2/cases/profiling/pprof/es/e2e.yaml
+          - name: Pprof BanyanDB
+            config: test/e2e-v2/cases/profiling/pprof/banyandb/e2e.yaml
+          - name: Pprof MySQL
+            config: test/e2e-v2/cases/profiling/pprof/mysql/e2e.yaml
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+          persist-credentials: false
+      - run: grep -v '^#' test/e2e-v2/script/env >> "$GITHUB_ENV"
+      - uses: apache/skywalking-cli/actions/setup@master
+        with:
+          version: ${{ env.SW_CTL_COMMIT }}
+      - uses: actions/download-artifact@v4
+        name: Download docker images
+        with:
+          name: docker-images-25
+          path: docker-images
+      - name: Load docker images
+        run: |
+          find docker-images -name "*.tar" -exec docker load -i {} \;
+          find docker-images -name "*.tar" -exec rm {} \;
+      - uses: actions/download-artifact@v4
+        name: Download distribution tar
+        with:
+          name: dist
+          path: dist
+      - name: Login to ghcr
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # The virtual-genai case builds e2e-spring-ai-service, which needs Java 17. Without this
+      # the job silently rides whatever JDK the runner image defaults to.
+      - uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: "17"
+      - name: Cache maven repository
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository
+          key: ${{ runner.os }}-maven-${{ hashFiles('test/e2e-v2/java-test-service/**/pom.xml') }}
+          restore-keys: ${{ runner.os }}-maven-
+      - name: Prepare test services
+        shell: bash
+        run: ./mvnw -B -q -f test/e2e-v2/java-test-service/pom.xml clean flatten:flatten package
+      - name: Set env var
+        run: |
+          echo "${{ matrix.test.env }}"  >> $GITHUB_ENV
+      - name: Build test image
+        if: matrix.test.docker != null
+        run: docker build -t ${{ matrix.test.docker.name }} -f ${{ matrix.test.docker.base }}/${{ matrix.test.docker.file }} ${{ matrix.test.docker.base }}
+      - name: ${{ matrix.test.name }}
+        uses: apache/skywalking-infra-e2e@68bbdec303cf2d3df9f2353f970f91938b52f674
+        with:
+          e2e-file: $GITHUB_WORKSPACE/${{ matrix.test.config }}
+      - if: ${{ failure() || cancelled() }}
+        run: |
+          df -h
+          du -sh .
+          docker images
+      # Capture container logs even when the job is CANCELLED (e.g. a case that
+      # hangs and hits the job timeout-minutes is `cancelled`, not `failure`, so a
+      # plain `if: failure()` upload is skipped and produces zero logs). The e2e
+      # action's own log collector also never runs when the trigger hangs, so dump
+      # the docker logs directly here while the containers are still alive.
+      - name: Dump container logs
+        if: ${{ failure() || cancelled() }}
+        run: |
+          LOG_DIR="${{ env.SW_INFRA_E2E_LOG_DIR }}"
+          mkdir -p "$LOG_DIR"
+          docker ps -a > "$LOG_DIR/docker-ps.txt" 2>&1 || true
+          for c in $(docker ps -aq); do
+            name=$(docker inspect -f '{{.Name}}' "$c" | tr -d '/')
+            docker logs "$c" > "$LOG_DIR/$name.log" 2>&1 || true
+          done
+      - uses: actions/upload-artifact@v4
+        if: ${{ failure() || cancelled() }}
+        name: Upload Logs
+        with:
+          name: test-logs-${{ matrix.test.name }}
+          path: "${{ env.SW_INFRA_E2E_LOG_DIR }}"
+          overwrite: true
+
+  e2e-test-istio:
+    if: |
+      ( always() && ! cancelled() ) &&
+      ((github.event_name == 'schedule' && github.repository == 'apache/skywalking') || needs.changes.outputs.oap == 'true')
+    name: Istio ALS
+    needs: [docker]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        analyzer: [k8s-mesh, mx-mesh]
+        storage: [ES, BanyanDB]
+        versions:
+          - istio: 1.21.0
+            kubernetes: 28
+          - istio: 1.22.0
+            kubernetes: 28
+          - istio: 1.23.0
+            kubernetes: 28
+          - istio: 1.24.0
+            kubernetes: 28
+          - istio: 1.25.0
+            kubernetes: 28
+          - istio: 1.26.0
+            kubernetes: 28
+          - istio: 1.27.0
+            kubernetes: 28
+          - istio: 1.28.0
+            kubernetes: 28
+          - istio: 1.29.0
+            kubernetes: 28
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+          persist-credentials: false
+      - run: grep -v '^#' test/e2e-v2/script/env >> "$GITHUB_ENV"
+      - uses: apache/skywalking-cli/actions/setup@master
+        with:
+          version: ${{ env.SW_CTL_COMMIT }}
+      - uses: actions/download-artifact@v4
+        name: Download docker images
+        with:
+          name: docker-images-25
+          path: docker-images
+      - name: Load docker images
+        run: |
+          find docker-images -name "*.tar" -exec docker load -i {} \;
+          find docker-images -name "*.tar" -exec rm {} \;
+      - name: Login to ghcr
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: ALS ${{ matrix.storage }}, ${{ matrix.analyzer }}, istio-${{ matrix.versions.istio }}, k8s-${{ matrix.versions.kubernetes }}
+        uses: apache/skywalking-infra-e2e@68bbdec303cf2d3df9f2353f970f91938b52f674
+        env:
+          ISTIO_VERSION: ${{ matrix.versions.istio }}
+          KUBERNETES_VERSION: ${{ matrix.versions.kubernetes }}
+          ALS_ANALYZER: ${{ matrix.analyzer }}
+        with:
+          e2e-file: ${{ matrix.storage == 'BanyanDB' && 'test/e2e-v2/cases/istio/als/banyandb/e2e.yaml' || 'test/e2e-v2/cases/istio/als/e2e.yaml' }}
+      - if: ${{ failure() }}
+        run: |
+          df -h
+          du -sh .
+          docker images
+      - uses: actions/upload-artifact@v4
+        if: ${{ failure() }}
+        name: Upload Logs
+        with:
+          name: test-istio-als-logs-${{ matrix.storage }}-${{ matrix.analyzer }}-istio-${{ matrix.versions.istio }}-k8s-${{ matrix.versions.kubernetes }}
+          path: "${{ env.SW_INFRA_E2E_LOG_DIR }}"
+          overwrite: true
+
+  e2e-test-istio-ambient:
+    if: |
+      ( always() && ! cancelled() ) &&
+      ((github.event_name == 'schedule' && github.repository == 'apache/skywalking') || needs.changes.outputs.oap == 'true')
+    name: Istio Ambient ALS
+    needs: [docker]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        analyzer: [k8s-mesh, mx-mesh]
+        versions:
+          - istio: 1.23.0
+            kubernetes: 28
+          - istio: 1.24.0
+            kubernetes: 28
+          - istio: 1.25.0
+            kubernetes: 28
+          - istio: 1.26.0
+            kubernetes: 28
+          - istio: 1.27.0
+            kubernetes: 28
+          - istio: 1.28.0
+            kubernetes: 28
+          - istio: 1.29.0
+            kubernetes: 28
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+          persist-credentials: false
+      - run: grep -v '^#' test/e2e-v2/script/env >> "$GITHUB_ENV"
+      - uses: apache/skywalking-cli/actions/setup@master
+        with:
+          version: ${{ env.SW_CTL_COMMIT }}
+      - uses: actions/download-artifact@v4
+        name: Download docker images
+        with:
+          name: docker-images-25
+          path: docker-images
+      - name: Load docker images
+        run: |
+          find docker-images -name "*.tar" -exec docker load -i {} \;
+          find docker-images -name "*.tar" -exec rm {} \;
+      - name: Login to ghcr
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: ${{ matrix.test.name }}
+        uses: apache/skywalking-infra-e2e@68bbdec303cf2d3df9f2353f970f91938b52f674
+        env:
+          ISTIO_VERSION: ${{ matrix.versions.istio }}
+          KUBERNETES_VERSION: ${{ matrix.versions.kubernetes }}
+          ALS_ANALYZER: ${{ matrix.analyzer }}
+        with:
+          e2e-file: test/e2e-v2/cases/istio/ambient-als/e2e.yaml
+      - if: ${{ failure() }}
+        run: |
+          df -h
+          du -sh .
+          docker images
+      - uses: actions/upload-artifact@v4
+        if: ${{ failure() }}
+        name: Upload Logs
+        with:
+          name: test-istio-ambient-logs-${{ matrix.versions.istio }}-${{ matrix.versions.kubernetes }}-${{ matrix.analyzer }}
+          path: "${{ env.SW_INFRA_E2E_LOG_DIR }}"
+          overwrite: true
+
+  e2e-test-java-versions:
+    if: |
+      ( always() && ! cancelled() ) &&
+      ((github.event_name == 'schedule' && github.repository == 'apache/skywalking') || needs.changes.outputs.oap == 'true')
+    name: Java ${{ matrix.java-version }}
+    needs: [docker]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        java-version: [11, 17, 25]
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+          persist-credentials: false
+      - run: grep -v '^#' test/e2e-v2/script/env >> "$GITHUB_ENV"
+      - uses: apache/skywalking-cli/actions/setup@master
+        with:
+          version: ${{ env.SW_CTL_COMMIT }}
+      - uses: actions/download-artifact@v4
+        name: Download docker images
+        with:
+          name: docker-images-${{ matrix.java-version }}
+          path: docker-images
+      - name: Load docker images
+        run: |
+          find docker-images -name "*.tar" -exec docker load -i {} \;
+          find docker-images -name "*.tar" -exec rm {} \;
+      - uses: actions/setup-java@v4
+        with:
+          java-version: ${{ matrix.java-version }}
+          distribution: temurin
+      - name: Cache maven repository
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository
+          key: ${{ runner.os }}-maven-${{ hashFiles('test/e2e-v2/java-test-service/**/pom.xml') }}
+          restore-keys: ${{ runner.os }}-maven-
+      - name: Prepare test services
+        shell: bash
+        run: ./mvnw -B -q -f test/e2e-v2/java-test-service/pom.xml clean package
+      - name: Java version ${{ matrix.java-version }}
+        uses: apache/skywalking-infra-e2e@68bbdec303cf2d3df9f2353f970f91938b52f674
+        env:
+          SW_AGENT_JDK_VERSION: ${{ matrix.java-version }}
+        with:
+          e2e-file: $GITHUB_WORKSPACE/test/e2e-v2/cases/simple/jdk/e2e.yaml
+
+  e2e-test-banyandb-stages:
+    if: |
+      ( always() && ! cancelled() ) &&
+      ((github.event_name == 'schedule' && github.repository == 'apache/skywalking') || needs.changes.outputs.oap == 'true')
+    name: ${{ matrix.test.name }}
+    needs: [docker, dist-tar]
+    runs-on: ${{ matrix.test.runs-on || 'ubuntu-latest' }}
+    timeout-minutes: 60
+    env:
+      BANYANDB_DATA_GENERATE_ROOT: test/e2e-v2/cases/storage/banyandb/data-generate
+    strategy:
+      fail-fast: false
+      matrix:
+        test:
+          - name: BanyanDB Stages
+            config: test/e2e-v2/cases/storage/banyandb/stages/e2e.yaml
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+          persist-credentials: false
+      - run: grep -v '^#' test/e2e-v2/script/env >> "$GITHUB_ENV"
+      - uses: apache/skywalking-cli/actions/setup@master
+        with:
+          version: ${{ env.SW_CTL_COMMIT }}
+      - uses: actions/download-artifact@v4
+        name: Download docker images
+        with:
+          name: docker-images-25
+          path: docker-images
+      - name: Load docker images
+        run: |
+          find docker-images -name "*.tar" -exec docker load -i {} \;
+          find docker-images -name "*.tar" -exec rm {} \;
+      - uses: actions/download-artifact@v4
+        name: Download distribution tar
+        with:
+          name: dist
+          path: dist
+      - name: Login to ghcr
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Cache maven repository
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository
+          key: ${{ runner.os }}-maven-${{ hashFiles('test/e2e-v2/java-test-service/**/pom.xml') }}
+          restore-keys: ${{ runner.os }}-maven-
+      - name: Prepare test services
+        shell: bash
+        run: ./mvnw -B -q -f test/e2e-v2/java-test-service/pom.xml clean flatten:flatten package
+      - name: Set env var
+        run: |
+          echo "${{ matrix.test.env }}"  >> $GITHUB_ENV
+      - name: Build test image
+        if: matrix.test.docker != null
+        run: docker build -t ${{ matrix.test.docker.name }} -f ${{ matrix.test.docker.base }}/${{ matrix.test.docker.file }} ${{ matrix.test.docker.base }}
+      - name: Generate BanyanDB cold data
+        run: |
+          export $(grep -v '^#' test/e2e-v2/script/env | xargs)
+          docker compose -f ${BANYANDB_DATA_GENERATE_ROOT}/docker-compose.yml up -d
+          CONTAINER_ID=$(docker compose -f ${BANYANDB_DATA_GENERATE_ROOT}/docker-compose.yml ps -q banyandb)
+          echo "⌛ monitoring segment files..."
+          found=false
+          for i in {1..60}; do
+            # check if segment files exist
+            if docker exec $CONTAINER_ID sh -c '[ -n "$(ls /tmp/measure/data/sw_metricsDay/seg* 2>/dev/null)" ]'; then
+              echo "✅ found segment files"
+              sleep 180
+              # create and copy files
+              docker cp $CONTAINER_ID:/tmp ${BANYANDB_DATA_GENERATE_ROOT}
+              docker cp $CONTAINER_ID:/tmp/measure/data/sw_metadata ${BANYANDB_DATA_GENERATE_ROOT}
+              found=true
+              break
+            else
+              echo "⏳ didn't find segment files (retry $i/60)"
+              sleep 10
+            fi
+          done
+          if $found; then
+            echo "✅ segment files copied to ${BANYANDB_DATA_GENERATE_ROOT}"
+          else
+            echo "❌ segment files not found"
+            exit 1
+          fi
+          docker compose -f ${BANYANDB_DATA_GENERATE_ROOT}/docker-compose.yml down -v
+      - name: ${{ matrix.test.name }}
+        uses: apache/skywalking-infra-e2e@68bbdec303cf2d3df9f2353f970f91938b52f674
+        with:
+          e2e-file: $GITHUB_WORKSPACE/${{ matrix.test.config }}
+      - if: ${{ failure() || cancelled() }}
+        run: |
+          df -h
+          du -sh .
+          docker images
+      # Capture container logs even when the job is CANCELLED (e.g. a case that
+      # hangs and hits the job timeout-minutes is `cancelled`, not `failure`, so a
+      # plain `if: failure()` upload is skipped and produces zero logs). The e2e
+      # action's own log collector also never runs when the trigger hangs, so dump
+      # the docker logs directly here while the containers are still alive.
+      - name: Dump container logs
+        if: ${{ failure() || cancelled() }}
+        run: |
+          LOG_DIR="${{ env.SW_INFRA_E2E_LOG_DIR }}"
+          mkdir -p "$LOG_DIR"
+          docker ps -a > "$LOG_DIR/docker-ps.txt" 2>&1 || true
+          for c in $(docker ps -aq); do
+            name=$(docker inspect -f '{{.Name}}' "$c" | tr -d '/')
+            docker logs "$c" > "$LOG_DIR/$name.log" 2>&1 || true
+          done
+      - uses: actions/upload-artifact@v4
+        if: ${{ failure() || cancelled() }}
+        name: Upload Logs
+        with:
+          name: test-logs-${{ matrix.test.name }}
+          path: "${{ env.SW_INFRA_E2E_LOG_DIR }}"
+          overwrite: true
+
+  required:
+    if: always()
+    name: Required
+    needs:
+      - dependency-license
+      - unit-test
+      - integration-test
+      - slow-integration-test
+      - e2e-test
+      - e2e-test-istio
+      - e2e-test-istio-ambient
+      - e2e-test-java-versions
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Merge Requirement
+        # check changes, sanity, dependency license, unit, integration, e2e, e2e-istio and e2e-java-versions,
+        # if all of them are working as expected then naturally exits else return error code
+        run: |
+          execute=${{ needs.changes.outputs.oap }}
+
+          sanityResults=${{ needs.dependency-license.result }}
+          [[ ${sanityResults} == 'success' ]] || [[ ${execute} != 'true' && ${sanityResults} == 'skipped' ]] || exit -1;
+
+          depLicenseResults=${{ needs.dependency-license.result }}
+          unitResults=${{ needs.unit-test.result }};
+          integrationResults=${{ needs.integration-test.result }};
+          timeConsumingITResults=${{ needs.slow-integration-test.result }};
+          e2eResults=${{ needs.e2e-test.result }};
+          e2eIstioResults=${{ needs.e2e-test-istio.result }};
+          e2eIstioAmbientResults=${{ needs.e2e-test-istio-ambient.result }};
+          e2eJavaVersionResults=${{ needs.e2e-test-java-versions.result }};
+
+          [[ ${depLicenseResults} == 'success' ]] || [[ ${execute} != 'true' && ${depLicenseResults} == 'skipped' ]] || exit -2;
+          [[ ${unitResults} == 'success' ]] || [[ ${execute} != 'true' && ${unitResults} == 'skipped' ]] || exit -3;
+          [[ ${integrationResults} == 'success' ]] || [[ ${execute} != 'true' && ${integrationResults} == 'skipped' ]] || exit -4;
+          [[ ${e2eResults} == 'success' ]] || [[ ${execute} != 'true' && ${e2eResults} == 'skipped' ]] || exit -5;
+          [[ ${e2eIstioResults} == 'success' ]] || [[ ${execute} != 'true' && ${e2eIstioResults} == 'skipped' ]] || exit -6;
+          [[ ${e2eIstioAmbientResults} == 'success' ]] || [[ ${execute} != 'true' && ${e2eIstioAmbientResults} == 'skipped' ]] || exit -6;
+          [[ ${e2eJavaVersionResults} == 'success' ]] || [[ ${execute} != 'true' && ${e2eJavaVersionResults} == 'skipped' ]] || exit -7;
+          [[ ${timeConsumingITResults} == 'success' ]] || [[ ${execute} != 'true' && ${timeConsumingITResults} == 'skipped' ]] || exit -8;
+
+          exit 0;

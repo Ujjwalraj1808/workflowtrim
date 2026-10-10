@@ -76,7 +76,8 @@ if st.button("Analyze", type="primary") and repo.strip():
     savings = cached_estimate(repo.strip(), smells_by_file, date.today().isoformat())
     repairs = build_repairs(repo.strip(), files, branch, savings["timeouts"])
 
-    repairable = sum(len(applied) for _, applied, _ in repairs.values())
+    # a repair that fails any safety check is shown but not proposed
+    repairable = sum(len(applied) for _, applied, checks in repairs.values() if all(checks.values()))
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Workflow files", len(files))
     c2.metric("Smells found", len(df))
@@ -105,7 +106,10 @@ if st.button("Analyze", type="primary") and repo.strip():
             st.write(", ".join(f"{s} ({loc})" for s, loc in applied))
             st.write(" · ".join(f"{'✓' if v else '✗'} {k.replace('_', ' ')}" for k, v in checks.items()))
             st.code(diff(text, fixed, name), language="diff")
-            st.download_button("Download fixed YAML", fixed, file_name=name, mime="text/yaml", key=name)
+            if ok:
+                st.download_button("Download fixed YAML", fixed, file_name=name, mime="text/yaml", key=name)
+            else:
+                st.warning("Not proposed: this repair failed a safety check, so the file should be fixed by hand.")
 
     st.subheader("Savings (estimated)")
     st.caption(f"From {savings['runs']} completed runs ({savings['from']} to {savings['to']}), job-level timing. "

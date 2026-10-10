@@ -1,0 +1,319 @@
+# -----------------------------------------------------------------------------
+# Copyright Siemens AG, 2021.
+# Copyright Helio Chissini de Castro 2022-2025
+# Part of the SW360 Portal Project.
+#
+# This program and the accompanying materials are made
+# available under the terms of the Eclipse Public License 2.0
+# which is available at https://www.eclipse.org/legal/epl-2.0/
+#
+# SPDX-License-Identifier: EPL-2.0
+#
+# -----------------------------------------------------------------------------
+
+name: SW360 Build and Test
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths-ignore:
+      - third-party/**
+      - docker_build.sh
+      - .github/sw360_container.yml
+      - .github/thrift_container.yml
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  COUCHDB_USER: sw360
+  COUCHDB_PASSWORD: sw360fossie
+  THRIFT_VERSION: "0.20.0"
+  JAVA_VERSION: '21'
+  JAVA_DISTRO: 'temurin'
+
+permissions:
+  contents: read
+
+jobs:
+  check-changes:
+    name: Detect build-relevant changes
+    runs-on: ubuntu-24.04
+    outputs:
+      only-docker-changes: ${{ steps.changed.outputs.docker_only_changed }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Detect whether build/test is needed
+        uses: tj-actions/changed-files@9426d40962ed5378910ee2e21d5f8c6fcbf2dd96 # v47.0.6
+        id: changed
+        with:
+          files_yaml: |
+            docker:
+              - Dockerfile
+
+  build:
+    needs: [check-changes]
+    if: github.event_name == 'workflow_dispatch' || needs.check-changes.outputs.only-docker-changes != 'true'
+    name: SW360 Build and Test
+    runs-on: ubuntu-24.04
+
+    services:
+      couchdb:
+        image: couchdb:3.5
+        ports:
+          - 5984:5984
+        env:
+          COUCHDB_USER: ${{ env.COUCHDB_USER }}
+          COUCHDB_PASSWORD: ${{ env.COUCHDB_PASSWORD }}
+
+      couchdb-nouveau:
+        image: couchdb:3.5-nouveau
+        ports:
+          - 5987:5987
+        env:
+          JAVA_TOOL_OPTIONS: "-Ddw.rootDir=/opt/nouveau/data/nouveau"
+
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@351661ca32ac09a36dc5ee2d536e3128f2a3c8ed # v2.22.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: webiny/action-conventional-commits@7f91b1595ca1951cdb671ddc9f07a49081ec5b69 # v1.4.2
+
+      - name: Verify license headers
+        run: |
+          chmod +x .github/testForLicenseHeaders.sh
+          bash .github/testForLicenseHeaders.sh
+
+      - name: Configure CouchDB Nouveau
+        run: |
+          echo "⏳ Waiting for CouchDB..."
+          timeout 60 bash -c 'until curl -fsS http://localhost:5984/_up >/dev/null 2>&1; do sleep 2; done'
+          echo "✅ CouchDB is ready"
+
+          echo "⏳ Waiting for Nouveau sidecar..."
+          timeout 60 bash -c 'until curl -sS -o /dev/null --connect-timeout 3 http://localhost:5987 2>/dev/null; do sleep 2; done'
+          echo "✅ Nouveau sidecar is ready"
+
+          echo "Enabling Nouveau in CouchDB..."
+          curl -sS -X PUT "http://${COUCHDB_USER}:${COUCHDB_PASSWORD}@localhost:5984/_node/_local/_config/nouveau/enable" -d '"true"'
+          curl -sS -X PUT "http://${COUCHDB_USER}:${COUCHDB_PASSWORD}@localhost:5984/_node/_local/_config/nouveau/url" -d '"http://couchdb-nouveau:5987"'
+          echo ""
+          echo "✅ Nouveau configured in CouchDB"
+
+      - name: Update properties with DB credentials
+        run: |
+          sudo mkdir -p /etc/sw360
+          sudo cp ./build-configuration/test-resources/couchdb-test.properties /etc/sw360/
+          sudo sed -i 's/^couchdb.user\s*=/& '${COUCHDB_USER}'/' /etc/sw360/couchdb-test.properties
+          sudo sed -i 's/^couchdb.password\s*=/& '${COUCHDB_PASSWORD}'/' /etc/sw360/couchdb-test.properties
+
+      - name: Copy test configuration files
+        run: |
+          sudo cp ./build-configuration/resources/orgmapping.properties /etc/sw360/
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: ${{ env.JAVA_DISTRO }}
+          check-latest: true
+
+      - name: Cache Thrift
+        id: cache-thrift
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ${{ github.workspace }}/dist/thrift-${{ env.THRIFT_VERSION }}
+          key: ${{ runner.os }}-thrift-${{ env.THRIFT_VERSION }}
+          restore-keys: |
+            ${{ runner.os }}-thrift-${{ env.THRIFT_VERSION }}
+
+      - name: Install Thrift
+        if: steps.cache-thrift.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -yq build-essential libevent-dev libtool flex bison pkg-config libssl-dev git cmake
+          chmod +x third-party/thrift/install-thrift.sh
+          DESTDIR=${{ github.workspace }}/dist/thrift-${{ env.THRIFT_VERSION }} third-party/thrift/install-thrift.sh
+
+      - name: Build SW360 (compile only)
+        run: |
+          export PATH=$PATH:${{ github.workspace }}/dist/thrift-${{ env.THRIFT_VERSION }}/usr/local/bin
+          mvn clean install \
+            --no-transfer-progress \
+            -P deploy -Dhelp-docs=true \
+            -Dbase.deploy.dir=${PWD}/deploy \
+            -DskipTests \
+            -Dmaven.plugin.validation=VERBOSE
+
+      - name: Run ArchUnit Architecture Tests
+        id: archunit-tests
+        continue-on-error: false
+        run: |
+          mvn -pl rest/resource-server test \
+            -Dtest="org.eclipse.sw360.rest.resourceserver.architecture.*Test" \
+            -Dbase.deploy.dir=${PWD}/deploy
+
+      - name: Publish Architecture Tests Results
+        if: always()
+        run: |
+          if [ "${{ steps.archunit-tests.outcome }}" = "success" ]; then
+            echo "## ✅ Architecture Tests" >> $GITHUB_STEP_SUMMARY
+            echo "All architecture constraints verified." >> $GITHUB_STEP_SUMMARY
+          else
+            echo "## ❌ Architecture Violations Detected" >> $GITHUB_STEP_SUMMARY
+            echo "Review logs for constraint violations that must be fixed before merge." >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Run Unit and Integration Tests
+        continue-on-error: false
+        run: |
+          mvn test \
+            --no-transfer-progress \
+            -Dbase.deploy.dir=${PWD}/deploy \
+            -DRunComponentVisibilityRestrictionTest=false \
+            -DRunPrivateProjectAccessTest=false \
+            -DRunRestForceUpdateTest=false \
+            -Dsurefire.excludes="**/architecture/*Test.java" \
+            jacoco:report \
+            -fae
+
+      - name: Extract Test Results
+        id: unit-tests
+        if: always()
+        run: |
+          TESTS=N/A
+          FAILURES=N/A
+          SKIPPED=N/A
+          FILES=$(find . -path "*/target/surefire-reports/TEST-*.xml")
+          if [ -n "$FILES" ]; then
+            TOTAL=$(grep -h "tests=\"" $FILES | sed 's/.*tests="\([0-9]*\)".*/\1/' | awk '{sum+=$1} END {print sum}')
+            FAILED=$(grep -h "failures=\"" $FILES | sed 's/.*failures="\([0-9]*\)".*/\1/' | awk '{sum+=$1} END {print sum}')
+            ERROR=$(grep -h "errors=\"" $FILES | sed 's/.*errors="\([0-9]*\)".*/\1/' | awk '{sum+=$1} END {print sum}')
+            SKIPPED=$(grep -h "skipped=\"" $FILES | sed 's/.*skipped="\([0-9]*\)".*/\1/' | awk '{sum+=$1} END {print sum}')
+            FAILED=$((FAILED + ERROR))
+          fi
+          echo "unit_tests_total=${TOTAL:-0}" >> $GITHUB_OUTPUT
+          echo "unit_tests_failed=${FAILED:-0}" >> $GITHUB_OUTPUT
+          echo "unit_tests_skipped=${SKIPPED:-0}" >> $GITHUB_OUTPUT
+
+      - name: Run PrivateProjectAccessTest
+        run: |
+          mvn install -pl :build-configuration -am -Dbase.deploy.dir=.
+          mvn -pl :datahandler test -Dtest=ProjectPermissionsVisibilityTest -DRunPrivateProjectAccessTest=true -DRunRestForceUpdateTest=true -Dbase.deploy.dir=. jacoco:report
+
+      - name: Run BulkReleaseDeletingTest
+        run: |
+          mvn -pl :backend-components test -Dtest=BulkDeleteUtilTest -DRunPrivateProjectAccessTest=true -DRunBulkReleaseDeletingTest=true -Dbase.deploy.dir=. jacoco:report
+
+      - name: Extract coverage metrics
+        id: coverage-metrics
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import glob
+          import os
+          import xml.etree.ElementTree as ET
+
+          files = glob.glob("**/target/site/jacoco/jacoco.xml", recursive=True)
+          counter_types = ("LINE", "INSTRUCTION", "BRANCH")
+          totals = {kind: {"missed": 0, "covered": 0} for kind in counter_types}
+
+          for xml_file in files:
+            tree = ET.parse(xml_file)
+            root = tree.getroot()
+            for counter in root.findall("counter"):
+              ctype = counter.get("type")
+              if ctype in totals:
+                totals[ctype]["missed"] += int(counter.get("missed", "0"))
+                totals[ctype]["covered"] += int(counter.get("covered", "0"))
+
+          def ratio(covered, missed):
+            total = covered + missed
+            if total == 0:
+              return "N/A"
+            return f"{(covered * 100.0 / total):.2f}%"
+
+          github_output = os.environ["GITHUB_OUTPUT"]
+          with open(github_output, "a", encoding="utf-8") as out:
+            out.write(f"coverage_report_files={len(files)}\n")
+            for kind in counter_types:
+              covered = totals[kind]["covered"]
+              missed = totals[kind]["missed"]
+              out.write(f"{kind.lower()}_covered={covered}\n")
+              out.write(f"{kind.lower()}_missed={missed}\n")
+              out.write(f"{kind.lower()}_coverage={ratio(covered, missed)}\n")
+          PY
+
+      - name: Publish Test Results Summary
+        if: always()
+        run: |
+          TOTAL="${{ steps.unit-tests.outputs.unit_tests_total }}"
+          FAILED="${{ steps.unit-tests.outputs.unit_tests_failed }}"
+          SKIPPED="${{ steps.unit-tests.outputs.unit_tests_skipped }}"
+          COVERAGE_FILES="${{ steps.coverage-metrics.outputs.coverage_report_files }}"
+          LINE_COVERAGE="${{ steps.coverage-metrics.outputs.line_coverage }}"
+          INSTRUCTION_COVERAGE="${{ steps.coverage-metrics.outputs.instruction_coverage }}"
+          BRANCH_COVERAGE="${{ steps.coverage-metrics.outputs.branch_coverage }}"
+
+          echo "## ✅ Unit and Integration Test Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Metric | Count |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Total Tests Run | ${TOTAL:-N/A} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Tests Failed | ${FAILED:-N/A} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Tests Skipped | ${SKIPPED:-N/A} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## 📊 Coverage Summary (JaCoCo)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| JaCoCo XML Reports Found | ${COVERAGE_FILES:-0} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Line Coverage | ${LINE_COVERAGE:-N/A} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Instruction Coverage | ${INSTRUCTION_COVERAGE:-N/A} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Branch Coverage | ${BRANCH_COVERAGE:-N/A} |" >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload JaCoCo Reports
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: jacoco-report
+          path: "**/target/site/jacoco/"
+          retention-days: 7
+
+      - name: Publish Build Status
+        if: always()
+        run: |
+          if [ "${{ job.status }}" == "success" ]; then
+            echo "## ✅ Workflow Status: SUCCESS" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "## ❌ Workflow Status: FAILED" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Check the pipeline logs for details on any failures." >> $GITHUB_STEP_SUMMARY
+
+  required-check:
+    name: Build and Test
+    needs: [build]
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check build result
+        run: |
+          result="${{ needs.build.result }}"
+          if [[ "$result" == "success" || "$result" == "skipped" ]]; then
+            echo "✅ Required check passed (build result: $result)"
+            exit 0
+          else
+            echo "❌ Required check failed (build result: $result)"
+            exit 1
+          fi

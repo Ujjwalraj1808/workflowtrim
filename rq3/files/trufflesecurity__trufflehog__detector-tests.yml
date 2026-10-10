@@ -1,0 +1,29 @@
+name: Detectors Aggregation
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 8 * * *"
+
+jobs:
+  test-detectors:
+    if: ${{ github.repository == 'trufflesecurity/trufflehog' }}
+    runs-on: ubuntu-latest
+    permissions:
+      actions: "read"
+      contents: "read"
+      id-token: "write"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+      - name: Install gotestsum
+        uses: jaxxstorm/action-install-gh-release@25e24d2d23ae098373794ef1d6faecb48ee52da8 # v3.0.0
+        with:
+          repo: gotestyourself/gotestsum
+      - uses: rwx-research/setup-captain@f761ee3671e4c027299f8a5842a53fba8ddd8e37 # v1.4.1
+      - name: Test Go
+        run: |
+          export CGO_ENABLED=1
+          captain run detectors
+        env:
+          RWX_ACCESS_TOKEN: ${{ secrets.RWX_ACCESS_TOKEN }}

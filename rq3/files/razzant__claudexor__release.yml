@@ -1,0 +1,1202 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Build a signed candidate or publish an existing reviewed tag
+        required: true
+        type: choice
+        options: [candidate, publish]
+      ref:
+        description: Full 40-character SHA for candidate; stable vMAJOR.MINOR.PATCH tag for publish
+        required: true
+        type: string
+      review_url:
+        description: Reference to the complete independent review report and disposition (PR or CI artifact); required for publish
+        required: false
+        type: string
+      review_confirmed:
+        description: I am responsible for this release and have read the independent review, checked its findings and accepted the exact candidate
+        required: false
+        type: boolean
+        default: false
+      runtime_manifest_b64:
+        description: Base64 owner-signed runtime-update manifest (D-2); required for publish
+        required: false
+        type: string
+      remote_runtime_manifest_b64:
+        description: Base64 owner-signed four-target SSH runtime manifest; required for publish
+        required: false
+        type: string
+      candidate_run_id:
+        description: The candidate workflow run id whose exact artifact bytes publish promotes (A-5); required only for publish
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  RELEASE_MODE_INPUT: ${{ inputs.mode }}
+  RELEASE_REF_INPUT: ${{ inputs.ref }}
+  REVIEW_URL_INPUT: ${{ inputs.review_url }}
+  REVIEW_CONFIRMED_INPUT: ${{ inputs.review_confirmed }}
+  RUNTIME_MANIFEST_B64_INPUT: ${{ inputs.runtime_manifest_b64 }}
+  REMOTE_RUNTIME_MANIFEST_B64_INPUT: ${{ inputs.remote_runtime_manifest_b64 }}
+  CANDIDATE_RUN_ID_INPUT: ${{ inputs.candidate_run_id }}
+
+concurrency:
+  group: claudexor-release-v2
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      mode: ${{ steps.release.outputs.mode }}
+      sha: ${{ steps.release.outputs.sha }}
+      tree: ${{ steps.release.outputs.tree }}
+      tag: ${{ steps.release.outputs.tag }}
+      version: ${{ steps.release.outputs.version }}
+      candidate_run_id: ${{ steps.candidate.outputs.candidate_run_id }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate input syntax before fetching it
+        run: node scripts/verify-release-input.mjs --syntax-only
+
+      - name: Fetch immutable release authority
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin '+refs/heads/*:refs/remotes/origin/*'
+          if [ "$RELEASE_MODE_INPUT" = publish ]; then
+            git fetch --no-tags origin "refs/tags/$RELEASE_REF_INPUT:refs/tags/$RELEASE_REF_INPUT"
+          fi
+
+      - name: Resolve exact SHA, tree, tag, and version
+        id: release
+        run: node scripts/verify-release-input.mjs
+
+      - name: Validate the promoted candidate run id (publish only, A-5)
+        id: candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$RELEASE_MODE_INPUT" = publish ]; then
+            case "$CANDIDATE_RUN_ID_INPUT" in
+              ''|*[!0-9]*)
+                echo "::error::publish requires candidate_run_id (the candidate run whose exact artifact bytes are promoted, A-5)"
+                exit 1
+                ;;
+            esac
+            echo "candidate_run_id=$CANDIDATE_RUN_ID_INPUT" >> "$GITHUB_OUTPUT"
+          else
+            echo "candidate_run_id=" >> "$GITHUB_OUTPUT"
+          fi
+
+  windows-conpty-authority:
+    name: Build or promote authoritative Windows ConPTY bytes
+    needs: prepare
+    runs-on: windows-2022
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        if: needs.prepare.outputs.mode == 'candidate'
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 20.19.0
+
+      - name: Initialize pinned x64 MSVC environment
+        if: needs.prepare.outputs.mode == 'candidate'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (-not (Test-Path -LiteralPath $vswhere -PathType Leaf)) {
+            throw "vswhere.exe is unavailable on the hosted Windows image"
+          }
+          $installation = (& $vswhere -latest -products * `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            -property installationPath | Select-Object -First 1).Trim()
+          if (-not $installation) { throw "x64 MSVC build tools are unavailable" }
+          $devCmd = Join-Path $installation "Common7\Tools\VsDevCmd.bat"
+          if (-not (Test-Path -LiteralPath $devCmd -PathType Leaf)) {
+            throw "VsDevCmd.bat is unavailable at $devCmd"
+          }
+          $setup = Join-Path $env:RUNNER_TEMP "claudexor-msvc-env.cmd"
+          "@call `"$devCmd`" -no_logo -arch=x64 -host_arch=x64`r`n@set`r`n" |
+            Set-Content -LiteralPath $setup -Encoding ascii
+          $developer = @{}
+          & $env:ComSpec /d /s /c "`"$setup`"" | ForEach-Object {
+            $separator = $_.IndexOf("=")
+            if ($separator -gt 0) {
+              $developer[$_.Substring(0, $separator)] = $_.Substring($separator + 1)
+            }
+          }
+          foreach ($name in @("Path", "INCLUDE", "LIB", "LIBPATH", "VCToolsInstallDir", "WindowsSdkDir", "WindowsSDKVersion", "UCRTVersion")) {
+            if ($developer.ContainsKey($name)) {
+              Add-Content -LiteralPath $env:GITHUB_ENV -Value "$name=$($developer[$name])" -Encoding utf8
+            }
+          }
+
+      - name: Install candidate build dependencies
+        if: needs.prepare.outputs.mode == 'candidate'
+        run: pnpm install --frozen-lockfile
+
+      - name: Build authoritative helper and native fake child
+        if: needs.prepare.outputs.mode == 'candidate'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $authority = Join-Path $env:RUNNER_TEMP "windows-conpty-authority"
+          New-Item -ItemType Directory -Force -Path $authority | Out-Null
+          $helper = Join-Path $authority "claudexor-conpty-helper.exe"
+          $fixture = Join-Path $authority "claudexor-conpty-test-child.exe"
+          node packages/core/scripts/build-win32-conpty-helper.mjs `
+            --require --out $helper --fixture-out $fixture
+          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $helper).Hash.ToLowerInvariant()
+          [IO.File]::WriteAllText(
+            (Join-Path $authority "claudexor-conpty-helper.exe.sha256"),
+            "$hash  claudexor-conpty-helper.exe`n",
+            [Text.Encoding]::ASCII
+          )
+
+      - name: Download the candidate authority artifact for exact publish promotion
+        if: needs.prepare.outputs.mode == 'publish'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: Claudexor-${{ needs.prepare.outputs.version }}-windows-conpty-authority
+          path: ${{ runner.temp }}/windows-conpty-authority
+          run-id: ${{ needs.prepare.outputs.candidate_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Bind promoted authority to the successful candidate run
+        if: needs.prepare.outputs.mode == 'publish'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PREPARED_SHA: ${{ needs.prepare.outputs.sha }}
+          CANDIDATE_RUN_ID: ${{ needs.prepare.outputs.candidate_run_id }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $metadata = gh api "repos/$env:GITHUB_REPOSITORY/actions/runs/$env:CANDIDATE_RUN_ID" | ConvertFrom-Json
+          if ($metadata.path -ne ".github/workflows/release.yml") {
+            throw "candidate authority belongs to $($metadata.path), not release.yml"
+          }
+          if ($metadata.head_sha -ne $env:PREPARED_SHA) {
+            throw "candidate authority SHA $($metadata.head_sha) does not match $env:PREPARED_SHA"
+          }
+          if ($metadata.conclusion -ne "success") {
+            throw "candidate authority run conclusion is $($metadata.conclusion)"
+          }
+
+      - name: Verify the exact three-file internal authority set
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $authority = Join-Path $env:RUNNER_TEMP "windows-conpty-authority"
+          $expected = @(
+            "claudexor-conpty-helper.exe",
+            "claudexor-conpty-helper.exe.sha256",
+            "claudexor-conpty-test-child.exe"
+          ) | Sort-Object
+          $entries = @(Get-ChildItem -LiteralPath $authority -Force)
+          $actual = @($entries | ForEach-Object Name | Sort-Object)
+          if (Compare-Object -ReferenceObject $expected -DifferenceObject $actual) {
+            throw "unexpected Windows ConPTY authority set: $($actual -join ', ')"
+          }
+          foreach ($entry in $entries) {
+            if (-not $entry.PSIsContainer -and -not ($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) -and $entry.Length -gt 0) {
+              continue
+            }
+            throw "authority entry is not a nonempty regular file: $($entry.Name)"
+          }
+          $helper = Join-Path $authority "claudexor-conpty-helper.exe"
+          $fixture = Join-Path $authority "claudexor-conpty-test-child.exe"
+          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $helper).Hash.ToLowerInvariant()
+          $sidecar = [IO.File]::ReadAllText(
+            (Join-Path $authority "claudexor-conpty-helper.exe.sha256"),
+            [Text.Encoding]::ASCII
+          )
+          if ($sidecar -ne "$hash  claudexor-conpty-helper.exe`n") {
+            throw "Windows ConPTY authority SHA sidecar mismatch"
+          }
+          node scripts/verify-win32-conpty-helper.mjs --file $helper --expected-sha256 $hash
+          node scripts/verify-win32-conpty-helper.mjs --file $fixture
+
+      - name: Upload the internal Windows authority artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: Claudexor-${{ needs.prepare.outputs.version }}-windows-conpty-authority
+          path: ${{ runner.temp }}/windows-conpty-authority
+          if-no-files-found: error
+          retention-days: 14
+
+  package-macos:
+    name: Build signed, notarized and attested macOS artifacts
+    needs: [prepare, windows-conpty-authority]
+    runs-on: macos-26
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Download authoritative Windows ConPTY bytes
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: Claudexor-${{ needs.prepare.outputs.version }}-windows-conpty-authority
+          path: ${{ runner.temp }}/windows-conpty-authority
+
+      - name: Verify and export authoritative Windows ConPTY custody
+        shell: bash
+        run: |
+          set -euo pipefail
+          authority="$RUNNER_TEMP/windows-conpty-authority"
+          helper="$authority/claudexor-conpty-helper.exe"
+          fixture="$authority/claudexor-conpty-test-child.exe"
+          sidecar="$authority/claudexor-conpty-helper.exe.sha256"
+          test "$(find "$authority" -mindepth 1 -maxdepth 1 -type f | wc -l | tr -d ' ')" = 3
+          (cd "$authority" && shasum -a 256 -c "$(basename "$sidecar")")
+          expected="$(awk '{print $1}' "$sidecar")"
+          node scripts/verify-win32-conpty-helper.mjs --file "$helper" --expected-sha256 "$expected"
+          node scripts/verify-win32-conpty-helper.mjs --file "$fixture"
+          echo "CLAUDEXOR_WIN32_CONPTY_HELPER=$helper" >> "$GITHUB_ENV"
+          echo "CLAUDEXOR_WIN32_CONPTY_SHA256=$expected" >> "$GITHUB_ENV"
+          echo "CLAUDEXOR_REQUIRE_WIN32_CONPTY_HELPER=1" >> "$GITHUB_ENV"
+
+      - name: Revalidate reviewed release authority
+        run: |
+          git fetch --no-tags origin '+refs/heads/main:refs/remotes/origin/main'
+          if [ "$RELEASE_MODE_INPUT" = publish ]; then
+            git fetch --no-tags origin "refs/tags/$RELEASE_REF_INPUT:refs/tags/$RELEASE_REF_INPUT"
+          fi
+          node scripts/verify-release-input.mjs
+
+      - name: Secret scan
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git grep -InE '(\bsk-[A-Za-z0-9_-]{20,}|\bsk-ant-[A-Za-z0-9_-]{20,}|\bsk-or-[A-Za-z0-9_-]{20,}|\bghp_[A-Za-z0-9_]{20,}|\bgithub_pat_[A-Za-z0-9_]{20,}|xox[baeprs]-[A-Za-z0-9-]{10,}|\bnpm_[A-Za-z0-9]{30,}|-----BEGIN [A-Z ]*PRIVATE KEY-----)' -- . ':!pnpm-lock.yaml'; then
+            echo "::error::Potential token-like secret found in tracked files."
+            exit 1
+          fi
+
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .node-version
+          cache: pnpm
+
+      - name: Pin release Node runtime
+        shell: bash
+        run: echo "CLAUDEXOR_NODE_BIN=$(node -p 'process.execPath')" >> "$GITHUB_ENV"
+
+      - name: Require and import Apple release credentials
+        if: needs.prepare.outputs.mode == 'candidate'
+        shell: bash
+        env:
+          BUILD_CERTIFICATE_BASE64: ${{ secrets.BUILD_CERTIFICATE_BASE64 }}
+          P12_PASSWORD: ${{ secrets.P12_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+        run: |
+          set -euo pipefail
+          for name in BUILD_CERTIFICATE_BASE64 P12_PASSWORD KEYCHAIN_PASSWORD APPLE_ID APPLE_TEAM_ID APPLE_APP_SPECIFIC_PASSWORD; do
+            if [ -z "${!name:-}" ]; then
+              echo "::error::Signing and notarization secrets are required for every release artifact."
+              exit 1
+            fi
+          done
+          cert="$RUNNER_TEMP/build_certificate.p12"
+          keychain="$RUNNER_TEMP/app-signing.keychain-db"
+          echo -n "$BUILD_CERTIFICATE_BASE64" | base64 --decode -o "$cert"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$keychain"
+          security import "$cert" -P "$P12_PASSWORD" -A -t cert -f pkcs12 -k "$keychain"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$keychain" >/dev/null
+          security list-keychains -d user -s "$keychain" login.keychain
+          identity="$(security find-identity -v -p codesigning "$keychain" | awk -F'"' '/Developer ID Application/ {print $2; exit}')"
+          test -n "$identity" || { echo "::error::No Developer ID Application identity found."; exit 1; }
+          xcrun notarytool store-credentials claudexor-notary \
+            --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" \
+            --password "$APPLE_APP_SPECIFIC_PASSWORD" --keychain "$keychain" >/dev/null
+          echo "SIGN_IDENTITY=$identity" >> "$GITHUB_ENV"
+          echo "NOTARY_PROFILE=claudexor-notary" >> "$GITHUB_ENV"
+          echo "NOTARY_KEYCHAIN=$keychain" >> "$GITHUB_ENV"
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Deterministic release gates
+        shell: bash
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          pnpm build
+          pnpm typecheck
+          pnpm typecheck:tests
+          pnpm test
+          pnpm schema:gen
+          git diff --exit-code packages/schema/generated
+          test -z "$(git ls-files --others --exclude-standard packages/schema/generated)"
+          node scripts/validate-generated-schemas.mjs
+          pnpm docs:check
+          node scripts/concept-gate.mjs --since-last-tag
+          pnpm staged:check
+          pnpm retired:check
+          pnpm inv:check
+          pnpm fixtures:swift:check
+          pnpm fixtures:runtime-update:check
+          pnpm sensitive:check
+          pnpm knip
+          node scripts/complexity-ratchet.mjs
+          node scripts/model-hints-freshness.mjs --strict
+          node scripts/mcp-cli-parity-check.mjs
+          node scripts/artifact-text-parity-check.mjs
+          node scripts/fixture-freshness-check.mjs
+          pnpm release:workflow:check
+          pnpm format:check
+          pnpm canary
+          pnpm release:verify:swift
+          node scripts/verify-version-parity.mjs "$VERSION"
+
+      - name: Build shared engine resources before app packaging
+        if: needs.prepare.outputs.mode == 'candidate'
+        shell: bash
+        run: |
+          set -euo pipefail
+          resources="$RUNNER_TEMP/engine-resources"
+          bash scripts/build-engine-resources.sh "$resources"
+          echo "CLAUDEXOR_ENGINE_RESOURCES=$resources" >> "$GITHUB_ENV"
+
+      - name: Build signed DMG and ZIP
+        if: needs.prepare.outputs.mode == 'candidate'
+        env:
+          CLAUDEXOR_VERSION: ${{ needs.prepare.outputs.version }}
+          CLAUDEXOR_BUILD: ${{ github.run_number }}
+          MAKE_DMG: "1"
+          MAKE_ZIP: "1"
+        run: apps/macos/scripts/build-app.sh
+
+      - name: Verify signed and notarized artifacts
+        if: needs.prepare.outputs.mode == 'candidate'
+        shell: bash
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          PREPARED_SHA: ${{ needs.prepare.outputs.sha }}
+        run: |
+          set -euo pipefail
+          app="apps/macos/dist/bundle.noindex/Claudexor.app"
+          dmg="apps/macos/dist/Claudexor-$VERSION.dmg"
+          zip="apps/macos/dist/Claudexor-$VERSION.zip"
+          for file in "$dmg" "$dmg.sha256" "$zip" "$zip.sha256"; do
+            test -s "$file" || { echo "::error::Missing expected asset: $file"; exit 1; }
+          done
+          shasum -a 256 -c "$dmg.sha256"
+          shasum -a 256 -c "$zip.sha256"
+          codesign --verify --strict --verbose=2 "$app"
+          xcrun stapler validate "$app"
+          spctl --assess --type execute --verbose=2 "$app"
+          codesign --verify --verbose=2 "$dmg"
+          xcrun stapler validate "$dmg"
+          spctl --assess --type open --context context:primary-signature --verbose=2 "$dmg"
+          zipstage="$(mktemp -d)"
+          /usr/bin/ditto -x -k "$zip" "$zipstage"
+          codesign --verify --strict --verbose=2 "$zipstage/Claudexor.app"
+          xcrun stapler validate "$zipstage/Claudexor.app"
+          spctl --assess --type execute --verbose=2 "$zipstage/Claudexor.app"
+          test -x "$zipstage/Claudexor.app/Contents/Resources/node"
+          test -s "$zipstage/Claudexor.app/Contents/Resources/claudexord.bundle.cjs"
+          test -s "$zipstage/Claudexor.app/Contents/Resources/claudexor.bundle.cjs"
+          test -s "$zipstage/Claudexor.app/Contents/Resources/setup-login-runner.cjs"
+          test -s "$zipstage/Claudexor.app/Contents/Resources/browser-mcp-runtime/dist/browser-mcp-launcher.js"
+          node scripts/verify-win32-conpty-helper.mjs \
+            --file "$CLAUDEXOR_WIN32_CONPTY_HELPER" \
+            --file "$app/Contents/Resources/native/claudexor-conpty-helper.exe" \
+            --file "$zipstage/Claudexor.app/Contents/Resources/native/claudexor-conpty-helper.exe" \
+            --expected-sha256 "$CLAUDEXOR_WIN32_CONPTY_SHA256"
+          cli_home="$(mktemp -d)"
+          cli_help="$(env -i HOME="$cli_home" PATH="/usr/bin:/bin" \
+            "$zipstage/Claudexor.app/Contents/Resources/node" \
+            "$zipstage/Claudexor.app/Contents/Resources/claudexor.bundle.cjs" help --json)"
+          cli_install="$(env -i HOME="$cli_home" PATH="/usr/bin:/bin" \
+            "$zipstage/Claudexor.app/Contents/Resources/node" \
+            "$zipstage/Claudexor.app/Contents/Resources/claudexor.bundle.cjs" \
+            harness install codex --target local --dry-run --json)"
+          node -e '
+            const help = JSON.parse(process.argv[1]);
+            const install = JSON.parse(process.argv[2]);
+            const expectedVersion = process.argv[3];
+            const harness = Array.isArray(help.commands)
+              ? help.commands.find((command) => command?.id === "harness")
+              : null;
+            if (
+              help.ok !== true ||
+              help.version !== expectedVersion ||
+              !harness?.flags?.includes("target") ||
+              install.ok !== true ||
+              install.dryRun !== true ||
+              install.harness !== "codex" ||
+              install.target !== "local" ||
+              install.installLocation !== "~/.claudexor/node/bin"
+            ) {
+              throw new Error(`candidate CLI help mismatch: ${JSON.stringify(help)}`);
+            }
+          ' "$cli_help" "$cli_install" "$VERSION"
+          test -z "$(find "$cli_home" -mindepth 1 -print -quit)" || {
+            echo "::error::candidate CLI dry-run mutated its isolated HOME"
+            find "$cli_home" -mindepth 1 -maxdepth 3 -print
+            exit 1
+          }
+          rm -rf "$cli_home"
+          probe="$("$zipstage/Claudexor.app/Contents/Resources/node" \
+            "$zipstage/Claudexor.app/Contents/Resources/claudexord.bundle.cjs" --probe)"
+          node -e '
+            const probe = JSON.parse(process.argv[1]);
+            if (probe.version !== process.argv[2] || probe.buildSha !== process.argv[3]) {
+              throw new Error(`candidate app probe mismatch: ${JSON.stringify(probe)}`);
+            }
+          ' "$probe" "$VERSION" "$PREPARED_SHA"
+
+      - name: Promote the exact candidate release artifact (publish, A-5)
+        if: needs.prepare.outputs.mode == 'publish'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: Claudexor-${{ needs.prepare.outputs.version }}-release-assets
+          path: candidate-assets
+          run-id: ${{ needs.prepare.outputs.candidate_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Verify promoted candidate app artifacts (publish, A-5)
+        if: needs.prepare.outputs.mode == 'publish'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          PREPARED_SHA: ${{ needs.prepare.outputs.sha }}
+          CANDIDATE_RUN_ID: ${{ needs.prepare.outputs.candidate_run_id }}
+        run: |
+          set -euo pipefail
+          run_meta="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$CANDIDATE_RUN_ID" \
+            --jq '[.path, .head_sha, .conclusion] | @tsv')"
+          IFS=$'\t' read -r run_path run_sha run_conclusion <<< "$run_meta"
+          test "$run_path" = ".github/workflows/release.yml" || {
+            echo "::error::candidate_run_id belongs to $run_path, not the release workflow"
+            exit 1
+          }
+          test "$run_sha" = "$PREPARED_SHA" || {
+            echo "::error::candidate run SHA $run_sha does not match prepared SHA $PREPARED_SHA"
+            exit 1
+          }
+          test "$run_conclusion" = success || {
+            echo "::error::candidate run conclusion is $run_conclusion, not success"
+            exit 1
+          }
+          candidate_dmg="candidate-assets/Claudexor-$VERSION.dmg"
+          candidate_zip="candidate-assets/Claudexor-$VERSION.zip"
+          candidate_sbom="candidate-assets/Claudexor-$VERSION.spdx.json"
+          node - "$VERSION" <<'NODE'
+          const { lstatSync, readdirSync } = require("node:fs");
+          const version = process.argv[2];
+          const expected = [
+            `Claudexor-${version}.dmg`,
+            `Claudexor-${version}.spdx.json`,
+            `Claudexor-${version}.zip`,
+            `Claudexor-remote-runtime-${version}.spdx.json`,
+            "SHA256SUMS",
+            `claudexor-remote-runtime-${version}-darwin-arm64.tar.gz`,
+            `claudexor-remote-runtime-${version}-darwin-x64.tar.gz`,
+            `claudexor-remote-runtime-${version}-linux-arm64.tar.gz`,
+            `claudexor-remote-runtime-${version}-linux-x64.tar.gz`,
+            `claudexor-runtime-${version}.tar.gz`,
+            "remote-runtime-manifest.json",
+            "runtime-manifest.json",
+          ].sort();
+          const actual = readdirSync("candidate-assets").sort();
+          if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+            throw new Error(`unexpected candidate asset set: ${actual.join(", ")}`);
+          }
+          for (const name of actual) {
+            const stat = lstatSync(`candidate-assets/${name}`);
+            if (!stat.isFile() || stat.isSymbolicLink() || stat.size === 0) {
+              throw new Error(`candidate asset is not a nonempty regular file: ${name}`);
+            }
+          }
+          NODE
+          # This loop is the SINGLE owner of promoted-candidate provenance: the
+          # exact allowlist above covers every candidate asset (app, closure,
+          # remote runtimes, manifests, SBOMs, SHA256SUMS), so each one is
+          # verified HERE, before any later step copies, extracts, or trusts it.
+          for file in candidate-assets/*; do
+            gh attestation verify "$file" \
+              --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
+              --source-digest "$PREPARED_SHA"
+          done
+          (cd candidate-assets && shasum -a 256 -c SHA256SUMS)
+          codesign --verify --verbose=2 "$candidate_dmg"
+          xcrun stapler validate "$candidate_dmg"
+          spctl --assess --type open --context context:primary-signature --verbose=2 "$candidate_dmg"
+          promoted_app="$RUNNER_TEMP/promoted-candidate-app"
+          mkdir -p "$promoted_app"
+          /usr/bin/ditto -x -k "$candidate_zip" "$promoted_app"
+          codesign --verify --strict --verbose=2 "$promoted_app/Claudexor.app"
+          xcrun stapler validate "$promoted_app/Claudexor.app"
+          spctl --assess --type execute --verbose=2 "$promoted_app/Claudexor.app"
+          test -x "$promoted_app/Claudexor.app/Contents/Resources/node"
+          test -s "$promoted_app/Claudexor.app/Contents/Resources/claudexord.bundle.cjs"
+          test -s "$promoted_app/Claudexor.app/Contents/Resources/claudexor.bundle.cjs"
+          test -s "$promoted_app/Claudexor.app/Contents/Resources/setup-login-runner.cjs"
+          test -s "$promoted_app/Claudexor.app/Contents/Resources/browser-mcp-runtime/dist/browser-mcp-launcher.js"
+          node scripts/verify-win32-conpty-helper.mjs \
+            --file "$CLAUDEXOR_WIN32_CONPTY_HELPER" \
+            --file "$promoted_app/Claudexor.app/Contents/Resources/native/claudexor-conpty-helper.exe" \
+            --expected-sha256 "$CLAUDEXOR_WIN32_CONPTY_SHA256"
+          cli_home="$(mktemp -d)"
+          cli_help="$(env -i HOME="$cli_home" PATH="/usr/bin:/bin" \
+            "$promoted_app/Claudexor.app/Contents/Resources/node" \
+            "$promoted_app/Claudexor.app/Contents/Resources/claudexor.bundle.cjs" help --json)"
+          cli_install="$(env -i HOME="$cli_home" PATH="/usr/bin:/bin" \
+            "$promoted_app/Claudexor.app/Contents/Resources/node" \
+            "$promoted_app/Claudexor.app/Contents/Resources/claudexor.bundle.cjs" \
+            harness install codex --target local --dry-run --json)"
+          node -e '
+            const help = JSON.parse(process.argv[1]);
+            const install = JSON.parse(process.argv[2]);
+            const expectedVersion = process.argv[3];
+            const harness = Array.isArray(help.commands)
+              ? help.commands.find((command) => command?.id === "harness")
+              : null;
+            if (
+              help.ok !== true ||
+              help.version !== expectedVersion ||
+              !harness?.flags?.includes("target") ||
+              install.ok !== true ||
+              install.dryRun !== true ||
+              install.harness !== "codex" ||
+              install.target !== "local" ||
+              install.installLocation !== "~/.claudexor/node/bin"
+            ) {
+              throw new Error(`promoted CLI help mismatch: ${JSON.stringify(help)}`);
+            }
+          ' "$cli_help" "$cli_install" "$VERSION"
+          test -z "$(find "$cli_home" -mindepth 1 -print -quit)" || {
+            echo "::error::promoted CLI dry-run mutated its isolated HOME"
+            find "$cli_home" -mindepth 1 -maxdepth 3 -print
+            exit 1
+          }
+          rm -rf "$cli_home"
+          app_version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' \
+            "$promoted_app/Claudexor.app/Contents/Info.plist")"
+          test "$app_version" = "$VERSION" || {
+            echo "::error::promoted app version $app_version does not match $VERSION"
+            exit 1
+          }
+          probe="$("$promoted_app/Claudexor.app/Contents/Resources/node" \
+            "$promoted_app/Claudexor.app/Contents/Resources/claudexord.bundle.cjs" --probe)"
+          node -e '
+            const probe = JSON.parse(process.argv[1]);
+            if (probe.version !== process.argv[2] || probe.buildSha !== process.argv[3]) {
+              throw new Error(`promoted app probe mismatch: ${JSON.stringify(probe)}`);
+            }
+          ' "$probe" "$VERSION" "$PREPARED_SHA"
+          promoted_belt_home="$RUNNER_TEMP/promoted-belt-home"
+          mkdir -p "$promoted_belt_home"
+          HOME="$promoted_belt_home" node scripts/smoke-delegation-belt-entry.mjs \
+            --node "$promoted_app/Claudexor.app/Contents/Resources/node" \
+            --entry "$promoted_app/Claudexor.app/Contents/Resources/claudexord.bundle.cjs" \
+            --config-root "$promoted_belt_home/config"
+          GITHUB_SHA="$PREPARED_SHA" pnpm licenses list --prod --json | \
+            GITHUB_SHA="$PREPARED_SHA" node scripts/generate-release-sbom.mjs \
+            --app-bundle "$promoted_app/Claudexor.app" \
+            > "$RUNNER_TEMP/promoted-candidate.spdx.json"
+          cmp "$candidate_sbom" "$RUNNER_TEMP/promoted-candidate.spdx.json"
+
+      - name: Build (candidate) or promote (publish) the engine runtime closure
+        shell: bash
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          closure="$RUNNER_TEMP/runtime-closure"
+          rm -rf "$closure"
+          mkdir -p "$closure"
+          tarball="$closure/claudexor-runtime-$VERSION.tar.gz"
+          manifest="$closure/runtime-manifest.json"
+          if [ "$RELEASE_MODE_INPUT" = publish ]; then
+            # A-5 EXACT-ARTIFACT PROMOTION: ship the CANDIDATE run's exact closure
+            # bytes, never a publish-time rebuild. The owner signed THIS digest
+            # offline; a rebuild could never be byte-identical and would defeat
+            # the signature binding. The candidate artifact carries the closure +
+            # its UNSIGNED manifest; the signed manifest is verified against these
+            # promoted bytes in the assemble step below.
+            cand="candidate-assets/claudexor-runtime-$VERSION.tar.gz"
+            test -s "$cand" || { echo "::error::promoted candidate closure missing (wrong or expired candidate_run_id? release-asset artifacts retain 14 days)"; exit 1; }
+            test -s "candidate-assets/runtime-manifest.json" || { echo "::error::promoted candidate manifest missing"; exit 1; }
+            cp "$cand" "$tarball"
+            cp "candidate-assets/runtime-manifest.json" "$manifest"
+          else
+            # Both consumers use the shared stage. Signing/notarization must not
+            # mutate engine bytes after staging; compare every closure entry.
+            for entry in claudexord.bundle.cjs claudexor.bundle.cjs setup-login-runner.cjs browser-mcp-runtime native; do
+              diff -r "$CLAUDEXOR_ENGINE_RESOURCES/$entry" "apps/macos/dist/bundle.noindex/Claudexor.app/Contents/Resources/$entry"
+            done
+            node scripts/build-runtime-closure.mjs \
+              --resources "$CLAUDEXOR_ENGINE_RESOURCES" \
+              --version "$VERSION" \
+              --out "$closure" \
+              --win32-conpty-sha256 "$CLAUDEXOR_WIN32_CONPTY_SHA256"
+          fi
+          test -s "$tarball" || { echo "::error::runtime closure tarball missing"; exit 1; }
+          test -s "$manifest" || { echo "::error::runtime manifest missing"; exit 1; }
+          # The manifest must never claim a digest the shipped tarball does not
+          # have — recompute and compare before the tarball leaves this runner.
+          declared="$(node -e 'process.stdout.write(JSON.parse(require("node:fs").readFileSync(process.argv[1],"utf8")).sha256)' "$manifest")"
+          actual="$(shasum -a 256 "$tarball" | awk '{print $1}')"
+          test "$declared" = "$actual" || { echo "::error::runtime manifest sha256 does not match the tarball"; exit 1; }
+          closure_extract="$RUNNER_TEMP/runtime-closure-extract"
+          rm -rf "$closure_extract"
+          mkdir -p "$closure_extract"
+          tar -xzf "$tarball" -C "$closure_extract"
+          node scripts/verify-win32-conpty-helper.mjs \
+            --file "$CLAUDEXOR_WIN32_CONPTY_HELPER" \
+            --file "$closure_extract/native/claudexor-conpty-helper.exe" \
+            --expected-sha256 "$CLAUDEXOR_WIN32_CONPTY_SHA256"
+
+      - name: Build (candidate) or promote (publish) all SSH runtime targets
+        shell: bash
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          PREPARED_SHA: ${{ needs.prepare.outputs.sha }}
+        run: |
+          set -euo pipefail
+          remote="$RUNNER_TEMP/remote-runtimes"
+          rm -rf "$remote"
+          mkdir -p "$remote"
+          if [ "$RELEASE_MODE_INPUT" = publish ]; then
+            cp candidate-assets/claudexor-remote-runtime-"$VERSION"-*.tar.gz "$remote/"
+            cp candidate-assets/remote-runtime-manifest.json "$remote/"
+          else
+            node_version="$(cat .node-version)"
+            resources="apps/macos/dist/bundle.noindex/Claudexor.app/Contents/Resources"
+            for target in linux-x64 linux-arm64 darwin-x64 darwin-arm64; do
+              archive="$RUNNER_TEMP/node-v$node_version-$target.tar.gz"
+              curl --fail --location --proto '=https' --tlsv1.2 \
+                "https://nodejs.org/dist/v$node_version/node-v$node_version-$target.tar.gz" \
+                --output "$archive"
+              digest="$(node -e 'const x=require("./scripts/remote-node-sha256.json");process.stdout.write(x.assets[process.argv[1]])' "$target")"
+              node scripts/build-remote-runtime.mjs \
+                --target "$target" \
+                --version "$VERSION" \
+                --build-sha "$PREPARED_SHA" \
+                --resources "$resources" \
+                --node-archive "$archive" \
+                --node-sha256 "$digest" \
+                --node-version "$node_version" \
+                --out "$remote"
+            done
+            node scripts/build-remote-runtime-manifest.mjs \
+              --version "$VERSION" \
+              --build-sha "$PREPARED_SHA" \
+              --min-app-version "$VERSION" \
+              --assets-dir "$remote" \
+              --out "$remote/remote-runtime-manifest.json"
+          fi
+          test "$(find "$remote" -name 'claudexor-remote-runtime-*.tar.gz' | wc -l | tr -d ' ')" = 4
+          test -s "$remote/remote-runtime-manifest.json"
+          for archive in "$remote"/claudexor-remote-runtime-"$VERSION"-*.tar.gz; do
+            node scripts/verify-remote-runtime-archive.mjs "$archive"
+          done
+
+      - name: Smoke native Darwin SSH runtime through a PTY
+        shell: bash
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          case "$(uname -m)" in
+            arm64) target=darwin-arm64 ;;
+            x86_64) target=darwin-x64 ;;
+            *) echo "::error::unsupported Darwin runner architecture $(uname -m)"; exit 1 ;;
+          esac
+          scripts/smoke-darwin-remote-runtime.sh \
+            "$RUNNER_TEMP/remote-runtimes/claudexor-remote-runtime-$VERSION-$target.tar.gz"
+
+      - name: Assemble checksums, SBOM and review evidence
+        shell: bash
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          PREPARED_SHA: ${{ needs.prepare.outputs.sha }}
+        run: |
+          set -euo pipefail
+          assets="$RUNNER_TEMP/release-assets"
+          mkdir -p "$assets"
+          if [ "$RELEASE_MODE_INPUT" = publish ]; then
+            # A-5/D312-15: publish the exact signed/notarized app bytes accepted
+            # from the candidate run. No publish-run app build is authoritative.
+            cp "candidate-assets/Claudexor-$VERSION.dmg" "$assets/"
+            cp "candidate-assets/Claudexor-$VERSION.zip" "$assets/"
+            cp "candidate-assets/Claudexor-$VERSION.spdx.json" "$assets/"
+            cmp "candidate-assets/Claudexor-$VERSION.dmg" "$assets/Claudexor-$VERSION.dmg"
+            cmp "candidate-assets/Claudexor-$VERSION.zip" "$assets/Claudexor-$VERSION.zip"
+            cmp "candidate-assets/Claudexor-$VERSION.spdx.json" "$assets/Claudexor-$VERSION.spdx.json"
+          else
+            cp "apps/macos/dist/Claudexor-$VERSION.dmg" "$assets/"
+            cp "apps/macos/dist/Claudexor-$VERSION.zip" "$assets/"
+            GITHUB_SHA="$PREPARED_SHA" pnpm licenses list --prod --json | \
+              GITHUB_SHA="$PREPARED_SHA" node scripts/generate-release-sbom.mjs \
+              --app-bundle apps/macos/dist/bundle.noindex/Claudexor.app \
+              > "$assets/Claudexor-$VERSION.spdx.json"
+          fi
+          cp "$RUNNER_TEMP/runtime-closure/claudexor-runtime-$VERSION.tar.gz" "$assets/"
+          cp "$RUNNER_TEMP/remote-runtimes"/claudexor-remote-runtime-"$VERSION"-*.tar.gz "$assets/"
+          # Candidate manifests are unsigned; publish verifies both offline
+          # runtime signatures against these exact promoted archive bytes.
+          if [ "$RELEASE_MODE_INPUT" = publish ]; then
+            signed="$RUNNER_TEMP/runtime-manifest.signed.json"
+            printf '%s' "$RUNTIME_MANIFEST_B64_INPUT" | base64 -d > "$signed"
+            node scripts/verify-signed-runtime-manifest.mjs \
+              --signed "$signed" \
+              --unsigned "$RUNNER_TEMP/runtime-closure/runtime-manifest.json" \
+              --tarball "$RUNNER_TEMP/runtime-closure/claudexor-runtime-$VERSION.tar.gz" \
+              --version "$VERSION" \
+              --expected-build-sha "$PREPARED_SHA"
+            cp "$signed" "$assets/runtime-manifest.json"
+          else
+            cp "$RUNNER_TEMP/runtime-closure/runtime-manifest.json" "$assets/"
+          fi
+          if [ "$RELEASE_MODE_INPUT" = publish ]; then
+            remote_signed="$RUNNER_TEMP/remote-runtime-manifest.signed.json"
+            printf '%s' "$REMOTE_RUNTIME_MANIFEST_B64_INPUT" | base64 -d > "$remote_signed"
+            node scripts/verify-signed-remote-runtime-manifest.mjs \
+              --signed "$remote_signed" \
+              --unsigned "$RUNNER_TEMP/remote-runtimes/remote-runtime-manifest.json" \
+              --assets-dir "$RUNNER_TEMP/remote-runtimes" \
+              --version "$VERSION" \
+              --expected-build-sha "$PREPARED_SHA"
+            cp "$remote_signed" "$assets/remote-runtime-manifest.json"
+          else
+            cp "$RUNNER_TEMP/remote-runtimes/remote-runtime-manifest.json" "$assets/"
+          fi
+          # The remote SBOM derives every archive fact from the unsigned
+          # manifest, so publish can REGENERATE it deterministically from the
+          # promoted bytes, prove byte-identity with the provenance-verified
+          # candidate SBOM, and ship the CANDIDATE bytes (A-5).
+          if [ "$RELEASE_MODE_INPUT" = publish ]; then
+            GITHUB_SHA="$PREPARED_SHA" node scripts/generate-remote-runtime-sbom.mjs \
+              "$RUNNER_TEMP/remote-runtimes" "$VERSION" \
+              > "$RUNNER_TEMP/promoted-remote-runtime.spdx.json"
+            cmp "candidate-assets/Claudexor-remote-runtime-$VERSION.spdx.json" \
+              "$RUNNER_TEMP/promoted-remote-runtime.spdx.json"
+            cp "candidate-assets/Claudexor-remote-runtime-$VERSION.spdx.json" "$assets/"
+          else
+            GITHUB_SHA="$PREPARED_SHA" node scripts/generate-remote-runtime-sbom.mjs \
+              "$RUNNER_TEMP/remote-runtimes" "$VERSION" \
+              > "$assets/Claudexor-remote-runtime-$VERSION.spdx.json"
+          fi
+          (cd "$assets" && shasum -a 256 * > SHA256SUMS)
+
+      - name: Upload immutable candidate assets
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: Claudexor-${{ needs.prepare.outputs.version }}-release-assets
+          path: ${{ runner.temp }}/release-assets
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Attest candidate assets
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: ${{ runner.temp }}/release-assets/*
+
+  windows-conpty-candidate-smoke:
+    name: Execute assembled Windows ConPTY bytes (Node 24.16)
+    needs: [prepare, windows-conpty-authority, package-macos]
+    runs-on: windows-latest
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          persist-credentials: false
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: Claudexor-${{ needs.prepare.outputs.version }}-release-assets
+          path: release-assets
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: Claudexor-${{ needs.prepare.outputs.version }}-windows-conpty-authority
+          path: windows-conpty-authority
+
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24.16.0
+          cache: pnpm
+
+      - name: Install and build portable runtime code
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          pnpm install --frozen-lockfile
+          $env:CLAUDEXOR_SKIP_WIN32_CONPTY_BUILD = "1"
+          pnpm build
+
+      - name: Verify app, closure and authority carry identical PE-x64 bytes
+        shell: pwsh
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          node -e 'const {createHash}=require("node:crypto");const {readFileSync,readdirSync}=require("node:fs");const {join}=require("node:path");const root=process.argv[1];for(const line of readFileSync(join(root,"SHA256SUMS"),"utf8").trim().split(/\r?\n/)){const m=/^([0-9a-f]{64})  (.+)$/.exec(line);if(!m)throw new Error("malformed SHA256SUMS");const got=createHash("sha256").update(readFileSync(join(root,m[2]))).digest("hex");if(got!==m[1])throw new Error(`candidate checksum mismatch: ${m[2]}`)}' release-assets
+          $authority = (Resolve-Path "windows-conpty-authority/claudexor-conpty-helper.exe").Path
+          $sidecar = Get-Content -LiteralPath "windows-conpty-authority/claudexor-conpty-helper.exe.sha256" -Raw
+          $expected = ($sidecar -split "\s+")[0].ToLowerInvariant()
+          $appRoot = Join-Path $env:RUNNER_TEMP "candidate-app"
+          $closureRoot = Join-Path $env:RUNNER_TEMP "candidate-closure"
+          New-Item -ItemType Directory -Force -Path $appRoot | Out-Null
+          & tar -xf "release-assets/Claudexor-$env:VERSION.zip" -C $appRoot `
+            "Claudexor.app/Contents/Resources/native/claudexor-conpty-helper.exe"
+          if ($LASTEXITCODE -ne 0) { throw "candidate app helper extraction failed" }
+          New-Item -ItemType Directory -Force -Path $closureRoot | Out-Null
+          & tar -xzf "release-assets/claudexor-runtime-$env:VERSION.tar.gz" -C $closureRoot
+          if ($LASTEXITCODE -ne 0) { throw "runtime closure extraction failed" }
+          $appHelper = Join-Path $appRoot "Claudexor.app/Contents/Resources/native/claudexor-conpty-helper.exe"
+          $closureHelper = Join-Path $closureRoot "native/claudexor-conpty-helper.exe"
+          node scripts/verify-win32-conpty-helper.mjs `
+            --file $authority --file $appHelper --file $closureHelper `
+            --expected-sha256 $expected
+          New-Item -ItemType Directory -Force -Path "packages/core/dist/native" | Out-Null
+          New-Item -ItemType Directory -Force -Path "packages/core/dist/native-test" | Out-Null
+          Copy-Item -LiteralPath $authority -Destination "packages/core/dist/native/claudexor-conpty-helper.exe" -Force
+          Copy-Item -LiteralPath "windows-conpty-authority/claudexor-conpty-test-child.exe" `
+            -Destination "packages/core/dist/native-test/claudexor-conpty-test-child.exe" -Force
+
+      - name: Run helper, resolver and redaction contracts against assembled bytes
+        run: >
+          pnpm vitest run
+          packages/core/src/win32-conpty-helper.test.ts
+          packages/cli/src/setup-login-pty.test.ts
+          packages/cli/src/setup-login-runner-transport.test.ts
+
+      - name: Probe, handshake and gracefully stop the assembled daemon closure
+        shell: pwsh
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          PREPARED_SHA: ${{ needs.prepare.outputs.sha }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $entry = Join-Path $env:RUNNER_TEMP "candidate-closure/claudexord.bundle.cjs"
+          $probe = (& node $entry --probe | ConvertFrom-Json)
+          if ($probe.version -ne $env:VERSION -or $probe.buildSha -ne $env:PREPARED_SHA) {
+            throw "assembled closure probe identity mismatch"
+          }
+          # $home is a READ-ONLY pwsh automatic variable; assigning it is a
+          # WriteError under ErrorActionPreference=Stop.
+          $smokeHome = Join-Path $env:RUNNER_TEMP "windows-candidate-home"
+          $config = Join-Path $env:RUNNER_TEMP "windows-candidate-config"
+          New-Item -ItemType Directory -Force -Path $smokeHome | Out-Null
+          Remove-Item -LiteralPath $config -Recurse -Force -ErrorAction SilentlyContinue
+          $env:HOME = $smokeHome
+          $env:CLAUDEXOR_CONFIG_DIR = $config
+          $stdout = Join-Path $env:RUNNER_TEMP "windows-candidate-daemon.stdout.log"
+          $stderr = Join-Path $env:RUNNER_TEMP "windows-candidate-daemon.stderr.log"
+          $daemon = Start-Process -FilePath (Get-Command node).Source -ArgumentList @($entry) `
+            -NoNewWindow -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru
+          try {
+            $pointer = Join-Path $config "daemon/control-api.json"
+            $deadline = [DateTime]::UtcNow.AddSeconds(20)
+            while (-not (Test-Path -LiteralPath $pointer -PathType Leaf)) {
+              if ($daemon.HasExited) { throw "assembled daemon exited before handshake" }
+              if ([DateTime]::UtcNow -ge $deadline) { throw "assembled daemon handshake pointer timed out" }
+              Start-Sleep -Milliseconds 100
+            }
+            $control = Get-Content -LiteralPath $pointer -Raw | ConvertFrom-Json
+            $token = (Get-Content -LiteralPath $control.tokenPath -Raw).Trim()
+            $headers = @{
+              Authorization = "Bearer $token"
+              "X-Claudexor-Protocol-Major" = "3"
+            }
+            $body = @{ protocolMajor = 3; client = "windows-candidate-smoke" } | ConvertTo-Json
+            $handshake = Invoke-RestMethod -Method Post `
+              -Uri "http://$($control.host):$($control.port)/v2/handshake" `
+              -Headers $headers -ContentType "application/json" -Body $body
+            if (-not $handshake.compatible -or $handshake.engine.version -ne $env:VERSION -or $handshake.engine.sha -ne $env:PREPARED_SHA) {
+              throw "assembled daemon handshake identity mismatch"
+            }
+            $stop = (& node $entry --stop $env:VERSION $env:PREPARED_SHA | ConvertFrom-Json)
+            if ($LASTEXITCODE -ne 0 -or -not $stop.stopped) {
+              throw "assembled daemon graceful stop failed"
+            }
+            if (-not $daemon.WaitForExit(15000)) { throw "assembled daemon remained after graceful stop" }
+          } finally {
+            if (-not $daemon.HasExited) { Stop-Process -Id $daemon.Id -Force }
+          }
+
+  remote-linux-ssh-smoke:
+    name: Exercise the promoted Linux runtime over OpenSSH
+    needs: [prepare, package-macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          persist-credentials: false
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: Claudexor-${{ needs.prepare.outputs.version }}-release-assets
+          path: release-assets
+
+      - name: Auto-install, bootstrap, browse, create a thread, reconnect and forward preview
+        shell: bash
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          scripts/smoke-remote-runtime-ssh.sh \
+            "release-assets/claudexor-remote-runtime-$VERSION-linux-x64.tar.gz"
+
+  publish-npm:
+    name: Publish npm packages with provenance
+    needs: [prepare, package-macos, remote-linux-ssh-smoke, windows-conpty-candidate-smoke]
+    if: needs.prepare.outputs.mode == 'publish'
+    runs-on: macos-26
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: Claudexor-${{ needs.prepare.outputs.version }}-release-assets
+          path: release-assets
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: Claudexor-${{ needs.prepare.outputs.version }}-windows-conpty-authority
+          path: windows-conpty-authority
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .node-version
+          cache: pnpm
+          registry-url: https://registry.npmjs.org
+      - name: Revalidate review authority
+        run: |
+          git fetch --no-tags origin '+refs/heads/main:refs/remotes/origin/main'
+          git fetch --no-tags origin "refs/tags/$RELEASE_REF_INPUT:refs/tags/$RELEASE_REF_INPUT"
+          node scripts/verify-release-input.mjs
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+      - name: Stage the promoted closure's exact Windows helper for npm
+        shell: bash
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          closure="$RUNNER_TEMP/promoted-npm-closure"
+          rm -rf "$closure"
+          mkdir -p "$closure"
+          tar -xzf "release-assets/claudexor-runtime-$VERSION.tar.gz" -C "$closure"
+          authority="windows-conpty-authority/claudexor-conpty-helper.exe"
+          sidecar="windows-conpty-authority/claudexor-conpty-helper.exe.sha256"
+          expected="$(awk '{print $1}' "$sidecar")"
+          promoted="$closure/native/claudexor-conpty-helper.exe"
+          node scripts/verify-win32-conpty-helper.mjs \
+            --file "$authority" --file "$promoted" --expected-sha256 "$expected"
+          mkdir -p packages/core/dist/native
+          cp "$promoted" packages/core/dist/native/claudexor-conpty-helper.exe
+          chmod 755 packages/core/dist/native/claudexor-conpty-helper.exe
+          echo "CLAUDEXOR_WIN32_CONPTY_SHA256=$expected" >> "$GITHUB_ENV"
+          echo "CLAUDEXOR_REQUIRE_WIN32_CONPTY_HELPER=1" >> "$GITHUB_ENV"
+      - name: Verify packed native helper custody
+        shell: bash
+        run: |
+          set -euo pipefail
+          package_dir="$RUNNER_TEMP/core-package-smoke"
+          mkdir -p "$package_dir"
+          # pnpm pack rewrites workspace: specs but strips exec bits; npm pack
+          # does the reverse. The shared helper does pnpm + source-mode restore.
+          node scripts/lib/pack-with-modes.mjs --package packages/core --destination "$package_dir"
+          tarballs=("$package_dir"/*.tgz)
+          test "${#tarballs[@]}" -eq 1 && test -f "${tarballs[0]}" || {
+            echo "::error::Expected exactly one core npm tarball."
+            exit 1
+          }
+          node scripts/verify-npm-darwin-package.mjs --tarball "${tarballs[0]}" \
+            --win32-helper-sha256 "$CLAUDEXOR_WIN32_CONPTY_SHA256"
+      - name: Publish only missing, byte-identical packages
+        # Trusted publishing: npm exchanges this job's GitHub OIDC token (id-token: write)
+        # for a short-lived publish credential; no stored npm token is involved.
+        run: node scripts/publish-npm-release.mjs --provenance
+      - run: npm audit signatures
+
+  npm-smoke:
+    name: npm smoke on Node ${{ matrix.node-version }}
+    needs: [prepare, publish-npm]
+    if: needs.prepare.outputs.mode == 'publish'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: [20.19.0, 24.16.0]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: Claudexor-${{ needs.prepare.outputs.version }}-windows-conpty-authority
+          path: windows-conpty-authority
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ matrix.node-version }}
+          registry-url: https://registry.npmjs.org
+      - name: Clean install and CLI smoke
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          root="$(mktemp -d)"
+          cd "$root"
+          npm init -y >/dev/null
+          npm install --ignore-scripts "claudexor@$VERSION"
+          core_entry="$(node -p 'require.resolve("@claudexor/core")')"
+          packaged_conpty="$(dirname "$core_entry")/native/claudexor-conpty-helper.exe"
+          expected="$(awk '{print $1}' "$GITHUB_WORKSPACE/windows-conpty-authority/claudexor-conpty-helper.exe.sha256")"
+          node "$GITHUB_WORKSPACE/scripts/verify-win32-conpty-helper.mjs" \
+            --file "$GITHUB_WORKSPACE/windows-conpty-authority/claudexor-conpty-helper.exe" \
+            --file "$packaged_conpty" --expected-sha256 "$expected"
+          test "$(./node_modules/.bin/claudexor --version)" = "$VERSION"
+          ./node_modules/.bin/claudexor help --json > help.json
+          node -e 'const x=require("./help.json"); if(!x.ok||!Array.isArray(x.commands)) process.exit(1)'
+          ./node_modules/.bin/claudexor doctor --json > doctor.json
+          node -e 'const x=require("./doctor.json"); if(!Array.isArray(x.harnesses)) process.exit(1)'
+          belt_home="$root/belt-home"
+          mkdir -p "$belt_home"
+          HOME="$belt_home" CLAUDEXOR_ROOT_MODE=explicit CLAUDEXOR_PLUGIN_VERSION="$VERSION" \
+            node "$GITHUB_WORKSPACE/scripts/smoke-delegation-belt-entry.mjs" \
+            --node "$(command -v node)" \
+            --entry "$root/node_modules/.bin/claudexord" \
+            --config-root "$belt_home/config"
+
+  publish-release:
+    name: Publish immutable GitHub Release
+    needs: [prepare, package-macos, remote-linux-ssh-smoke, publish-npm, npm-smoke]
+    if: needs.prepare.outputs.mode == 'publish'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: Claudexor-${{ needs.prepare.outputs.version }}-release-assets
+          path: release-assets
+      - name: Revalidate downloaded release authority and digests
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin '+refs/heads/main:refs/remotes/origin/main'
+          git fetch --no-tags origin "refs/tags/$RELEASE_REF_INPUT:refs/tags/$RELEASE_REF_INPUT"
+          node scripts/verify-release-input.mjs
+          (cd release-assets && shasum -a 256 -c SHA256SUMS)
+      - name: Verify GitHub provenance
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for file in release-assets/*; do
+            gh attestation verify "$file" --repo "$GITHUB_REPOSITORY"
+          done
+      - name: Create draft, reject asset collisions, then publish last
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          notes="$RUNNER_TEMP/release-notes.md"
+          node - "$VERSION" > "$notes" <<'NODE'
+          const { readFileSync } = require("node:fs");
+          const version = process.argv[2];
+          const log = readFileSync("CHANGELOG.md", "utf8");
+          const escaped = version.replace(/\./g, "\\.");
+          const re = new RegExp(String.raw`^- \*\*v${escaped}\*\*([\s\S]*?)(?=^- \*\*v[0-9]+\.[0-9]+\.[0-9]+\*\*|$(?![\s\S]))`, "m");
+          const match = re.exec(log);
+          if (!match) throw new Error(`CHANGELOG.md has no entry for ${version}`);
+          process.stdout.write(`Claudexor ${version}\n\n${match[1].trim()}\n\nSigned, notarized, stapled, SBOM-backed and provenance-attested.\n`);
+          NODE
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            test "$(gh release view "$TAG" --json isDraft --jq .isDraft)" = true || {
+              echo "::error::Published release already exists; immutable releases are never edited."
+              exit 1
+            }
+          else
+            gh release create "$TAG" --verify-tag --draft --title "Claudexor $VERSION" --notes-file "$notes"
+          fi
+          remote_names="$RUNNER_TEMP/remote-assets-before.txt"
+          gh release view "$TAG" --json assets --jq '.assets[].name' > "$remote_names"
+          node scripts/verify-release-assets.mjs \
+            --phase before --expected-dir release-assets --remote-manifest "$remote_names"
+          gh release edit "$TAG" --title "Claudexor $VERSION" --notes-file "$notes" --draft
+          for file in release-assets/*; do
+            name="$(basename "$file")"
+            if grep -Fxq "$name" "$remote_names"; then
+              check="$RUNNER_TEMP/collision-$name"
+              mkdir -p "$check"
+              gh release download "$TAG" --pattern "$name" --dir "$check"
+              cmp "$file" "$check/$name" || {
+                echo "::error::Release asset collision for $name"
+                exit 1
+              }
+            else
+              gh release upload "$TAG" "$file"
+            fi
+          done
+          remote_names_after="$RUNNER_TEMP/remote-assets-after.txt"
+          gh release view "$TAG" --json assets --jq '.assets[].name' > "$remote_names_after"
+          node scripts/verify-release-assets.mjs \
+            --phase after --expected-dir release-assets --remote-manifest "$remote_names_after"
+          gh release edit "$TAG" --draft=false --latest

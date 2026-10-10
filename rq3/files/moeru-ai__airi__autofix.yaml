@@ -1,0 +1,39 @@
+name: autofix.ci
+
+permissions:
+  contents: read
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [crowdin]
+
+jobs:
+  autofix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      # NOTICE:
+      # Pin Node.js because 26.8.0 reports 26.8.0-alpha.0.0.0.
+      # sharp 0.29.3 rejects this prerelease version during pnpm install.
+      # Source: https://github.com/nodejs/node/blob/v26.8.0/src/node_version.h
+      # Remove this pin when Node.js 26 reports a stable version.
+      - uses: pnpm/setup@v2
+        with:
+          runtime: node@26.7.0
+          cache: true
+          install: false
+
+      - run: pnpm install
+      - run: pnpm prune && pnpm dedupe
+      - run: pnpm run lint:fix
+      - run: docker run -v `pwd`:`pwd` -w `pwd` ghcr.io/realm/swiftlint:latest --fix
+        working-directory: ./apps/stage-pocket
+
+      # - name: AutoCorrect
+      #   uses: huacnlee/autocorrect-action@main
+      #   with:
+      #     args: --fix
+
+      - uses: autofix-ci/action@7a166d7532b277f34e16238930461bf77f9d7ed8 # v1.3.3

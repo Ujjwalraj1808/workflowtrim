@@ -1,0 +1,14 @@
+name: PR Quality
+
+permissions:
+  contents: read
+  issues: read
+  pull-requests: write
+
+on:
+  pull_request_target:
+    types: [opened, reopened]
+
+jobs:
+  anti-slop:
+    uses: webpack/.github/.github/workflows/pr-quality.yml@438fc377cc376d2074ab1c6aaf4c35250b905670

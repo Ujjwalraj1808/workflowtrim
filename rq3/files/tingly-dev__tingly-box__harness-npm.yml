@@ -1,0 +1,190 @@
+name: Harness npm
+
+run-name: >-
+  🧪 Harness npm (virtual ${{ inputs.version }}, ${{ inputs.platform }}) on ${{ github.ref_name }}
+  by @${{ github.actor }}
+
+# Manual only, on purpose: nothing triggers this workflow. It rehearses the whole
+# npm release from the checked-out source against a throwaway local registry,
+# under a virtual version, then installs and launches as a user would, on Linux,
+# macOS and Windows. Run it from the Actions tab (Run workflow, pick the branch)
+# when a change touches build/npx/, the shims' platform packages, or the binaries
+# they launch.
+#
+# Nothing here publishes anywhere real: the registry is a Verdaccio started on
+# the runner, and the script refuses versions below 900.0.0.
+# Design, limits and what it asserts: .design/harness-npm.md.
+#
+# (GitHub lists a workflow_dispatch workflow in the Actions tab once its file is
+# on the default branch; until then it cannot be dispatched.)
+on:
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: 'Which OS to rehearse on'
+        required: false
+        default: all
+        type: choice
+        options:
+          - all
+          - linux
+          - macos
+          - windows
+      version:
+        description: 'Virtual version for the throwaway registry (>= 900.0.0, never a real release)'
+        required: false
+        default: '999.0.0'
+        type: string
+      gui_launch:
+        description: 'Start the GUI after installing it (turn off to only check install and CLI)'
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: harness-npm-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GO_VERSION: '1.26'
+  NODE_VERSION: '24'
+  # Keep in lockstep with release-gui.yml, gui/wails3/go.mod and Taskfile.wails.yml.
+  WAILS_VERSION: v3.0.0-beta.26
+
+jobs:
+  # `matrix` is not available in a job-level `if`, so the platform choice is
+  # turned into the matrix itself.
+  plan:
+    name: Plan
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - name: Pick the platforms
+        id: plan
+        env:
+          PLATFORM: ${{ inputs.platform }}
+        run: |
+          all='[{"platform":"linux","os":"ubuntu-24.04"},{"platform":"macos","os":"macos-15"},{"platform":"windows","os":"windows-2025"}]'
+          if [ "$PLATFORM" = all ]; then
+            echo "matrix=$all" >> "$GITHUB_OUTPUT"
+          else
+            echo "matrix=$(jq -c --arg p "$PLATFORM" '[.[] | select(.platform == $p)]' <<< "$all")" >> "$GITHUB_OUTPUT"
+          fi
+
+  # The web UI every binary here embeds, built once (same build a release ships).
+  frontend:
+    name: Frontend
+    uses: ./.github/workflows/build-frontend.yml
+
+  harness-npm:
+    name: Rehearse the npm release (${{ matrix.platform }})
+    needs: [plan, frontend]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    defaults:
+      run:
+        # bash everywhere (Git Bash on Windows). It also adds pipefail, without
+        # which `harness | tee` would end with tee's exit code and a failed
+        # rehearsal would show up as a green step.
+        shell: bash
+    env:
+      # The macOS launch uses the real HOME (`open -a` ignores the shell's env),
+      # which the script only touches on a throwaway CI runner.
+      CI: 'true'
+      # build/Taskfile.yml: the GUI tasks use frontend/dist as downloaded, no pnpm.
+      FRONTEND_PREBUILT: 'true'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          submodules: true
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          # setup-go caches the module and build caches.
+          cache-dependency-path: '**/go.sum'
+
+      # Into frontend/dist for the GUI tasks (FRONTEND_PREBUILT), and into
+      # internal/web/dist for the binaries built with plain `go build` (the CLI,
+      # the Linux GUI), which would otherwise embed the placeholder page.
+      - name: Download frontend artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: frontend-dist
+          path: frontend/dist/
+
+      - name: Place the frontend for embedding
+        run: |
+          mkdir -p internal/web/dist
+          cp -R frontend/dist/. internal/web/dist/
+
+      - name: Install GTK3 / WebKitGTK 4.1 headers, Xvfb and D-Bus
+        if: matrix.platform == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config libgtk-3-dev libwebkit2gtk-4.1-dev xvfb dbus-x11
+
+      # macOS and Windows build the GUI through the project's own tasks (what
+      # release-gui.yml runs), which need go-task and wails3. Skipped with
+      # gui_launch off: then no GUI is built.
+      - name: Install go-task and wails3
+        if: matrix.platform != 'linux' && inputs.gui_launch
+        run: |
+          go install github.com/go-task/task/v3/cmd/task@latest
+          go install github.com/wailsapp/wails/v3/cmd/"wails3@${WAILS_VERSION}"
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      # The harness bundles the shims with esbuild, which resolves undici and
+      # unzipper from build/npx/node_modules.
+      - name: Install the shims' dependencies
+        working-directory: build/npx
+        run: npm ci
+
+      - name: Run harness-npm
+        env:
+          HARNESS_VERSION: ${{ inputs.version }}
+          GUI_LAUNCH: ${{ inputs.gui_launch }}
+        run: |
+          ARGS=(--version "$HARNESS_VERSION" --keep)
+          if [ "$GUI_LAUNCH" != "true" ]; then ARGS+=(--no-gui-launch); fi
+          build/npx/harness-npm.sh "${ARGS[@]}" 2>&1 | tee "$RUNNER_TEMP/harness.log"
+
+      # The checks, as a summary table, even when the run failed halfway.
+      - name: Summarize
+        if: always()
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          {
+            echo "### harness-npm (${PLATFORM})"
+            echo
+            echo '```'
+            grep -E '^(✅|❌|ℹ️|passed=|🎉|💥)' "$RUNNER_TEMP/harness.log" || echo '(no output: the harness did not start)'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          WORK="$(sed -n 's/^work dir kept: //p' "$RUNNER_TEMP/harness.log" | tail -1 | tr -d '\r')"
+          echo "HARNESS_WORK=$WORK" >> "$GITHUB_ENV"
+
+      - name: Upload the harness logs
+        if: failure() && env.HARNESS_WORK != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: harness-npm-logs-${{ matrix.platform }}
+          path: ${{ env.HARNESS_WORK }}/logs
+          if-no-files-found: warn
+          retention-days: 7

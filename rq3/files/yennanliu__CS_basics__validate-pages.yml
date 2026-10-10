@@ -1,0 +1,88 @@
+name: Validate GitHub Pages
+
+on:
+  push:
+    branches: [ master ]
+    paths:
+      - 'data/problem_lists.json'
+      - 'data/roadmap.json'
+      - 'doc/**'
+      - 'README.md'
+      - '.github/workflows/deploy-pages.yml'
+      - '.github/workflows/validate-pages.yml'
+      - 'algo_demo/**'
+      - 'data/complexity_quiz.json'
+      - 'data/progress.txt'
+      - 'i18n/**'
+      - 'site/**.js'
+      - 'site/build.sh'
+      - 'site/pages/**'
+      - 'site/test/**'
+      - 'site/package.json'
+      - 'site/package-lock.json'
+      - 'site/*.css'
+      - 'vendor/**'
+  pull_request:
+    branches: [ master ]
+    paths:
+      - 'data/problem_lists.json'
+      - 'data/roadmap.json'
+      - 'doc/**'
+      - 'README.md'
+      - '.github/workflows/deploy-pages.yml'
+      - '.github/workflows/validate-pages.yml'
+      - 'algo_demo/**'
+      - 'data/complexity_quiz.json'
+      - 'data/progress.txt'
+      - 'i18n/**'
+      - 'site/**.js'
+      - 'site/build.sh'
+      - 'site/pages/**'
+      - 'site/test/**'
+      - 'site/package.json'
+      - 'site/package-lock.json'
+      - 'site/*.css'
+      - 'vendor/**'
+  workflow_dispatch:
+
+# This job only builds the site and reads the tree it produced. Saying so keeps
+# the token read-only whatever the repository default is, matching deploy-pages.yml.
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '22'
+
+    - name: Cache npm dependencies
+      uses: actions/cache@v4
+      with:
+        path: ~/.npm
+        key: ${{ runner.os }}-npm-${{ hashFiles('site/package-lock.json') }}
+        restore-keys: |
+          ${{ runner.os }}-npm-
+
+    - name: Install dependencies
+      run: npm ci --prefix site
+
+    - name: Build site
+      run: bash site/build.sh
+
+    - name: Run JS unit tests
+      run: npm test --prefix site
+
+    # The checks used to live here as a ~280-line heredoc, which meant they could
+    # not be run locally, could not be unit tested, and quietly warned rather than
+    # failed. site/e2e-check.js is the same rules plus the ones that omission cost
+    # us — it walks every page, not a hardcoded list of six.
+    - name: Validate the generated site
+      run: node site/e2e-check.js _site

@@ -1,0 +1,16 @@
+name: Docker CLI Build
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/docker-cli-branch.yaml'
+      - '.github/workflows/docker-cli.yaml'
+      - '.github/workflows/docker-cli-image.yaml'
+      - '.github/scripts/planCliBuild.sh'
+      - 'scripts/cli/**'
+      - 'code-style/.trivyignore.tools.yaml'
+
+jobs:
+  build-cli:
+    uses: ./.github/workflows/docker-cli.yaml
+    with:
+      pushImages: false

@@ -1,0 +1,33 @@
+name: License Scan
+
+on:
+  # enable running the workflow manually
+  workflow_dispatch:
+  push:
+    branches:
+      - master
+      - "1.0"
+    paths:
+      - pom.xml
+      - hawkbit-ui/pom.xml
+      - hawkbit-sdk/pom.xml
+      - hawkbit-sdk/hawkbit-sdk-demo/pom.xml
+  schedule:
+    # run every Monday at 2:00 AM (UTC), 429 when querying ClearlyDefined too frequently
+    - cron: '0 2 * * 1'
+
+permissions:
+  contents: write
+
+jobs:
+  license-scan:
+    # only on original eclipse-hawkbit/hawkbit repo or when manually triggered
+    if: github.repository == 'eclipse-hawkbit/hawkbit' || github.event_name == 'workflow_dispatch'
+    uses: ./.github/workflows/reusable_workflow_license-scan.yaml
+    permissions:
+      contents: write
+    with:
+      ref: ${{ github.ref }}
+      open_tickets: true
+    secrets:
+      GITLAB_API_TOKEN: ${{ secrets.GITLAB_API_TOKEN }}

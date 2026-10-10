@@ -1,0 +1,226 @@
+name: Data Prebuild (DART)
+
+# ──────────────────────────────────────────────────────────────
+# DART Data Sync 완료 후 자동 트리거 (증분) + 주 1 회 full 재생성.
+# scan 프리빌드(changes/finance/report/sharesOutstanding/docsIndex) 생성 → HF 업로드.
+#
+# 증분(기본): panel 변경 종목만 다운로드 → changes/sharesOutstanding/docsIndex 변경분만
+#   재계산 후 기존 parquet 에 종목 단위 머지. 전 92K panel(11GB) seed 금지 = OOM/디스크
+#   고갈 근본원인 제거. finance/report 는 캐시 full 입력이라 full 빌드. 단 새 필수 baseline이
+#   원격과 cache에 모두 없으면 최초 한 번 full bootstrap으로 자동 승격한다.
+# full(일요일 cron / dispatch full=true): 디스크 확보 후 전 종목 panel seed → 전체 재생성.
+#   빌더 변경·backfill drift 교정 안전망. _scanBuildState ledger 가 두 경로를 잇는다.
+#
+# 입력 seed 는 prebuildData.py 가 단일 SSOT (BASE_SEED_CATEGORIES). EDGAR 는 edgarSync.yml 전담.
+# ──────────────────────────────────────────────────────────────
+
+on:
+  workflow_run:
+    workflows: ["Data Sync"]
+    types: [completed]
+  schedule:
+    - cron: '0 17 * * 0'  # UTC 17:00 일 = KST 02:00 월, 주간 full 재생성 (Data Sync 18:00 와 1h 이격)
+  workflow_dispatch:
+    inputs:
+      full:
+        description: '전 종목 full 재생성 (panel 전량 seed, 디스크 확보)'
+        default: 'false'
+        type: choice
+        options: ['false', 'true']
+
+permissions:
+  contents: read  # HF push 는 HF_TOKEN 사용 — git 작업 없음(checkout+cache 만). 최소권한.
+
+jobs:
+  # ── 증분: Data Sync 직후 / dispatch(full=false). panel 변경분만 ──
+  prebuild-scan:
+    if: ${{ (github.event_name == 'workflow_run' && (github.event.workflow_run.conclusion == 'success' || github.event.workflow_run.conclusion == 'failure')) || (github.event_name == 'workflow_dispatch' && github.event.inputs.full != 'true') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    # job 레벨 concurrency 를 쓴다. 워크플로 레벨은 run 생성 즉시 큐를 점유하고, GitHub 은 그룹당
+    # pending 을 1 개만 유지해 새 트리거가 오면 기존 pending 을 취소한다(cancel-in-progress 무관).
+    # 2026-08 사고: hf-dart-push 대기 중이던 run 8 건이 job 0 개인 채 취소됐다. job 레벨이면
+    # if 로 skip 되는 job 은 큐에 진입조차 하지 않는다.
+    concurrency:
+      group: hf-dart-push
+      cancel-in-progress: false
+
+    steps:
+      - uses: actions/checkout@v6
+
+      # incremental 도 finance/report/scan 캐시 + 임시 parquet merge 가 동시에 생긴다.
+      # 기본 runner 디스크가 빌드 중 고갈되면 Python 예외 없이 runner 통신 상실로 끝난다.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache/CodeQL || true
+          df -h /
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Smoke import (fail fast on src regression)
+        run: uv run python -c "import dartlab; print('dartlab', getattr(dartlab, '__version__', 'dev'))"
+
+      # workflow_run 컨텍스트는 소스 run_id 를 모름 → restore-keys 접두사 매칭으로 최신 캐시.
+      - name: Restore finance cache
+        uses: actions/cache/restore@v5
+        with:
+          path: data/dart/finance
+          key: dartlab-data-finance-prebuild-never-match
+          restore-keys: dartlab-data-finance-
+
+      - name: Restore report cache
+        uses: actions/cache/restore@v5
+        with:
+          path: data/dart/report
+          key: dartlab-data-report-prebuild-never-match
+          restore-keys: dartlab-data-report-
+
+      # 직전 scan 산출물(+_scanBuildState ledger) 복원 → 증분 머지/prune 기준. cache miss 면
+      # prebuildData 의 base seed 가 HF 에서 scan 카테고리를 idempotent 충전한다.
+      - name: Restore scan cache
+        uses: actions/cache/restore@v5
+        with:
+          path: data/dart/scan
+          key: dartlab-data-scan-prebuild-never-match
+          restore-keys: dartlab-data-scan-
+
+      # KIND/dartList/corpProfile seed 는 prebuildData.py 가 retryHfCall SSOT 로 자체 수행
+      # (offline 가드 아래 HF 다운로드 — buildScan 의 KIND OfflineViolation 회피).
+      - name: Build DART scan prebuilds (incremental) + upload
+        run: |
+          echo "[prebuild] start incremental"
+          df -h /
+          free -h || true
+          uv run python -u -X utf8 .github/scripts/prebuild/prebuildData.py &
+          pid=$!
+          (
+            elapsed=0
+            while kill -0 "$pid" 2>/dev/null; do
+              sleep 60
+              elapsed=$((elapsed + 60))
+              echo "[prebuild] heartbeat incremental elapsed=${elapsed}s"
+              df -h /
+              free -h || true
+            done
+          ) &
+          heartbeat=$!
+          set +e
+          wait "$pid"
+          status=$?
+          set -e
+          echo "[prebuild] child incremental exit=${status}"
+          df -h /
+          free -h || true
+          kill "$heartbeat" 2>/dev/null || true
+          exit "$status"
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          PYTHONUNBUFFERED: "1"
+          DARTLAB_SCAN_BATCH_SIZE: '50'
+          POLARS_MAX_THREADS: '2'
+          MALLOC_ARENA_MAX: '2'
+          DARTLAB_HF_RETRY_ATTEMPTS: '3'
+          DARTLAB_HF_RETRY_MAX_SINGLE_WAIT_SECONDS: '120'
+
+      - name: Save DART scan cache
+        if: always()
+        uses: actions/cache/save@v5
+        with:
+          path: data/dart/scan
+          key: dartlab-data-scan-${{ github.run_id }}
+
+  # ── full: 주간 / dispatch(full=true). 전 종목 panel seed (디스크 확보) ──
+  prebuild-full:
+    if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.full == 'true') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    concurrency:
+      group: hf-dart-push
+      cancel-in-progress: false
+
+    steps:
+      - uses: actions/checkout@v6
+
+      # 전 종목 panel(~11GB) seed 를 위한 디스크 확보 — 기본 러너 / 파티션 ~14GB 한계 회피.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache/CodeQL || true
+          df -h /
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Smoke import (fail fast on src regression)
+        run: uv run python -c "import dartlab; print('dartlab', getattr(dartlab, '__version__', 'dev'))"
+
+      - name: Restore finance cache
+        uses: actions/cache/restore@v5
+        with:
+          path: data/dart/finance
+          key: dartlab-data-finance-prebuild-never-match
+          restore-keys: dartlab-data-finance-
+
+      - name: Restore report cache
+        uses: actions/cache/restore@v5
+        with:
+          path: data/dart/report
+          key: dartlab-data-report-prebuild-never-match
+          restore-keys: dartlab-data-report-
+
+      # KIND/dartList/corpProfile seed 는 prebuildData.py 가 retryHfCall SSOT 로 자체 수행.
+      - name: Build DART scan prebuilds (full rebuild) + upload
+        run: |
+          echo "[prebuild] start full"
+          df -h /
+          free -h || true
+          uv run python -u -X utf8 .github/scripts/prebuild/prebuildData.py &
+          pid=$!
+          (
+            elapsed=0
+            while kill -0 "$pid" 2>/dev/null; do
+              sleep 60
+              elapsed=$((elapsed + 60))
+              echo "[prebuild] heartbeat full elapsed=${elapsed}s"
+              df -h /
+              free -h || true
+            done
+          ) &
+          heartbeat=$!
+          set +e
+          wait "$pid"
+          status=$?
+          set -e
+          echo "[prebuild] child full exit=${status}"
+          df -h /
+          free -h || true
+          kill "$heartbeat" 2>/dev/null || true
+          exit "$status"
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          PREBUILD_FULL: "1"
+          PYTHONUNBUFFERED: "1"
+          DARTLAB_SCAN_BATCH_SIZE: '50'
+          POLARS_MAX_THREADS: '2'
+          MALLOC_ARENA_MAX: '2'
+          DARTLAB_HF_RETRY_ATTEMPTS: '3'
+          DARTLAB_HF_RETRY_MAX_SINGLE_WAIT_SECONDS: '120'
+
+      - name: Save DART scan cache
+        if: always()
+        uses: actions/cache/save@v5
+        with:
+          path: data/dart/scan
+          key: dartlab-data-scan-${{ github.run_id }}

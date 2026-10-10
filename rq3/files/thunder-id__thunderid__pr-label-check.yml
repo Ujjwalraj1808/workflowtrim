@@ -1,0 +1,114 @@
+# This workflow will perform required checks on pull requests
+# Uses:
+#   OS: ubuntu-latest
+
+name: "🔎 PR Check"
+
+on:
+  pull_request:
+    types: [opened, synchronize, labeled, unlabeled, ready_for_review]
+  merge_group:
+
+jobs:
+  check-labels:
+    name: "🏷️ Check PR Labels"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Skip label check for merge queue
+        if: github.event_name == 'merge_group'
+        run: echo "Skipping label check for merge queue."
+
+      - name: Check for required PR labels
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const requiredLabels = [
+                'Type/New Feature',
+                'Type/Improvement',
+                'Type/Bug',
+                'skip-changelog'
+            ];
+
+            if (typeof context === 'undefined' || !context.payload || !context.payload.pull_request) {
+              core.setFailed('Could not find PR labels in the event payload.');
+              return;
+            }
+
+            const prLabels = context.payload.pull_request.labels.map(l => l.name);
+            const hasRequired = prLabels.some(label => requiredLabels.includes(label));
+            if (!hasRequired) {
+                core.setFailed(`PR must have at least one of the following labels: ${requiredLabels.join(', ')}`);
+            } else {
+                core.info('PR has the required labels.');
+            }
+
+  # Cancels older pr-builder.yml runs for the same PR (or merge-queue entry) as soon as a newer
+  # push, re-queue, or `trigger-pr-builder` label lands. Colocated with `check-labels` so it can
+  # ride the same fast-scheduling slot this small workflow already enjoys, instead of competing
+  # with pr-builder.yml's own ~15-job queue.
+  #
+  # DISABLED: the cancel API 403s because neither GITHUB_TOKEN nor THUNDER_AUTOMATION_BOT has
+  # `actions: write` in this repo/org. Re-enable by uncommenting this job once the bot token is
+  # granted Actions: read/write (or another suitable token is provisioned as ACTIONS_CANCEL_TOKEN).
+  #
+  # cancel-superseded:
+  #   name: "🛑 Cancel Superseded Runs"
+  #   if: >-
+  #     github.event_name == 'merge_group'
+  #     || (github.event_name == 'pull_request'
+  #         && (github.event.action != 'labeled' || github.event.label.name == 'trigger-pr-builder'))
+  #   runs-on: ubuntu-latest
+  #   timeout-minutes: 2
+  #   permissions:
+  #     actions: write
+  #   steps:
+  #     - name: Cancel older pr-builder runs for this PR
+  #       env:
+  #         GH_TOKEN: ${{ secrets.THUNDER_AUTOMATION_BOT || github.token }}
+  #         GH_REPO: ${{ github.repository }}
+  #         EVENT: ${{ github.event_name }}
+  #         PR_NUMBER: ${{ github.event.pull_request.number }}
+  #         HEAD_BRANCH: ${{ github.head_ref }}
+  #         MERGE_HEAD_REF: ${{ github.event.merge_group.head_ref }}
+  #       run: |
+  #         set -euo pipefail
+  #
+  #         case "$EVENT" in
+  #           pull_request)
+  #             PR_NUM="$PR_NUMBER"
+  #             ;;
+  #           merge_group)
+  #             # merge_group head_ref format: refs/heads/gh-readonly-queue/<base>/pr-<N>-<sha>
+  #             PR_NUM=$(echo "$MERGE_HEAD_REF" | sed -n 's|.*pr-\([0-9]\{1,\}\)-.*|\1|p')
+  #             ;;
+  #           *)
+  #             echo "Event $EVENT unsupported, exiting."
+  #             exit 0
+  #             ;;
+  #         esac
+  #
+  #         if [ -z "$PR_NUM" ]; then
+  #           echo "Could not determine PR number, nothing to cancel."
+  #           exit 0
+  #         fi
+  #
+  #         echo "Looking for superseded pr-builder.yml runs for PR #$PR_NUM (event: $EVENT)"
+  #
+  #         if [ "$EVENT" = "pull_request" ]; then
+  #           RUNS=$(gh api "repos/$GH_REPO/actions/workflows/pr-builder.yml/runs?event=pull_request&branch=$HEAD_BRANCH&per_page=100" \
+  #             --jq '.workflow_runs[] | select(.status != "completed") | .id')
+  #         else
+  #           RUNS=$(gh api "repos/$GH_REPO/actions/workflows/pr-builder.yml/runs?event=merge_group&per_page=100" \
+  #             --jq ".workflow_runs[] | select(.status != \"completed\") | select(.head_branch | test(\"pr-$PR_NUM-\")) | .id")
+  #         fi
+  #
+  #         if [ -z "$RUNS" ]; then
+  #           echo "No superseded runs to cancel."
+  #           exit 0
+  #         fi
+  #
+  #         for RUN_ID in $RUNS; do
+  #           echo "Cancelling run $RUN_ID"
+  #           gh api -X POST "repos/$GH_REPO/actions/runs/$RUN_ID/cancel" || echo "Failed to cancel $RUN_ID (may already be terminal)"
+  #         done

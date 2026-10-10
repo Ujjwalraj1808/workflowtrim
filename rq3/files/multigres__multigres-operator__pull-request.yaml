@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  pull_request:
+    paths-ignore:
+      - "**/*.md"
+      - "**/*.txt"
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  scan-dependencies:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+  build:
+    name: Build
+    uses: ./.github/workflows/_reusable-build-changed.yaml
+  manifests:
+    name: Manifests
+    uses: ./.github/workflows/_reusable-manifests.yaml
+  coverage:
+    name: Coverage
+    permissions:
+      contents: read
+    uses: ./.github/workflows/_reusable-test-coverage.yaml
+    with:
+      COVERAGE_THRESHOLD: 70
+
+  promotion-tests:
+    name: Image promotion regression tests
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: node --test scripts/promote-runtime-images.test.js scripts/nightly-compatibility.test.js scripts/e2e-images.test.js
+      - name: Validate committed promotion record
+        if: github.head_ref == 'chore/promote-runtime-images'
+        run: node scripts/promote-runtime-images.js --check
+
+  promotion-e2e:
+    name: Promotion committed defaults
+    if: github.head_ref == 'chore/promote-runtime-images'
+    needs: promotion-tests
+    permissions:
+      contents: read
+    uses: ./.github/workflows/_reusable-e2e.yaml
+    with:
+      ref: ${{ github.event.pull_request.head.sha }}
+      timeout-minutes: 30

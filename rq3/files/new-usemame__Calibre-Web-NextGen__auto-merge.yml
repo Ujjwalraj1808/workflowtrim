@@ -1,0 +1,291 @@
+name: auto-merge
+
+# Tier-based auto-merge for safe-tier-1 / safe-tier-2 PRs.
+#
+# A PR is eligible to merge iff ALL of:
+#   1. State == OPEN, mergeable, not draft, not from a fork.
+#   2. Has label `safe-tier-1` (or `safe-tier-2` and the operator has set
+#      repo variable AUTOPILOT_TIER2_ENABLED == 'true').
+#      The label-as-contract is enforced by .github/workflows/
+#      tier-label-guard.yml: anyone outside TIER_LABEL_TRUSTED_LABELERS
+#      who applies a tier label has it stripped immediately. By the time
+#      this workflow sees the label, a trusted author has signed for it.
+#   3. Filename is NOT in FORBIDDEN_PATHS_REGEX (re-verified by
+#      `python -m scripts.lib.tier_policy validate-fork-pr`, since the
+#      PR head might have been updated after the label was applied).
+#   4. Diff content does NOT match FORBIDDEN_DIFF_CONTENT_REGEX.
+#   5. Tier-2 only: diff size <= TIER2_MAX_ADDITIONS LOC and
+#      <= TIER2_MAX_FILES files (re-verified at this step).
+#   6. Tier-2 only: non-translation/docs PRs update CHANGES-vs-upstream.md.
+#
+# If all of the above pass we call `gh pr merge --auto --squash`. GitHub
+# itself then waits for required status checks (per branch protection)
+# to become green before merging. We do NOT poll required checks here;
+# that responsibility is delegated to GitHub. The list of required
+# checks per tier (TIER{1,2}_REQUIRED_CHECKS in tier-policy.config) is
+# the documented contract for what branch protection should require —
+# `Test Suite Summary` is the unified gate (it knows about tier-2 via
+# the PR's labels and fails when Integration Tests didn't pass on a
+# tier-2 PR).
+#
+# All numeric/regex policy values live in .github/policy/tier-policy.config.
+# Anything else: the workflow comments why and stops. It never bypasses
+# checks, never merges without a label, never `--admin`-overrides.
+
+on:
+  pull_request:
+    # `edited` is what fires when a PR's BASE is changed. Without it, a PR
+    # armed while based on main and then re-targeted at a feature branch is
+    # never re-evaluated — and GitHub's auto-merge is sticky (see the
+    # disarm note in scripts/finish-armed-automerges.sh: a stripped tier
+    # label did nothing for months because nothing called --disable-auto).
+    # `edited` also fires on title/body edits, which is harmless: evaluate
+    # is idempotent and re-arming an already-armed PR is a no-op.
+    types: [labeled, synchronize, reopened, edited]
+
+permissions:
+  pull-requests: write
+  contents: write
+  checks: read
+
+concurrency:
+  group: auto-merge-tier-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  evaluate:
+    # Bail early for fork PRs — `gh pr merge --auto` won't work for them
+    # anyway (you can't enable auto-merge from outside the head repo),
+    # and we want one clear refusal line in the log rather than letting
+    # the later steps fail in confusing ways.
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main (for tier-policy.config + scripts/lib)
+        # Critical: ref must be main, NOT the PR head. The policy file
+        # and validator module used to gate the PR are always the ones
+        # currently on main; a malicious PR cannot widen its own auto-
+        # merge rules by editing the policy or shadowing the module in
+        # its branch.
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 1
+
+      - name: Set up Python (for scripts.lib.tier_policy)
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+
+      - name: Evaluate and (maybe) enable auto-merge
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          TIER2_ENABLED: ${{ vars.AUTOPILOT_TIER2_ENABLED }}
+        run: |
+          set -euo pipefail
+
+          if [ ! -f .github/policy/tier-policy.config ]; then
+            echo "::error::missing .github/policy/tier-policy.config — auto-merge cannot run safely"
+            exit 1
+          fi
+
+          comment_and_skip() {
+            local reason="$1"
+            gh pr comment "$PR_NUMBER" --repo "$REPO" --body "🤖 auto-merge skipped: $reason"
+            echo "skip #$PR_NUMBER: $reason"
+            exit 0
+          }
+
+          echo "=== evaluating PR #$PR_NUMBER ==="
+          META=$(gh pr view "$PR_NUMBER" --repo "$REPO" \
+            --json state,mergeable,labels,files,headRefName,headRefOid,title,isDraft,baseRefName)
+
+          state=$(jq -r .state <<<"$META")
+          mergeable=$(jq -r .mergeable <<<"$META")
+          is_draft=$(jq -r .isDraft <<<"$META")
+          labels=$(jq -r '.labels[].name' <<<"$META" | tr '\n' ',')
+
+          if [ "$state" != "OPEN" ]; then
+              echo "PR state=$state, skipping"; exit 0
+          fi
+          if [ "$is_draft" = "true" ]; then
+              echo "PR is draft, skipping"; exit 0
+          fi
+          if [ "$mergeable" != "MERGEABLE" ]; then
+              echo "PR mergeable=$mergeable, skipping"; exit 0
+          fi
+
+          # Tier label gate. tier-label-guard.yml ensures the label was
+          # applied by a trusted account; if a stale safe-tier label
+          # somehow survives a force-push (rare — tier-label-guard.yml
+          # fires per-labeling, so a `synchronize` event that re-adds a
+          # label wouldn't re-trigger the guard), the validate step
+          # below catches forbidden content regardless.
+          if [[ ",$labels," == *",safe-tier-1,"* ]]; then
+              tier="safe-tier-1"
+          elif [[ ",$labels," == *",safe-tier-2,"* ]]; then
+              if [ "${TIER2_ENABLED:-false}" != "true" ]; then
+                  echo "PR has safe-tier-2 but AUTOPILOT_TIER2_ENABLED!=true, skipping"
+                  exit 0
+              fi
+              tier="safe-tier-2"
+          else
+              echo "PR has no safe-tier label, skipping"
+              exit 0
+          fi
+          echo "tier=$tier"
+
+          # ─── Run validation through the shared policy module ───────
+          # scripts/lib/tier_policy.py is the single source of truth.
+          # It owns: forbidden-path filename check, tier-2 LOC/file cap
+          # check, diff-content sensitive-token scan. The CLI returns
+          # JSON with `ok` + `category` + `reason`.
+          pr_json=$(mktemp)
+          diff_text=$(mktemp)
+          # `--json additions,files` mirrors what validate_fork_pr expects.
+          # baseRefName is load-bearing: the validator refuses to arm on a
+          # base the required-status-checks ruleset doesn't cover. Drop it
+          # from this --json list and every PR fails closed instead.
+          gh pr view "$PR_NUMBER" --repo "$REPO" --json additions,changedFiles,files,baseRefName > "$pr_json"
+          gh pr diff "$PR_NUMBER" --repo "$REPO" > "$diff_text"
+
+          result=$(python -m scripts.lib.tier_policy validate-fork-pr \
+              --tier "$tier" "$pr_json" "$diff_text")
+          rm -f "$pr_json" "$diff_text"
+
+          echo "validate-fork-pr result: $result"
+          ok=$(jq -r '.ok' <<<"$result")
+          category=$(jq -r '.category' <<<"$result")
+          reason=$(jq -r '.reason' <<<"$result")
+
+          # ─── Second, independent base check: is it the DEFAULT branch? ──
+          # The policy allowlist names branches literally ("main"), but the
+          # ruleset that supplies our required checks is scoped to
+          # ~DEFAULT_BRANCH. Those two meanings are equal today and can
+          # drift: rename the default branch while a stale `main` survives,
+          # and the allowlist would go on authorising a branch that nothing
+          # protects. Resolving the default branch and requiring the base to
+          # BE it keeps the gate tied to the ruleset's own semantics rather
+          # than to a name that used to match them.
+          #
+          # Fail closed when the lookup fails — an unresolvable default
+          # branch is not permission to proceed.
+          if [ "$ok" = "true" ]; then
+              base_ref=$(jq -r '.baseRefName // ""' <<<"$META")
+              default_branch=$(gh repo view "$REPO" \
+                  --json defaultBranchRef --jq '.defaultBranchRef.name' 2>/dev/null || true)
+              if [ -z "$default_branch" ]; then
+                  ok="false"; category="unprotected_base"
+                  reason="could not resolve this repository's default branch, so could not confirm the base is the ref branch protection covers; refusing to arm auto-merge."
+              elif [ "$base_ref" != "$default_branch" ]; then
+                  ok="false"; category="unprotected_base"
+                  reason="base branch \`$base_ref\` is not this repository's default branch (\`$default_branch\`), and the required-status-checks ruleset is scoped to the default branch — arming here would merge with no required checks at all."
+              fi
+          fi
+
+          # An unprotected base is not a defect in the PR — the diff may be
+          # perfectly good tier-1 work — so it does NOT get demoted. The
+          # label is right; the base is wrong. Stripping the label here
+          # would thrash against the autopilot, which would just re-apply
+          # it. GitHub re-targets a stacked PR only when the branch below
+          # it is DELETED after merging, so this does not always clear
+          # itself — sometimes the base has to be changed by hand.
+          #
+          # Comment at most once per PR: this fires on every `synchronize`,
+          # and a stacked branch syncs often.
+          if [ "$ok" != "true" ] && [ "$category" = "unprotected_base" ]; then
+              # Refusing to arm is not enough on its own. Arming is STICKY:
+              # a PR armed while based on main and later re-targeted at a
+              # feature branch stays armed, and this job would otherwise
+              # just decline to re-arm something already armed. Disarm
+              # explicitly so the refusal applies to the PR's current
+              # state, not only to new arming attempts.
+              #
+              # Unconditional and tolerant of failure: --disable-auto errors
+              # when auto-merge was never enabled, which is the common case.
+              gh pr merge "$PR_NUMBER" --repo "$REPO" --disable-auto 2>/dev/null \
+                  && echo "disarmed existing auto-merge on #$PR_NUMBER" \
+                  || echo "no auto-merge to disarm on #$PR_NUMBER"
+
+              marker="auto-merge held: unprotected base"
+              # Deliberately NOT `gh ... | grep -qF`: grep -q exits on the
+              # first match and SIGPIPEs gh, which under `set -o pipefail`
+              # makes the pipeline non-zero *because* it matched. That
+              # inverts the test and re-comments on every sync. Capture
+              # first, then match in-shell with no pipe at all.
+              # NOT `|| true`: that collapses "no comments yet" together with
+              # auth failure, rate limiting and an API outage, and then posts
+              # again on the assumption the marker is absent — which is how
+              # "comment once" turns into a comment per sync during a partial
+              # outage, with the real failure invisible. The refusal has
+              # already happened either way; only the notice is at stake.
+              if ! existing=$(gh pr view "$PR_NUMBER" --repo "$REPO" \
+                     --json comments --jq '.comments[].body'); then
+                  echo "::warning::could not read existing comments on #$PR_NUMBER; not commenting"
+                  echo "skip #$PR_NUMBER: $reason"
+                  exit 0
+              fi
+              case "$existing" in
+                  *"$marker"*)
+                      echo "skip #$PR_NUMBER: $reason (already commented)" ;;
+                  *)
+                      gh pr comment "$PR_NUMBER" --repo "$REPO" \
+                          --body "🤖 $marker — $reason"
+                      echo "skip #$PR_NUMBER: $reason" ;;
+              esac
+              exit 0
+          fi
+
+          if [ "$ok" != "true" ]; then
+              # Demote to needs-review and stop. tier-2 demotion strips
+              # both labels because the operator may have intended tier-1
+              # but the validator caught something requiring eyes.
+              gh pr edit "$PR_NUMBER" --repo "$REPO" \
+                  --remove-label safe-tier-1 --remove-label safe-tier-2 \
+                  --add-label needs-review || true
+              comment_and_skip "$reason"
+          fi
+
+          # ─── Tier-2 only: CHANGES-vs-upstream.md update required ───
+          # Tier-2 PRs that touch any non-doc, non-po file MUST also
+          # update CHANGES-vs-upstream.md (CLAUDE.md hard rule for
+          # tracking divergence). Tier-1 (.po + *.md only) is exempt.
+          if [ "$tier" = "safe-tier-2" ]; then
+              files=$(jq -r '.files[].path' <<<"$META")
+              has_code=0
+              has_changes_update=0
+              while IFS= read -r f; do
+                  # Case patterns match positionally — the explicit
+                  # CHANGES-vs-upstream.md branch MUST precede *.md or
+                  # the wildcard wins and `has_changes_update` never
+                  # gets set, demoting every tier-2 PR that correctly
+                  # updates CHANGES-vs-upstream.md.
+                  case "$f" in
+                      CHANGES-vs-upstream.md) has_changes_update=1 ;;
+                      *.po|*.pot) ;;
+                      *.md|README*) ;;
+                      *) has_code=1 ;;
+                  esac
+              done <<<"$files"
+              if [ "$has_code" = "1" ] && [ "$has_changes_update" = "0" ]; then
+                  comment_and_skip "tier-2 PRs with code changes must update CHANGES-vs-upstream.md to document the divergence. Add a row, push, and CI will re-evaluate."
+              fi
+          fi
+
+          # ─── Enable auto-merge ────────────────────────────────────
+          # We do NOT poll required checks here. GitHub waits for them
+          # via branch protection (validate-author + Fast Tests + Test
+          # Suite Summary required; the summary is tier-aware and fails
+          # on integration-tests failure for safe-tier-2 PRs). This is
+          # the workflow_run polling loop that the old version did, but
+          # delegated to GitHub itself — fewer places for the state
+          # machine to live, no more race-on-completion bugs.
+          #
+          # --auto requires the repo to have "Allow auto-merge" enabled
+          # in settings (it is).
+          echo "Enabling auto-merge for PR #$PR_NUMBER under $tier"
+          gh pr merge "$PR_NUMBER" --repo "$REPO" --auto --squash --delete-branch
+          gh pr comment "$PR_NUMBER" --repo "$REPO" \
+              --body "🤖 auto-merge enabled under tier \`$tier\`. GitHub will merge once required status checks complete."

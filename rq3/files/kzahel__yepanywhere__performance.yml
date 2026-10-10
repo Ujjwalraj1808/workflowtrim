@@ -1,0 +1,122 @@
+name: Performance Ratchet
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+concurrency:
+  group: performance-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  server-fleet-small:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - driver: server
+            scenario: fleet-small
+            name: Server fleet-small ratchet
+            artifact: server-fleet-small
+            summary: server
+          - driver: browser
+            scenario: focused-append
+            name: Browser focused-append ratchet
+            artifact: browser-focused-append
+            summary: browser focused-append
+          - driver: built-client
+            scenario: fleet-small
+            name: Built client fleet-small ratchet
+            artifact: built-client-fleet-small
+            summary: built-client
+          - driver: specialized
+            scenario: specialized-contracts
+            name: Specialized lifecycle and sharing ratchet
+            artifact: specialized-contracts
+            summary: specialized contracts
+
+    steps:
+      - name: Checkout YA
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+
+      - name: Checkout reviewed performance helpers
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: graehl/agents
+          ref: 496159563aafd1f5abd15e4315bf502187d2e9d1
+          path: .perf-tools/agents
+          persist-credentials: false
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '22.16.0'
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Install Chromium
+        if: matrix.driver != 'server'
+        run: pnpm -F @yep-anywhere/client exec playwright install chromium
+
+      - name: Run capacity-keyed ${{ matrix.summary }} ratchet
+        env:
+          YA_PERF_SWEEP: ${{ github.workspace }}/.perf-tools/agents/scripts/perf-sweep
+        run: |
+          set -o pipefail
+          mkdir -p .perf-artifacts
+          node scripts/perf-suite/run.mjs \
+            --checkout "$GITHUB_WORKSPACE" \
+            --driver "${{ matrix.driver }}" \
+            --scenario "${{ matrix.scenario }}" \
+            --label "github-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            --output .perf-artifacts/result.json \
+            --history .perf-artifacts/history.jsonl \
+            2>&1 | tee .perf-artifacts/run.log
+
+      - name: Summarize capacity and artifacts
+        if: always()
+        run: |
+          {
+            echo '### YA ${{ matrix.summary }} performance ratchet'
+            echo
+            echo 'Scrapeable host, history, capacity-registration, and result records:'
+            echo '```text'
+            if [ -f .perf-artifacts/run.log ]; then
+              grep -E '^YA_PERF_(HOST|HISTORY|CAPACITY_RATCHET|RESULT)_JSON ' \
+                .perf-artifacts/run.log || true
+            else
+              echo 'Performance run did not produce a log.'
+            fi
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload performance evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: ${{ matrix.artifact }}-${{ github.run_attempt }}
+          if-no-files-found: ignore
+          include-hidden-files: true
+          path: .perf-artifacts/**
+
+      - name: Verify no performance process debris remains
+        if: always()
+        env:
+          YA_PERF_SWEEP: ${{ github.workspace }}/.perf-tools/agents/scripts/perf-sweep
+        run: |
+          "$YA_PERF_SWEEP" 'ya-perf-suite-' --kill --kill-group

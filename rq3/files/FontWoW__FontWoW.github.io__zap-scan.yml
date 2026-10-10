@@ -1,0 +1,39 @@
+name: Live Site Security Scan
+
+on:
+  workflow_run:
+    workflows: ['Deploy to GitHub Pages']
+    types: [completed]
+    branches: [main]
+  schedule:
+    - cron: '47 4 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: live-site-security
+  cancel-in-progress: true
+
+jobs:
+  zap-baseline:
+    name: OWASP ZAP baseline
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Scan the deployed site
+        uses: zaproxy/action-baseline@v0.15.0
+        with:
+          target: https://fontwow.github.io/
+          fail_action: true
+          allow_issue_writing: true
+          issue_title: OWASP ZAP live-site security report
+          artifact_name: zap-security-report
+          # GitHub Pages does not expose every security header control. Keep
+          # warnings visible in the report/issue while failing on scan errors.
+          cmd_options: '-a -j -m 5 -I'

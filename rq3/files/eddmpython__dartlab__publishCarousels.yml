@@ -1,0 +1,47 @@
+name: Publish Carousels
+
+# 블로그 글 frontmatter 의 `carousel:` 블록(손글 SSOT)이 바뀌면 hfMedia `manifests/carousels.json`을
+# 자동 재발행한다. 발행은 dartlab-media 데이터셋 *HF push* 이지 GitHub 커밋이 아니다 — 깃 이력은 안 늘고,
+# 운영자가 매번 `build_carousel_contracts.py` 를 수동 실행할 필요가 없어진다.
+#   트리거 정밀화: 회사 글 index.md · cards.plan.json · standalone 이슈 · 빌드/기획 스크립트 변경만.
+#   landing/** 무관 변경엔 안 돈다(불필요 재발행 차단).
+#   프록시(/media)는 가변 JSON 을 max-age=600(10분)로 캐시 → 발행 후 ~10분 내 배포 사이트 전파(이미지는 콘텐츠해시라 무관).
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'blog/**/index.md'
+      - 'blog/**/cards.plan.json'
+      - 'blog/_issues/**'
+      - 'blog/_scripts/cards_plan.py'
+      - 'blog/_scripts/plan_card_news.py'
+      - 'blog/_scripts/build_carousel_contracts.py'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-carousels
+  cancel-in-progress: true
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install deps
+        run: uv sync
+
+      - name: Publish carousels to hfMedia
+        run: uv run python -X utf8 blog/_scripts/build_carousel_contracts.py
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          DARTLAB_DATA_DIR: ${{ github.workspace }}

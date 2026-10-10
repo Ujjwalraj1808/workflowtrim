@@ -1,0 +1,48 @@
+name: test
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: ntfy
+          POSTGRES_PASSWORD: ntfy
+          POSTGRES_DB: ntfy_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ntfy"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      NTFY_TEST_DATABASE_URL: "postgres://ntfy:ntfy@localhost:5432/ntfy_test?sslmode=disable"
+      NTFY_TEST_S3_URL: ${{ secrets.NTFY_TEST_S3_URL }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: '.go-version'
+      - name: Install node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24'
+          cache: 'npm'
+          cache-dependency-path: './web/package-lock.json'
+      - name: Install dependencies
+        run: make build-deps-ubuntu
+      - name: Build docs (required for tests)
+        run: make docs
+      - name: Build web app (required for tests)
+        run: make web
+      - name: Run tests, formatting, vetting and linting
+        run: make checkv
+      - name: Run coverage
+        run: make coverage

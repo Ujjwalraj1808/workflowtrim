@@ -1,0 +1,142 @@
+name: tag-assets
+
+on:
+  push:
+    tags:
+      - '*'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  actions: write
+  contents: write
+
+jobs:
+  build-net-assets:
+    name: Build net asset (${{ matrix.goos }}-${{ matrix.goarch }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            os_title: Linux
+            arch_label: x86_64
+            archive_ext: tar.gz
+          - goos: linux
+            goarch: arm64
+            os_title: Linux
+            arch_label: arm64
+            archive_ext: tar.gz
+          - goos: darwin
+            goarch: amd64
+            os_title: Darwin
+            arch_label: x86_64
+            archive_ext: tar.gz
+          - goos: darwin
+            goarch: arm64
+            os_title: Darwin
+            arch_label: arm64
+            archive_ext: tar.gz
+          - goos: windows
+            goarch: amd64
+            os_title: Windows
+            arch_label: x86_64
+            archive_ext: zip
+          - goos: windows
+            goarch: arm64
+            os_title: Windows
+            arch_label: arm64
+            archive_ext: zip
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.27.1'
+          cache: false
+
+      - name: Cache trusted Go dependencies
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: trusted-go-${{ github.job }}-${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+
+      - name: Prune superseded Go dependency caches
+        uses: ./.github/actions/prune-go-cache
+
+      - name: Build bifrost archive
+        shell: bash
+        env:
+          ARCHIVE_EXT: ${{ matrix.archive_ext }}
+          ARCH_LABEL: ${{ matrix.arch_label }}
+          GOARCH: ${{ matrix.goarch }}
+          GOOS: ${{ matrix.goos }}
+          OS_TITLE: ${{ matrix.os_title }}
+          VERSION: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          stage=".tmp/release/${GOOS}-${GOARCH}"
+          dist=".tmp/release-dist"
+          asset="bifrost_${OS_TITLE}_${ARCH_LABEL}.${ARCHIVE_EXT}"
+          bin_name="bifrost"
+          if [[ "${GOOS}" == "windows" ]]; then
+            bin_name="bifrost.exe"
+          fi
+
+          rm -rf "${stage}" "${dist}"
+          mkdir -p "${stage}" "${dist}"
+
+          CGO_ENABLED=0 GOOS="${GOOS}" GOARCH="${GOARCH}" \
+            go build -trimpath \
+              -ldflags "-s -w -X main.version=${VERSION}" \
+              -o "${stage}/${bin_name}" \
+              ./net/cmd/bifrost
+
+          if [[ "${GOOS}" == "windows" ]]; then
+            (
+              cd "${stage}"
+              zip -q "../${asset}" "${bin_name}"
+            )
+          else
+            tar -C "${stage}" -czf ".tmp/release/${asset}" "${bin_name}"
+          fi
+
+          mv ".tmp/release/${asset}" "${dist}/${asset}"
+
+      - name: Upload bifrost archive
+        uses: actions/upload-artifact@v7
+        with:
+          name: net-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: .tmp/release-dist/*
+          if-no-files-found: error
+
+  upload-net-assets:
+    name: Upload net assets
+    runs-on: ubuntu-latest
+    needs: build-net-assets
+    env:
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Download bifrost archives
+        uses: actions/download-artifact@v8
+        with:
+          path: .tmp/release-assets
+          pattern: net-*
+          merge-multiple: true
+
+      - name: Ensure release exists
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release view "${GITHUB_REF_NAME}" >/dev/null
+
+      - name: Attach bifrost archives
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${GITHUB_REF_NAME}" .tmp/release-assets/* --clobber

@@ -1,0 +1,162 @@
+# Separate jobs because they fail for unrelated reasons. `checks` answers in
+# about a minute; the browser and container builds run beside it so a formatting
+# mistake does not wait behind either build to be reported.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  merge_group:
+    types: [checks_requested]
+  workflow_dispatch:
+
+# A second push supersedes the first. Nothing here is worth finishing for a
+# commit that is no longer the head of the branch.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # Matches the version this is developed against. Bun's lockfile format and
+  # its workspace catalogs are both young enough that "latest" is a variable.
+  BUN_VERSION: 1.4.2
+
+jobs:
+  checks:
+    name: format, lint, types, tests
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: mirror.gcr.io/library/postgres:17-alpine
+        env:
+          POSTGRES_DB: chopin
+          POSTGRES_USER: chopin
+          POSTGRES_PASSWORD: chopin
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U chopin -d chopin"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      # The pinned Impeccable CLI requires Node 22.18 or newer.
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+
+      # Refuses rather than resolving: a lockfile that does not describe
+      # package.json is a difference between what was reviewed and what ran.
+      - run: bun install --frozen-lockfile
+
+      # dprint fetches its plugins as wasm from GitHub releases on first use.
+      # Cached on the config that names them, since that is exactly what
+      # decides which ones are wanted.
+      - uses: actions/cache@v6
+        with:
+          path: ~/.cache/dprint
+          key: dprint-${{ runner.os }}-${{ hashFiles('dprint.json') }}
+
+      - name: Format, lint, and enforce design tokens
+        run: bun run ci
+
+      - run: bun run types
+
+      # 500 tests, no browser, no agent. `AGENT=off` is set by the tests that
+      # spawn a server; nothing here needs a token.
+      - run: bun test
+
+      # Every durable provider passes the same behavioral contract. The ordinary
+      # unit command leaves this one skipped so it stays usable without Docker.
+      - run: bun run test:postgres
+
+  browser:
+    name: e2e
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - run: bun install --frozen-lockfile
+
+      # Keyed on the Playwright version and nothing else. Keying on the
+      # lockfile would discard a 180MB browser every time an unrelated
+      # dependency moved.
+      - name: Resolve the Playwright version
+        id: playwright
+        run: |
+          version=$(bun --print 'require("./package.json").devDependencies["@playwright/test"]')
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/cache@v6
+        with:
+          path: ~/.cache/ms-playwright
+          key: ms-playwright-${{ runner.os }}-${{ steps.playwright.outputs.version }}
+
+      # Run unconditionally, cache hit or not: it makes the Playwright binary
+      # available when the cache is cold. GitHub's Ubuntu image already ships
+      # Chromium's shared libraries, so do not make E2E depend on its apt mirror.
+      - run: bun node_modules/@playwright/test/cli.js install chromium
+
+      - name: Design behaviour (keyboard, focus, motion, and scrolling)
+        run: bun run design:behavior
+
+      - name: Diagram gallery (rendering and keyboard behaviour)
+        run: bun run diagrams:test
+
+      # Build once, and reject development previews before the long browser suite.
+      - run: bun run build
+
+      - name: Verify design audit stays out of production
+        run: bun scripts/check-design-production.ts
+
+      - name: Cache PostgreSQL from the Docker Hub mirror
+        run: |
+          docker pull mirror.gcr.io/library/postgres:17-alpine
+          docker tag mirror.gcr.io/library/postgres:17-alpine postgres:17-alpine
+
+      - run: E2E_SKIP_BUILD=1 bun run e2e
+
+      # Only on failure, and only the parts worth reading. `test-results`
+      # carries the traces; the report is the thing that indexes them.
+      - if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: playwright-report
+          path: |
+            e2e/playwright-report
+            e2e/test-results
+          retention-days: 7
+
+  container:
+    name: container
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@v3
+        with:
+          buildkitd-config-inline: |
+            [registry."docker.io"]
+              mirrors = ["mirror.gcr.io"]
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          tags: chopin:test
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

@@ -1,0 +1,54 @@
+name: Test Feed Generation
+
+on:
+  push:
+    branches: [main]
+    paths: ["feed_generators/**", "tests/**", "feeds.yaml", "pyproject.toml", "uv.lock", ".github/workflows/**", "makefiles/**", "Makefile"]
+  pull_request:
+    paths: ["feed_generators/**", "tests/**", "feeds/**", "feeds.yaml", "pyproject.toml", "uv.lock", ".github/workflows/**", "makefiles/**", "Makefile"]
+  workflow_dispatch:
+
+concurrency:
+  group: offline-ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  UV_FROZEN: "true"
+
+jobs:
+  test-feed:
+    name: Offline feed checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.0.1
+        with:
+          enable-cache: true
+
+      - name: Install locked dependencies
+        run: |
+          uv sync --frozen --group dev
+
+      - name: Test fixture generation and failure handling (no live websites)
+        run: make dev_test_unit
+
+      - name: Lint and format check
+        run: make dev_lint
+
+      - name: Validate registry and published XML (no live websites)
+        run: |
+          PYTHONPATH=feed_generators uv run python -c 'from models import load_feed_registry; load_feed_registry()'
+          uv run feed_generators/validate_feeds.py

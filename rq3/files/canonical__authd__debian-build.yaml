@@ -1,0 +1,222 @@
+name: build-deb (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      files-hash:
+        description: 'Hash of build-relevant files, used as cache key and concurrency group'
+        type: string
+        required: true
+      ubuntu-version:
+        description: 'Ubuntu version to build the Debian package for'
+        type: string
+        required: true
+    outputs:
+      pkg-name:
+        value: ${{ jobs.build-deb.outputs.pkg-name }}
+      pkg-version:
+        value: ${{ jobs.build-deb.outputs.pkg-version }}
+      pkg-dsc:
+        value: ${{ jobs.build-deb.outputs.pkg-dsc }}
+      pkg-src-changes:
+        value: ${{ jobs.build-deb.outputs.pkg-src-changes }}
+
+concurrency:
+  # Queue builds of the same package so later runs can restore the artifact.
+  group: build-deb-${{ inputs.files-hash }}-${{ inputs.ubuntu-version }}
+  cancel-in-progress: false
+  queue: max
+
+env:
+  # Keep this aligned with update-packaging-on-dependabot-pr.yaml.
+  # Noble's Rust 1.75 supports cargo-vendor-filterer only up to 0.5.16.
+  CARGO_VENDOR_FILTERER_NOBLE_VERSION: 0.5.16
+
+jobs:
+  build-deb:
+    name: Build Debian package
+    runs-on: ubuntu-26.04 # ubuntu-latest
+    permissions:
+      # Needed by actions/checkout
+      contents: read
+      # Needed to push OCI artifact to ghcr.io
+      packages: write
+    outputs:
+      pkg-name: ${{ steps.outputs.outputs.pkg-name }}
+      pkg-version: ${{ steps.outputs.outputs.pkg-version }}
+      pkg-dsc: ${{ steps.outputs.outputs.pkg-dsc }}
+      pkg-src-changes: ${{ steps.outputs.outputs.pkg-src-changes }}
+
+    steps:
+      # Keep the source root name stable across forks.
+      - uses: actions/checkout@v7
+        with:
+          path: authd
+
+      - uses: ./authd/.github/actions/setup-oras
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Try to restore deb and sources from OCI registry
+        id: restore-cache
+        run: |
+          set -euo pipefail
+          set -x
+
+          echo "${{ secrets.GITHUB_TOKEN }}" \
+            | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+          OCI_DEB=ghcr.io/${{ github.repository }}/authd-deb-${{ inputs.ubuntu-version }}
+          OCI_SOURCES=ghcr.io/${{ github.repository }}/authd-deb-sources-${{ inputs.ubuntu-version }}
+          OCI_TAG=${{ inputs.files-hash }}
+
+          try_restore() {
+            # Try to restore the deb
+            if ! oras pull "${OCI_DEB}:${OCI_TAG}" 2>/dev/null; then
+              return 1
+            fi
+            PKG_DEB=$(find . -maxdepth 1 -name "authd_*.deb")
+            [ -n "${PKG_DEB}" ] || return 1
+
+            # Try to restore the sources
+            if ! oras pull "${OCI_SOURCES}:${OCI_TAG}" 2>/dev/null; then
+              echo "cache-hit=false" >> "${GITHUB_OUTPUT}"
+              return 0
+            fi
+            PKG_DSC=$(find . -maxdepth 1 -name "authd_*.dsc")
+            PKG_SOURCE_CHANGES=$(find . -maxdepth 1 -name "authd_*.changes")
+            PKG_TARBALL=$(find . -maxdepth 1 -name "authd_*.tar*")
+            [ -n "${PKG_DSC}" ] || return 1
+            [ -n "${PKG_SOURCE_CHANGES}" ] || return 1
+            [ -n "${PKG_TARBALL}" ] || return 1
+
+            (
+              cd authd
+              echo "PKG_NAME=$(dpkg-parsechangelog --show-field source)"
+              echo "PKG_VERSION=$(dpkg-parsechangelog --show-field version)"
+            ) >> "${GITHUB_ENV}"
+            echo "PKG_DEB=${PKG_DEB}" >> "${GITHUB_ENV}"
+            echo "PKG_DSC=${PKG_DSC}" >> "${GITHUB_ENV}"
+            echo "PKG_SOURCE_CHANGES=${PKG_SOURCE_CHANGES}" >> "${GITHUB_ENV}"
+            echo "PKG_TARBALL=${PKG_TARBALL}" >> "${GITHUB_ENV}"
+            echo "cache-hit=true" >> "${GITHUB_OUTPUT}"
+            return 0
+          }
+
+          # Fast path: artifact already in OCI registry
+          if try_restore; then
+            exit 0
+          fi
+          echo "cache-hit=false" >> "${GITHUB_OUTPUT}"
+
+      - name: Build Debian package and sources
+        if: steps.restore-cache.outputs.cache-hit != 'true'
+        uses: canonical/desktop-engineering/gh-actions/common/build-debian@main
+        with:
+          source-dir: authd
+          docker-image: ubuntu:${{ inputs.ubuntu-version }}
+          # Add the Go backports PPA if we're testing a Ubuntu release which
+          # doesn't have the required Go version in main.
+          extra-apt-repositories: ${{ (inputs.ubuntu-version == 'noble') && 'ppa:ubuntu-enterprise-desktop/golang' || '' }}
+          # Extra build dependencies:
+          # - systemd-dev: Required to read compile time variables from systemd via pkg-config.
+          extra-source-build-deps: |
+            ca-certificates
+            git
+            libssl-dev
+            systemd-dev
+          extra-source-build-script: |
+            if [ "${{ inputs.ubuntu-version }}" == noble ]; then
+              cargo install --locked --root=/usr \
+                cargo-vendor-filterer@${{ env.CARGO_VENDOR_FILTERER_NOBLE_VERSION }}
+              command -v cargo-vendor-filterer
+            fi
+          allow-sudo: true
+          lintian: --fail-on error,warning,info --verbose
+          run-lrc: true
+
+      - name: Prepare deb and sources for upload
+        # Skip if:
+        # * we have a cache hit and thus didn't build the package ourselves, or
+        # * the PR is from a fork, as we don't have the permission to upload to
+        #   the OCI registry.
+        if: >-
+          steps.restore-cache.outputs.cache-hit != 'true' &&
+          (
+            (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) ||
+            github.event_name == 'push' ||
+            github.event_name == 'release' ||
+            github.event_name == 'schedule' ||
+            github.event_name == 'workflow_dispatch'
+          )
+        run: |
+          set -euo pipefail
+          set -x
+
+          # In the next step we upload the deb and sources with 'oras push'.
+          # When using a relative file path with that command, that path is
+          # preserved and the directory structure is recreated when downloading
+          # the file. To avoid that, we copy the files to be uploaded to the
+          # working directory and upload them from there.
+
+          # Copy binary deb to working directory. In contrast to the dsc and
+          # changes files, the path to the binary deb is not set in the
+          # environment by the build-debian action, so we have to find it first.
+          DEB_PATH=$(find "${{ env.BUILD_OUTPUT_DIR }}" -maxdepth 1 -name "authd_*.deb")
+          PKG_DEB=$(basename "${DEB_PATH}")
+          cp "${DEB_PATH}" "${PKG_DEB}"
+          echo "PKG_DEB=${PKG_DEB}" >> ${GITHUB_ENV}
+
+          # Copy sources to working directory
+          TARBALL_PATH=$(find "${{ env.SOURCE_OUTPUT_DIR }}" -maxdepth 1 -name "authd_*.tar*")
+          PKG_TARBALL=$(basename "${TARBALL_PATH}")
+          cp "${TARBALL_PATH}" "${PKG_TARBALL}"
+          cp "${{ env.SOURCE_OUTPUT_DIR }}/${{ env.PKG_DSC }}" .
+          cp "${{ env.SOURCE_OUTPUT_DIR }}/${{ env.PKG_SOURCE_CHANGES }}" .
+          echo "PKG_TARBALL=${PKG_TARBALL}" >> ${GITHUB_ENV}
+
+      - name: Upload deb and sources as OCI artifacts
+        # Skip if the PR is from a fork, as we don't have the permission to
+        # upload to the OCI registry.
+        if: >-
+          (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) ||
+          github.event_name == 'push' ||
+          github.event_name == 'release' ||
+          github.event_name == 'schedule' ||
+          github.event_name == 'workflow_dispatch'
+        run: |
+          set -euo pipefail
+          set -x
+
+          OCI_REPO=ghcr.io/${{ github.repository }}/authd-deb-${{ inputs.ubuntu-version }}
+          OCI_TAG=${{ inputs.files-hash }}
+          oras push "${OCI_REPO}:${OCI_TAG}" \
+            "${{ env.PKG_DEB }}" \
+            --artifact-type=application/vnd.debian.binary-package \
+            --annotation "org.opencontainers.image.title=authd debian package" \
+            --annotation "org.opencontainers.image.version=${{ env.PKG_VERSION }}"
+          oras tag "${OCI_REPO}:${OCI_TAG}" "${{ github.sha }}"
+          rm "${{ env.PKG_DEB }}"
+
+          OCI_REPO=ghcr.io/${{ github.repository }}/authd-deb-sources-${{ inputs.ubuntu-version }}
+          oras push "${OCI_REPO}:${OCI_TAG}" \
+            "${{ env.PKG_DSC }}" \
+            "${{ env.PKG_SOURCE_CHANGES }}" \
+            "${{ env.PKG_TARBALL }}" \
+            --artifact-type=application/vnd.debian.source-package \
+            --annotation "org.opencontainers.image.title=authd source debian package" \
+            --annotation "org.opencontainers.image.version=${{ env.PKG_VERSION }}"
+          oras tag "${OCI_REPO}:${OCI_TAG}" "${{ github.sha }}"
+          rm "${{ env.PKG_DSC }}" \
+             "${{ env.PKG_SOURCE_CHANGES }}" \
+             "${{ env.PKG_TARBALL }}"
+
+      - name: Generate outputs
+        id: outputs
+        run: |-
+          (
+            echo "pkg-name=${{ env.PKG_NAME }}"
+            echo "pkg-version=${{ env.PKG_VERSION }}"
+            echo "pkg-dsc=${{ env.PKG_DSC }}"
+            echo "pkg-src-changes=${{ env.PKG_SOURCE_CHANGES }}"
+          ) >> "${GITHUB_OUTPUT}"

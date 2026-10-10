@@ -1,0 +1,824 @@
+name: CD For SiYuan
+
+on:
+  push:
+    tags:
+      - '*-alpha*'
+      - '*-beta*'
+      - '*-rc*'
+  workflow_dispatch:
+
+env:
+  package_json: "app/package.json"
+
+jobs:
+  prepare:
+    name: Prepare
+    runs-on: ubuntu-24.04
+    outputs:
+      release_title: ${{ steps.release_info.outputs.release_title }}
+      version: ${{ steps.version.outputs.value }}
+      android_ref: ${{ steps.android_version.outputs.ref }}
+      packageManager: ${{ steps.packageManager.outputs.value }}
+      release_body: ${{ steps.release_info.outputs.release_body }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - run: pip install PyGithub
+
+      - id: thisLatestRelease
+        run: |
+          LATEST=$(gh api "repos/${{ github.repository }}/releases/latest" --jq '.tag_name' 2>/dev/null || echo "")
+          echo "release=$LATEST" >> $GITHUB_OUTPUT
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract version from package.json
+        id: version
+        run: |
+          echo "value=$(jq .version ${{ env.package_json }} -r)" >> $GITHUB_OUTPUT
+
+      - name: Checkout siyuan-android
+        uses: actions/checkout@v6
+        with:
+          repository: siyuan-note/siyuan-android
+          ref: main
+          path: ${{ github.workspace }}/siyuan-android
+
+      - name: Verify siyuan-android version
+        id: android_version
+        # Android 的 siyuanVersionName 必须与 package.json 版本一致，否则在打包前终止整个流程。
+        run: |
+          ANDROID_VERSION=$(sed -nE 's/^[[:space:]]*siyuanVersionName[[:space:]]*=[[:space:]]*"([^"]+)"[[:space:]]*$/\1/p' build.gradle)
+          VERSION="${{ steps.version.outputs.value }}"
+          if [ -z "$ANDROID_VERSION" ]; then
+            echo "Unable to read siyuanVersionName from siyuan-android/build.gradle, stopping"
+            exit 1
+          fi
+          if [ "$ANDROID_VERSION" != "$VERSION" ]; then
+            echo "siyuan-android version ($ANDROID_VERSION) does not match package.json version ($VERSION), stopping"
+            exit 1
+          fi
+          echo "siyuan-android version matches: $ANDROID_VERSION"
+          echo "ref=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
+        working-directory: ${{ github.workspace }}/siyuan-android
+
+      - name: Verify tag matches package.json version
+        # 仅 tag 推送触发时校验：去掉 tag 前导 v 后与 package.json 中的版本号比对，
+        # 不一致说明开发者推 tag 前忘记同步版本号，直接终止整个流程。
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          VERSION="${{ steps.version.outputs.value }}"
+          if [ "$TAG" != "$VERSION" ]; then
+            echo "Tag (v$TAG) does not match version in package.json ($VERSION), stopping"
+            exit 1
+          fi
+          echo "Tag matches version: $TAG"
+
+      - name: Extract electronVersion from package.json
+        id: electronVersion
+        run: |
+          echo "value=$(jq .devDependencies.electron ${{ env.package_json }} -r)" >> $GITHUB_OUTPUT
+
+      - name: Extract packageManager from package.json
+        id: packageManager
+        run: |
+          echo "value=$(jq .packageManager ${{ env.package_json }} -r)" >> $GITHUB_OUTPUT
+
+      - name: Gather Release Information
+        id: release_info
+        run: |
+          echo "release_title=v${{ steps.version.outputs.value }}" >> $GITHUB_OUTPUT
+          changelog_header=$(python scripts/parse-changelog-HEAD.py -t ${{ github.ref }} -b ${{ steps.thisLatestRelease.outputs.release }} -e ${{ steps.electronVersion.outputs.value }} ${{ github.repository }})
+          changelog=$(python scripts/parse-changelog.py -t ${{ github.ref }} ${{ github.repository }})
+          EOF=$(dd if=/dev/urandom bs=15 count=1 status=none | base64)
+          echo "release_body<<$EOF" >> $GITHUB_OUTPUT
+          echo "$changelog_header" >> $GITHUB_OUTPUT
+          echo "$changelog" >> $GITHUB_OUTPUT
+          echo "$EOF" >> $GITHUB_OUTPUT
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  languages:
+    name: Language validation
+    needs: prepare
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.x'
+      - name: Test language validation
+        # 测试失败只记录结果，不阻塞后续发布构建。
+        continue-on-error: true
+        run: python -m unittest discover -s scripts -p "test_check_lang_keys.py"
+      - name: Check language keys and kernel placeholders
+        run: python scripts/check-lang-keys.py
+
+  contracts:
+    name: API contracts and kernel tests
+    needs: prepare
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: kernel/go.mod
+          cache-dependency-path: kernel/go.sum
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+      - name: Install repository pnpm version
+        run: npm install --global ${{ needs.prepare.outputs.packageManager }}
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+        working-directory: app
+      - name: Check generated contracts and route coverage
+        run: pnpm run api:check
+        working-directory: app
+      - name: Check legacy coverage does not grow
+        # 排除当前提交上的标签，与上一个版本比较旧接口列表。
+        run: |
+          API_CONTRACT_BASE=$(git describe --tags --match 'v[0-9]*' --abbrev=0 HEAD^)
+          pnpm run api:check --base "$API_CONTRACT_BASE"
+        working-directory: app
+      - name: Check application and strict contract types
+        run: pnpm run typecheck
+        working-directory: app
+      - name: Install filesystem fault injection dependency
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y strace
+      - name: Test all kernel packages
+        # 测试失败只记录结果，不阻塞后续发布构建。
+        continue-on-error: true
+        run: go test -tags "fts5 sqlcipher" ./... -count=1
+        working-directory: kernel
+      - name: Test path fixtures with custom temporary directories
+        # 测试失败只记录结果，不阻塞后续发布构建。
+        continue-on-error: true
+        run: go test -tags "fts5 sqlcipher" ./internal/testutil ./util ./model ./server -run 'Test(PublicDataDir|IsSensitivePath|.*Obsidian|RegisterStaticFileHandlers|StaticFile|WidgetResponseCacheControl|TemplatesAndExportRequireAdministrator|SnippetPublishAccess|PluginPublish|PublishFile)' -count=1
+        working-directory: kernel
+        env:
+          TMPDIR: /tmp
+          GOTMPDIR: ${{ runner.temp }}
+
+  frontend-tests:
+    name: Frontend, Electron and packaging tests
+    needs: prepare
+    runs-on: windows-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+      - name: Install repository pnpm version
+        run: npm install --global ${{ needs.prepare.outputs.packageManager }}
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+        working-directory: app
+      - name: Test frontend, Electron and packaging scripts
+        # 测试失败只记录结果，不阻塞后续发布构建。
+        continue-on-error: true
+        run: pnpm test
+        working-directory: app
+
+  build:
+    runs-on: ${{ matrix.config.os }}
+    name: ${{ matrix.config.name }}
+    needs: [prepare, languages, contracts, frontend-tests]
+    env:
+      SIYUAN_E2E_SHARDS: ${{ matrix.config.e2e_shards }}
+    strategy:
+      matrix:
+        config:
+          - os: ubuntu-24.04
+            name: ubuntu build linux
+            kernel_path: "../app/kernel-linux/SiYuan-Kernel"
+            build_args_prefix: "-s -w -X"
+            build_args_suffix: "Mode=prod"
+            electron_args: "dist-linux"
+            goos: "linux"
+            goarch: "amd64"
+            suffix: "linux"
+            e2e_shards: ""
+          - os: macos-latest
+            name: macos build mac.dmg
+            kernel_path: "../app/kernel-darwin/SiYuan-Kernel"
+            build_args_prefix: "-s -w -X"
+            build_args_suffix: "Mode=prod"
+            electron_args: "dist-darwin"
+            goos: "darwin"
+            goarch: "amd64"
+            suffix: "mac.dmg"
+            e2e_shards: "main:6806"
+          - os: macos-latest
+            name: macos build mac-arm64.dmg
+            kernel_path: "../app/kernel-darwin-arm64/SiYuan-Kernel"
+            build_args_prefix: "-s -w -X"
+            build_args_suffix: "Mode=prod"
+            electron_args: "dist-darwin-arm64"
+            goos: "darwin"
+            goarch: "arm64"
+            suffix: "mac-arm64.dmg"
+            e2e_shards: "editor:6807"
+          - os: windows-latest
+            name: windows build win.exe
+            kernel_path: "../app/kernel/SiYuan-Kernel.exe"
+            build_args_prefix: "-s -w -X"
+            build_args_suffix: "Mode=prod"
+            electron_args: "dist"
+            goos: "windows"
+            gobin: "bin"
+            mingwsys: "MINGW64"
+            goarch: "amd64"
+            suffix: "win.exe"
+            e2e_shards: "attribute-view:6808"
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          path: ${{ github.workspace }}/go/src/github.com/${{ github.repository }}
+
+      - name: Set up MingGW
+        uses: msys2/setup-msys2@v2
+        if: "contains( matrix.config.goos, 'windows')"
+        with:
+          install: p7zip mingw-w64-x86_64-lua
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: ${{ github.workspace }}/go/src/github.com/${{ github.repository }}/kernel/go.mod
+          cache-dependency-path: ${{ github.workspace }}/go/src/github.com/${{ github.repository }}/kernel/go.sum
+          cache: true
+      - run: go version
+
+      - name: Set up goversioninfo
+        run: go get github.com/josephspurrier/goversioninfo/cmd/goversioninfo && go install github.com/josephspurrier/goversioninfo/cmd/goversioninfo
+        if: "contains( matrix.config.goos, 'windows')"
+        working-directory: ${{ github.workspace }}/go/src/github.com/${{ github.repository }}/kernel
+        env:
+          GO111MODULE: on
+          CGO_ENABLED: 1
+          GOOS: ${{ matrix.config.goos }}
+          GOPATH: ${{ github.workspace }}/go
+          GOARCH: ${{ matrix.config.goarch }}
+
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+
+      - name: Install Node pnpm
+        run: npm install -g ${{ needs.prepare.outputs.packageManager }}
+        working-directory: ${{ github.workspace }}/go/src/github.com/${{ github.repository }}/app
+
+      - name: Cache pnpm store
+        uses: actions/cache@v5
+        with:
+          path: ~/.pnpm-store
+          key: pnpm-${{ runner.os }}-${{ hashFiles('app/pnpm-lock.yaml') }}
+          restore-keys: pnpm-${{ runner.os }}-
+
+      - name: Install Node Dependencies
+        run: pnpm install --no-frozen-lockfile
+        working-directory: ${{ github.workspace }}/go/src/github.com/${{ github.repository }}/app
+
+      - name: Install Electron Binary
+        run: node node_modules/electron/install.js
+        working-directory: ${{ github.workspace }}/go/src/github.com/${{ github.repository }}/app
+
+      - name: Building UI
+        run: pnpm run build
+        working-directory: ${{ github.workspace }}/go/src/github.com/${{ github.repository }}/app
+
+      - name: Clean Build and Kernel Directories
+        run: |
+          rm -rf "${{ github.workspace }}/go/src/github.com/${{ github.repository }}/app/build"
+          rm -rf "${{ github.workspace }}/go/src/github.com/${{ github.repository }}/app/kernel"*
+        shell: bash
+
+      - name: Generate Icon Resource and Properties/Version Info For Windows
+        run: ${{ github.workspace }}\go\${{ matrix.config.gobin }}\goversioninfo -platform-specific=true -icon="resource\icon.ico" -manifest="resource\goversioninfo.exe.manifest"
+        if: "contains( matrix.config.goos, 'windows')"
+        working-directory: ${{ github.workspace }}/go/src/github.com/${{ github.repository }}/kernel
+
+      - name: Building Kernel
+        run: go build -tags "fts5 sqlcipher" -o "${{ matrix.config.kernel_path }}" -ldflags "${{ matrix.config.build_args_prefix }} github.com/${{ github.repository }}/kernel/util.${{ matrix.config.build_args_suffix }}"
+        working-directory: ${{ github.workspace }}/go/src/github.com/${{ github.repository }}/kernel
+        env:
+          GO111MODULE: on
+          CGO_ENABLED: 1
+          GOOS: ${{ matrix.config.goos }}
+          GOPATH: ${{ github.workspace }}/go
+          GOARCH: ${{ matrix.config.goarch }}
+
+      - name: Checkout siyuan-testing
+        if: matrix.config.e2e_shards != ''
+        continue-on-error: true
+        uses: actions/checkout@v6
+        with:
+          repository: siyuan-note/siyuan-testing
+          ref: main
+          path: ${{ github.workspace }}/siyuan-testing
+
+      - name: Install End-to-End Test Dependencies
+        if: matrix.config.e2e_shards != ''
+        continue-on-error: true
+        run: pnpm install --frozen-lockfile
+        working-directory: ${{ github.workspace }}/siyuan-testing
+
+      - name: Validate End-to-End Test Shards
+        if: matrix.config.e2e_shards != ''
+        shell: bash
+        run: |
+          pnpm run typecheck
+          # 每个 E2E job 只配置自己的 shard，校验脚本需要全量 shard 列表
+          # 才能验证三个 shard 的并集覆盖全部测试且无重复
+          unset SIYUAN_E2E_SHARDS
+          pnpm run test:shards
+        working-directory: ${{ github.workspace }}/siyuan-testing
+
+      - name: Start Kernel for End-to-End Tests
+        if: matrix.config.e2e_shards != ''
+        continue-on-error: true
+        shell: bash
+        run: |
+          APP_DIR="${{ github.workspace }}/go/src/github.com/${{ github.repository }}/app"
+          KERNEL_PATH="${{ matrix.config.kernel_path }}"
+          for shard_config in ${SIYUAN_E2E_SHARDS}; do
+            shard="${shard_config%:*}"
+            port="${shard_config#*:}"
+            workspace="${USERPROFILE:-${HOME}}/SiYuan-Testing"
+            mkdir -p "${workspace}"
+            "${KERNEL_PATH}" --workspace="${workspace}" serve --wd="${APP_DIR}" --port="${port}" \
+              > "${RUNNER_TEMP}/siyuan-e2e-${shard}-kernel-console.log" 2>&1 &
+            echo "$!" > "${RUNNER_TEMP}/siyuan-e2e-${shard}-kernel.pid"
+          done
+        working-directory: ${{ github.workspace }}/go/src/github.com/${{ github.repository }}/kernel
+
+      - name: Wait for End-to-End Test Kernels
+        if: matrix.config.e2e_shards != ''
+        continue-on-error: true
+        shell: bash
+        run: |
+          wait_for_kernel() {
+            local pid="$1"
+            local port="$2"
+            local log_path="$3"
+            local boot_progress_path="${RUNNER_TEMP}/siyuan-e2e-${port}-boot-progress.json"
+            for attempt in {1..60}; do
+              if curl --fail --silent --output "${boot_progress_path}" --request POST \
+                "http://127.0.0.1:${port}/api/system/bootProgress" && \
+                node -e 'try { const data = JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8")); process.exit(data.data?.progress >= 100 ? 0 : 1); } catch { process.exit(1); }' \
+                  "${boot_progress_path}"; then
+                rm -f "${boot_progress_path}"
+                return
+              fi
+              if ! kill -0 "${pid}" 2>/dev/null; then
+                cat "${log_path}"
+                return 1
+              fi
+              sleep 1
+            done
+            cat "${log_path}"
+            if [ -f "${boot_progress_path}" ]; then
+              cat "${boot_progress_path}"
+            fi
+            return 1
+          }
+          for shard_config in ${SIYUAN_E2E_SHARDS}; do
+            shard="${shard_config%:*}"
+            port="${shard_config#*:}"
+            pid="$(cat "${RUNNER_TEMP}/siyuan-e2e-${shard}-kernel.pid")"
+            wait_for_kernel "${pid}" "${port}" \
+              "${RUNNER_TEMP}/siyuan-e2e-${shard}-kernel-console.log"
+          done
+
+      - name: Run End-to-End Tests
+        if: matrix.config.e2e_shards != ''
+        continue-on-error: true
+        timeout-minutes: 50
+        shell: bash
+        run: |
+          TEST_PIDS=()
+          TEST_SHARDS=()
+          for shard_config in ${SIYUAN_E2E_SHARDS}; do
+            shard="${shard_config%:*}"
+            port="${shard_config#*:}"
+            (
+              # UI 测试共享同一内核及全局界面状态，必须串行运行
+              # 编辑器分组用例较多，保留 45 分钟总时限；其他分组保持 25 分钟
+              # 外层步骤保留 5 分钟余量，单项用例仍使用测试配置中的超时
+              test_timeout=1500000
+              if [ "${shard}" = "editor" ]; then
+                test_timeout=2700000
+              fi
+              SIYUAN_BASE_URL="http://127.0.0.1:${port}" \
+              SIYUAN_E2E_SHARD="${shard}" \
+              SIYUAN_TEST_RESULTS_DIR="test-results-${shard}" \
+              PLAYWRIGHT_HTML_OUTPUT_DIR="playwright-report-${shard}" \
+              pnpm exec playwright test --config=config/playwright.focused.config.ts \
+                --global-timeout="${test_timeout}" --workers=1 \
+                --reporter=line,html --output="test-results-${shard}"
+            ) &
+            TEST_PID=$!
+            TEST_PIDS+=("${TEST_PID}")
+            TEST_SHARDS+=("${shard}")
+          done
+          TEST_STATUS=0
+          set +e
+          for index in "${!TEST_PIDS[@]}"; do
+            wait "${TEST_PIDS[${index}]}"
+            shard_status=$?
+            if [ "${shard_status}" -ne 0 ]; then
+              echo "::error title=End-to-End shard failed::${TEST_SHARDS[${index}]} exited with ${shard_status}"
+              TEST_STATUS=1
+            fi
+          done
+          set -e
+          exit "${TEST_STATUS}"
+        working-directory: ${{ github.workspace }}/siyuan-testing
+
+      - name: Stop End-to-End Test Kernels
+        if: always() && matrix.config.e2e_shards != ''
+        continue-on-error: true
+        shell: bash
+        run: |
+          stop_kernel() {
+            local pid="$1"
+            if [ -z "${pid}" ] || ! kill -0 "${pid}" 2>/dev/null; then
+              return
+            fi
+            kill -TERM "${pid}"
+            for attempt in {1..30}; do
+              if ! kill -0 "${pid}" 2>/dev/null; then
+                return
+              fi
+              sleep 1
+            done
+            kill -KILL "${pid}"
+          }
+          for shard_config in ${SIYUAN_E2E_SHARDS}; do
+            shard="${shard_config%:*}"
+            pid_path="${RUNNER_TEMP}/siyuan-e2e-${shard}-kernel.pid"
+            if [ -f "${pid_path}" ]; then
+              stop_kernel "$(cat "${pid_path}")"
+            fi
+          done
+
+      - name: Collect End-to-End Test Logs
+        if: always() && matrix.config.e2e_shards != ''
+        continue-on-error: true
+        shell: bash
+        run: |
+          log_dir="${{ github.workspace }}/siyuan-testing/kernel-logs"
+          mkdir -p "${log_dir}"
+          cp "${RUNNER_TEMP}"/siyuan-e2e-*-kernel-console.log "${log_dir}/" 2>/dev/null || true
+          workspace="${USERPROFILE:-${HOME}}/SiYuan-Testing"
+          if [ -f "${workspace}/temp/siyuan.log" ]; then
+            cp "${workspace}/temp/siyuan.log" "${log_dir}/siyuan.log"
+          fi
+
+      - name: Upload End-to-End Test Results
+        if: always() && matrix.config.e2e_shards != ''
+        continue-on-error: true
+        uses: actions/upload-artifact@v7
+        with:
+          name: siyuan-e2e-${{ matrix.config.suffix }}
+          path: |
+            ${{ github.workspace }}/siyuan-testing/playwright-report-*
+            ${{ github.workspace }}/siyuan-testing/test-results-*
+            ${{ github.workspace }}/siyuan-testing/kernel-logs
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Install RPM build tools
+        if: matrix.config.goos == 'linux'
+        run: sudo apt-get install -y rpm
+
+      - name: Building Electron App
+        run: pnpm run ${{ matrix.config.electron_args }}
+        working-directory: ${{ github.workspace }}/go/src/github.com/${{ github.repository }}/app
+
+      - name: Verify RPM Package Contents
+        if: matrix.config.goos == 'linux'
+        working-directory: ${{ github.workspace }}/go/src/github.com/${{ github.repository }}/app
+        run: |
+          for package in build/*.rpm; do
+            test -f "$package"
+            build_id_entries="$(rpm -qpl "$package" | awk '/^\/usr\/lib\/\.build-id(\/|$)/')"
+            if [ -n "$build_id_entries" ]; then
+              echo "Unexpected build-id entries in $package:"
+              echo "$build_id_entries"
+              exit 1
+            fi
+          done
+
+      - name: Upload Build Artifacts (Non-Linux)
+        if: matrix.config.goos != 'linux'
+        uses: actions/upload-artifact@v7
+        with:
+          name: siyuan-${{ matrix.config.suffix }}
+          path: ${{ github.workspace }}/go/src/github.com/${{ github.repository }}/app/build/siyuan-*-${{ matrix.config.suffix }}
+
+      - name: Upload Build Artifacts (Linux)
+        if: matrix.config.goos == 'linux'
+        uses: actions/upload-artifact@v7
+        with:
+          name: siyuan-linux
+          path: |
+            ${{ github.workspace }}/go/src/github.com/${{ github.repository }}/app/build/siyuan-*-linux.AppImage
+            ${{ github.workspace }}/go/src/github.com/${{ github.repository }}/app/build/siyuan-*-linux.tar.gz
+            ${{ github.workspace }}/go/src/github.com/${{ github.repository }}/app/build/siyuan-*-linux.deb
+            ${{ github.workspace }}/go/src/github.com/${{ github.repository }}/app/build/siyuan-*-linux.rpm
+
+  build_android:
+    runs-on: ubuntu-24.04
+    name: ubuntu build android.apk
+    # 测试通过后并行执行 Android 和桌面构建，全部成功后汇总产物并创建发布。
+    needs: [prepare, languages, contracts, frontend-tests]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          path: ${{ github.workspace }}/go/src/github.com/${{ github.repository }}
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: ${{ github.workspace }}/go/src/github.com/${{ github.repository }}/kernel/go.mod
+          cache-dependency-path: ${{ github.workspace }}/go/src/github.com/${{ github.repository }}/kernel/go.sum
+          cache: true
+      - run: go version
+
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+
+      - name: Install Node pnpm
+        run: npm install -g ${{ needs.prepare.outputs.packageManager }}
+        working-directory: ${{ github.workspace }}/go/src/github.com/${{ github.repository }}/app
+
+      - name: Cache pnpm store
+        uses: actions/cache@v5
+        with:
+          path: ~/.pnpm-store
+          key: pnpm-${{ runner.os }}-${{ hashFiles('app/pnpm-lock.yaml') }}
+          restore-keys: pnpm-${{ runner.os }}-
+
+      - name: Install Node Dependencies
+        run: pnpm install --no-frozen-lockfile
+        working-directory: ${{ github.workspace }}/go/src/github.com/${{ github.repository }}/app
+
+      - name: Building UI
+        run: pnpm run build
+        working-directory: ${{ github.workspace }}/go/src/github.com/${{ github.repository }}/app
+
+      - name: Set up JDK
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Set up Android NDK
+        # 锁定 NDK r28b(与本地开发环境同版本)。sdkmanager 不在 PATH 上
+        # (actions/runner-images#13674),用全路径调用;同时预接受 SDK 许可,
+        # 避免 NDK 安装卡在交互式许可确认。
+        run: |
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -x "$SDKMANAGER" ]; then
+            SDKMANAGER=$(ls "$ANDROID_HOME"/cmdline-tools/*/bin/sdkmanager 2>/dev/null | head -1)
+          fi
+          if [ -z "$SDKMANAGER" ]; then
+            echo "ERROR: sdkmanager not found under $ANDROID_HOME/cmdline-tools/"
+            exit 1
+          fi
+          echo "Using sdkmanager: $SDKMANAGER"
+          yes | "$SDKMANAGER" --licenses > /dev/null 2>&1 || true
+          "$SDKMANAGER" "ndk;28.2.13676358" > /dev/null
+          NDK_DIR="$ANDROID_HOME/ndk/28.2.13676358"
+          echo "ANDROID_NDK_HOME=$NDK_DIR" >> $GITHUB_ENV
+          echo "ANDROID_NDK_ROOT=$NDK_DIR" >> $GITHUB_ENV
+          echo "Installed NDK r28b at $NDK_DIR"
+
+      - name: Set up gomobile
+        # 锁定到 kernel/go.mod 中 x/mobile 模块的同一版本,避免工具与库版本漂移。
+        # GOPATH 被显式指向 workspace 下,go install 的产物在 $GOPATH/bin,
+        # 该目录不在默认 PATH 上,需用全路径调用并写入 $GITHUB_PATH 供后续步骤使用。
+        run: |
+          go install golang.org/x/mobile/cmd/gomobile@2553ed8ce294
+          echo "$GOPATH/bin" >> $GITHUB_PATH
+          "$GOPATH/bin/gomobile" init
+        env:
+          GOPATH: ${{ github.workspace }}/go
+
+      - name: Building Android Kernel
+        run: gomobile bind -tags "fts5 sqlcipher" -ldflags "-s -w" -v -o kernel.aar -target android/arm64 -androidapi 26 ./mobile/
+        working-directory: ${{ github.workspace }}/go/src/github.com/${{ github.repository }}/kernel
+        env:
+          GOPATH: ${{ github.workspace }}/go
+          CGO_ENABLED: 1
+          JAVA_TOOL_OPTIONS: -Dfile.encoding=UTF-8
+
+      - name: Checkout siyuan-android
+        uses: actions/checkout@v6
+        with:
+          repository: siyuan-note/siyuan-android
+          ref: ${{ needs.prepare.outputs.android_ref }}
+          path: ${{ github.workspace }}/siyuan-android
+
+      - name: Patch siyuan-android Repositories
+        # siyuan-android 默认把阿里云镜像排在最前,某些依赖(如 org.apache:apache:31)
+        # 在阿里云镜像缺失会导致解析失败。CI 在海外,直接走 google()/mavenCentral()
+        # 更稳;sed 删除所有 maven.aliyun.com 行,保留官方仓库。
+        run: |
+          sed -i '/maven.aliyun.com/d' build.gradle
+          echo "=== Patched build.gradle repositories ==="
+          grep -A 6 "repositories" build.gradle | head -20
+        working-directory: ${{ github.workspace }}/siyuan-android
+
+      - name: Prepare siyuan-android Build Inputs
+        run: |
+          mkdir -p ${{ github.workspace }}/siyuan-android/app/libs
+          cp ${{ github.workspace }}/go/src/github.com/${{ github.repository }}/kernel/kernel.aar \
+             ${{ github.workspace }}/siyuan-android/app/libs/kernel.aar
+          cd ${{ github.workspace }}/go/src/github.com/${{ github.repository }}/app
+          node scripts/trimChangelogs.js
+          zip -r app.zip appearance guide stage $([ -d changelogs ] && echo changelogs)
+          zip -j app.zip ../LICENSE ../THIRD_PARTY_NOTICES.md
+          mkdir -p ${{ github.workspace }}/siyuan-android/app/src/main/assets
+          cp app.zip ${{ github.workspace }}/siyuan-android/app/src/main/assets/app.zip
+
+      - name: Inject Signing Config
+        run: |
+          echo "$ANDROID_KEYSTORE_BASE64" | base64 -d > ${{ github.workspace }}/siyuan-android/app/siyuan-android.jks
+          cat > ${{ github.workspace }}/siyuan-android/signings.gradle <<EOF
+          android {
+            signingConfigs {
+              siyuanConfig {
+                storeFile file("siyuan-android.jks")
+                storePassword "$ANDROID_KEYSTORE_PASSWORD"
+                keyAlias "$ANDROID_KEY_ALIAS"
+                keyPassword "$ANDROID_KEY_PASSWORD"
+              }
+            }
+          }
+          EOF
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+
+      - name: Building Android App
+        # local.properties 被 siyuan-android 的 .gitignore 忽略,CI 里需现场生成,
+        # 否则 Gradle 报 "SDK location not found";gradlew 也需显式加可执行权限。
+        # 产物重命名为带版本号的固定名,确保下载文件名正确(GitHub Release 的下载名
+        # 取决于上传时的本地文件名,# 语法只改显示标签)。
+        run: |
+          echo "sdk.dir=$ANDROID_HOME" > local.properties
+          chmod +x ./gradlew
+          ./gradlew assembleOfficialRelease
+          cd app/build/outputs/apk/official/release
+          mv siyuan-*-official-release.apk siyuan-${{ needs.prepare.outputs.version }}.apk
+        working-directory: ${{ github.workspace }}/siyuan-android
+
+      - name: Upload Build Artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: siyuan-android
+          path: ${{ github.workspace }}/siyuan-android/app/build/outputs/apk/official/release/siyuan-${{ needs.prepare.outputs.version }}.apk
+
+  create_release:
+    name: Create Release
+    runs-on: ubuntu-24.04
+    needs: [prepare, build, build_android]
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v8
+
+      - name: Prepare Release Assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.prepare.outputs.version }}"
+          mkdir -p release-assets
+          cp "siyuan-linux/siyuan-${VERSION}-linux.AppImage" release-assets/
+          cp "siyuan-linux/siyuan-${VERSION}-linux.tar.gz" release-assets/
+          cp "siyuan-linux/siyuan-${VERSION}-linux.deb" release-assets/
+          cp "siyuan-linux/siyuan-${VERSION}-linux.rpm" release-assets/
+          cp "siyuan-mac.dmg/siyuan-${VERSION}-mac.dmg" release-assets/
+          cp "siyuan-mac-arm64.dmg/siyuan-${VERSION}-mac-arm64.dmg" release-assets/
+          cp "siyuan-win.exe/siyuan-${VERSION}-win.exe" release-assets/
+          cp "siyuan-android/siyuan-${VERSION}.apk" release-assets/
+
+          EXPECTED_ASSETS=(
+            "siyuan-${VERSION}-linux.AppImage"
+            "siyuan-${VERSION}-linux.tar.gz"
+            "siyuan-${VERSION}-linux.deb"
+            "siyuan-${VERSION}-linux.rpm"
+            "siyuan-${VERSION}-mac.dmg"
+            "siyuan-${VERSION}-mac-arm64.dmg"
+            "siyuan-${VERSION}-win.exe"
+            "siyuan-${VERSION}.apk"
+          )
+          for asset in "${EXPECTED_ASSETS[@]}"; do
+            test -s "release-assets/${asset}"
+          done
+          (
+            cd release-assets
+            sha256sum "${EXPECTED_ASSETS[@]}" > SHA256SUMS.txt
+            sha256sum --check SHA256SUMS.txt
+          )
+
+      - name: Create Release
+        uses: ncipollo/release-action@v1
+        with:
+          name: ${{ needs.prepare.outputs.release_title }}
+          tag: ${{ github.ref_name }}
+          body: ${{ needs.prepare.outputs.release_body }}
+          draft: true
+          prerelease: true
+          allowUpdates: true
+          omitDraftDuringUpdate: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify Release Is Draft
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          test "$(gh release view "${{ github.ref_name }}" --json isDraft --jq '.isDraft')" = "true"
+
+      - name: Upload Release Assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release upload "${{ github.ref_name }}" release-assets/* --clobber
+
+      - name: Validate and Publish Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.prepare.outputs.version }}"
+          TAG="${{ github.ref_name }}"
+          RELEASE_ID="$(gh release view "${TAG}" --json databaseId --jq '.databaseId')"
+          EXPECTED_ASSETS=(
+            "siyuan-${VERSION}-linux.AppImage"
+            "siyuan-${VERSION}-linux.tar.gz"
+            "siyuan-${VERSION}-linux.deb"
+            "siyuan-${VERSION}-linux.rpm"
+            "siyuan-${VERSION}-mac.dmg"
+            "siyuan-${VERSION}-mac-arm64.dmg"
+            "siyuan-${VERSION}-win.exe"
+            "siyuan-${VERSION}.apk"
+            "SHA256SUMS.txt"
+          )
+          declare -A EXPECTED_DIGESTS
+          for asset in "${EXPECTED_ASSETS[@]}"; do
+            EXPECTED_DIGESTS["${asset}"]="sha256:$(sha256sum "release-assets/${asset}" | awk '{print $1}')"
+          done
+
+          for attempt in {1..12}; do
+            ASSETS="$(gh api -H "X-GitHub-Api-Version: 2022-11-28" \
+              "repos/${GH_REPO}/releases/${RELEASE_ID}/assets?per_page=100")"
+            READY=true
+            for asset in "${EXPECTED_ASSETS[@]}"; do
+              REMOTE_DIGEST="$(jq -r --arg name "${asset}" \
+                '.[] | select(.name == $name and .state == "uploaded") | .digest // empty' <<< "${ASSETS}")"
+              if [ "${REMOTE_DIGEST}" != "${EXPECTED_DIGESTS[$asset]}" ]; then
+                READY=false
+                break
+              fi
+            done
+            if [ "${READY}" = true ]; then
+              gh release edit "${TAG}" --draft=false --prerelease
+              exit 0
+            fi
+            sleep 5
+          done
+
+          echo "Release assets or SHA-256 digests are incomplete"
+          exit 1

@@ -102,6 +102,18 @@ python rq2_score.py      # after labelling: kappa + agreement, disagreements, th
 
 The sample has 100 random workflow files (sheet `recall`, every smell labelled Y/N without seeing the detector output) and 50 detector findings per smell (sheet `precision`, labelled TP/FP). Sampled files are saved in `rq2/files/` so labels refer to a fixed snapshot. Two annotators label independently following [ANNOTATION.md](ANNOTATION.md); disagreements are resolved in `rq2/resolved.csv`.
 
+## RQ3: repair correctness
+
+```
+python rq3_snapshot.py               # once: snapshot of every included repository's workflow files (needs git)
+python rq3_repair.py                 # repairs every file, runs the safety checks, writes the RQ3 tables
+python rq3_repair.py --minutes 9     # same, stopping after 9 minutes; run again to continue
+```
+
+`rq3_snapshot.py` makes a sparse, shallow clone of each included repository and copies `.github/workflows/*.yml|yaml` to `rq3/files/`; `rq3/snapshot.csv` records the commit SHA and date of each snapshot. `rq3_repair.py` repairs each smell in isolation and all smells together (S1 with a fixed 30-minute timeout, since no run history is used here; S4 and S7 are detect-only), and checks that the result parses, the repaired smell is gone, jobs and steps are unchanged, actionlint reports no new error, a second repair changes nothing and no new smell appears. Progress is saved in `rq3/progress.jsonl`, so the run can be stopped and continued.
+
+Outputs: `rq3/findings.csv` (every finding: repaired, skipped with reason, or detect-only), `rq3/repairs.csv` (checks and diff size per file and scope) and `rq3/review.xlsx` (a fixed random sample of 20 diffs per repairable smell for manual review, see [rq3/REVIEW.md](rq3/REVIEW.md)).
+
 ## Running the tests
 
 ```
@@ -123,6 +135,8 @@ review.csv      manual review of the automatic exclusions (repo, excluded, note)
 rq2_sample.py   RQ2 sample and labelling workbooks
 rq2_score.py    RQ2 agreement and precision / recall / F1
 ANNOTATION.md   RQ2 annotation protocol
+rq3_snapshot.py RQ3 snapshot of the dataset's workflow files
+rq3_repair.py   RQ3 repair coverage, safety checks and review sample
 summarize.py    prevalence tables from the CSVs
 test_rules.py   detector tests
 test_repair.py  repairer tests

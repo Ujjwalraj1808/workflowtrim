@@ -1,0 +1,39 @@
+name: Verify
+
+on:
+  pull_request:
+    branches: [main, feat/canvas-browser-integration]
+  push:
+    branches: [main, feat/canvas-browser-integration]
+
+jobs:
+  verify:
+    runs-on: ubicloud-standard-2
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Lint
+        run: pnpm lint
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - name: Build
+        run: pnpm build
+
+      - name: Test
+        run: pnpm test:run

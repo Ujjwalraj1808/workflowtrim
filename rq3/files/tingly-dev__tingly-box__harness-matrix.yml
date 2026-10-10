@@ -1,0 +1,156 @@
+name: Harness Matrix
+
+run-name: >-
+  🧪 Harness ${{ github.event_name == 'workflow_dispatch'
+    && format('(focus={0})', github.event.inputs.focus)
+    || format('(branch {0})', github.ref_name) }}
+  by @${{ github.actor }}
+
+# Trigger wrapper for the harness. This workflow owns ONLY when the harness
+# runs; the matrix itself lives in harness-template.yml (the single shared
+# definition), which this calls and which release.yml also calls directly.
+#
+# Triggers:
+#   - push ci/**             : validate CI branch changes.
+#   - pull_request merged to main : validate after a PR merge (not on
+#     plain closes; see the gate job).
+#   (Open PRs get the in-process sections only, via harness-pr.yml.)
+#   - workflow_dispatch      : manual run, optionally focused on one axis.
+#
+# Both automatic triggers are scoped to the harness's own paths (see the
+# `paths` lists below): the protocol data plane it guards, plus the harness
+# itself. Changes elsewhere (frontend, homepage, docs, management APIs …)
+# don't run the matrix; use workflow_dispatch if one should.
+#
+# Release tags are deliberately NOT triggered here — they run the harness
+# only through release.yml's workflow_call, so the matrix is never scheduled
+# twice for the same tag.
+#
+# See .design/harness-matrix.md and cli/harness/README.md for the modes.
+on:
+  push:
+    branches:
+      - 'ci/**'
+    paths:
+      # Protocol data plane
+      - 'internal/protocol/**'
+      - 'internal/protocolserver/**'
+      - 'internal/protocoltest/**'
+      - 'internal/routing/**'
+      - 'internal/loadbalance/**'
+      - 'internal/forwarding/**'
+      - 'internal/toolengine/**'
+      - 'internal/catalog/**'
+      - 'internal/guardrails/**'
+      - 'internal/server/*.go'        # top-level handlers only, not module/ (management APIs)
+      - 'vmodel/**'
+      - 'ai/*.go'
+      - 'ai/go.mod'
+      - 'ai/go.sum'
+      - 'libs/**'
+      - 'go.mod'
+      - 'go.sum'
+      # The harness itself
+      - 'cli/harness/**'
+      - 'tests/clients/**'
+      - 'scripts/harness-baseline.sh'
+      - '.github/workflows/harness-matrix.yml'
+      - '.github/workflows/harness-template.yml'
+  # Run after every merge to main. We react to PR-close events instead of a
+  # raw `push: main` so direct pushes (e.g. bot bump commits) don't re-trigger
+  # the full matrix — only genuine PR merges do.
+  pull_request:
+    types:
+      - closed
+    branches:
+      - 'main'
+    # Keep in sync with the push paths above.
+    paths:
+      # Protocol data plane
+      - 'internal/protocol/**'
+      - 'internal/protocolserver/**'
+      - 'internal/protocoltest/**'
+      - 'internal/routing/**'
+      - 'internal/loadbalance/**'
+      - 'internal/forwarding/**'
+      - 'internal/toolengine/**'
+      - 'internal/catalog/**'
+      - 'internal/guardrails/**'
+      - 'internal/server/*.go'        # top-level handlers only, not module/ (management APIs)
+      - 'vmodel/**'
+      - 'ai/*.go'
+      - 'ai/go.mod'
+      - 'ai/go.sum'
+      - 'libs/**'
+      - 'go.mod'
+      - 'go.sum'
+      # The harness itself
+      - 'cli/harness/**'
+      - 'tests/clients/**'
+      - 'scripts/harness-baseline.sh'
+      - '.github/workflows/harness-matrix.yml'
+      - '.github/workflows/harness-template.yml'
+  workflow_dispatch:
+    inputs:
+      focus:
+        description: 'Which axis to run (all = full parallel set)'
+        required: false
+        type: choice
+        default: all
+        options:
+          - all
+          - single
+          - transitive
+          - idempotent
+          - flags
+          - content_shapes
+          - cache_controls
+          - cache_prefix
+          - vendor
+          - gosdk
+          - python
+          - node
+          - aisdk
+          - replay
+          - lb
+          - duo
+          - routing
+
+permissions:
+  contents: read
+
+# Cancel superseded runs on the same branch.
+concurrency:
+  group: harness-matrix-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Decide whether this trigger should actually run the harness. The only
+  # case we drop is a pull_request:closed that was NOT a merge into main.
+  # (push ci/** and workflow_dispatch always run.)
+  gate:
+    name: Trigger gate
+    runs-on: ubuntu-latest
+    outputs:
+      should_run: ${{ steps.check.outputs.should_run }}
+    steps:
+      - name: Check trigger
+        id: check
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ] && [ "${{ github.event.pull_request.merged }}" != "true" ]; then
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+            echo "⏭️ pull_request closed without merge — not running harness."
+          else
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  # Delegate to the shared template. Forward the manual focus (defaults to
+  # 'all' for non-dispatch events). The template carries the full matrix and
+  # the pass/fail result aggregation.
+  harness:
+    name: Run harness
+    needs: gate
+    if: needs.gate.outputs.should_run == 'true'
+    uses: ./.github/workflows/harness-template.yml
+    with:
+      focus: ${{ github.event.inputs.focus || 'all' }}

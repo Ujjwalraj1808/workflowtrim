@@ -1,0 +1,549 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+# Токен по умолчанию — только чтение; право записи выдаётся точечно тем job,
+# которые публикуют релиз (REL-02). Раньше contents:write был глобальным и
+# доставался в том числе build-матрице, которой запись не нужна.
+permissions:
+  contents: read
+
+# Сериализация, но БЕЗ cancel-in-progress: в отличие от CI, прерывать релиз
+# нельзя — отменённый прогон может оставить тег с половиной артефактов или
+# опубликованный релиз без файлов. Очередь на ref: два пуша в main ждут друг
+# друга, тег со своей очередью им не мешает.
+concurrency:
+  group: release-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+  # По умолчанию GitHub держит только один pending-run и третий пуш отменяет
+  # второй. max сохраняет до 100 ожидающих релизов вместо их тихой замены.
+  queue: max
+
+jobs:
+  build:
+    name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+    runs-on: ${{ matrix.runner }}
+    # Без явного лимита зависший раннер держит релиз и минуты организации до
+    # 6-часового дефолта GitHub. Сборка одной цели укладывается в единицы минут.
+    timeout-minutes: 30
+    strategy:
+      matrix:
+        include:
+          - goos: windows
+            goarch: amd64
+            runner: windows-latest
+            ext: .exe
+            archive: zip
+          # windows/arm64 уезжает БЕЗ onebase-gui.exe — см. гейт шага «Build GUI
+          # binary» ниже. Нативное окно требует CGo, а C-тулчейна под arm64 на
+          # amd64-раннере нет; сервер и CLI при этом нативные, а GUI под ARM
+          # доступен из amd64-архива через эмуляцию x64 (#988, А1).
+          - goos: windows
+            goarch: arm64
+            runner: windows-latest
+            ext: .exe
+            archive: zip
+          - goos: linux
+            goarch: amd64
+            runner: ubuntu-latest
+            ext: ''
+            archive: tar
+          # Целевая аудитория «сервер учёта в углу офиса» — Raspberry Pi, мини-ПК
+          # и NAS, то есть как раз arm64. Кросс-сборка достаточна: CGO_ENABLED=0,
+          # а modernc.org/sqlite — чистый Go и берёт все цели без тулчейна.
+          - goos: linux
+            goarch: arm64
+            runner: ubuntu-latest
+            ext: ''
+            archive: tar
+          - goos: darwin
+            goarch: amd64
+            runner: macos-latest
+            ext: ''
+            archive: tar
+          # Все Mac с 2020 года. До этого ARM-раннер macos-latest кросс-собирал
+          # только amd64-бинарь, нативно не нужный почти никому.
+          - goos: darwin
+            goarch: arm64
+            runner: macos-latest
+            ext: ''
+            archive: tar
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: '.go-version'
+          cache: true
+
+      - name: Compute version
+        id: ver
+        shell: bash
+        run: |
+          if [[ "${{ github.ref_type }}" == "tag" ]]; then
+            echo "ver=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+          else
+            echo "ver=build-${{ github.run_number }}" >> $GITHUB_OUTPUT
+          fi
+
+      # shell: bash обязателен — шаг идёт по всей матрице, а на windows-раннере
+      # умолчание GitHub это pwsh. Значения подставляются через env, а не
+      # ${{ }} прямо в команду: подстановка в текст команды исполняет то, что
+      # лежит в переменной, а собранный здесь бинарь потом подписывается
+      # настоящим ключом.
+      - name: Build binary
+        shell: bash
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 0
+          BUILD_VER: ${{ steps.ver.outputs.ver }}
+          RELEASE_PUBLIC_KEY: ${{ vars.RELEASE_PUBLIC_KEY }}
+        run: |
+          set -euo pipefail
+          # Пустая переменная молча выключает проверку подписи во всех
+          # выпущенных бинарях: -X ...PublicKey= компилируется успешно, а
+          # SignatureConfigured() возвращает false. При этом .sig-ассеты в
+          # релиз всё равно кладутся, и снаружи он выглядит подписанным —
+          # состояние «проверка выключена» неотличимо от «проверка работает»
+          # до самого инцидента (#967). Для форков это законно, поэтому
+          # предупреждение, а не отказ.
+          if [ -z "${RELEASE_PUBLIC_KEY:-}" ]; then
+            echo "::warning::RELEASE_PUBLIC_KEY не задан — сборки выйдут без проверки подписи"
+          fi
+          ldflags="-s -w"
+          ldflags="$ldflags -X github.com/ivantit66/onebase/internal/version.Build=$BUILD_VER"
+          ldflags="$ldflags -X github.com/ivantit66/onebase/internal/selfupdate.PublicKey=$RELEASE_PUBLIC_KEY"
+          # Жёсткий режим: релиз без .sig отвергается (#1195). Пока он был
+          # мягким, подпись обходилась её отсутствием — обладателю доступа к
+          # релизам не нужно подделывать подпись, достаточно не класть её.
+          # Без вшитого открытого ключа флаг не меняет ничего: проверка
+          # выключена целиком, и форк без ключей не задет.
+          ldflags="$ldflags -X github.com/ivantit66/onebase/internal/selfupdate.RequireSignature=1"
+          go build "-ldflags=$ldflags" -o onebase${{ matrix.ext }} ./cmd/onebase
+
+      # Гейт по goarch, а не только по goos: шаг требует CGO_ENABLED=1, то есть
+      # C-компилятор ПОД ЦЕЛЕВУЮ архитектуру. Раннер здесь amd64, тулчейна под
+      # arm64 в образе нет — без этого условия ARM-ячейка валила бы шаг, а
+      # следом «Package (Windows)», ждущий onebase-gui.exe, и релиз целиком.
+      - name: Build GUI binary (Windows native window, webview)
+        if: matrix.goos == 'windows' && matrix.goarch == 'amd64'
+        shell: pwsh
+        env:
+          CGO_ENABLED: 1
+          BUILD_VER: ${{ steps.ver.outputs.ver }}
+          RELEASE_PUBLIC_KEY: ${{ vars.RELEASE_PUBLIC_KEY }}
+        run: |
+          $ldflags = "-s -w -H windowsgui"
+          $ldflags += " -X github.com/ivantit66/onebase/internal/version.Build=$env:BUILD_VER"
+          $ldflags += " -X github.com/ivantit66/onebase/internal/selfupdate.PublicKey=$env:RELEASE_PUBLIC_KEY"
+          # Тот же жёсткий режим, что и в CLI-бинаре (#1195). Оба обязаны идти
+          # с ним: на Windows лаунчер может быть запущен из любого из двух, и
+          # мягкий GUI-бинарь оставил бы дыру открытой на основной платформе.
+          $ldflags += " -X github.com/ivantit66/onebase/internal/selfupdate.RequireSignature=1"
+          go build -tags webview "-ldflags=$ldflags" -o onebase-gui.exe ./cmd/onebase
+
+      - name: Package (Windows)
+        if: matrix.goos == 'windows'
+        shell: pwsh
+        run: |
+          $name = "onebase-${{ matrix.goos }}-${{ matrix.goarch }}"
+          New-Item -ItemType Directory -Name $name
+          Copy-Item onebase.exe "$name\"
+          # Для arm64 GUI-бинаря нет по построению, а для amd64 его отсутствие —
+          # поломка. Без явной проверки архив без нативного окна собрался бы
+          # молча и выглядел бы обычным релизом: расхождение всплыло бы уже у
+          # пользователя, а не на раннере.
+          if ("${{ matrix.goarch }}" -eq "amd64") {
+            if (-not (Test-Path onebase-gui.exe)) {
+              Write-Error "onebase-gui.exe не собран — архив amd64 без нативного окна не публикуем"
+              exit 1
+            }
+            Copy-Item onebase-gui.exe "$name\"
+          }
+          Copy-Item README.md "$name\" -ErrorAction SilentlyContinue
+          Copy-Item examples "$name\" -Recurse -ErrorAction SilentlyContinue
+          Compress-Archive -Path "$name\*" -DestinationPath "${name}.zip"
+          echo "ASSET=${name}.zip" >> $env:GITHUB_ENV
+
+      - name: Package (Unix)
+        if: matrix.goos != 'windows'
+        run: |
+          name="onebase-${{ matrix.goos }}-${{ matrix.goarch }}"
+          mkdir "$name"
+          cp onebase "$name/"
+          cp README.md "$name/" 2>/dev/null || true
+          cp -r examples "$name/" 2>/dev/null || true
+          tar czf "${name}.tar.gz" "$name"
+          echo "ASSET=${name}.tar.gz" >> $GITHUB_ENV
+
+      - name: Checksum (Windows)
+        if: matrix.goos == 'windows'
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash -Algorithm SHA256 $env:ASSET).Hash.ToLower()
+          "$hash  $env:ASSET" | Out-File -Encoding ascii "$env:ASSET.sha256"
+
+      - name: Checksum (Unix)
+        if: matrix.goos != 'windows'
+        run: sha256sum "$ASSET" > "$ASSET.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: onebase-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: |
+            ${{ env.ASSET }}
+            ${{ env.ASSET }}.sha256
+          retention-days: 7
+
+  # Гейт REL-02: публиковать можно только коммит, для которого основной CI
+  # (ci.yml) завершился успехом. Раньше release.yml запускался независимо от
+  # результата CI — красный или ещё не прогнанный коммит мог быть опубликован.
+  verify-ci:
+    name: Require green CI for this commit
+    runs-on: ubuntu-latest
+    # Свой дедлайн ожидания CI — 30 минут (см. шаг ниже); лимит job'а стоит
+    # чуть выше, чтобы срабатывал внутренний с внятным сообщением, а этот
+    # оставался страховкой на случай зависания самого раннера.
+    timeout-minutes: 40
+    permissions:
+      # contents:read нужен появившемуся checkout: объявленные на джобе
+      # permissions ЗАМЕЩАЮТ умолчание workflow, а не дополняют его.
+      contents: read
+      actions: read
+    steps:
+      # Полная история нужна для проверки происхождения коммита: без неё
+      # merge-base не с чем сравнивать.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Гейт #782 проверял только «есть ли зелёный прогон CI для этого SHA» —
+      # не глядя ни на событие, ни на ветку. ci.yml триггерится и на
+      # pull_request без ограничений на происхождение ветки, поэтому
+      # опубликовать можно было НЕПРОМЕРЖЕННУЮ ветку или форк: достаточно,
+      # чтобы для её SHA когда-либо был зелёный PR-прогон (#874).
+      - name: Require the commit to be on main
+        env:
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "$SHA" origin/main; then
+            echo "::error::коммит $SHA не входит в main — публикация непромерженного кода отменена"
+            echo "Если релиз делается из ветки, сначала влейте её в main."
+            exit 1
+          fi
+          echo "коммит $SHA достижим из main"
+
+      - name: Wait for CI success on this SHA
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SHA: ${{ github.sha }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # Ищем прогон workflow "CI" для ТОЧНОГО SHA, запущенный именно событием
+          # push в main. PR/workflow_dispatch-прогоны здесь не доказательство:
+          # они проверяют другой ref. Не требуем успеха от ВСЕХ запусков этого
+          # SHA: старый cancelled run (или отменённая первая попытка перед rerun)
+          # не должен навсегда отравлять уже успешную проверку push@main.
+          deadline=$(( $(date +%s) + 1800 ))
+          while :; do
+            runs=$(gh api "repos/$REPO/actions/workflows/ci.yml/runs?head_sha=$SHA&branch=main&event=push&per_page=100" \
+              --jq '[.workflow_runs[] | {status: .status, conclusion: .conclusion, event: .event, branch: .head_branch, attempt: .run_attempt}]')
+            total=$(echo "$runs" | jq 'length')
+            successful=$(echo "$runs" | jq '[.[] | select(.status=="completed" and .conclusion=="success" and .event=="push" and .branch=="main")] | length')
+            active=$(echo "$runs" | jq '[.[] | select(.status!="completed")] | length')
+            if [ "$successful" -gt 0 ]; then
+              echo "CI зелёный для $SHA: найден успешный прогон push@main."
+              exit 0
+            fi
+            if [ "$total" -gt 0 ] && [ "$active" -eq 0 ]; then
+              echo "::error::все прогоны CI push@main для $SHA завершились без успеха. Публикация отменена."
+              echo "$runs" | jq .
+              exit 1
+            fi
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "::error::Не дождались успешного CI для $SHA за 30 минут. Публикация отменена."
+              echo "$runs" | jq .
+              exit 1
+            fi
+            echo "Жду успешный CI push@main для $SHA ($active активных, $total найдено)..."
+            sleep 20
+          done
+
+  dev-release:
+    name: Dev Pre-Release
+    needs: [build, verify-ci]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    if: github.ref == 'refs/heads/main'
+    permissions:
+      contents: write   # публикация пре-релиза
+    steps:
+      # checkout нужен чтобы `git log` дал subject последнего коммита для
+      # <!-- summary --> маркера. Сайт onabase.site берёт текст из этого
+      # маркера для карточки релиза — без него попадает дефолтный «Автосборка…».
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+
+      # Подпись сумм — здесь, а не в матрице сборки: приватный ключ не должен
+      # попадать на windows/macos-раннеры, а достаточно одного места. Подпись
+      # накладывается на файл .sha256, и цепочка получается полной: подпись
+      # подтверждает сумму, сумма подтверждает архив (#783).
+      #
+      # Без секрета шаг не падает, а пропускается: форк, у которого ключа нет,
+      # обязан публиковать релизы как раньше.
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: '.go-version'
+          cache: true
+
+      - name: Sign checksums
+        env:
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+          # Обычно подпись сверяется с тем же ключом, который вшит в бинарь.
+          # При плановой ротации переходный бинарь уже несёт новый ключ, но его
+          # архив обязан быть подписан старым: временная переменная отвязывает
+          # pair-check от ключа сборки без поддержки двух ключей в runtime.
+          RELEASE_SIGNING_PUBLIC_KEY: ${{ vars.RELEASE_SIGNING_PUBLIC_KEY || vars.RELEASE_PUBLIC_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${RELEASE_SIGNING_KEY:-}" ]; then
+            echo "::warning::RELEASE_SIGNING_KEY не задан — релиз выйдет без подписи"
+            exit 0
+          fi
+          shopt -s nullglob
+          sums=(dist/*.sha256)
+          if [ ${#sums[@]} -eq 0 ]; then
+            echo "::error::в dist нет ни одного файла .sha256 — подписывать нечего"
+            exit 1
+          fi
+          go run ./tools/relsign sign -pub "$RELEASE_SIGNING_PUBLIC_KEY" "${sums[@]}"
+          ls -1 dist/*.sig
+
+      - name: Compute commit subject
+        id: subj
+        # heredoc-форма GH_OUTPUT — корректно переживает спецсимволы
+        # (кавычки, обратные апострофы, эмодзи) в subject коммита.
+        run: |
+          {
+            echo "subject<<EOF"
+            git log -1 --format=%s
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create Pre-Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: build-${{ github.run_number }}
+          prerelease: true
+          files: dist/*
+          body: |
+            <!-- summary: ${{ steps.subj.outputs.subject }} -->
+
+            ## Что нового
+
+            ${{ steps.subj.outputs.subject }}
+
+            ## Сборка
+
+            Автосборка из ветки `main`.
+            Коммит: `${{ github.sha }}`
+            Версия платформы: `build-${{ github.run_number }}`
+
+            Для идентификации: в конфигураторе в шапке отображается `платформа build-${{ github.run_number }}`.
+
+      - name: Append commit diff
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="build-${{ github.run_number }}"
+          # Find the previous build release
+          PREV=$(gh release list --repo "${{ github.repository }}" --limit 50 --json tagName --jq '.[].tagName' \
+            | grep '^build-' \
+            | sed 's/build-//' \
+            | sort -n \
+            | awk -v cur="${{ github.run_number }}" '$1 < cur' \
+            | tail -1)
+
+          SUMMARY=""
+          CHANGES=""
+
+          if [[ -n "$PREV" ]]; then
+            PREV_TAG="build-${PREV}"
+            COMMITS=$(gh api "repos/${{ github.repository }}/compare/${PREV_TAG}...${TAG}" \
+              --jq '.commits[] | "- \(.commit.message | split("\n")[0]) (\(.sha[0:7]))"' 2>/dev/null || true)
+
+            if [[ -n "$COMMITS" ]]; then
+              COUNT=$(echo "$COMMITS" | wc -l | tr -d ' ')
+              CHANGES=$'\n\n'"## Изменения с ${PREV_TAG} (${COUNT} коммит(ов))"$'\n'"${COMMITS}"
+
+              # Generate summary from first commit message (one line, stripped of conventional prefix)
+              FIRST=$(echo "$COMMITS" | head -1 | sed 's/([^)]*)$//' | sed 's/^[- ]*//' | sed 's/<!--//g; s/-->//g')
+              SUMMARY="<!-- summary: ${FIRST} -->"$'\n\n'
+            fi
+          fi
+
+          # Read current body, prepend summary marker, append changes
+          CURRENT=$(gh release view "$TAG" --repo "${{ github.repository }}" --json body --jq '.body')
+          NEW_BODY="${SUMMARY}${CURRENT}${CHANGES}"
+
+          gh release edit "$TAG" --repo "${{ github.repository }}" --notes "$NEW_BODY"
+
+  release:
+    name: Create GitHub Release
+    needs: [build, verify-ci]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write   # публикация релиза
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # releasecheck читает полный first-parent диапазон и предыдущий
+          # стабильный тег; shallow checkout теряет как раз начало диапазона.
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: '.go-version'
+          cache: true
+
+      - name: Resolve release body
+        id: release_body
+        shell: bash
+        run: |
+          # Заметки переехали из корня в docs/releases/ (#988, А3). Корень
+          # проверяется вторым не ради совместимости, а ради предсказуемого
+          # отказа: тег, для которого заметка осталась по старому пути, иначе
+          # молча получил бы дефолтное тело вместо своего текста.
+          notes="docs/releases/release_${GITHUB_REF_NAME}.md"
+          if [[ ! -f "$notes" && -f "release_${GITHUB_REF_NAME}.md" ]]; then
+            notes="release_${GITHUB_REF_NAME}.md"
+            echo "::warning::заметка $notes лежит в корне; место для них — docs/releases/"
+          fi
+          if [[ -f "$notes" ]]; then
+            echo "path=$notes" >> "$GITHUB_OUTPUT"
+            echo "custom=true" >> "$GITHUB_OUTPUT"
+          else
+            cat > release-default.md <<'EOF'
+          <!-- summary: Обновление OneBase с бинарными сборками для Windows, Linux и macOS. -->
+
+          ## Что нового
+
+          См. автоматически сгенерированный список изменений ниже.
+
+          ## Установка
+
+          ### Windows
+          1. Скачайте `onebase-windows-amd64.zip` (на Windows ARM — `onebase-windows-arm64.zip`)
+          2. Распакуйте в любую папку, например `C:\onebase\`
+          3. Запустите `onebase-gui.exe`
+
+          В arm64-архиве `onebase-gui.exe` нет: нативное окно требует WebView2
+          через CGo. Лаунчер там открывается в браузере, всё остальное нативно.
+
+          ### Linux / macOS
+          ```bash
+          tar xzf onebase-linux-amd64.tar.gz
+          ./onebase-linux-amd64/onebase start
+          ```
+
+          Под ARM берите архив с `-arm64`: `onebase-linux-arm64.tar.gz`
+          (Raspberry Pi, мини-ПК, NAS) или `onebase-darwin-arm64.tar.gz`
+          (Mac на Apple Silicon).
+
+          ### Требования
+          - PostgreSQL 14+ нужен только для многопользовательского режима
+          - Для SQLite-режима дополнительных зависимостей нет
+          EOF
+            echo "path=release-default.md" >> "$GITHUB_OUTPUT"
+            # У дефолтного тела generate_release_notes ниже строит полный
+            # список сам; репозиторную проверку применяем только к своей заметке.
+            echo "custom=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check release note completeness
+        if: steps.release_body.outputs.custom == 'true'
+        shell: bash
+        env:
+          NOTES_PATH: ${{ steps.release_body.outputs.path }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          stable_tags=$(git tag --merged "${RELEASE_TAG}^" --list 'v[0-9]*' --sort=-version:refname)
+          previous_tag=""
+          while IFS= read -r tag; do
+            if [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              previous_tag=$tag
+              break
+            fi
+          done <<< "$stable_tags"
+          if [[ -z "$previous_tag" ]]; then
+            echo "::error::не найден предыдущий стабильный тег перед ${RELEASE_TAG}"
+            exit 1
+          fi
+          go run ./tools/releasecheck \
+            -from "$previous_tag" \
+            -to "$RELEASE_TAG" \
+            -notes "$NOTES_PATH"
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+
+      # Подпись сумм — здесь, а не в матрице сборки: приватный ключ не должен
+      # попадать на windows/macos-раннеры, а достаточно одного места. Подпись
+      # накладывается на файл .sha256, и цепочка получается полной: подпись
+      # подтверждает сумму, сумма подтверждает архив (#783).
+      #
+      # Без секрета шаг не падает, а пропускается: форк, у которого ключа нет,
+      # обязан публиковать релизы как раньше.
+      - name: Sign checksums
+        env:
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+          # Обычно подпись сверяется с тем же ключом, который вшит в бинарь.
+          # При плановой ротации переходный бинарь уже несёт новый ключ, но его
+          # архив обязан быть подписан старым: временная переменная отвязывает
+          # pair-check от ключа сборки без поддержки двух ключей в runtime.
+          RELEASE_SIGNING_PUBLIC_KEY: ${{ vars.RELEASE_SIGNING_PUBLIC_KEY || vars.RELEASE_PUBLIC_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${RELEASE_SIGNING_KEY:-}" ]; then
+            echo "::warning::RELEASE_SIGNING_KEY не задан — релиз выйдет без подписи"
+            exit 0
+          fi
+          shopt -s nullglob
+          sums=(dist/*.sha256)
+          if [ ${#sums[@]} -eq 0 ]; then
+            echo "::error::в dist нет ни одного файла .sha256 — подписывать нечего"
+            exit 1
+          fi
+          go run ./tools/relsign sign -pub "$RELEASE_SIGNING_PUBLIC_KEY" "${sums[@]}"
+          ls -1 dist/*.sig
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          body_path: ${{ steps.release_body.outputs.path }}

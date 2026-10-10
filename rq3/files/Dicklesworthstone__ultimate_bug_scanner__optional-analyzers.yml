@@ -1,0 +1,82 @@
+name: Optional Analyzer Coverage
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ubs
+      - SHA256SUMS
+      - modules/**
+      - scripts/new-module.sh
+      - scripts/update_checksums.py
+      - scripts/verify_checksums.sh
+      - scripts/verify_sha256sums.sh
+      - test-suite/shareable/test_optional_analyzers.py
+      - test-suite/shareable/test_ruby_analyzers.py
+      - test-suite/shareable/test_go_analyzers.py
+      - test-suite/quality/test_bash_scan.py
+      - test-suite/quality/test_cache.py
+      - test-suite/quality/test_scan_selection.py
+      - test-suite/quality/test_module_file_counting.py
+      - .github/workflows/optional-analyzers.yml
+  pull_request:
+    paths:
+      - ubs
+      - SHA256SUMS
+      - modules/**
+      - scripts/new-module.sh
+      - scripts/update_checksums.py
+      - scripts/verify_checksums.sh
+      - scripts/verify_sha256sums.sh
+      - test-suite/shareable/test_optional_analyzers.py
+      - test-suite/shareable/test_ruby_analyzers.py
+      - test-suite/shareable/test_go_analyzers.py
+      - test-suite/quality/test_bash_scan.py
+      - test-suite/quality/test_cache.py
+      - test-suite/quality/test_scan_selection.py
+      - test-suite/quality/test_module_file_counting.py
+      - .github/workflows/optional-analyzers.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  optional-analyzers:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+      UBS_NO_AUTO_UPDATE: "1"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install test dependencies
+        run: |
+          sudo apt-get update && sudo apt-get install -y jq ripgrep rsync shellcheck
+          npm install --global @ast-grep/cli@0.45.3
+          go version
+          command -v gofmt
+      - name: Verify syntax, lint, and checksum chain
+        run: |
+          for script in ubs modules/lib/ubs-common.sh modules/ubs-*.sh; do bash -n "$script"; done
+          shellcheck -S warning ubs modules/ubs-bash.sh modules/ubs-ruby.sh modules/ubs-golang.sh
+          ./scripts/verify_checksums.sh
+          ./scripts/verify_sha256sums.sh
+      - name: Test custom policies with real analyzers and all report formats
+        run: python3 -m unittest discover -s test-suite/quality -p test_bash_scan.py -v
+      - name: Test Go tools, real offline vet, and production reports
+        run: python3 test-suite/shareable/test_go_analyzers.py -v
+      - name: Test Ruby tools across output, scope, and cache paths
+        run: python3 test-suite/shareable/test_ruby_analyzers.py -v
+      - name: Test existing external coverage and reports
+        run: python3 test-suite/shareable/test_optional_analyzers.py -v
+      - name: Test existing cache, selection, and file-counting behavior
+        run: |
+          cd test-suite
+          python3 -m unittest quality.test_cache quality.test_scan_selection quality.test_module_file_counting -v
+      - name: Verify checksum regeneration is stable
+        run: |
+          python3 scripts/update_checksums.py
+          git diff --exit-code

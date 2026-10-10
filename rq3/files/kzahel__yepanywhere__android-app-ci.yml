@@ -1,0 +1,349 @@
+name: Android App CI
+
+on:
+  # Shared web/server and lockfile changes are covered by nightly runs.
+  push:
+    branches: [main]
+    paths:
+      - 'packages/android/**'
+      - 'packages/mobile-core/**'
+      - 'packages/mobile-core-proof/test-vectors/**'
+      - 'packages/client/src/lib/nativeHost.ts'
+      - 'packages/client/src/lib/__tests__/nativeHost.test.ts'
+      - 'packages/server/src/crypto/**'
+      - 'packages/shared/src/binary-framing.ts'
+      - 'packages/server/scripts/android-native-secure-probe-server.ts'
+      - 'scripts/android-secure-interop-fixture.ts'
+      - 'pnpm-workspace.yaml'
+      - '.github/workflows/android-app-ci.yml'
+      - '!packages/android/**/*.md'
+      - '!packages/mobile-core/**/*.md'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'packages/android/**'
+      - 'packages/mobile-core/**'
+      - 'packages/mobile-core-proof/test-vectors/**'
+      - 'packages/client/src/lib/nativeHost.ts'
+      - 'packages/client/src/lib/__tests__/nativeHost.test.ts'
+      - 'packages/server/src/crypto/**'
+      - 'packages/shared/src/binary-framing.ts'
+      - 'packages/server/scripts/android-native-secure-probe-server.ts'
+      - 'scripts/android-secure-interop-fixture.ts'
+      - 'pnpm-workspace.yaml'
+      - '.github/workflows/android-app-ci.yml'
+      - '!packages/android/**/*.md'
+      - '!packages/mobile-core/**/*.md'
+  schedule:
+    - cron: '17 4 * * *'
+  workflow_dispatch:
+    inputs:
+      publish_internal:
+        description: 'Publish to Play internal testing after verification (main only)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+concurrency:
+  # Verification runs coalesce; explicit releases use a separate group so a
+  # later push cannot cancel the selected release or interrupt its Play edit.
+  group: android-app-${{ github.workflow }}-${{ github.ref }}-${{ github.event_name == 'workflow_dispatch' && inputs.publish_internal && 'publish' || 'verify' }}
+  cancel-in-progress: ${{ !(github.event_name == 'workflow_dispatch' && inputs.publish_internal) }}
+
+jobs:
+  verify-android-app:
+    name: Build, lint, and inspect
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          # JavaScript tasks install/build the root workspace, whose engines changed.
+          node-version: '22.16.0'
+          cache: pnpm
+
+      - name: Setup Java
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+          cache-dependency-path: |
+            packages/android/*.gradle.kts
+            packages/android/gradle.properties
+            packages/android/gradle/wrapper/gradle-wrapper.properties
+            packages/android/app/*.gradle.kts
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Install Android SDK packages
+        run: >-
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          'platforms;android-36' 'build-tools;35.0.0' 'ndk;28.2.13676358'
+
+      - name: Test internal publication policy
+        run: node --test packages/android/scripts/publish-internal.test.mjs
+
+      - name: Test the web native-host adapter
+        run: >-
+          pnpm --filter @yep-anywhere/client exec vitest run
+          src/lib/__tests__/nativeHost.test.ts
+
+      - name: Verify native secure-transport fixtures
+        run: pnpm android:interop:check
+
+      - name: Install pinned Rust tools
+        run: |
+          rustup toolchain install 1.97.0 --profile minimal --component rustfmt --component clippy
+          cargo +1.97.0 install cargo-ndk --version 4.1.2 --locked
+
+      - name: Set CI package version
+        run: |
+          test "$GITHUB_RUN_ATTEMPT" -lt 100
+          echo "ORG_GRADLE_PROJECT_yaVersionCode=$((10000 + GITHUB_RUN_NUMBER * 100 + GITHUB_RUN_ATTEMPT))" >> "$GITHUB_ENV"
+          echo "ORG_GRADLE_PROJECT_yaVersionName=0.1.2-ci.${GITHUB_RUN_NUMBER}.${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_ENV"
+
+      - name: Restore Firebase build configuration
+        if: github.repository == 'kzahel/yepanywhere' && github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        env:
+          FIREBASE_CONFIG: ${{ secrets.ANDROID_GOOGLE_SERVICES_JSON }}
+        run: |
+          test -n "$FIREBASE_CONFIG"
+          printf '%s' "$FIREBASE_CONFIG" > packages/android/app/google-services.json
+
+      - name: Prepare bundled client assets
+        run: pnpm --filter @yep-anywhere/android prepare-frontend
+
+      - name: Test, lint, and build Android channels
+        working-directory: packages/android
+        run: >-
+          ./gradlew test lint assembleBundledDebug assembleBundledRelease
+          assembleHostedLatestRelease bundleBundledRelease --warning-mode all --no-daemon
+
+      - name: Inspect APK contracts
+        run: pnpm --filter @yep-anywhere/android inspect:apks
+
+      - name: Upload verified Play candidate
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: android-play-candidate-${{ github.run_attempt }}
+          if-no-files-found: error
+          path: packages/android/app/build/outputs/bundle/bundledRelease/app-bundled-release.aab
+
+      - name: Upload Android build artifacts and reports
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: android-app-build-${{ github.run_attempt }}
+          if-no-files-found: ignore
+          path: |
+            packages/android/app/build/outputs/apk/**/*.apk
+            packages/android/app/build/reports/**
+            packages/android/app/build/test-results/**
+
+  instrument-android-app:
+    name: WebView instrumentation
+    needs: verify-android-app
+    runs-on: ubuntu-latest
+    # Run 37704886933/attempts/2 spent ~13 minutes preparing the APK/emulator
+    # and 8m18s in passing direct tests, then reached 30m during relay tests.
+    # Keep per-test deadlines unchanged; allow bounded whole-job headroom.
+    timeout-minutes: 40
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          # JavaScript tasks install/build the root workspace, whose engines changed.
+          node-version: '22.16.0'
+          cache: pnpm
+
+      - name: Setup Java
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+          cache-dependency-path: |
+            packages/android/*.gradle.kts
+            packages/android/gradle.properties
+            packages/android/gradle/wrapper/gradle-wrapper.properties
+            packages/android/app/*.gradle.kts
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Install Android SDK packages
+        run: >-
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          'platforms;android-36' 'build-tools;35.0.0' 'ndk;28.2.13676358'
+
+      - name: Install pinned Rust tools
+        run: |
+          rustup toolchain install 1.97.0 --profile minimal --component rustfmt --component clippy
+          cargo +1.97.0 install cargo-ndk --version 4.1.2 --locked
+
+      - name: Set CI package version
+        run: |
+          test "$GITHUB_RUN_ATTEMPT" -lt 100
+          echo "ORG_GRADLE_PROJECT_yaVersionCode=$((10000 + GITHUB_RUN_NUMBER * 100 + GITHUB_RUN_ATTEMPT))" >> "$GITHUB_ENV"
+          echo "ORG_GRADLE_PROJECT_yaVersionName=0.1.2-ci.${GITHUB_RUN_NUMBER}.${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_ENV"
+
+      - name: Restore Firebase build configuration
+        if: github.repository == 'kzahel/yepanywhere' && github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        env:
+          FIREBASE_CONFIG: ${{ secrets.ANDROID_GOOGLE_SERVICES_JSON }}
+        run: |
+          test -n "$FIREBASE_CONFIG"
+          printf '%s' "$FIREBASE_CONFIG" > packages/android/app/google-services.json
+
+      - name: Prepare bundled client assets
+        run: pnpm --filter @yep-anywhere/android prepare-frontend
+
+      # Do not starve the freshly booted launcher with Rust/NDK compilation.
+      # Run 37219989321 left a Pixel Launcher ANR covering the live test UI.
+      # Use the live probe's exact variant throughout, including R8, so the
+      # later test:live command does not rebuild it beside the running emulator.
+      - name: Build instrumented APKs before emulator startup
+        working-directory: packages/android
+        run: >-
+          ./gradlew assembleBundledDebug assembleBundledDebugAndroidTest
+          -PyaNativeProbeCleartext=true -PyaNativeProbeMinify=true
+          --warning-mode all --no-daemon
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' |
+            sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Run WebView instrumentation
+        uses: ReactiveCircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2
+        with:
+          api-level: 35
+          target: google_apis
+          arch: x86_64
+          profile: pixel_7
+          # Two-core software-rendered runs 36974124012/36977714721 missed
+          # the unchanged 100 ms frame gate at 122/128 ms (physical: 24 ms).
+          # Use the hosted runner's four cores and the current software backend;
+          # swiftshader_indirect was deprecated in emulator 36.4.9.
+          # https://developer.android.com/studio/run/emulator-acceleration
+          cores: 4
+          disable-animations: true
+          pre-emulator-launch-script: >-
+            node -e 'const os = require("node:os");
+            console.log(JSON.stringify({cores: os.availableParallelism(),
+            memoryMiB: Math.round(os.totalmem() / 1048576), load: os.loadavg()}))'
+          emulator-options: >-
+            -no-window -gpu software -noaudio -no-boot-anim
+            -camera-back none
+          script: >-
+            cd packages/android && ./gradlew connectedBundledDebugAndroidTest
+            -PyaNativeProbeCleartext=true -PyaNativeProbeMinify=true
+            --warning-mode all --no-daemon && cd ../.. && pnpm --filter
+            @yep-anywhere/android test:live
+
+      - name: Upload Android instrumentation reports
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: android-app-instrumentation-${{ github.run_attempt }}
+          if-no-files-found: ignore
+          path: |
+            packages/android/app/build/reports/**
+            packages/android/app/build/outputs/androidTest-results/**
+
+  publish-internal:
+    name: Publish to Play internal testing
+    needs: [verify-android-app, instrument-android-app]
+    if: >-
+      github.repository == 'kzahel/yepanywhere' &&
+      github.ref == 'refs/heads/main' &&
+      github.event_name == 'workflow_dispatch' &&
+      inputs.publish_internal &&
+      vars.ANDROID_PLAY_PUBLISH_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: android-internal
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: android-play-candidate-${{ github.run_attempt }}
+          path: play-candidate
+
+      - name: Sign the verified bundle with the existing upload key
+        env:
+          UPLOAD_KEYSTORE_BASE64: ${{ secrets.ANDROID_UPLOAD_KEYSTORE_BASE64 }}
+          YA_UPLOAD_STORE_PASSWORD: ${{ secrets.ANDROID_UPLOAD_STORE_PASSWORD }}
+          YA_UPLOAD_KEY_PASSWORD: ${{ secrets.ANDROID_UPLOAD_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          umask 077
+          key="$RUNNER_TEMP/ya-upload.p12"
+          trap 'rm -f "$key"' EXIT
+          printf '%s' "$UPLOAD_KEYSTORE_BASE64" | base64 --decode > "$key"
+          actual=$(keytool -exportcert -keystore "$key" -alias upload -storepass:env YA_UPLOAD_STORE_PASSWORD | sha256sum | cut -d ' ' -f 1)
+          test "$actual" = fd48a0e128f60c7e48b4e9cf000ffb32766fefe8acde805f054ec11597898b00
+          jarsigner -keystore "$key" -storepass:env YA_UPLOAD_STORE_PASSWORD -keypass:env YA_UPLOAD_KEY_PASSWORD \
+            -signedjar play-candidate/yepanywhere-upload.aab play-candidate/app-bundled-release.aab upload
+          jarsigner -verify play-candidate/yepanywhere-upload.aab
+          test "$GITHUB_RUN_ATTEMPT" -lt 100
+          echo "ORG_GRADLE_PROJECT_yaVersionCode=$((10000 + GITHUB_RUN_NUMBER * 100 + GITHUB_RUN_ATTEMPT))" >> "$GITHUB_ENV"
+
+      - name: Authenticate to Google Play without a service-account key
+        id: google
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          workload_identity_provider: ${{ vars.ANDROID_PLAY_WIF_PROVIDER }}
+          service_account: ${{ vars.ANDROID_PLAY_SERVICE_ACCOUNT }}
+          token_format: access_token
+          access_token_scopes: https://www.googleapis.com/auth/androidpublisher
+          create_credentials_file: false
+          export_environment_variables: false
+
+      - name: Publish the candidate to internal testers
+        env:
+          PLAY_ACCESS_TOKEN: ${{ steps.google.outputs.access_token }}
+        run: node packages/android/scripts/publish-internal.mjs play-candidate/yepanywhere-upload.aab play-candidate/receipt.json
+
+      - name: Retain signed bundle and publication receipt
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: android-play-release-${{ github.run_attempt }}
+          path: |
+            play-candidate/yepanywhere-upload.aab
+            play-candidate/receipt.json

@@ -1,0 +1,85 @@
+name: JavaScript Policy Coverage
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ubs
+      - SHA256SUMS
+      - modules/**
+      - scripts/update_checksums.py
+      - test-suite/quality/test_js_*.py
+      - test-suite/quality/test_bash_scan.py
+      - test-suite/quality/test_cache.py
+      - test-suite/quality/test_prefilter.py
+      - test-suite/quality/test_build_output_pruning.py
+      - test-suite/quality/test_scan_selection.py
+      - test-suite/quality/test_module_file_counting.py
+      - test-suite/shareable/test_*analyzers.py
+      - test-suite/shareable/test_status_invariants.py
+      - .github/workflows/javascript-policies.yml
+  pull_request:
+    paths:
+      - ubs
+      - SHA256SUMS
+      - modules/**
+      - scripts/update_checksums.py
+      - test-suite/quality/test_js_*.py
+      - test-suite/quality/test_bash_scan.py
+      - test-suite/quality/test_cache.py
+      - test-suite/quality/test_prefilter.py
+      - test-suite/quality/test_build_output_pruning.py
+      - test-suite/quality/test_scan_selection.py
+      - test-suite/quality/test_module_file_counting.py
+      - test-suite/shareable/test_*analyzers.py
+      - test-suite/shareable/test_status_invariants.py
+      - .github/workflows/javascript-policies.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  policies:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+      UBS_NO_AUTO_UPDATE: "1"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install real analyzers
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq jq ripgrep rsync shellcheck python3-yaml
+          npm install --global @ast-grep/cli@0.45.3
+      - name: Verify source and checksum integrity
+        run: |
+          for source in ubs modules/lib/ubs-common.sh modules/ubs-*.sh; do bash -n "$source"; done
+          shellcheck -S warning ubs modules/ubs-js.sh
+          ./scripts/verify_checksums.sh > "$RUNNER_TEMP/js-checksums.log"
+          ./scripts/verify_sha256sums.sh
+          python3 scripts/update_checksums.py > "$RUNNER_TEMP/js-checksum-repeat.log"
+          git diff --exit-code
+      - name: Exercise policies, cache, real analyzers and traversal
+        run: |
+          cd test-suite
+          python3 -m unittest quality.test_js_rules quality.test_js_scan quality.test_bash_scan quality.test_cache quality.test_prefilter quality.test_build_output_pruning quality.test_scan_selection quality.test_module_file_counting -v 2>&1 | tee "$RUNNER_TEMP/js-policy-tests.log"
+          python3 -S -m unittest quality.test_prefilter -v 2>&1 | tee "$RUNNER_TEMP/js-prefilter-without-yaml.log"
+      - name: Exercise partial reports and optional analyzer adapters
+        run: |
+          python3 test-suite/shareable/test_optional_analyzers.py -v 2>&1 | tee "$RUNNER_TEMP/js-optional-tests.log"
+          python3 test-suite/shareable/test_ruby_analyzers.py -v 2>&1 | tee "$RUNNER_TEMP/js-ruby-tests.log"
+          python3 test-suite/shareable/test_go_analyzers.py -v 2>&1 | tee "$RUNNER_TEMP/js-go-tests.log"
+          python3 test-suite/shareable/test_status_invariants.py 2>&1 | tee "$RUNNER_TEMP/js-status-tests.log"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: javascript-completeness-validation
+          path: ${{ runner.temp }}/js-*.log
+          retention-days: 7

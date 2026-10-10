@@ -1,0 +1,356 @@
+name: Tests
+
+on:
+  workflow_call:
+    inputs:
+      tests:
+        required: true
+        type: string
+      server_id:
+        required: true
+        type: string
+      skip_tests:
+        description: "Mechanism to skip the steps, but not the jobs, so we can have a status check passing."
+        required: true
+        type: boolean
+      recommended_tests:
+        description: "List of recommended tests. Optional."
+        required: false
+        type: string
+    secrets:
+      GH_TOKEN_GALAXY_CI:
+        required: false
+
+permissions:
+  contents: read
+
+env:
+  UYUNI_PROJECT: uyuni-project
+  UYUNI_VERSION: master
+  NO_AUTH_REGISTRY: "noauthregistry.lab"
+  PUBLISH_CUCUMBER_REPORT: true
+  AUTH_REGISTRY: "authregistry.lab"
+  AUTH_REGISTRY_CREDENTIALS: "cucutest|cucutest"
+
+jobs:
+  filters:
+    runs-on: ubuntu-latest
+    outputs:
+      java: ${{ steps.filter.outputs.java }}
+      web: ${{ steps.filter.outputs.web }}
+      testsuite: ${{ steps.filter.outputs.testsuite }}
+      controller_dockerfile: ${{ steps.filter.outputs.controller_dockerfile }}
+      not_bv_validation: ${{ steps.bv_filter.outputs.not_build_validation }}
+      require_acceptance_tests: ${{ steps.filter.outputs.java == 'true' || steps.filter.outputs.web == 'true' || ( steps.filter.outputs.testsuite == 'true' && steps.bv_filter.outputs.not_build_validation == 'true' ) }}
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 #v5.0.0
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ github.event.pull_request.head.ref }}
+      - uses: dorny/paths-filter@9d7afb8d214ad99e78fbd4247752c4caed2b6e4c # v4.0.0
+        id: filter
+        with:
+          predicate-quantifier: 'some'
+          filters: |
+            java:
+              - 'java/**'
+            web:
+              - 'web/html/src/**'
+            testsuite:
+              - 'testsuite/**'
+            controller_dockerfile:
+              - 'testsuite/dockerfiles/controller-dev/**'
+      - uses: dorny/paths-filter@9d7afb8d214ad99e78fbd4247752c4caed2b6e4c # v4.0.0
+        id: bv_filter
+        with:
+          predicate-quantifier: 'every'
+          filters: |
+            not_build_validation:
+              - 'testsuite/**'
+              - '!testsuite/features/build_validation/**'
+  tests:
+    runs-on: ubuntu-24.04
+    needs: filters
+    # GitHub-hosted runners hard-kill jobs at 6h; keep this below that so the
+    # timeout actually fires (and runs post steps) instead of being pre-empted.
+    timeout-minutes: 350
+    steps:
+      - name: Skipping tests
+        if: ${{ inputs.skip_tests }}
+        run: |
+          echo "Skipping tests."
+          echo "This is a workaround to avoid running the tests, but still have a passing status check."
+          echo "The job will be marked as success, but the steps will be skipped."
+      - name: Install Podman
+        if: ${{ !inputs.skip_tests && needs.filters.outputs.require_acceptance_tests == 'true' }}
+        timeout-minutes: 10
+        run: sudo apt install podman
+
+      # The step above installs podman 4.9.3 in /usr/bin, but since runner image
+      # 20260810.271 the image itself also ships podman 5.8.4 in /usr/local/bin,
+      # which wins on root's PATH. That is the image where the jobs began to
+      # wedge in "podman exec", so keep using the version that has been running
+      # these tests all along. The two use different storage backends, so start
+      # from an empty store.
+      - name: Use the distro podman, not the one shipped with the runner image
+        if: ${{ !inputs.skip_tests && needs.filters.outputs.require_acceptance_tests == 'true' }}
+        run: |
+          if [ -e /usr/local/bin/podman ]; then
+            sudo mv -v /usr/local/bin/podman /usr/local/bin/podman-runner-image
+            sudo rm -rf /var/lib/containers
+          fi
+          # The rest of the image is still built around podman 5: its conmon has
+          # no journald support, so keep the log driver 5.8.4 was using here.
+          sudo mkdir -p /etc/containers/containers.conf.d
+          printf '[containers]\nlog_driver = "k8s-file"\n\n[engine]\nconmon_path = ["/usr/bin/conmon"]\n' \
+            | sudo tee /etc/containers/containers.conf.d/99-distro-podman.conf
+          sudo -i podman version | head -2
+
+      - name: Install Python dependencies
+        if: ${{ !inputs.skip_tests && needs.filters.outputs.require_acceptance_tests == 'true' }}
+        run: pip install pyyaml
+
+      - name: Welcome message
+        if: ${{ !inputs.skip_tests && needs.filters.outputs.require_acceptance_tests == 'true' }}
+        run: echo "Running acceptance tests. More info at https://github.com/uyuni-project/uyuni/wiki/Running-Acceptance-Tests-at-PR"
+
+      - name: Checkout repository
+        if: ${{ !inputs.skip_tests && needs.filters.outputs.require_acceptance_tests == 'true' }}
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 #v5.0.0
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ github.event.pull_request.head.ref }}
+
+      - name: Use Node.js 22.x
+        uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 #v6.0.0
+        with:
+          node-version: 22.x
+
+      - name: Cache jar files (Java/Ivy Dependencies)
+        if: ${{ !inputs.skip_tests && needs.filters.outputs.require_acceptance_tests == 'true' }}
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 #v4.3.0
+        id: cache-ivy
+        with:
+          path: java/buildconf/ivy/repository/
+          key: ${{ runner.os }}-build-cache-uyuni-jars-${{ hashFiles('**/java/buildconf/ivy/*.xml') }}
+          restore-keys: |
+            ${{ runner.os }}-build-cache-uyuni-jars-
+
+      - name: Cache obs-to-maven files
+        if: ${{ !inputs.skip_tests && needs.filters.outputs.require_acceptance_tests == 'true' }}
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 #v4.3.0
+        with:
+          path: java/.obs-to-maven-cache
+          key: ${{ runner.os }}-build-cache-uyuni-obs-to-maven-${{ hashFiles('**/java/buildconf/ivy/obs-maven-config.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-build-cache-uyuni-obs-to-maven-
+
+      # See https://docs.github.com/en/actions/reference/workflows-and-actions/dependency-caching
+      - name: Use cached NPM dependencies
+        if: ${{ !inputs.skip_tests && needs.filters.outputs.require_acceptance_tests == 'true' }}
+        id: cache-node-modules
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 #v4.3.0
+        env:
+          cache-name: cache-node-modules
+        with:
+          path: web/node_modules
+          key: ${{ runner.os }}-build-${{ env.cache-name }}-${{ hashFiles('web/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-build-${{ env.cache-name }}-
+
+      - name: Install NPM dependencies on Host (For Cache Save/Restore)
+        # Runs only if the cache misses, ensuring node_modules is created on the host for future caching
+        if: ${{ !inputs.skip_tests && needs.filters.outputs.require_acceptance_tests == 'true' && steps.cache-node-modules.outputs.cache-hit != 'true' }}
+        run: |
+          echo "Cache miss detected, installing node_modules on host to create the directory for future runs."
+          npm --prefix web ci --ignore-scripts --save=false --omit=dev
+
+      - name: List cache misses
+        if: ${{ !inputs.skip_tests && needs.filters.outputs.require_acceptance_tests == 'true' && steps.cache-node-modules.outputs.cache-hit != 'true' }}
+        continue-on-error: true
+        run: npm --prefix web list
+
+      - name: Create temporary directories
+        if: ${{ !inputs.skip_tests && needs.filters.outputs.require_acceptance_tests == 'true' }}
+        run: ./testsuite/podman_runner/01_setup_tmp_dirs.sh
+
+      # Before the first podman call, so an early wedge is still on record.
+      - name: Container runtime info
+        if: ${{ !inputs.skip_tests && needs.filters.outputs.require_acceptance_tests == 'true' }}
+        # Purely informational, and it calls podman: never let it fail the job.
+        continue-on-error: true
+        timeout-minutes: 5
+        run: ./testsuite/podman_runner/00_container_runtime_info.sh
+
+      - name: Create Podman network
+        if: ${{ !inputs.skip_tests && needs.filters.outputs.require_acceptance_tests == 'true' }}
+        run: ./testsuite/podman_runner/02_setup_network.sh
+
+      - name: Build controller image from current branch
+        if: ${{ !inputs.skip_tests && needs.filters.outputs.require_acceptance_tests == 'true' && needs.filters.outputs.controller_dockerfile == 'true' }}
+        timeout-minutes: 20
+        run: |
+          sudo podman build \
+            -t ghcr.io/${{ env.UYUNI_PROJECT }}/uyuni/ci-test-controller-dev:${{ env.UYUNI_VERSION }} \
+            ./testsuite/dockerfiles/controller-dev/
+
+      - name: Start controller, registry and build host
+        if: ${{ !inputs.skip_tests && needs.filters.outputs.require_acceptance_tests == 'true' }}
+        timeout-minutes: 30
+        run: ./testsuite/podman_runner/03_run_controller_and_registry_and_buildhost.sh
+
+      - name: Create SSH configuration in controller
+        if: ${{ !inputs.skip_tests && needs.filters.outputs.require_acceptance_tests == 'true' }}
+        run: ./testsuite/podman_runner/04_setup_ssh_controller.sh
+
+      - name: Parse recommended tests coming from the input as XML
+        if: ${{ !inputs.skip_tests && inputs.recommended_tests != '' && needs.filters.outputs.require_acceptance_tests == 'true' }}
+        env:
+          RECOMMENDED_TESTS: ${{ inputs.recommended_tests }}
+        run: python .github/scripts/get_tests.py "${RECOMMENDED_TESTS}" > testsuite/run_sets/filter.yml
+
+      - name: Generate recommended tests as YAML
+        if: ${{ !inputs.skip_tests && inputs.recommended_tests != '' && needs.filters.outputs.require_acceptance_tests == 'true' }}
+        run: ./testsuite/podman_runner/19_generate_recommended_tests_yml.sh
+
+      - name: Install gems in controller
+        if: ${{ !inputs.skip_tests && needs.filters.outputs.require_acceptance_tests == 'true' }}
+        timeout-minutes: 20
+        run: ./testsuite/podman_runner/05_install_gems_in_controller.sh
+
+      - name: Collect and tag flaky tests in controller
+        # For security reasons, it only runs on uyuni-project/uyuni repository, as it collects data from a private GH board
+        if: ${{ !inputs.skip_tests && github.repository == 'uyuni-project/uyuni' && needs.filters.outputs.require_acceptance_tests == 'true' }}
+        run: |
+          if [ -n "${GITHUB_TOKEN}" ]; then
+            ./testsuite/podman_runner/06_collect_and_tag_flaky_tests_in_controller.sh
+          else
+            echo "Skipping flaky test collection: GH_TOKEN_GALAXY_CI is not available for this workflow run."
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_TOKEN_GALAXY_CI }}
+
+      - name: Setup server container
+        if: ${{ !inputs.skip_tests && needs.filters.outputs.require_acceptance_tests == 'true' }}
+        timeout-minutes: 45
+        run: ./testsuite/podman_runner/07_server_setup.sh
+
+      - name: Start server container
+        if: ${{ !inputs.skip_tests && needs.filters.outputs.require_acceptance_tests == 'true' }}
+        timeout-minutes: 45
+        run: ./testsuite/podman_runner/08_start_server.sh
+
+      - name: Inject cached Ivy JARs into server container
+        if: ${{ !inputs.skip_tests && needs.filters.outputs.require_acceptance_tests == 'true' && steps.cache-ivy.outputs.cache-hit == 'true' }}
+        run: |
+          sudo podman exec server mkdir -p /root/.ivy2/cache/
+          sudo podman cp java/buildconf/ivy/repository/. server:/root/.ivy2/cache/
+
+      - name: Inject cached node_modules into server container
+        if: ${{ !inputs.skip_tests && needs.filters.outputs.require_acceptance_tests == 'true' && steps.cache-node-modules.outputs.cache-hit == 'true' }}
+        run: sudo podman cp web/node_modules server:/web/node_modules
+
+      - name: Build server code
+        if: ${{ !inputs.skip_tests && needs.filters.outputs.require_acceptance_tests == 'true' }}
+        timeout-minutes: 90
+        run: ./testsuite/podman_runner/09_build_server_code.sh
+      #     - name: copy_ca
+      #     run: podman exec server bash -c "cp /etc/pki/tls/certs/spacewalk.crt /tmp"
+      #     - name: update_ca_in_controller
+      #       run: podman exec controller bash -c "cat /tmp/spacewalk.crt >> /etc/ssl/ca-bundle.pem"
+
+      #- name: Run SSH minion container
+      #  if: ${{ !inputs.skip_tests && needs.filters.outputs.require_acceptance_tests == 'true' }}
+      #  run: ./testsuite/podman_runner/10_run_sshminion.sh
+
+      - name: Test access to server from controller
+        if: ${{ !inputs.skip_tests && needs.filters.outputs.require_acceptance_tests == 'true' }}
+        run: curl --insecure https://localhost:8443/rhn/help/Copyright.do
+
+      #- name: Test access to server from SSH minion
+      #  if: ${{ !inputs.skip_tests && needs.filters.outputs.require_acceptance_tests == 'true' }}
+      #  run: sudo -i podman exec opensusessh curl --insecure https://server:443/rhn/help/Copyright.do
+
+      - name: Configure SSHD in controller, server, build host and SSH minion
+        if: ${{ !inputs.skip_tests && needs.filters.outputs.require_acceptance_tests == 'true' }}
+        run: ./testsuite/podman_runner/11_setup_sshd.sh
+
+      - name: Run and configure Salt Minion container
+        if: ${{ !inputs.skip_tests && needs.filters.outputs.require_acceptance_tests == 'true' }}
+        run: ./testsuite/podman_runner/12_run_salt_sle_minion.sh
+
+      - name: Run and configure RH-Like Minion container
+        if: ${{ !inputs.skip_tests && needs.filters.outputs.require_acceptance_tests == 'true' }}
+        run: ./testsuite/podman_runner/13_run_salt_rhlike_minion.sh
+
+      - name: Run and configure Deb-Like Minion container
+        if: ${{ !inputs.skip_tests && needs.filters.outputs.require_acceptance_tests == 'true' }}
+        run: ./testsuite/podman_runner/14_run_salt_deblike_minion.sh
+
+      - name: Run Core tests
+        if: ${{ !inputs.skip_tests && needs.filters.outputs.require_acceptance_tests == 'true' }}
+        run: ./testsuite/podman_runner/15_run_core_tests.sh
+
+      - name: Accept all keys
+        if: ${{ !inputs.skip_tests && needs.filters.outputs.require_acceptance_tests == 'true' }}
+        run: ./testsuite/podman_runner/16_accept_all_keys.sh
+
+      - name: Run init clients
+        if: ${{ !inputs.skip_tests && needs.filters.outputs.require_acceptance_tests == 'true' }}
+        run: ./testsuite/podman_runner/17_run_init_clients_tests.sh
+
+      - name: Split tests into multiple YAML files
+        if: ${{ !inputs.skip_tests && contains(inputs.server_id, 'additional') && needs.filters.outputs.require_acceptance_tests == 'true' }}
+        run: ./testsuite/podman_runner/23_split_secondary_p_tests.sh
+
+      - name: Run acceptance tests
+        if: ${{ !inputs.skip_tests && needs.filters.outputs.require_acceptance_tests == 'true' }}
+        run: ./testsuite/podman_runner/${{ inputs.tests }}
+
+      - name: Upload Cucumber JSON Reports
+        if: ${{ always() && !inputs.skip_tests && needs.filters.outputs.require_acceptance_tests == 'true' }}
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 #v5.0.0
+        with:
+          name: cucumber_json_reports_${{ inputs.server_id }}
+          path: ./testsuite/results/**/*.json
+          if-no-files-found: warn
+          # Duration after which the artifact will expire in days.
+          # The maximum is 90 days.
+          retention-days: 90
+          # Default compression level is '6', the same as GNU Gzip.
+          # For more details: https://github.com/actions/upload-artifact?tab=readme-ov-file#altering-compressions-level-speed-v-size
+          compression-level: 6
+
+      # Runs before the log collection below, because that one goes through
+      # podman too and hangs as well when the runtime is wedged.
+      - name: Dump container runtime diagnostics
+        if: ${{ failure() && !inputs.skip_tests && needs.filters.outputs.require_acceptance_tests == 'true' }}
+        timeout-minutes: 10
+        run: ./testsuite/podman_runner/26_dump_hang_diagnostics.sh
+
+      # Both collect through podman, so when the runtime is the thing that is
+      # wedged they hang too. They have been seen running for hours on master,
+      # holding a runner for logs that will never arrive.
+      - name: Get server logs
+        if: ${{ failure() && !inputs.skip_tests && needs.filters.outputs.require_acceptance_tests == 'true'}}
+        timeout-minutes: 15
+        run: ./testsuite/podman_runner/24_get_server_logs.sh ${{ inputs.server_id }}
+
+      - name: Get client logs
+        if: ${{ failure() && !inputs.skip_tests && needs.filters.outputs.require_acceptance_tests == 'true' }}
+        timeout-minutes: 15
+        run: ./testsuite/podman_runner/25_get_client_logs.sh ${{ inputs.server_id }}
+
+      - name: Upload server log artifacts
+        if: ${{ failure() && !inputs.skip_tests && needs.filters.outputs.require_acceptance_tests == 'true' }}
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 #v5.0.0
+        with:
+          name: server_rhn_logs_${{ inputs.server_id }}
+          path: /tmp/testing/server-logs/${{ inputs.server_id }}
+
+      - name: Upload client log artifacts
+        if: ${{ failure() && !inputs.skip_tests && needs.filters.outputs.require_acceptance_tests == 'true' }}
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 #v5.0.0
+        with:
+          name: client_logs_${{ inputs.server_id }}
+          path: ./testsuite/logs

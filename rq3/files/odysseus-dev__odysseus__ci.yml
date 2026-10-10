@@ -1,0 +1,241 @@
+name: CI
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+
+# Least privilege: none of the jobs write to the repo.
+permissions:
+  contents: read
+
+# Cancel superseded runs on the same ref to save Actions minutes.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  focused-test-guidance:
+    name: Focused test guidance (report-only)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Report changed test paths
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          report_file="$RUNNER_TEMP/focused-test-guidance.md"
+          publish_report() {
+            cat "$report_file"
+            if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+              cat "$report_file" >> "$GITHUB_STEP_SUMMARY" || true
+            fi
+            return 0
+          }
+
+          report_unavailable() {
+            {
+              printf '%s\n\n' '## Focused test guidance unavailable (report-only)'
+              printf '%s\n\n' "$1"
+              printf '%s\n' 'Existing blocking CI remains the source of truth.'
+            } > "$report_file"
+            publish_report
+            exit 0
+          }
+
+          if [ -z "$BASE_SHA" ] || [ -z "$HEAD_SHA" ]; then
+            report_unavailable "Pull request base/head metadata is missing."
+          fi
+
+          if ! git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null; then
+            report_unavailable "The pull request base commit is unavailable locally."
+          fi
+
+          if ! git cat-file -e "${HEAD_SHA}^{commit}" 2>/dev/null; then
+            report_unavailable "The pull request head commit is unavailable locally."
+          fi
+
+          if ! python3 .github/scripts/focused_test_guidance.py \
+            --base-sha "$BASE_SHA" \
+            --head-sha "$HEAD_SHA" > "$report_file"; then
+            report_unavailable "The focused test guidance helper could not produce a report."
+          fi
+
+          publish_report
+
+  python-syntax:
+    name: Python syntax (compileall)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: "3.11"
+      # Byte-compile sources — catches syntax errors without installing deps.
+      - run: python -m compileall -q app.py core routes src services scripts tests
+
+  node-syntax:
+    name: JS syntax (node --check)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
+        with:
+          node-version: "20"
+      # Syntax-check our own JS (skip vendored libs in static/lib).
+      - name: node --check
+        run: |
+          shopt -s globstar nullglob
+          for f in static/app.js static/js/**/*.js; do
+            node --check "$f"
+          done
+
+  python-tests:
+    name: Python tests (pytest ${{ matrix.shard }})
+    # Keep the namespace/AppArmor setup tied to the audited Ubuntu release.
+    runs-on: ubuntu-24.04
+    # Make Python test validation authoritative for the configured scope.
+    strategy:
+      # Report every failing section in one run instead of cancelling the rest
+      # the moment one shard goes red.
+      fail-fast: false
+      matrix:
+        # Shards partition the suite by test file, so the four together run
+        # every test exactly once. tests/_shards.py owns the partition and
+        # tests/test_shards.py pins this list to its DEFAULT_SHARD_COUNT.
+        shard: ["1/4", "2/4", "3/4", "4/4"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # Detect whether this PR only touches repository prose outside the Pages site.
+      # If so, skip the expensive pytest run while still reporting a passing check.
+      - name: Check for docs-only changes
+        id: docs-check
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE="${{ github.event.pull_request.base.sha }}"
+            HEAD="${{ github.event.pull_request.head.sha }}"
+          else
+            BASE="${{ github.event.before }}"
+            HEAD="${{ github.sha }}"
+          fi
+          # Keep website/ and assets/branding/ out of this bypass: pytest owns
+          # regression guards for their published-file and orphan-asset contracts.
+          changed=$(git diff --name-only "$BASE" "$HEAD" 2>/dev/null || git diff --name-only HEAD~1 HEAD)
+          non_docs=$(echo "$changed" | grep -Ev '^(docs/|[^/]+\.md$|\.github/[^/]+\.md$)' || true)
+          if [ -z "$non_docs" ]; then
+            echo "docs_only=true" >> "$GITHUB_OUTPUT"
+            echo "Docs-only change detected — skipping pytest."
+          else
+            echo "docs_only=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        if: steps.docs-check.outputs.docs_only != 'true'
+        with:
+          python-version: "3.11"
+      # uv resolves the same versions as pip but installs ~5x faster, and its
+      # cache keeps each shard from re-downloading the whole requirement set.
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
+        if: steps.docs-check.outputs.docs_only != 'true'
+        with:
+          enable-cache: true
+          cache-dependency-glob: requirements.txt
+          prune-cache: false
+      - run: uv pip install --system -r requirements.txt
+        if: steps.docs-check.outputs.docs_only != 'true'
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
+        if: steps.docs-check.outputs.docs_only != 'true'
+        with:
+          node-version: "20"
+          cache: npm
+      - run: npm ci
+        if: steps.docs-check.outputs.docs_only != 'true'
+      # Browser binaries are keyed on the lockfile's Playwright version. On a
+      # hit, --with-deps still installs the system libraries but skips the
+      # browser downloads.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        if: steps.docs-check.outputs.docs_only != 'true'
+        with:
+          path: ~/.cache/ms-playwright
+          key: ms-playwright-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+      - run: npx playwright install --with-deps chromium
+        if: steps.docs-check.outputs.docs_only != 'true'
+      - run: mkdir -p data  # sqlite DB lives at ./data/app.db
+        if: steps.docs-check.outputs.docs_only != 'true'
+      # One apt pass for FFmpeg (media integration tests) and bubblewrap
+      # (containment, verified in the next step).
+      - name: Install FFmpeg and bubblewrap
+        if: steps.docs-check.outputs.docs_only != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg bubblewrap
+          command -v ffmpeg
+          ffmpeg -version | head -n 1
+
+      - name: Establish functional bubblewrap containment
+        if: steps.docs-check.outputs.docs_only != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          bwrap --version
+          sysctl kernel.unprivileged_userns_clone user.max_user_namespaces \
+            kernel.apparmor_restrict_unprivileged_userns
+          if [ "$(sysctl -n kernel.unprivileged_userns_clone)" != 1 ] || \
+             [ "$(sysctl -n user.max_user_namespaces)" -eq 0 ]; then
+            echo '::error::The pytest runner must allow unprivileged user namespaces; kernel namespace support is disabled.'
+            exit 1
+          fi
+
+          # Match containment._bwrap_available(): PID and mount namespaces,
+          # including fresh proc/dev mounts, as the unprivileged runner user.
+          bwrap_probe() {
+            timeout 3s bwrap --die-with-parent --unshare-pid --ro-bind / / \
+              --proc /proc --dev /dev /bin/true
+          }
+
+          if ! bwrap_probe && [ "$(sysctl -n kernel.apparmor_restrict_unprivileged_userns)" = 1 ]; then
+            # Ubuntu 24.04 restricts userns for unconfined applications. Allow
+            # only the distro bwrap entry point on this ephemeral pytest VM;
+            # retain the global restriction and all unrelated AppArmor policy.
+            sudo tee /etc/apparmor.d/odysseus-ci-bwrap > /dev/null <<'PROFILE'
+          abi <abi/4.0>,
+          include <tunables/global>
+          profile odysseus-ci-bwrap /usr/bin/bwrap flags=(unconfined) {
+            userns,
+          }
+          PROFILE
+            sudo apparmor_parser -r /etc/apparmor.d/odysseus-ci-bwrap
+          fi
+
+          if ! bwrap_probe; then
+            echo '::error::Functional bubblewrap PID/mount namespaces are required for pytest; containment setup failed.'
+            exit 1
+          fi
+          # Also gate on the runtime probe so a future requirements change
+          # cannot silently leave this job without real containment coverage.
+          python - <<'PY'
+          from src import containment
+          if not containment._bwrap_available():
+              raise SystemExit("::error::Runtime bubblewrap functionality probe failed; pytest must not start.")
+          print("Runtime bubblewrap PID/mount namespace probe passed.")
+          PY
+
+      - name: pytest (shard ${{ matrix.shard }})
+        if: steps.docs-check.outputs.docs_only != 'true'
+        env:
+          PYTEST_SHARD: ${{ matrix.shard }}
+        run: python -m pytest -q -rs --durations=25 --shard "$PYTEST_SHARD"

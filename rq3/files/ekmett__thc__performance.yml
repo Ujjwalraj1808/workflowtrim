@@ -1,0 +1,168 @@
+# SPDX-FileCopyrightText: 2026 Edward Kmett
+# SPDX-License-Identifier: UPL-1.0 AND BSD-3-Clause
+
+name: Manual Map performance
+
+on:
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: Standard matrix, selected legacy toggles, or all experimental flags on
+        type: choice
+        options: [standard, combined, all-on]
+        default: standard
+      constructor_class:
+        description: Combined suite only — constructor class matching
+        type: choice
+        options: ['false', 'true']
+        default: 'false'
+      unchecked:
+        description: Combined suite only — unchecked owned storage
+        type: choice
+        options: ['false', 'true']
+        default: 'false'
+      compact_headers:
+        description: Combined suite only — compact object headers
+        type: choice
+        options: ['false', 'true']
+        default: 'false'
+
+permissions:
+  contents: read
+
+# Preserve queued manual requests and run only one performance job at a time.
+concurrency:
+  group: thc-manual-performance
+  queue: max
+  cancel-in-progress: false
+
+jobs:
+  performance:
+    runs-on: macos-latest
+    timeout-minutes: 90
+    env:
+      THC_DIAGNOSTIC_UNSUPPORTED: 'true'
+      THC_SOURCE_NOTES: 'true'
+      THC_BACKEND: bytecode
+      THC_SUITE: ${{ inputs.suite }}
+      THC_CONSTRUCTOR_CLASS: ${{ inputs.constructor_class }}
+      THC_UNCHECKED: ${{ inputs.unchecked }}
+      THC_COMPACT_HEADERS: ${{ inputs.compact_headers }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          submodules: true
+          persist-credentials: false
+      - name: Check out original runtime separately
+        if: inputs.suite == 'standard'
+        uses: actions/checkout@v7.0.1
+        with:
+          submodules: true
+          ref: 4c116a8493eafad4077a1c5eb9c046bff56fe3c4
+          path: work/ci-baseline-checkout
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - name: Validate suite selection
+        shell: bash
+        run: |
+          python3 tools/ci-performance.py validate work/ci-performance \
+            --suite "$THC_SUITE" --constructor-class "$THC_CONSTRUCTOR_CLASS" \
+            --unchecked "$THC_UNCHECKED" --compact-headers "$THC_COMPACT_HEADERS"
+      - uses: haskell-actions/setup@0f8e8c99d88aeb3fbfd523f1ef2c6f762d10d64d # v2
+        with:
+          ghc-version: '9.14.1'
+          cabal-update: false
+      - uses: graalvm/setup-graalvm@0426e2e191540e8514dff98dc52a5f5146a2a276 # v1
+        with:
+          version: '25.3.4.1'
+          java-version: '25'
+          distribution: 'graalvm'
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          check-for-updates: false
+      - name: Verify pinned toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p work/ci-performance/logs
+          echo "GRADLE_USER_HOME=$RUNNER_TEMP/thc-performance-gradle" >> "$GITHUB_ENV"
+          test "$(ghc --numeric-version)" = 9.14.1
+          test "$(ghc-pkg --version)" = 'GHC package manager version 9.14.1'
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          release = dict(line.split('=', 1) for line in (Path(os.environ['JAVA_HOME']) / 'release').read_text().splitlines() if '=' in line)
+          assert release['GRAALVM_VERSION'].strip('"') == '25.3.4.1', release.get('GRAALVM_VERSION')
+          assert release['JAVA_VERSION'].strip('"').split('.')[0] == '25', release.get('JAVA_VERSION')
+          PY
+          java --version 2>&1 | tee work/ci-performance/logs/toolchain.log
+          echo 'GitHub-hosted macOS run: compare configurations within this run; absolute timings are not comparable to the local M3 measurements.' >> "$GITHUB_STEP_SUMMARY"
+      - name: Build, test, export current Core and native oracle
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin/try-map.sh 2>&1 | tee work/ci-performance/logs/current-build.log
+          python3 tools/test-compare-map-runtimes.py
+          python3 tools/test-ci-performance.py
+      - name: Build original runtime in isolated checkout
+        if: inputs.suite == 'standard'
+        shell: bash
+        run: |
+          set -euo pipefail
+          work/ci-baseline-checkout/gradlew -p work/ci-baseline-checkout --no-daemon installDist \
+            2>&1 | tee work/ci-performance/logs/original-build.log
+      - name: Freeze selected runtimes, options and shared current corpus
+        shell: bash
+        run: |
+          python3 tools/ci-performance.py freeze work/ci-performance --baseline-checkout work/ci-baseline-checkout \
+            --suite "$THC_SUITE" --constructor-class "$THC_CONSTRUCTOR_CLASS" \
+            --unchecked "$THC_UNCHECKED" --compact-headers "$THC_COMPACT_HEADERS"
+      - name: Full Map checks before timings
+        if: inputs.suite == 'standard'
+        run: python3 work/ci-performance/frozen/helpers/ci-performance.py check work/ci-performance
+      - name: Original bytecode versus class-owned compact baseline
+        if: inputs.suite == 'standard'
+        run: python3 work/ci-performance/frozen/helpers/ci-performance.py compare work/ci-performance --comparison original-vs-current
+      - name: Layout-bearing checked storage with class matching off versus on
+        if: inputs.suite == 'standard'
+        run: python3 work/ci-performance/frozen/helpers/ci-performance.py compare work/ci-performance --comparison constructor-class
+      - name: Layout-bearing class matching with checked versus unchecked storage
+        if: inputs.suite == 'standard'
+        run: python3 work/ci-performance/frozen/helpers/ci-performance.py compare work/ci-performance --comparison owned-storage
+      - name: Optional compact headers — full tests, Map check, sizes, then timing
+        if: inputs.suite == 'standard'
+        run: python3 work/ci-performance/frozen/helpers/ci-performance.py compact work/ci-performance
+      - name: Selected suite — full tests, both Map checks, then one comparison
+        if: inputs.suite == 'combined' || inputs.suite == 'all-on'
+        run: python3 work/ci-performance/frozen/helpers/ci-performance.py combined work/ci-performance
+      - name: Verify immutable inputs and summarize completed comparisons
+        run: python3 work/ci-performance/frozen/helpers/ci-performance.py finish work/ci-performance
+      - uses: actions/upload-artifact@v7.0.1
+        if: always()
+        with:
+          name: map-performance-${{ github.run_id }}-${{ github.run_attempt }}
+          retention-days: 30
+          if-no-files-found: warn
+          path: |
+            work/ci-performance/run.json
+            work/ci-performance/immutable-manifest.json
+            work/ci-performance/checks.json
+            work/ci-performance/summary.json
+            work/ci-performance/compact-status.json
+            work/ci-performance/combined-status.json
+            work/ci-performance/*-test-totals.json
+            work/ci-performance/frozen/suite.json
+            work/ci-performance/test-results/
+            work/ci-performance/compact-object-sizes/*.json
+            work/ci-performance/compact-object-sizes/*.out
+            work/ci-performance/compact-object-sizes/*.err
+            work/ci-performance/logs/
+            work/ci-performance/comparisons/
+            build/map/audit.json
+            build/map/oracle.tsv
+            build/map/oracle-validation.json
+            build/map/provenance.json
+            build/map/reproduction-provenance.json
+            build/reports/tests/
+            build/test-results/

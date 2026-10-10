@@ -1,0 +1,77 @@
+name: Repo Label Sync
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/repo-label-sync.yml'
+
+permissions:
+  issues: write
+  contents: read
+
+jobs:
+  sync-labels:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create or update repository labels
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const desiredLabels = [
+              { name: 'bug', color: 'd73a4a', description: 'Bug report or broken behavior' },
+              { name: 'enhancement', color: 'a2eeef', description: 'Feature request or product improvement' },
+              { name: 'question', color: 'd876e3', description: 'Usage question or support request' },
+              { name: 'docs', color: '0075ca', description: 'Documentation improvement or problem' },
+
+              { name: 'site-compatibility', color: '1d76db', description: 'Website compatibility or selector issue' },
+              { name: 'data-management', color: '0e8a16', description: 'Records, lists, actors, or library management topic' },
+              { name: 'new-works', color: '0e8a16', description: 'New works subscription or monitoring topic' },
+              { name: 'sync', color: '5319e7', description: 'WebDAV or data synchronization topic' },
+              { name: '115', color: 'fbca04', description: '115 drive integration topic' },
+              { name: 'ai', color: '0e8a16', description: 'AI translation or model-related topic' },
+              { name: 'privacy', color: '5319e7', description: 'Privacy, password, or encryption topic' },
+              { name: 'dashboard', color: '0052cc', description: 'Dashboard, insights, or report topic' },
+              { name: 'settings', color: '0052cc', description: 'Settings, configuration, or preferences topic' },
+              { name: 'search', color: '0052cc', description: 'Search engine or magnet search topic' },
+              { name: 'emby', color: '0052cc', description: 'Emby integration topic' },
+              { name: 'browser-extension', color: '6f42c1', description: 'Browser extension runtime or browser compatibility topic' },
+              { name: 'tampermonkey', color: '6f42c1', description: 'Tampermonkey or userscript topic' },
+
+              { name: 'needs-info', color: 'f9d0c4', description: 'More details are needed before triage can continue' },
+              { name: 'confirmed', color: 'c2e0c6', description: 'The issue has been reproduced or verified' },
+              { name: 'duplicate', color: 'cfd3d7', description: 'The issue matches an existing report' },
+              { name: 'wontfix', color: 'ffffff', description: 'The issue will not be addressed' },
+              { name: 'good first issue', color: '7057ff', description: 'A good starter task for new contributors' }
+            ];
+
+            const { data: existingLabels } = await github.rest.issues.listLabelsForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              per_page: 100,
+            });
+
+            const labelMap = new Map(existingLabels.map(label => [label.name, label]));
+
+            for (const label of desiredLabels) {
+              const current = labelMap.get(label.name);
+              if (current) {
+                await github.rest.issues.updateLabel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  name: label.name,
+                  color: label.color,
+                  description: label.description,
+                });
+                core.info(`Updated label: ${label.name}`);
+              } else {
+                await github.rest.issues.createLabel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  name: label.name,
+                  color: label.color,
+                  description: label.description,
+                });
+                core.info(`Created label: ${label.name}`);
+              }
+            }

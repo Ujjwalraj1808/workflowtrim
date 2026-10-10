@@ -1,0 +1,83 @@
+name: golangci-lint
+on:
+  push:
+    branches:
+      - "main"
+  pull_request:
+    branches:
+      - "main"
+  merge_group:
+    types: [checks_requested]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  golangci:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: |
+            go.sum
+            _catalog/go.sum
+
+      - name: Run golangci-lint
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          version: latest
+          args: --verbose
+
+      - name: Run catalog tooling golangci-lint
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          version: latest
+          working-directory: _catalog
+          args: --verbose --config ../.golangci.yml
+
+  no-binaries:
+    name: no committed binaries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Check for committed binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Compiled binaries and build artifacts are reproducible from source
+          # and must never be checked in (see .github/copilot-instructions.md).
+          # Fail if any tracked file is a compiled executable, shared object,
+          # object/archive, or a well-known build-artifact extension.
+          violations=""
+          while IFS= read -r f; do
+            [ -f "$f" ] || continue
+            case "$f" in
+              *.exe|*.dll|*.so|*.dylib|*.test|*.a|*.o|*.out|coverage.html)
+                violations="${violations}${f}"$'\n'; continue;;
+            esac
+            # Only inspect binary-content files; text (e.g. scripts) is skipped.
+            mime=$(file --mime -b -- "$f" 2>/dev/null || echo "")
+            case "$mime" in
+              *charset=binary*) ;;
+              *) continue;;
+            esac
+            desc=$(file -b -- "$f" 2>/dev/null || echo "")
+            case "$desc" in
+              *executable*|*Mach-O*|*ELF*|*PE32*|*"ar archive"*|*"shared object"*|*"relocatable"*)
+                violations="${violations}${f}"$'\n';;
+            esac
+          done < <(git ls-files)
+          if [ -n "$violations" ]; then
+            echo "::error::Committed compiled binaries/build artifacts detected. Remove them; binaries are reproducible from source and must not be checked in."
+            printf '%s' "$violations"
+            exit 1
+          fi
+          echo "No committed binaries found."
+

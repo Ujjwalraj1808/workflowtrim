@@ -1,0 +1,40 @@
+name: Rebuild Release
+on:
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: Existing tag to finish or rebuild
+        required: true
+        type: string
+      resume_run_id:
+        description: 'Recover this run; empty automatically reuses matching successful stages'
+        default: ''
+        type: string
+      force_rebuild:
+        description: 'Rebuild every stage, including native binaries (e.g. after rotating embedded configuration)'
+        default: false
+        type: boolean
+      allow_unsigned_desktop:
+        description: 'No platform certificates (updater signatures remain required)'
+        default: true
+        type: boolean
+      allow_missing_migration_fixtures:
+        description: 'Explicit recovery override: production migration tests only'
+        default: false
+        type: boolean
+concurrency:
+  group: release-desktop-${{ github.repository }}
+  cancel-in-progress: false
+permissions:
+  contents: write
+  actions: write
+jobs:
+  release:
+    uses: ./.github/workflows/reusable-release-pipeline.yml
+    with:
+      tag_name: ${{ inputs.tag_name }}
+      resume_run_id: ${{ inputs.resume_run_id }}
+      force_rebuild: ${{ inputs.force_rebuild }}
+      allow_unsigned_desktop: ${{ inputs.allow_unsigned_desktop }}
+      allow_missing_migration_fixtures: ${{ inputs.allow_missing_migration_fixtures }}
+    secrets: inherit

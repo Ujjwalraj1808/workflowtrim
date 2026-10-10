@@ -1,0 +1,1775 @@
+# CI for mecatl — runs on every push to main and every pull_request.
+#
+# Deliberately uses `pull_request` (NOT `pull_request_target`): these jobs check
+# out and execute untrusted PR code, so they must run WITHOUT access to repo
+# secrets. `pull_request` runs in the fork's context with a read-only token and
+# no secrets, which is exactly what we want here. `pull_request_target` would
+# run in the BASE repo's context WITH secrets — combining that with a checkout
+# of PR code is the classic "pwn request" RCE pattern. See:
+#   https://docs.github.com/en/actions/security-guides/security-hardening-for-github-actions
+#   https://securitylab.github.com/resources/github-actions-preventing-pwn-requests/
+#
+# All third-party actions are SHA-pinned (with a # vX.Y.Z comment) so a
+# re-pointed tag from a compromised maintainer cannot change what runs here.
+# Pins match the Stacklok house set used in a downstream consumer.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
+  workflow_dispatch:
+
+# Least-privilege default for the whole workflow. The CI jobs only read source.
+permissions:
+  contents: read
+
+# Cancel superseded runs on the same ref so a force-push doesn't pile up minutes.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Fail loudly rather than silently downloading a different toolchain over the
+  # network if the local Go is older than go.mod requires. setup-go provisions
+  # the right version; this keeps the build deterministic against that pin.
+  GOTOOLCHAIN: local
+  GOFLAGS: -mod=readonly
+  # Prefer the checksum-backed public proxy, but use the module's VCS origin if
+  # its transport fails. `|` (unlike `,`) permits fallback on any proxy error.
+  GOPROXY: https://proxy.golang.org|direct
+
+jobs:
+  # Do not use workflow-level path filters: required checks must exist on every
+  # push/PR. This job instead classifies the exact compare range and fail-closes
+  # to full validation whenever Git cannot prove a narrow docs-only change.
+  changes:
+    name: Changes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      docs_only: ${{ steps.classify.outputs.docs_only }}
+      # macOS runners cost ~10x a Linux minute. These flags gate the three
+      # macos-14 jobs: they default to true (RUN) and flip to false only when the
+      # trusted base-ref classifier proves the change cannot affect that category.
+      macos_go: ${{ steps.classify.outputs.macos_go }}
+      macos_sdk: ${{ steps.classify.outputs.macos_sdk }}
+      # Linux job-family relevance. Same fail-closed, trusted base-ref discipline
+      # as the macOS flags — default true (RUN) and flip to false only when the
+      # change provably cannot affect that family. go_relevant gates the Go
+      # build/test matrix; sdk_relevant gates the pure-TypeScript SDK unit job;
+      # site_relevant gates the Docusaurus site build; studio_relevant gates the
+      # Mecatl Studio (apps/) job; microvm_relevant gates the opt-in runtime's
+      # nested-module checks. module_publication_relevant gates the public
+      # proxy proof inside Build to module metadata and its CI controls.
+      go_relevant: ${{ steps.classify.outputs.go_relevant }}
+      sdk_relevant: ${{ steps.classify.outputs.sdk_relevant }}
+      site_relevant: ${{ steps.classify.outputs.site_relevant }}
+      studio_relevant: ${{ steps.classify.outputs.studio_relevant }}
+      microvm_relevant: ${{ steps.classify.outputs.microvm_relevant }}
+      module_publication_relevant: ${{ steps.classify.outputs.module_publication_relevant }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # Fetch bounded ancestry for merge-base..head PR comparisons. If the
+          # merge base is beyond that depth, classification fails closed.
+          fetch-depth: 100
+
+      - name: Classify changed paths
+        id: classify
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+          PUSH_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          docs_only=false
+          # Fail closed: run the macOS jobs unless the classifier proves otherwise.
+          macos_go=true
+          macos_sdk=true
+          # Fail closed: run each Linux job family unless the classifier proves the
+          # change cannot affect it.
+          go_relevant=true
+          sdk_relevant=true
+          site_relevant=true
+          studio_relevant=true
+          microvm_relevant=true
+          module_publication_relevant=true
+          case "$EVENT_NAME" in
+            pull_request)
+              base="$PR_BASE_SHA"
+              head="$PR_HEAD_SHA"
+              ;;
+            push)
+              base="$PUSH_BEFORE_SHA"
+              head="$PUSH_SHA"
+              ;;
+            *)
+              base=""
+              head=""
+              ;;
+          esac
+          if [[ "$base" =~ ^[0-9a-f]{40}$ ]] && [[ "$head" =~ ^[0-9a-f]{40}$ ]] \
+            && [[ "$base" != 0000000000000000000000000000000000000000 ]] \
+            && [[ "$head" != 0000000000000000000000000000000000000000 ]] \
+            && git fetch --no-tags --depth=100 origin "$base" "$head" \
+            && git cat-file -e "$base^{commit}" \
+            && git cat-file -e "$head^{commit}"; then
+            compare_base="$base"
+            if [[ "$EVENT_NAME" == pull_request ]]; then
+              compare_base="$(git merge-base "$base" "$head")" || compare_base=""
+            fi
+            if [[ -n "$compare_base" ]]; then
+              trusted_classifier="$RUNNER_TEMP/docs-only-changes.sh"
+              if git show "$base:.github/scripts/docs-only-changes.sh" > "$trusted_classifier"; then
+                result="$(git diff --name-only --no-renames -z "$compare_base" "$head" | bash "$trusted_classifier")" || result=false
+                if [[ "$result" == true ]]; then
+                  docs_only=true
+                fi
+              fi
+              # Same trusted-from-base-ref discipline for the macOS relevance flags:
+              # a PR cannot edit the classifier to skip a job it should run, because
+              # the base version is used until it merges. A missing script (the PR
+              # that introduces it) leaves both flags at their fail-closed RUN value.
+              macos_classifier="$RUNNER_TEMP/macos-relevant-changes.sh"
+              if git show "$base:.github/scripts/macos-relevant-changes.sh" > "$macos_classifier"; then
+                macos_go="$(git diff --name-only --no-renames -z "$compare_base" "$head" | bash "$macos_classifier" go)" || macos_go=true
+                macos_sdk="$(git diff --name-only --no-renames -z "$compare_base" "$head" | bash "$macos_classifier" sdk)" || macos_sdk=true
+              fi
+              # Same trusted-from-base-ref discipline for the Linux job-family flags:
+              # a PR cannot edit the classifier to skip a job it should run, because
+              # the base version is used until it merges. A missing script (the PR
+              # that introduces it) leaves all flags at their fail-closed RUN
+              # value. (A base-ref classifier that predates the `studio` category
+              # treats it as an unknown category and prints true — RUN — so the PR
+              # that introduces the category also fails closed.)
+              relevant_classifier="$RUNNER_TEMP/relevant-changes.sh"
+              if git show "$base:.github/scripts/relevant-changes.sh" > "$relevant_classifier"; then
+                go_relevant="$(git diff --name-only --no-renames -z "$compare_base" "$head" | bash "$relevant_classifier" go)" || go_relevant=true
+                sdk_relevant="$(git diff --name-only --no-renames -z "$compare_base" "$head" | bash "$relevant_classifier" sdk)" || sdk_relevant=true
+                site_relevant="$(git diff --name-only --no-renames -z "$compare_base" "$head" | bash "$relevant_classifier" site)" || site_relevant=true
+                studio_relevant="$(git diff --name-only --no-renames -z "$compare_base" "$head" | bash "$relevant_classifier" studio)" || studio_relevant=true
+                microvm_relevant="$(git diff --name-only --no-renames -z "$compare_base" "$head" | bash "$relevant_classifier" microvm)" || microvm_relevant=true
+                module_publication_relevant="$(git diff --name-only --no-renames -z "$compare_base" "$head" | bash "$relevant_classifier" module_publication)" || module_publication_relevant=true
+              fi
+            fi
+          fi
+          # One redirect group for all outputs (shellcheck SC2129).
+          {
+            echo "docs_only=$docs_only"
+            echo "macos_go=$macos_go"
+            echo "macos_sdk=$macos_sdk"
+            echo "go_relevant=$go_relevant"
+            echo "sdk_relevant=$sdk_relevant"
+            echo "site_relevant=$site_relevant"
+            echo "studio_relevant=$studio_relevant"
+            echo "microvm_relevant=$microvm_relevant"
+            echo "module_publication_relevant=$module_publication_relevant"
+          } >> "$GITHUB_OUTPUT"
+
+      # Validate the path classifiers HERE, in the always-run changes job — never
+      # in a flag-gated Go job. These tests decide which jobs run; misclassification
+      # could otherwise skip the very tests that would catch it. Pure bash, no Go
+      # toolchain, so they are cheap to run on every push/PR.
+      - name: Validate path classifiers
+        run: |
+          bash .github/scripts/docs-only-changes_test.sh
+          bash .github/scripts/docs-only-workflow_test.sh
+          bash .github/scripts/macos-relevant-changes_test.sh
+          bash .github/scripts/macos-relevant-workflow_test.sh
+          bash .github/scripts/relevant-changes_test.sh
+          bash .github/scripts/relevant-changes-workflow_test.sh
+
+  sdk:
+    name: TypeScript SDK (Node ${{ matrix.node-version }})
+    needs: changes
+    # Pure-TypeScript unit suite: runs against the COMMITTED sdk/typescript/src/gen,
+    # so only an SDK-frontend or proto-contract change can affect it. (The SDK jobs
+    # below that build/spawn mecated gate on go OR sdk, not on sdk alone.)
+    if: needs.changes.outputs.sdk_relevant == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: ['22.x', '24.x']
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Install the packageManager pin explicitly. Do not rely on corepack being
+      # present or enabled on the runner.
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          version: 11.25.0
+          run_install: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: pnpm
+          cache-dependency-path: sdk/typescript/pnpm-lock.yaml
+
+      - uses: go-task/setup-task@a00fbb05ce67b35648be3c78cbc9fd85354c757e # v2.2.0
+
+      - name: Install SDK dependencies (frozen)
+        run: task sdk:install
+
+      - name: Audit SDK dependency closure
+        run: task sdk:audit
+
+      - name: Lint and format-check SDK
+        run: task sdk:lint
+
+      - name: Type-check SDK
+        run: task sdk:typecheck
+
+      - name: Test SDK unit suite
+        run: task sdk:test
+
+      - name: Build SDK
+        run: task sdk:build
+
+      - name: Type-check published SDK examples
+        run: task sdk:examples:typecheck
+
+      - name: Pack SDK
+        run: task sdk:pack
+
+      - name: Verify SDK API reports
+        run: task sdk:api:check
+
+  sdk-integration:
+    name: TypeScript SDK codegen and offline e2e
+    needs: changes
+    # Regenerates contracts from proto and runs the SDK e2e against a same-checkout
+    # mecated, so both Go and SDK/contract changes are relevant.
+    if: needs.changes.outputs.docs_only != 'true' && (needs.changes.outputs.go_relevant == 'true' || needs.changes.outputs.sdk_relevant == 'true')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          version: 11.25.0
+          run_install: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24.x'
+          cache: pnpm
+          cache-dependency-path: sdk/typescript/pnpm-lock.yaml
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: '1.4.1'
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: |
+            go.sum
+            engine/go.sum
+            internal/adaptersupport/go.sum
+            contracts/gen/go/mecatl/driver/go.sum
+            adapters/go.sum
+
+      - uses: bufbuild/buf-setup-action@a47c93e0b1648d5651a065437926377d060baa99 # v1.50.0
+        with:
+          version: '1.72.0'
+          github_token: ${{ github.token }}
+
+      - uses: go-task/setup-task@a00fbb05ce67b35648be3c78cbc9fd85354c757e # v2.2.0
+
+      - name: Install SDK dependencies (frozen)
+        run: task sdk:install
+
+      - name: Verify generated contracts are fresh
+        run: |
+          task generate
+          git diff --exit-code -- contracts/gen sdk/typescript/src/gen
+
+      - name: Run offline SDK e2e against same-checkout mecated
+        run: task sdk:e2e
+
+  sdk-deno:
+    name: TypeScript SDK (Deno ${{ matrix.deno-version }})
+    needs: changes
+    # Spawns mecated via Deno.Command, so both Go and SDK/contract changes matter.
+    if: needs.changes.outputs.docs_only != 'true' && (needs.changes.outputs.go_relevant == 'true' || needs.changes.outputs.sdk_relevant == 'true')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        deno-version: ['2.9.3', '2.x']
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          version: 11.25.0
+          run_install: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24.x'
+          cache: pnpm
+          cache-dependency-path: sdk/typescript/pnpm-lock.yaml
+
+      - uses: denoland/setup-deno@22d081ff2d3a40755e97629de92e3bcbfa7cf2ed # v2.0.5
+        with:
+          deno-version: ${{ matrix.deno-version }}
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: |
+            go.sum
+            engine/go.sum
+            internal/adaptersupport/go.sum
+            contracts/gen/go/mecatl/driver/go.sum
+            adapters/go.sum
+
+      - uses: go-task/setup-task@a00fbb05ce67b35648be3c78cbc9fd85354c757e # v2.2.0
+
+      - name: Install SDK dependencies (frozen)
+        run: task sdk:install
+
+      - name: Type-check and run the Deno.Command local integration
+        run: task sdk:deno
+
+  sdk-browser:
+    name: TypeScript SDK browser (${{ matrix.label }})
+    needs: changes
+    # Builds mecated for the browser integration, so both Go and SDK/contract
+    # changes are relevant.
+    if: needs.changes.outputs.docs_only != 'true' && (needs.changes.outputs.go_relevant == 'true' || needs.changes.outputs.sdk_relevant == 'true')
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - browser: chromium
+            label: Chromium full flow
+            project: chromium-full
+            runner: ubuntu-24.04
+          - browser: firefox
+            label: Firefox smoke
+            project: firefox-smoke
+            runner: ubuntu-24.04
+          - browser: webkit
+            label: WebKit smoke
+            project: webkit-smoke
+            runner: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          version: 11.25.0
+          run_install: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24.x'
+          cache: pnpm
+          cache-dependency-path: sdk/typescript/pnpm-lock.yaml
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: |
+            go.sum
+            engine/go.sum
+            internal/adaptersupport/go.sum
+            contracts/gen/go/mecatl/driver/go.sum
+            adapters/go.sum
+
+      - uses: go-task/setup-task@a00fbb05ce67b35648be3c78cbc9fd85354c757e # v2.2.0
+
+      - name: Install SDK dependencies (frozen)
+        run: task sdk:install
+
+      - name: Resolve pinned Playwright version
+        id: playwright-version
+        working-directory: sdk/typescript
+        run: node -e "process.stdout.write('version=' + require('@playwright/test/package.json').version + '\\n')" >> "$GITHUB_OUTPUT"
+
+      - name: Cache pinned Playwright browser
+        id: playwright-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ matrix.runner }}-${{ runner.arch }}-${{ matrix.browser }}-${{ steps.playwright-version.outputs.version }}
+
+      - name: Ensure pinned Playwright browser and host dependencies
+        working-directory: sdk/typescript
+        run: pnpm exec playwright install --with-deps ${{ matrix.browser }}
+
+      - name: Run browser project
+        run: task sdk:browser:project PROJECT="${{ matrix.project }}"
+
+  sdk-macos-spawn:
+    name: TypeScript SDK macOS spawn (macos-14, Node 22)
+    needs: changes
+    # macOS is ~10x a Linux minute. The SDK spawns mecated, so both Go and
+    # sdk/typescript changes are relevant (macos_sdk); skip on docs/site-only
+    # changes and on drafts.
+    if: >-
+      needs.changes.outputs.docs_only != 'true'
+      && needs.changes.outputs.macos_sdk == 'true'
+      && (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
+    runs-on: macos-14
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          version: 11.25.0
+          run_install: false
+
+      # setup-node and setup-go include runner OS and architecture in their cache
+      # keys, so this macos-14 job cannot restore either Linux cache family.
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22.x'
+          cache: pnpm
+          cache-dependency-path: sdk/typescript/pnpm-lock.yaml
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: |
+            go.sum
+            engine/go.sum
+            internal/adaptersupport/go.sum
+            contracts/gen/go/mecatl/driver/go.sum
+            adapters/go.sum
+
+      - uses: go-task/setup-task@a00fbb05ce67b35648be3c78cbc9fd85354c757e # v2.2.0
+
+      - name: Install SDK dependencies (frozen)
+        run: task sdk:install
+
+      - name: Run the focused macOS Node spawn smoke
+        run: task sdk:macos-spawn
+
+  slack-bot-example:
+    name: Slack bot example
+    needs: changes
+    # Builds bin/mecated and spawns it (--mock) for the offline bridge test, so
+    # both Go and SDK/contract changes are relevant.
+    if: needs.changes.outputs.docs_only != 'true' && (needs.changes.outputs.go_relevant == 'true' || needs.changes.outputs.sdk_relevant == 'true')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read # checkout
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Install the packageManager pin explicitly. Do not rely on corepack being
+      # present or enabled on the runner.
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          version: 11.25.0
+          run_install: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+          cache: pnpm
+          cache-dependency-path: |
+            sdk/typescript/pnpm-lock.yaml
+            sdk/typescript/examples/slack-bot/pnpm-lock.yaml
+
+      # Builds bin/mecated for the offline bridge test — a plain Go build, same
+      # toolchain the `sdk` job above already provisions. The example consumes
+      # the in-tree SDK via file:../..; slack-bot:install builds that first.
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: |
+            go.sum
+            engine/go.sum
+            internal/adaptersupport/go.sum
+            contracts/gen/go/mecatl/driver/go.sum
+            adapters/go.sum
+
+      - uses: go-task/setup-task@a00fbb05ce67b35648be3c78cbc9fd85354c757e # v2.2.0
+
+      - name: Install Slack bot example dependencies (frozen)
+        run: task slack-bot:install
+
+      - name: Lint and format-check Slack bot example
+        run: task slack-bot:lint
+
+      - name: Type-check Slack bot example
+        run: task slack-bot:typecheck
+
+      - name: Test Slack bot example (offline, spawns mecated --mock)
+        run: task slack-bot:test
+
+      - name: Build hardened Slack bot image (no push)
+        run: docker build --load --tag mecatl-slack-bot:ci --file sdk/typescript/examples/slack-bot/docker/bot.Dockerfile sdk/typescript
+
+      - name: Validate Slack bot runtime image
+        run: |
+          # Use the image's real ENTRYPOINT and CMD. A missing app token makes
+          # dist/index.js fail before Socket Mode can contact Slack, while its
+          # module imports still prove the compiled entrypoint and runtime deps load.
+          mkdir -p .scratch
+          if docker run --rm \
+            --env SLACK_BOT_TOKEN=ci-test-token \
+            --env MECATL_GRPC_ADDRESS=127.0.0.1:1 \
+            mecatl-slack-bot:ci > .scratch/runtime-image.log 2>&1; then
+            cat .scratch/runtime-image.log
+            echo "container unexpectedly started without SLACK_APP_TOKEN" >&2
+            exit 1
+          fi
+          grep --fixed-strings "Missing required environment variable: SLACK_APP_TOKEN" .scratch/runtime-image.log
+
+          # Exercise the bridge compiled into the final image against a real,
+          # offline mecated --mock. Socket Mode itself requires Slack's network
+          # service and credentials, so this intentionally stops at the bot's
+          # lowest independently testable integration boundary.
+          mkdir -p .scratch/slack-image-workspace .scratch/slack-image-home
+          env -i PATH="$PATH" HOME="$PWD/.scratch/slack-image-home" \
+            XDG_CONFIG_HOME="$PWD/.scratch/slack-image-home/config" \
+            XDG_STATE_HOME="$PWD/.scratch/slack-image-home/state" \
+            bin/mecated serve --mock \
+            --workspace="$PWD/.scratch/slack-image-workspace" \
+            --user-model-dir="$PWD/.scratch/slack-image-home/user-model" \
+            --permissions-conventional=false \
+            --ready-file="$PWD/.scratch/slack-image-ready.json" \
+            --grpc-addr=127.0.0.1:0 \
+            --http-addr= \
+            --metrics-addr= \
+            --no-soul \
+            --no-user-model \
+            --no-scheduler \
+            --flight-recorder=false \
+            > .scratch/slack-image-mecated.log 2>&1 &
+          daemon_pid=$!
+          trap 'kill "$daemon_pid" 2>/dev/null || true; wait "$daemon_pid" 2>/dev/null || true' EXIT
+          for _ in {1..500}; do
+            test -s .scratch/slack-image-ready.json && break
+            if ! kill -0 "$daemon_pid" 2>/dev/null; then
+              cat .scratch/slack-image-mecated.log
+              exit 1
+            fi
+            sleep 0.02
+          done
+          test -s .scratch/slack-image-ready.json
+          grpc_address=$(jq --exit-status --raw-output '.grpc_address' .scratch/slack-image-ready.json)
+          docker run --rm --network host \
+            --env BRIDGE_BASE_URL="http://$grpc_address" \
+            --entrypoint /usr/bin/node \
+            mecatl-slack-bot:ci --input-type=module --eval '
+              import { MecatlBridge } from "./dist/bridge.js";
+              const bridge = new MecatlBridge({ baseUrl: process.env.BRIDGE_BASE_URL });
+              try {
+                const result = await bridge.handlePrompt("ci:final-image", "hello");
+                const expected = "Mock provider: no real model is configured. Set OPENAI_API_KEY for live use.";
+                if (result.text !== expected || result.stopReason !== "end_turn" || !result.sessionId) {
+                  throw new Error(`unexpected bridge result: ${JSON.stringify(result)}`);
+                }
+              } finally {
+                await bridge.close();
+              }
+            '
+
+          docker run --rm --entrypoint /usr/bin/node mecatl-slack-bot:ci --input-type=module --eval '
+            import { existsSync } from "node:fs";
+            // Slack packages and @types/node are also production dependencies; do not forbid them.
+            const forbidden = [
+              "/bin/sh", "/usr/bin/corepack", "/usr/bin/pnpm",
+              "node_modules/tsx", "node_modules/typescript", "node_modules/vitest", "node_modules/@biomejs", "node_modules/fast-check",
+              "../../node_modules/@biomejs/biome", "../../node_modules/@microsoft/api-extractor", "../../node_modules/@playwright/test",
+              "../../node_modules/typescript", "../../node_modules/typescript-5.7", "../../node_modules/vitest",
+            ];
+            if (process.getuid() === 0 || forbidden.some(existsSync)) process.exit(1);
+          '
+
+  studio:
+    name: Mecatl Studio (apps/)
+    needs: changes
+    # Studio is a self-contained pnpm workspace on the PUBLISHED
+    # @stacklok-oss/mecatl-sdk; its offline gates are pure Node. The
+    # integration suite at the end builds bin/mecated and drives the BFF against
+    # it, so a daemon change can break Studio too: the job runs when either its
+    # own studio_relevant flag (apps/ + the CI-control files) or go_relevant is
+    # set, never on sdk relevance alone. The image build is push: false — the
+    # same apps/Dockerfile the `publish-studio` release job pushes, here only
+    # proven to build.
+    if: needs.changes.outputs.docs_only != 'true' && (needs.changes.outputs.studio_relevant == 'true' || needs.changes.outputs.go_relevant == 'true')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read # checkout
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Install the packageManager pin explicitly (read from apps/package.json —
+      # pnpm 12.x, deliberately NOT the SDK's pnpm 11 pin: the workspace is
+      # self-contained). Do not rely on corepack being present or enabled on the
+      # runner.
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          package_json_file: apps/package.json
+          run_install: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: apps/.node-version
+          cache: pnpm
+          cache-dependency-path: apps/pnpm-lock.yaml
+
+      - uses: go-task/setup-task@a00fbb05ce67b35648be3c78cbc9fd85354c757e # v2.2.0
+
+      - name: Install Studio dependencies (frozen)
+        run: task studio:install
+
+      - name: Audit Studio production dependencies
+        run: task studio:audit
+
+      - name: Lint and format-check Studio (Biome)
+        run: task studio:lint
+
+      - name: Type-check Studio (contracts, server, web)
+        run: task studio:typecheck
+
+      - name: Test Studio (Vitest, offline)
+        run: task studio:test
+
+      - name: Install Chromium for Studio browser journeys
+        run: task studio:browser:install
+
+      - name: Verify committed contracts artifacts are fresh
+        run: task studio:generated-check
+
+      # The integration suite boots the BFF over the REAL SDK against a spawned
+      # `mecated --mock`, so it needs the Go toolchain to build bin/mecated —
+      # the same shape as the Slack bot example job. The task requires the
+      # binary it just built, so a build that produced none fails here.
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: |
+            go.sum
+            engine/go.sum
+            internal/adaptersupport/go.sum
+            contracts/gen/go/mecatl/driver/go.sum
+            adapters/go.sum
+
+      - name: Integration-test Studio against a spawned mecated --mock
+        run: task studio:test:integration
+
+      # The approval journey uses the binary built by the integration task
+      # through the published SDK and a loopback-only browser fixture.
+      - name: Test Studio browser journeys (Playwright, offline)
+        run: task studio:browser
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      # The same apps/Dockerfile the release job publishes, loaded locally so the
+      # steps below can run and scan it. amd64 only here — the release job builds
+      # both platforms.
+      - name: Build Studio image (no push)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: apps
+          file: apps/Dockerfile
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: mecatl-studio:ci
+
+      - name: Validate Studio runtime image
+        run: |
+          # The runtime base tracks Chainguard `latest` by digest, so its Node
+          # major can move under a Renovate digest bump. apps/package.json
+          # `engines` is the source of truth; refuse any other major.
+          engines='require("./apps/package.json").engines.node.match(/^>=(\d+) <(\d+)$/)'
+          min=$(node --print "${engines}[1]")
+          max=$(node --print "${engines}[2]")
+          got=$(docker run --rm --entrypoint /usr/bin/node mecatl-studio:ci --print 'process.versions.node.split(".")[0]')
+          if [ "$got" -lt "$min" ] || [ "$got" -ge "$max" ]; then
+            echo "Studio image runs Node $got, outside apps/package.json engines (>=$min <$max)" >&2
+            exit 1
+          fi
+
+          # Non-root, code not writable by the server process, no build tooling.
+          docker run --rm --entrypoint /usr/bin/node mecatl-studio:ci --input-type=module --eval '
+            import { accessSync, constants, existsSync } from "node:fs";
+            let writable = true;
+            try { accessSync(".", constants.W_OK); } catch { writable = false; }
+            const forbidden = ["/usr/bin/corepack", "/usr/bin/pnpm", "node_modules/vitest", "node_modules/typescript", "node_modules/esbuild"];
+            if (process.getuid() === 0 || writable || forbidden.some(existsSync)) process.exit(1);
+          '
+
+          # Boot the image with its real entrypoint against the offline daemon the
+          # integration step built. It needs both listeners: gRPC for the SDK and
+          # HTTP for the RFC 9728 protected-resource document (a 404 there means
+          # no browser login, so the unauthenticated opt-in is required).
+          mkdir -p .scratch/studio-image-workspace .scratch/studio-image-home
+          env -i PATH="$PATH" HOME="$PWD/.scratch/studio-image-home" \
+            XDG_CONFIG_HOME="$PWD/.scratch/studio-image-home/config" \
+            XDG_STATE_HOME="$PWD/.scratch/studio-image-home/state" \
+            bin/mecated serve --mock \
+            --workspace="$PWD/.scratch/studio-image-workspace" \
+            --user-model-dir="$PWD/.scratch/studio-image-home/user-model" \
+            --permissions-conventional=false \
+            --ready-file="$PWD/.scratch/studio-image-ready.json" \
+            --grpc-addr=127.0.0.1:0 \
+            --http-addr=127.0.0.1:0 \
+            --metrics-addr= \
+            --no-soul \
+            --no-user-model \
+            --no-scheduler \
+            --flight-recorder=false \
+            > .scratch/studio-image-mecated.log 2>&1 &
+          daemon_pid=$!
+          trap 'docker rm --force studio-image >/dev/null 2>&1 || true; kill "$daemon_pid" 2>/dev/null || true; wait "$daemon_pid" 2>/dev/null || true' EXIT
+          for _ in $(seq 500); do
+            test -s .scratch/studio-image-ready.json && break
+            if ! kill -0 "$daemon_pid" 2>/dev/null; then
+              cat .scratch/studio-image-mecated.log
+              exit 1
+            fi
+            sleep 0.02
+          done
+          grpc_address=$(jq --exit-status --raw-output '.grpc_address' .scratch/studio-image-ready.json)
+          http_address=$(jq --exit-status --raw-output '.http_address' .scratch/studio-image-ready.json)
+          docker run --detach --name studio-image --network host \
+            --env STUDIO_PORT=3100 \
+            --env STUDIO_PUBLIC_URL=http://127.0.0.1:3100 \
+            --env MECATL_BASE_URL="http://$grpc_address" \
+            --env MECATL_RESOURCE_URL="http://$http_address" \
+            --env STUDIO_ALLOW_UNAUTHENTICATED=1 \
+            mecatl-studio:ci
+          status=""
+          for _ in $(seq 100); do
+            status=$(curl --silent --fail http://127.0.0.1:3100/api/v1/status) && break
+            sleep 0.1
+          done
+          if ! printf '%s' "$status" | jq --exit-status '.connection == "reachable"' >/dev/null; then
+            echo "unexpected Studio status: $status" >&2
+            docker logs studio-image >&2
+            exit 1
+          fi
+          curl --silent --fail --output /dev/null http://127.0.0.1:3100/
+
+      # Same gate as the release job (publish-studio), here before any merge.
+      - name: Scan Studio image for fixable critical vulnerabilities
+        uses: anchore/scan-action@27805bf3b4e84b4a5c980df22ed233c00390a439 # v7.4.2
+        with:
+          image: mecatl-studio:ci
+          fail-build: true
+          only-fixed: true
+          severity-cutoff: critical
+          output-format: table
+
+  build:
+    name: Build
+    needs: changes
+    if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.go_relevant == 'true'
+    runs-on: ubuntu-24.04
+    # Cold module downloads took over seven minutes in PR #580, leaving too
+    # little of the former ten-minute limit for the multi-module build.
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: go-task/setup-task@a00fbb05ce67b35648be3c78cbc9fd85354c757e # v2.2.0
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+          # engine/ is its own module (consumed via the committed go.work), so its
+          # go.sum participates in the build cache key alongside the root's.
+          cache-dependency-path: |
+            go.sum
+            engine/go.sum
+            internal/adaptersupport/go.sum
+            contracts/gen/go/mecatl/driver/go.sum
+            adapters/go.sum
+            authn/oidc/go.sum
+            environment/microvm/go.sum
+            integration/microvm/go.sum
+            provider/ssefilter/go.sum
+            provider/anthropic/go.sum
+            provider/openai/go.sum
+            provider/openaichat/go.sum
+
+      - name: go build
+        run: go build ./...
+
+      # engine/ is a separate module under the workspace — `./...` from the root
+      # does NOT cross the module boundary, so build it explicitly too.
+      - name: go build (engine module)
+        run: cd engine && go build ./...
+
+      - name: go build (public persistence modules)
+        run: |
+          (cd internal/adaptersupport && go build ./...)
+          (cd contracts/gen/go/mecatl/driver && go build ./...)
+          (cd adapters && go build ./...)
+
+      - name: go build (OIDC authn module)
+        run: cd authn/oidc && go build ./...
+
+      - name: go build (microVM module)
+        if: needs.changes.outputs.microvm_relevant == 'true'
+        run: cd environment/microvm && go build ./...
+
+      # provider/ holds the opt-in LLM-provider Go submodules, each
+      # its own module under the workspace — build them explicitly too.
+      - name: go build (provider modules)
+        run: |
+          (cd provider/ssefilter && go build ./...)
+          (cd provider/anthropic && go build ./...)
+          (cd provider/openai && go build ./...)
+          (cd provider/openaichat && go build ./...)
+
+      - name: Verify Go module and workspace metadata freshness
+        shell: bash
+        run: |
+          set -euo pipefail
+          task tidy
+          git diff --exit-code -- go.mod go.sum go.work go.work.sum ':(glob)**/go.mod' ':(glob)**/go.sum'
+          untracked=$(git ls-files --others --exclude-standard -- go.mod go.sum go.work go.work.sum ':(glob)**/go.mod' ':(glob)**/go.sum')
+          if [[ -n "$untracked" ]]; then printf 'Untracked Go metadata:\n%s\n' "$untracked" >&2; exit 1; fi
+
+      - name: Verify nested module publication
+        if: needs.changes.outputs.module_publication_relevant == 'true'
+        run: |
+          git fetch --unshallow --tags origin main
+          task test:module-publication
+
+      # Prove the macOS-job cost gate stays sound: the terminal leaf directories
+      # that macos-relevant-changes.sh skips must remain OUTSIDE the darwin+freebsd
+      # build/test closure of those jobs. Fails if a new import drags one in. Runs
+      # here because it needs resolved modules (unlike the offline shell tests).
+      - name: Verify macOS-job closure allowlist
+        run: bash .github/scripts/macos-closure-guard.sh
+
+  # Release archives are cross-compiled for darwin on an ubuntu runner, which
+  # cannot execute them, so nothing else in CI ever RUNS a darwin binary. This
+  # job is the native Apple Silicon smoke test: it proves the two executables the
+  # Homebrew formula ships actually start on the platform most users install on,
+  # and that the buildinfo.BuildID linker stamp round-trips.
+  #
+  # The stamp assertion matters because .goreleaser.yaml is the only place that
+  # names the -X symbol path; a wrong path still compiles and still produces a
+  # working binary, but reports the `dev+<vcs-rev>` fallback instead of the tag.
+  # Catching that here means it cannot reach a published formula, where the only
+  # other check (`brew test`) runs post-publication.
+  smoke-darwin-arm64:
+    name: CLI smoke test (macOS arm64)
+    needs: changes
+    # macOS is ~10x a Linux minute. This is a native Go build/run smoke, so gate
+    # on Go relevance (macos_go — skips docs/site/SDK-frontend-only changes) and
+    # on drafts.
+    if: >-
+      needs.changes.outputs.docs_only != 'true'
+      && needs.changes.outputs.macos_go == 'true'
+      && (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
+    runs-on: macos-14
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: |
+            go.sum
+            engine/go.sum
+            internal/adaptersupport/go.sum
+            contracts/gen/go/mecatl/driver/go.sum
+            adapters/go.sum
+      - name: Build and run the formula's executables
+        env:
+          # A recognisable stand-in for a release tag. The release build stamps
+          # the same symbol with `v{{ .Version }}` (see .goreleaser.yaml).
+          STAMP: v0.0.0-cismoke
+        run: |
+          set -euo pipefail
+          # CGO_ENABLED=0 matches .goreleaser.yaml and .ko.yaml, so this exercises
+          # the same static build the formula ships.
+          for bin in mecated mecatui; do
+            CGO_ENABLED=0 go build -trimpath \
+              -ldflags "-s -w -X github.com/stacklok/mecatl/internal/buildinfo.BuildID=${STAMP}" \
+              -o "$RUNNER_TEMP/$bin" "./cmd/$bin"
+            out="$("$RUNNER_TEMP/$bin" --version)"
+            echo "$out"
+            # Exact form, matching buildinfo.PrintVersion: "<name> <BuildID>".
+            if [ "$out" != "$bin $STAMP" ]; then
+              echo "::error::$bin --version printed '$out', expected '$bin $STAMP' (linker stamp lost)"
+              exit 1
+            fi
+          done
+      - name: Exercise provider configuration writes
+        run: |
+          go test ./internal/adapter/privatefile ./internal/adapter/authfile ./internal/adapter/permconfig ./internal/adapter/credentialstore -count=1
+          go test ./cmd/mecatui -run '^(TestProviderCommandsOIDCLoginPreparesAbsentPrivateRoot|TestInvariant_ProviderSetupFollowup_SecretSafety|TestProviderReview.*)$' -count=1
+
+  managed-temp-macos:
+    name: Managed temporary storage (macOS)
+    needs: changes
+    # macOS is ~10x a Linux minute. Native Go tests, so gate on Go relevance
+    # (macos_go — skips docs/site/SDK-frontend-only changes) and on drafts.
+    # Restoring the macOS Go cache can take over 10 minutes before the native
+    # tests and FreeBSD cross-build begin.
+    if: >-
+      needs.changes.outputs.docs_only != 'true'
+      && needs.changes.outputs.macos_go == 'true'
+      && (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: |
+            go.sum
+            engine/go.sum
+            internal/adaptersupport/go.sum
+            contracts/gen/go/mecatl/driver/go.sum
+            adapters/go.sum
+      - name: Run managed temporary storage tests
+        run: |
+          go test ./internal/adapter/managedtemp -count=1
+          go test ./internal/adapter/osfs -run '^TestManagedTemp_' -count=1
+          go test ./internal/app -run '^TestManagedModeUnixAdmission$' -count=1
+          # The FreeBSD check covers the OS adapter. The app is released for
+          # Linux/macOS, and ToolHive's 1Password SDK cannot compile on FreeBSD.
+          GOOS=freebsd GOARCH=amd64 go test -c -o "$RUNNER_TEMP/osfs-freebsd.test" ./internal/adapter/osfs
+
+  test:
+    name: ${{ needs.changes.outputs.docs_only == 'true' && 'Test (docs-only)' || github.event_name == 'pull_request' && github.event.pull_request.draft && 'Test (non-race draft)' || 'Test (race)' }}
+    needs: changes
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Require successful change classification
+        env:
+          CHANGES_RESULT: ${{ needs.changes.result }}
+        run: test "$CHANGES_RESULT" = success
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.go_relevant == 'true'
+        with:
+          persist-credentials: false
+      - uses: go-task/setup-task@a00fbb05ce67b35648be3c78cbc9fd85354c757e # v2.2.0
+        if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.go_relevant == 'true'
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.go_relevant == 'true'
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: '**/go.sum'
+      - name: Test modules
+        if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.go_relevant == 'true'
+        env:
+          IS_DRAFT: ${{ github.event_name == 'pull_request' && github.event.pull_request.draft }}
+        run: |
+          if [ "$IS_DRAFT" = true ]; then task --concurrency 3 test; else task --concurrency 3 test:race; fi
+
+  analysis:
+    name: Analysis
+    needs: changes
+    if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.go_relevant == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: |
+            go.sum
+            engine/go.sum
+            internal/adaptersupport/go.sum
+            contracts/gen/go/mecatl/driver/go.sum
+            adapters/go.sum
+            authn/oidc/go.sum
+            environment/microvm/go.sum
+            integration/microvm/go.sum
+            provider/ssefilter/go.sum
+            provider/anthropic/go.sum
+            provider/openai/go.sum
+            provider/openaichat/go.sum
+
+      - id: golangci-version
+        run: echo "version=$(sh scripts/install-golangci-lint.sh --version)" >> "$GITHUB_OUTPUT"
+
+      # golangci-lint-action manages its own cache and installs the same pinned
+      # release local `task lint` installs into .tools/bin.
+      - uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          # Must be a golangci-lint built with Go >= the go.mod toolchain
+          # (1.26.x): older binaries refuse to load with "the Go language
+          # version used to build golangci-lint is lower than the targeted Go
+          # version". The version is declared by scripts/install-golangci-lint.sh.
+          version: ${{ steps.golangci-version.outputs.version }}
+          # 10m, not 5m: the repo outgrew the old budget on the 2-core runners —
+          # at 5m the run died with exit code 4 ("Timeout exceeded") and the
+          # interrupted staticcheck pass reported spurious SA5011s (partial
+          # no-return facts), failing every push since. The module lint steps run
+          # sequentially, so the 30-minute job budget leaves room after a worst-case
+          # root lint for the remaining module lint and workflow checks; this
+          # lets golangci-lint, not the job, report a timeout.
+          args: --timeout=10m
+
+      # engine/ is its own module — lint it with the SHARED root config (no
+      # engine-local .golangci.yml) so the depguard layering allowlists stay the
+      # single source of truth across the module boundary. Uses the binary the
+      # action above installed onto PATH.
+      - name: golangci-lint (engine module)
+        run: cd engine && golangci-lint run --config ../.golangci.yml --allow-parallel-runners --timeout=10m ./...
+
+      - name: golangci-lint (public persistence modules)
+        run: |
+          (cd internal/adaptersupport && golangci-lint run --config ../../.golangci.yml --allow-parallel-runners --timeout=10m ./...)
+          (cd contracts/gen/go/mecatl/driver && golangci-lint run --config ../../../../../.golangci.yml --allow-parallel-runners --timeout=10m ./...)
+          (cd adapters && golangci-lint run --config ../.golangci.yml --allow-parallel-runners --timeout=10m ./...)
+
+      - name: golangci-lint (OIDC authn module)
+        run: cd authn/oidc && golangci-lint run --config ../../.golangci.yml --allow-parallel-runners --timeout=10m ./...
+
+      - name: golangci-lint (microVM module)
+        if: needs.changes.outputs.microvm_relevant == 'true'
+        run: cd environment/microvm && golangci-lint run --config ../../.golangci.yml --allow-parallel-runners --timeout=10m ./...
+
+      - name: golangci-lint (microVM integration module)
+        run: cd integration/microvm && golangci-lint run --config ../../.golangci.yml --allow-parallel-runners --timeout=10m ./...
+
+      # provider/ submodules — each its own module, sharing the ROOT
+      # golangci config so the depguard allowlists stay the single source of truth.
+      - name: golangci-lint (provider modules)
+        run: |
+          (cd provider/ssefilter && golangci-lint run --config ../../.golangci.yml --allow-parallel-runners --timeout=10m ./...)
+          (cd provider/anthropic && golangci-lint run --config ../../.golangci.yml --allow-parallel-runners --timeout=10m ./...)
+          (cd provider/openai && golangci-lint run --config ../../.golangci.yml --allow-parallel-runners --timeout=10m ./...)
+          (cd provider/openaichat && golangci-lint run --config ../../.golangci.yml --allow-parallel-runners --timeout=10m ./...)
+
+      # Lint the GitHub Actions workflows. actionlint is pinned via `go run` so no extra
+      # binary install is needed; it embeds shellcheck for `run:` blocks when available.
+      #
+      # -ignore: actionlint's latest release (v1.7.12, 2026-03) predates the `$/`
+      # self-repository `uses:` syntax GitHub shipped in 2026-07, so it rejects a valid ref
+      # as "invalid format". Upstream request: rhysd/actionlint#711. Scoped to that one
+      # message, so every other `uses:` error still fails the build.
+      - name: Lint GitHub Actions
+        run: |
+          go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7 \
+            -ignore 'specifying action "\$/.*" in invalid format'
+
+      # Reject a LIVE empty ${{ }} expression in a PARSED field of any workflow/action manifest
+      # (issue #70). GitHub evaluates `${{ ... }}` inside parsed action.yml/workflow scalars, and
+      # an EMPTY `${{ }}` is a hard parse error ("An expression was expected") that makes the
+      # action fail to load and aborts every run that references it — exactly what bricked the
+      # v0.0.2 reusable workflow. The guard excludes YAML `#` comment lines (never evaluated).
+      - name: Check action templates for empty expressions
+        run: bash .github/actions/check-action-templates.sh
+
+      # github-action-benchmark owns the generated HTML on gh-pages. Assert the final
+      # publish step enforces the noindex directive and that the transformation remains
+      # idempotent and fails closed on template drift.
+      - name: Test performance dashboard noindex guard
+        run: bash .github/scripts/ensure-perf-dashboard-noindex_test.sh
+
+      # Validate .goreleaser.yaml on every PR. A schema error there is otherwise
+      # only discoverable AFTER a tag has been pushed, which is irreversible: the
+      # tag has already published images and a public Homebrew formula. GoReleaser
+      # loads the config strictly, so an unknown or misspelled field is a hard
+      # error here rather than a warning.
+      #
+      # install-only downloads the pinned PREBUILT binary (seconds). Do not switch
+      # this to `go run github.com/goreleaser/goreleaser/v2@<ver>`: goreleaser does
+      # not build from source on this repo's Go toolchain (its module graph
+      # resolves grpc v1.80.0 against an x/net without http2.TrailerPrefix).
+      #
+      # The pin must stay in lockstep with release.yml and Taskfile.yml's
+      # GORELEASER_VERSION.
+      - uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
+        with:
+          version: "v2.16.0"
+          install-only: true
+      - name: Validate the GoReleaser config
+        # `goreleaser check` exits 2 for "valid, but uses DEPRECATED properties".
+        # .goreleaser.yaml deliberately uses the deprecated `brews` block, because
+        # stacklok/homebrew-tap is a Formula/ tap and casks must live in Casks/.
+        # So 2 is expected and accepted; only exit 1 (invalid config) fails.
+        run: |
+          status=0
+          goreleaser check || status=$?
+          case "$status" in
+            0) ;;
+            2) echo "goreleaser check: config valid; uses deprecated properties (brews) - accepted" ;;
+            *) exit "$status" ;;
+          esac
+
+      # The mecatequi composite-action glue scripts (extract-prompt.sh, publish.sh) have
+      # offline bash tests with fake gh/git stubs that assert their SECURITY logic (no
+      # untrusted-body interpolation; protected-paths gate incl. the -z path-quoting bypass;
+      # template-confinement; literal+single-pass PR-body render; the comment-without-PR
+      # branches). The action-wrappers test pins the composite action.yml env-mapping contract
+      # (actionlint cannot lint a composite action). They are shell, not Go, so they ride here
+      # rather than in `go test`.
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      # The publisher-format release fixture signs once, then verifies the exact
+      # bundles strict admission consumes and rejects statement tampering.
+      - name: Test GitHub Actions scripts
+        run: |
+          bash .github/actions/mecatequi-extract-prompt/extract-prompt_test.sh
+          bash .github/actions/mecatequi-publish/publish_test.sh
+          bash .github/actions/action-wrappers_test.sh
+          bash .github/scripts/microvm-ci-release_test.sh
+
+  # Preserve one stable required context while golangci-lint runs.
+  # The aggregate validates the classifier and applicable analysis job, so failures
+  # and cancellations cannot be hidden by dependency skipping.
+  lint:
+    name: Lint
+    needs: [changes, analysis]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require applicable lint coverage
+        shell: bash
+        env:
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          DOCS_ONLY: ${{ needs.changes.outputs.docs_only }}
+          GO_RELEVANT: ${{ needs.changes.outputs.go_relevant }}
+          ANALYSIS_RESULT: ${{ needs.analysis.result }}
+        run: |
+          set -euo pipefail
+          if [[ "$CHANGES_RESULT" != success ]]; then
+            echo "changes job did not succeed: $CHANGES_RESULT" >&2
+            exit 1
+          fi
+          if [[ "$DOCS_ONLY" == true ]]; then
+            if [[ "$ANALYSIS_RESULT" != skipped ]]; then
+              echo "docs-only analysis job was not skipped: analysis=$ANALYSIS_RESULT" >&2
+              exit 1
+            fi
+            exit 0
+          fi
+          # A non-Go change (e.g. website- or SDK-frontend-only) legitimately skips
+          # the analysis job; require the skip exactly as the docs-only branch does.
+          if [[ "$GO_RELEVANT" != true ]]; then
+            if [[ "$ANALYSIS_RESULT" != skipped ]]; then
+              echo "non-go-relevant analysis job was not skipped: analysis=$ANALYSIS_RESULT" >&2
+              exit 1
+            fi
+            exit 0
+          fi
+          if [[ "$ANALYSIS_RESULT" != success ]]; then
+            echo "lint coverage failed: analysis=$ANALYSIS_RESULT" >&2
+            exit 1
+          fi
+
+  fuzz-smoke:
+    name: Fuzz smoke
+    needs: changes
+    if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.go_relevant == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: |
+            go.sum
+            engine/go.sum
+            internal/adaptersupport/go.sum
+            contracts/gen/go/mecatl/driver/go.sum
+            adapters/go.sum
+            authn/oidc/go.sum
+            environment/microvm/go.sum
+            integration/microvm/go.sum
+            provider/ssefilter/go.sum
+            provider/anthropic/go.sum
+            provider/openai/go.sum
+            provider/openaichat/go.sum
+
+      - uses: go-task/setup-task@a00fbb05ce67b35648be3c78cbc9fd85354c757e # v2.2.0
+        with:
+          version: 3.x
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      # A short coverage-guided pass over the security-critical parsers. This is
+      # a smoke check (find shallow crashers fast), NOT the nightly deep fuzz —
+      # the seed corpora already run under `go test` in the test job. The
+      # Taskfile `fuzz` task runs the FuzzXxx targets sequentially.
+      #
+      # FUZZTIME is an ITERATION COUNT (`Nx`), not a wall-clock duration. A
+      # duration budget (e.g. `40s`) races go test's own fuzz coordinator: near
+      # the deadline the coordinator can kill an in-flight worker RPC and
+      # report the whole target as failed with "context deadline exceeded" —
+      # this reproduced reliably at 20s/target and intermittently even after
+      # doubling to 40s/target, on a loaded runner. An iteration count has no
+      # deadline to race: the coordinator stops after N executions regardless
+      # of how fast the runner is that day. 300000 execs/target is comfortably
+      # under a minute per target even on a slow runner (CI logs showed
+      # 10k-30k execs/sec), well inside the job timeout.
+      # The governance fuzzers live in the engine module — `task fuzz` runs
+      # them from engine/ (workspace-on, so it resolves against the same
+      # checkout).
+      - name: task fuzz (short)
+        run: task fuzz FUZZTIME=300000x
+
+  engine-standalone:
+    name: Engine module (standalone, GOWORK=off)
+    needs: changes
+    if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.go_relevant == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    # Proves the importable-core module builds + tests with NO workspace and NO
+    # host-repo deps: the engine's small dependency closure is self-contained, so
+    # an external `go get github.com/stacklok/mecatl/engine` resolves only that
+    # closure, not mecatl's heavy require cone.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: engine/go.mod
+          cache: true
+          cache-dependency-path: engine/go.sum
+
+      # GOWORK=off ignores the committed go.work, so the engine module resolves
+      # against its OWN go.mod/go.sum alone — exactly an external consumer's view.
+      - name: go build (engine standalone)
+        env:
+          GOWORK: off
+        run: cd engine && go build ./...
+
+      - name: go test (engine standalone)
+        env:
+          GOWORK: off
+        run: cd engine && go test ./...
+
+  microvm-standalone:
+    name: MicroVM module (standalone, GOWORK=off)
+    needs: changes
+    if: needs.changes.outputs.microvm_relevant == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: environment/microvm/go.mod
+          cache: true
+          cache-dependency-path: |
+            engine/go.sum
+            environment/microvm/go.sum
+            integration/microvm/go.sum
+
+      - name: go build (microVM standalone)
+        env:
+          GOWORK: off
+        run: cd environment/microvm && go build ./...
+
+      - name: go test (microVM standalone)
+        env:
+          GOWORK: off
+        run: cd environment/microvm && go test ./...
+
+      - name: go test (microVM integration standalone)
+        env:
+          GOWORK: off
+        run: cd integration/microvm && go test ./...
+
+  provider-standalone:
+    name: Provider modules (standalone, GOWORK=off)
+    needs: changes
+    if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.go_relevant == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    # Proves the opt-in provider/ submodules build + test with NO workspace
+    # (GOWORK=off), the engine-standalone hygiene gate. Because mecatl is a
+    # private/INTERNAL repo, a module that `require`s another mecatl module
+    # (anthropic → engine; openai/openaichat → engine + provider/ssefilter) can
+    # only be fetched from the origin WITH auth — proxy.golang.org cannot serve a
+    # private module. So the cache is WARMED with read-only git auth (the
+    # workflow's GITHUB_TOKEN via an insteadOf rewrite), then the gate itself runs
+    # fully OFFLINE (GOPROXY=off): the proof that the module's closure is
+    # self-contained never touches the network, and the token lives only on the
+    # warm step. Covers ssefilter + anthropic. openai + openaichat additionally
+    # `require provider/ssefilter v0.0.0`, which is unresolvable until the first
+    # provider/ssefilter/vX.Y.Z tag — deferred (issue #379); covered by the
+    # workspace (GOWORK=on) build/test jobs. Once mecatl is open-sourced the warm
+    # needs no token (proxy serves the modules).
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: |
+            provider/ssefilter/go.sum
+            provider/anthropic/go.sum
+
+      # Warm the module cache. The build/test resolve the FULL (incl. test-only)
+      # dependency graph into the cache. engine v0.8.0 (and provider/ssefilter for
+      # the openai family) are fetched from the private origin over HTTPS using
+      # the GITHUB_TOKEN via an insteadOf rewrite; GOFLAGS=-mod=mod overrides the
+      # global -mod=readonly so the graph can resolve. GOPRIVATE keeps the
+      # checksum DB + proxy from rejecting the private module path.
+      - name: warm module cache (ssefilter + anthropic)
+        env:
+          GOWORK: off
+          GOFLAGS: -mod=mod
+          GOPRIVATE: github.com/stacklok/*
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config --global url."https://x-access-token:${GITHUB_TOKEN}@github.com/".insteadOf "https://github.com/"
+          (cd provider/ssefilter && go build ./... && go test ./... >/dev/null)
+          (cd provider/anthropic && go build ./... && go test ./... >/dev/null)
+
+      - name: drop git credential rewrite
+        if: always()
+        run: git config --global --unset-all url."https://x-access-token@github.com/".insteadOf || true
+
+      # The proof itself: fully offline (GOPROXY=off) + no workspace (GOWORK=off).
+      # If any dependency were missing from the cache this fails — no credential
+      # is present on this step.
+      - name: go build (provider standalone, offline)
+        env:
+          GOWORK: off
+          GOPROXY: off
+        run: |
+          (cd provider/ssefilter && go build ./...)
+          (cd provider/anthropic && go build ./...)
+
+      - name: go test (provider standalone, offline)
+        env:
+          GOWORK: off
+          GOPROXY: off
+        run: |
+          (cd provider/ssefilter && go test ./...)
+          (cd provider/anthropic && go test ./...)
+
+  api-compat:
+    name: API compat (engine public surface)
+    needs: changes
+    if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.go_relevant == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    # The engine module's public API surface (the eight core packages) is a
+    # committed compatibility contract — see engine/COMPATIBILITY.md.
+    # This gate re-derives the surface and fails on any drift from the committed
+    # engine/api/*.txt baselines, forcing a deliberate, reviewed `task api:update`
+    # + an engine/CHANGELOG.md note. The dumper test lives in the ROOT module
+    # (internal/apicheck) so the engine go.mod stays free of go/tools. This test
+    # ALSO runs in the main `test` job via ./...; the dedicated job is for a clear
+    # named signal (acceptable redundancy, like fuzz-smoke).
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: |
+            go.sum
+            engine/go.sum
+            internal/adaptersupport/go.sum
+            contracts/gen/go/mecatl/driver/go.sum
+            adapters/go.sum
+            authn/oidc/go.sum
+            environment/microvm/go.sum
+            integration/microvm/go.sum
+            provider/ssefilter/go.sum
+            provider/anthropic/go.sum
+            provider/openai/go.sum
+            provider/openaichat/go.sum
+
+      - name: go test ./internal/apicheck
+        run: go test ./internal/apicheck
+
+  vuln:
+    name: Vulnerabilities (govulncheck)
+    needs: changes
+    if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.go_relevant == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    # Supply-chain hygiene that travels with the engine library: govulncheck
+    # reports only REACHABLE vulnerabilities (call-graph analysis, not a bare
+    # require-list scan), so a reachable CVE in either module's dependency cone
+    # reds the PR. Both modules are scanned — the engine module's tiny closure
+    # separately from the root's heavy cone, so a downstream consumer pin of the engine
+    # library inherits this gate against its own deps.
+    #
+    # govulncheck has NO native allowlist and its text mode exits non-zero on ANY
+    # finding, so we run `-format json` (which exits 0 even WITH findings) and
+    # filter through .github/scripts/govulncheck-gate.go, which fails on any NEW
+    # reachable id while accepting a documented allowlist. `set -o pipefail` +
+    # the gate's own fail-closed checks make a govulncheck build/network error a
+    # hard FAIL (never a vacuous pass).
+    #
+    # ROOT ALLOWLIST: empty as of 2026-06-26 — the toolhive bump to v0.31.0
+    # pulled a fixed docker/docker, clearing GO-2026-4887/4883/5617/5668/5746.
+    # Re-add a dated entry here ONLY if a new reachable vuln has no upstream fix.
+    # ENGINE: STRICT — no allowlist; it is clean and must stay clean.
+    # See the allowlist rationale below + issue #118.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: |
+            go.sum
+            engine/go.sum
+            internal/adaptersupport/go.sum
+            contracts/gen/go/mecatl/driver/go.sum
+            adapters/go.sum
+            authn/oidc/go.sum
+            environment/microvm/go.sum
+            integration/microvm/go.sum
+            provider/ssefilter/go.sum
+            provider/anthropic/go.sum
+            provider/openai/go.sum
+            provider/openaichat/go.sum
+
+      # Self-test the gate filter on synthetic JSON first (offline) so a broken
+      # gate is caught here rather than silently mis-judging the real scan below.
+      - name: Test govulncheck gate
+        run: bash .github/scripts/govulncheck-gate_test.sh
+
+      # govulncheck is PINNED and installed ONCE here (`go install`, not `go run`
+      # per invocation) — four separate `go run pkg@version` calls below each
+      # re-resolved+downloaded the SAME govulncheck dep closure (x/vuln,
+      # x/telemetry, x/mod, x/tools, x/sync) from scratch, which repeatedly ate
+      # into this job's network-bound window and its timeout budget. Installing
+      # once cuts that 4x down to 1x; `go env GOPATH`/bin is added to PATH so
+      # every module-scoped step below can just call `govulncheck`.
+      - name: Install govulncheck (pinned, shared by every module below)
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@v1.8.0
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      # `./...` from the root does NOT cross the engine module boundary, so the
+      # engine module is a second, separate invocation against its OWN go.mod/go.sum.
+      - name: govulncheck (root module — allowlisted gate)
+        shell: bash
+        run: |
+          set -o pipefail
+          govulncheck -format json ./... \
+            | go run .github/scripts/govulncheck-gate.go # v1.8.0 — no allowlist (toolhive v0.31.0 cleared the docker/docker vulns)
+
+      - name: govulncheck (engine module — strict, no allowlist)
+        shell: bash
+        run: |
+          set -o pipefail
+          cd engine && govulncheck -format json ./... \
+            | go run ../.github/scripts/govulncheck-gate.go # v1.8.0
+
+      - name: govulncheck (OIDC authn module — strict, no allowlist)
+        shell: bash
+        run: |
+          set -o pipefail
+          cd authn/oidc && govulncheck -format json ./... \
+            | go run ../../.github/scripts/govulncheck-gate.go # v1.8.0
+
+      # provider/ submodules — each its own module; scan against its
+      # own go.mod so the provider library's closure is checked independently.
+      - name: govulncheck (provider modules — strict, no allowlist)
+        shell: bash
+        run: |
+          set -o pipefail
+          (cd provider/ssefilter && govulncheck -format json ./... \
+            | go run ../../.github/scripts/govulncheck-gate.go) # v1.8.0
+          (cd provider/anthropic && govulncheck -format json ./... \
+            | go run ../../.github/scripts/govulncheck-gate.go) # v1.8.0
+          (cd provider/openai && govulncheck -format json ./... \
+            | go run ../../.github/scripts/govulncheck-gate.go) # v1.8.0
+          (cd provider/openaichat && govulncheck -format json ./... \
+            | go run ../../.github/scripts/govulncheck-gate.go) # v1.8.0
+
+  docs:
+    name: Doc validation
+    needs: changes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The config-reference + skeleton generator is a Go program; the matlatl
+      # composite action below brings its own toolchain but does not expose one to
+      # later steps, so provision Go here for the freshness gate. Pinned to the same
+      # SHA as the other jobs (house rule).
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: |
+            go.sum
+            engine/go.sum
+            internal/adaptersupport/go.sum
+            contracts/gen/go/mecatl/driver/go.sum
+            adapters/go.sum
+            authn/oidc/go.sum
+            environment/microvm/go.sum
+            integration/microvm/go.sum
+            provider/ssefilter/go.sum
+            provider/anthropic/go.sum
+            provider/openai/go.sum
+            provider/openaichat/go.sum
+            Taskfile.yml
+
+      - uses: go-task/setup-task@a00fbb05ce67b35648be3c78cbc9fd85354c757e # v2.2.0
+
+      # AGENTS.md size and symlinks, rule size, agent/skill description size, and
+      # that every `task` an AGENTS.md names exists (needs setup-task above).
+      - name: instruction-file hygiene
+        run: python3 .github/scripts/instruction-files.py
+
+      - uses: bufbuild/buf-setup-action@a47c93e0b1648d5651a065437926377d060baa99 # v1.50.0
+        with:
+          version: '1.72.0'
+          github_token: ${{ github.token }}
+
+      # This command validates the executable systemd, launchd, and retention
+      # examples in the session-storage operations guide under user-docs/.
+      - name: go test documented mecated operations
+        run: go test ./cmd/mecated -run '^TestSessionStorageContinuity_Scenario9_ServiceExamplesExecuteConfiguredArgs$'
+
+      # Freshness gate for the generated configuration reference + the embedded
+      # config-init skeleton: regenerate both to a temp dir and fail if they differ
+      # from what's committed. The error names the exact regen command.
+      - name: configuration reference is up to date
+        shell: bash
+        run: |
+          set -euo pipefail
+          go run ./internal/configgen/cmd/configref \
+            --skeleton "${RUNNER_TEMP}/settings.skeleton.yaml" \
+            --reference "${RUNNER_TEMP}/configuration-reference.md"
+          stale=0
+          if ! diff -u internal/configgen/settings.skeleton.yaml "${RUNNER_TEMP}/settings.skeleton.yaml"; then
+            stale=1
+          fi
+          if ! diff -u user-docs/reference/configuration.md "${RUNNER_TEMP}/configuration-reference.md"; then
+            stale=1
+          fi
+          if [ "$stale" -ne 0 ]; then
+            echo "::error file=user-docs/reference/configuration.md::config reference / settings skeleton is out of date — run 'task docs:configref' and commit the result."
+            exit 1
+          fi
+
+      # Regenerate into RUNNER_TEMP so the freshness check never modifies the
+      # checkout. The checked-in page is the exact output developers get from
+      # `task docs:grpc-ref`.
+      - name: gRPC schema reference is up to date
+        shell: bash
+        run: |
+          set -euo pipefail
+          buf generate --template buf.gen.grpc-docs.yaml \
+            --output "$RUNNER_TEMP/grpc-reference" \
+            --path contracts/proto/mecatl/v1/harness.proto \
+            --path contracts/proto/mecatl/v1/schedule.proto
+          generated="$RUNNER_TEMP/grpc-reference/user-docs/reference/grpc-schema.md"
+          if ! diff -u user-docs/reference/grpc-schema.md "$generated"; then
+            echo "::error file=user-docs/reference/grpc-schema.md::gRPC schema reference is out of date — run 'task docs:grpc-ref' and commit the result."
+            exit 1
+          fi
+
+      # matlatl's composite action builds the gate from ITS OWN checkout, so
+      # there is no binary step and no extra credentials here — only org Actions
+      # access to stacklok/matlatl (granted org-wide). strict also fails on
+      # orphans / unreachable / ambiguous links, not just broken
+      # links/anchors. Pinned to a release SHA (house rule); the # comment
+      # records the tag. findings.json + junit.xml land in matlatl-out/.
+      - name: matlatl docs gate (strict)
+        id: matlatl
+        uses: stacklok/matlatl@0b3087139018a4aa49ec6889ede1c17263e5d93c # v0.0.11
+        with:
+          strict: "true"
+
+  user-docs:
+    name: User docs (Docusaurus build)
+    needs: changes
+    # Builds the Docusaurus site (website/ + user-docs/) and checks the generated
+    # SDK reference. Gate on site relevance ONLY — no docs_only guard, because a
+    # user-docs/ content change IS docs-only yet must still rebuild the site.
+    if: needs.changes.outputs.site_relevant == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    # matlatl checks user-docs links and graph structure; this complementary
+    # gate verifies Docusaurus rendering and site-specific link resolution.
+    # Vercel builds previews and production after the change reaches GitHub,
+    # so this required job remains the pre-merge site build gate.
+    # The SDK reference check fails when its committed declaration-based
+    # pages drift. `npm run build` is the SAME command the deploy workflow uses,
+    # and Docusaurus's own `onBrokenLinks: 'throw'` (docusaurus.config.ts) fails
+    # the build on a broken internal link or a page that isn't in any sidebar.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          version: 11.25.0
+          run_install: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+          cache: 'npm'
+          cache-dependency-path: website/package-lock.json
+
+      - uses: go-task/setup-task@a00fbb05ce67b35648be3c78cbc9fd85354c757e # v2.2.0
+
+      - name: Verify generated SDK reference is fresh
+        run: task sdk:docs:check
+
+      - name: Install site dependencies
+        working-directory: website
+        run: npm ci
+
+      # Docusaurus builds through its own bundler and never runs tsc, so a
+      # TypeScript upgrade that breaks the site config only surfaces here.
+      - name: Typecheck site
+        working-directory: website
+        run: npm run typecheck
+
+      - name: Build site
+        working-directory: website
+        run: npm run build
+
+  user-docs-gate:
+    name: User docs (gate)
+    needs: [changes, user-docs]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    # Required-check aggregator for the Docusaurus build, mirroring `lint`/`test`.
+    # `user-docs` is gated on site_relevant, and a job skipped via `if:` reports as
+    # SUCCESS for branch protection — so gating a required check directly would let
+    # a classifier bug that wrongly marks a content change site-irrelevant turn the
+    # gate green having never built the site or checked link integrity. This job
+    # ALWAYS runs: it turns a legitimate skip (non-site change) into a real pass
+    # while a genuine build failure stays red. Point branch protection at THIS job
+    # ("User docs (gate)"), not `user-docs` directly.
+    steps:
+      - name: Require applicable user-docs coverage
+        shell: bash
+        env:
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          SITE_RELEVANT: ${{ needs.changes.outputs.site_relevant }}
+          USER_DOCS_RESULT: ${{ needs.user-docs.result }}
+        run: |
+          set -euo pipefail
+          if [[ "$CHANGES_RESULT" != success ]]; then
+            echo "changes job did not succeed: $CHANGES_RESULT" >&2
+            exit 1
+          fi
+          # A non-site change legitimately skips the Docusaurus build; require the
+          # skip so a job that should have run but didn't is caught.
+          if [[ "$SITE_RELEVANT" != true ]]; then
+            if [[ "$USER_DOCS_RESULT" != skipped ]]; then
+              echo "non-site-relevant user-docs job was not skipped: user-docs=$USER_DOCS_RESULT" >&2
+              exit 1
+            fi
+            exit 0
+          fi
+          if [[ "$USER_DOCS_RESULT" != success ]]; then
+            echo "user-docs coverage failed: user-docs=$USER_DOCS_RESULT" >&2
+            exit 1
+          fi
+
+  domain-model:
+    name: Domain model
+    needs: changes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # modelith's composite action downloads a prebuilt, checksum-verified
+      # release binary — stacklok/modelith is now public, so there's no
+      # cross-repo Actions access grant to worry about (unlike when it was
+      # private). Pinned to a SHA (house rule); the # comment records the
+      # revision the committed .md was rendered with. `lint` validates the
+      # model (completeness gaps are errors — the model is currently clean),
+      # and check-rendered fails the build if
+      # docs/architecture/mecatl.modelith.md has drifted from its .yaml
+      # source.
+      - uses: stacklok/modelith@26d8f41b42f445144ba0f14d0997a3b9eb9657f4 # post-v0.4.0
+        with:
+          files: docs/architecture/mecatl.modelith.yaml
+          completeness: error
+          check-rendered: true

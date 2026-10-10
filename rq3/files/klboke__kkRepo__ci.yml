@@ -1,0 +1,202 @@
+name: CI
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit-and-protocol-tests:
+    name: unit-and-protocol-tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up JDK 25
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "25"
+          cache: maven
+
+      - name: Set up Node.js 24
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+
+      - name: Validate development compose file
+        run: |
+          docker compose -f docker-compose.dev.yml config
+          docker compose -f docker-compose.dev.yml --profile postgresql config
+          docker compose -f docker-compose.quickstart.yml config
+          docker compose -f docker-compose.quickstart-postgresql.yml config
+
+      - name: Run server tests
+        run: mvn -B -ntp -T 4 -pl server,scanner-adapter -am '-Dsurefire.excludes=**/DatabaseServerSmokeTest.java' -Dsurefire.failIfNoSpecifiedTests=false verify
+
+      - name: Run non-live compatibility tests
+        run: mvn -B -ntp -pl compat-test -am -Dtest=MavenMetadataMergeCompatibilityTest,MavenWritePolicyCompatibilityTest,NpmProtocolCompatibilityTest -Dsurefire.failIfNoSpecifiedTests=false verify
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v7
+        with:
+          directory: .
+          fail_ci_if_error: true
+          token: ${{ secrets.CODECOV_TOKEN }}
+
+  persistence-package-boundary:
+    name: persistence-package-boundary
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "25"
+          cache: maven
+      - run: mvn -B -ntp -pl server -am -Dtest=PersistencePackageBoundaryTest -Dsurefire.failIfNoSpecifiedTests=false test
+
+  persistence-contract:
+    name: persistence-contract (${{ matrix.database }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - database: mysql
+            module: persistence-mysql
+            test: MySqlPersistenceApiContractTest
+          - database: postgresql
+            module: persistence-postgresql
+            test: PostgreSqlPersistenceApiContractTest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "25"
+          cache: maven
+      - run: mvn -B -ntp -pl ${{ matrix.module }} -am -Dtest=${{ matrix.test }} -Dsurefire.failIfNoSpecifiedTests=false test
+
+  server-smoke:
+    name: server-smoke (${{ matrix.database }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - database: mysql
+            method: mysqlSupportsFreshAndRepeatStartupWithCrossNodeSession
+          - database: postgresql
+            method: postgresqlSupportsFreshAndRepeatStartupWithCrossNodeSession
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "25"
+          cache: maven
+      - run: mvn -B -ntp -pl server -am -Dtest=DatabaseServerSmokeTest#${{ matrix.method }} -Dsurefire.failIfNoSpecifiedTests=false verify
+      - name: Upload smoke coverage to Codecov
+        uses: codecov/codecov-action@v7
+        with:
+          directory: .
+          fail_ci_if_error: true
+          flags: server-smoke-${{ matrix.database }}
+          token: ${{ secrets.CODECOV_TOKEN }}
+
+  mysql-v29-upgrade-compatibility:
+    name: mysql-v29-upgrade-compatibility
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "25"
+          cache: maven
+      - run: mvn -B -ntp -pl persistence-mysql -am -Dtest=MySqlV29MigrationCompatibilityTest -Dsurefire.failIfNoSpecifiedTests=false test
+
+  flyway-version-parity:
+    name: flyway-version-parity
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Verify migration and deployment contracts
+        run: |
+          scripts/ci/check-flyway-parity.sh
+          docker compose -f docker-compose.quickstart.yml config
+          docker compose -f docker-compose.quickstart-postgresql.yml config
+          scripts/ci/check-compose-scanner-isolation.sh
+          docker compose -f docker-compose.compat-postgres.yml --profile kkrepo-postgresql config
+      - uses: azure/setup-helm@v5
+      - name: Verify Helm rendering and scanner egress isolation
+        run: |
+          helm lint deploy/helm/kkrepo
+          helm lint deploy/helm/kkrepo \
+            --set securityScanning.enabled=true \
+            --set securityScanning.serviceCredential.existingSecret=kkrepo-scanner
+          scripts/ci/check-helm-scanner-isolation.sh
+          scripts/ci/check-helm-database-auth.sh
+
+  dev-runtime-deploy-contract:
+    name: dev-runtime-deploy-contract
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Verify dev JVM and Native deployment scripts
+        run: |
+          bash -n scripts/deploy/kkrepo-jar-deploy.sh
+          bash -n scripts/deploy/kkrepo-runtime-deploy.sh
+          bash -n scripts/deploy/kkrepo-dual-runtime-deploy.sh
+          bash -n scripts/ci/test-dev-jar-deploy.sh
+          bash -n scripts/ci/test-dev-dual-runtime-deploy.sh
+          bash -n scripts/ci/test-dev-nginx-bind-mount.sh
+          bash -n scripts/ci/check-dev-dual-runtime-deploy.sh
+          bash -n .github/deploy/dev/bootstrap-dual-runtime.sh
+          bash -n scripts/build-dist.sh
+          bash -n scripts/build-docker-image.sh
+          bash -n scripts/ci/package-e2e-candidate-image.sh
+          bash -n scripts/ci/load-e2e-candidate-image.sh
+          bash -n scripts/ci/prepare-swift-e2e-tls.sh
+          bash -n scripts/ci/setup-swift-e2e-wrappers.sh
+          bash -n scripts/ci/swift-e2e-image-cache.sh
+          bash -n scripts/ci/client-e2e-image-cache.sh
+          bash -n scripts/ci/run-client-e2e-container.sh
+          bash -n scripts/ci/client-e2e-image/install.sh
+          bash -n scripts/ci/client-e2e-image/verify.sh
+          bash -n scripts/ci/prepare-e2e-disk.sh
+          bash -n scripts/ci/test-e2e-image-artifact.sh
+          bash -n scripts/ci/test-quickstart-data-permissions.sh
+          bash -n scripts/ci/test-quickstart-runtime.sh
+          bash -n scripts/ci/test-swift-e2e-wrappers.sh
+          bash -n scripts/ci/test-dist-launcher.sh
+          bash -n server/src/dist/bin/start.sh
+          bash -n server/src/dist/bin/status.sh
+          bash -n server/src/dist/bin/stop.sh
+          scripts/ci/test-dev-jar-deploy.sh
+          scripts/ci/test-dev-dual-runtime-deploy.sh
+          scripts/ci/test-dev-nginx-bind-mount.sh
+          scripts/ci/check-dev-dual-runtime-deploy.sh
+          scripts/ci/test-e2e-image-artifact.sh
+          scripts/ci/test-quickstart-data-permissions.sh
+          scripts/ci/test-quickstart-runtime.sh
+          scripts/ci/test-swift-e2e-wrappers.sh
+          python3 -m unittest discover -s scripts/ci -p 'test_e2e_orchestration.py'
+          scripts/ci/test-dist-launcher.sh
+          test -f .github/deploy/dev/systemd/kkrepo.service
+          test -f .github/deploy/dev/systemd/kkrepo-native.service
+          test -f .github/deploy/dev/README.md
+          POSTGRES_DB=kkrepo POSTGRES_USER=kkrepo POSTGRES_PASSWORD=kkrepo \
+            docker compose -f .github/deploy/dev/docker-compose.yml config --quiet

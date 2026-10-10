@@ -1,0 +1,82 @@
+name: real-server-matrix
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 8 * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  matrix:
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Setup Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      - name: Run real-server matrix
+        id: matrix
+        continue-on-error: true
+        timeout-minutes: 10
+        env:
+          MCP_OBSERVATORY_MATRIX_TIMEOUT_MS: "300000"
+        run: npm run integration:real
+
+      - name: Build dashboard
+        run: npm run dashboard:build
+
+      - name: Validate dashboard
+        run: npm run dashboard:validate
+
+      - name: Upload matrix artifacts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: real-server-matrix-artifacts
+          path: |
+            examples/artifacts/*.json
+            examples/artifacts/*-report.md
+          retention-days: 14
+
+      - name: Commit history update
+        if: github.ref != 'refs/heads/main'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add examples/matrix-history.json
+          git diff --staged --quiet || git commit -m "Update matrix history [skip ci]"
+          git push || echo "::warning::Failed to push matrix history update"
+
+      - name: Skip protected main history push
+        if: github.ref == 'refs/heads/main'
+        run: echo "::notice::Skipping matrix-history push on protected main; dashboard still uses this run's generated artifacts."
+
+      - name: Deploy dashboard to Cloudflare Pages
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: 385e00f98ceabbee25800bda2756cc75
+        run: |
+          if [ "${GITHUB_REF}" = "refs/heads/main" ]; then
+            npx wrangler pages deploy dashboard --project-name mcp-observatory
+          else
+            npx wrangler pages deploy dashboard --project-name mcp-observatory --branch "${GITHUB_REF_NAME}"
+          fi
+
+      - name: Fail if matrix found issues
+        if: steps.matrix.outcome == 'failure'
+        run: |
+          echo "::error::Real-server matrix completed with failing target(s). See uploaded artifacts and dashboard output for details."
+          exit 1

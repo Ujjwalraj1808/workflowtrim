@@ -1,0 +1,37 @@
+name: Build Query Modules
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/chunk-query.yaml'
+      - '.github/workflows/chunk.yaml'
+      - '.github/config/chunks.yaml'
+      - 'code-style/checkstyle*.xml'
+      - 'code-style/spotbugs*.xml'
+      - 'java/pom.xml'
+      - 'java/query/pom.xml'
+      - 'java/query/query-core/**'
+      - 'java/query/query-runner/**'
+      - 'java/query/query-lambda/**'
+      - 'java/query/query-datafusion/**'
+      - 'java/common/foreign-bridge/**'
+      - 'java/analytics-integration/pom.xml'
+      - 'java/analytics-integration/trino/**'
+      - 'java/ingest/ingest-runner/**'
+      - 'java/statestore/**'
+      - 'java/common/common-job/**'
+      - 'java/ingest/ingest-tracker/**'
+      - 'java/common/sketches/**'
+      - 'java/common/parquet/**'
+      - 'java/configuration/**'
+      - 'java/ingest/ingest-core/**'
+      - 'java/common/dynamodb-tools/**'
+      - 'java/example-iterators/**'
+      - 'java/core/**'
+      - 'java/common/localstack-test/**'
+      - 'java/common/arrow/**'
+
+jobs:
+  chunk-workflow:
+    uses: ./.github/workflows/chunk.yaml
+    with:
+      chunkId: query

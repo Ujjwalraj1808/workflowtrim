@@ -1,0 +1,35 @@
+name: Stale open-issue detector (weekly)
+
+on:
+  schedule:
+    - cron: "0 7 * * 1" # Monday 07:00 UTC
+  workflow_dispatch: {}
+
+permissions: {}
+
+jobs:
+  detect:
+    name: Detect stale open issues
+    # #4053: posts the shared detector comment, so a branch dispatch must not
+    # run it.
+    if: github.event_name == 'schedule' || github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    # refs #3123: bounds a hang against GitHub's 360-min default.
+    # Measured max over the workflow's entire run history (5 successful runs
+    # total; weekly cron): 45s; timeout = floor of 10 min.
+    timeout-minutes: 10
+    permissions:
+      contents: read # checkout
+      issues: write # single detector summary comment
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GITHUB_REPOSITORY: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: "22"
+      - name: Detect and publish candidates
+        run: node scripts/detect-stale-open-issues.mjs

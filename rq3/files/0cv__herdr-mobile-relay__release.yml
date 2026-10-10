@@ -1,0 +1,215 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  verify:
+    name: Require successful check workflow
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require successful check workflow
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          deadline=$((SECONDS + 1800))
+          while (( SECONDS < deadline )); do
+            state="$(
+              gh run list \
+                --repo "$GITHUB_REPOSITORY" \
+                --workflow check.yml \
+                --commit "$GITHUB_SHA" \
+                --limit 20 \
+                --json status,conclusion \
+                --jq '
+                  if any(.[]; .conclusion == "success") then "success"
+                  elif length == 0 or any(.[]; .status != "completed") then "pending"
+                  else "failed"
+                  end
+                '
+            )"
+            case "$state" in
+              success)
+                exit 0
+                ;;
+              failed)
+                echo "Tagged commit $GITHUB_SHA has no successful check.yml run." >&2
+                exit 1
+                ;;
+            esac
+            sleep 15
+          done
+          echo "Timed out waiting for check.yml on tagged commit $GITHUB_SHA." >&2
+          exit 1
+
+  build:
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v7
+        with:
+          go-version: 1.27.0
+          cache: true
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.0
+      - run: bun install --frozen-lockfile --cwd frontend
+      - name: Build release bundles
+        run: |
+          make cross-build
+          version="${GITHUB_REF_NAME#v}"
+          manifest_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' herdr-plugin.toml)"
+          test "$version" = "$manifest_version" || {
+            echo "Tag version $version does not match plugin version $manifest_version." >&2
+            exit 1
+          }
+          scripts/package-release.sh "$version" "$GITHUB_SHA" dist/release
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-bundles
+          path: dist/release/
+          retention-days: 1
+
+  native-smoke:
+    name: Native release smoke (${{ matrix.target }})
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: linux_amd64
+          - runner: ubuntu-24.04-arm
+            target: linux_arm64
+          - runner: macos-15-intel
+            target: darwin_amd64
+          - runner: macos-15
+            target: darwin_arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: release-bundles
+          path: dist/release
+      - name: Exercise packaged relay on its native target
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          target="${{ matrix.target }}"
+          scripts/check-installed-release.sh \
+            "dist/release/herdr-mobile-relay_${version}_${{ matrix.target }}.tar.gz" \
+            dist/release/checksums.txt "$version" "$GITHUB_SHA" \
+            "${target%_*}/${target#*_}"
+
+  mobile:
+    # Temporarily disabled while the installed-device harness is fixed on ci-mobile.
+    if: ${{ github.event_name == 'herdr-mobile-release-disabled' }}
+    needs: build
+    uses: ./.github/workflows/mobile-ci.yml
+    with:
+      artifact_run_id: ${{ github.run_id }}
+      artifact_name: release-bundles
+      candidate_commit: ${{ github.sha }}
+      head_commit: ${{ github.sha }}
+      platform: all
+      suite: release
+      baseline_set: all
+    permissions:
+      actions: read
+      contents: read
+
+  publish:
+    # Do not depend on the disabled mobile job: a skipped dependency skips
+    # publication too. Restore this dependency when mobile CI is re-enabled.
+    needs: [verify, build, native-smoke]
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v8
+        with:
+          name: release-bundles
+          path: dist/release
+      - name: Publish verified complete bundles
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Candidates are tagged on dev, so a tag is only a stable release once
+          # its commit is on main. Until then it ships as a prerelease, which the
+          # relay's update check skips, and promotion flips it with
+          # `gh release edit --prerelease=false --latest`.
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          if git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            on_main=1
+          else
+            # 1 means "not on main"; any other status is a real git failure.
+            status=$?
+            test "$status" -eq 1 || exit "$status"
+            on_main=0
+          fi
+          assets=(
+            dist/release/checksums.txt
+            dist/release/herdr-mobile-relay_*.tar.gz
+          )
+          if prerelease="$(
+            gh release view "$GITHUB_REF_NAME" \
+              --repo "$GITHUB_REPOSITORY" \
+              --json isPrerelease \
+              --jq .isPrerelease 2>/dev/null
+          )"; then
+            # A candidate tag moves as dev advances, so its release already
+            # exists. Every bundle embeds the commit it was built from, so the
+            # assets must be replaced: leaving them would advertise this tag
+            # with a revision the relay refuses to install.
+            if [ "$prerelease" = false ] && [ "$on_main" -eq 0 ]; then
+              echo "Release $GITHUB_REF_NAME is already promoted; refusing to republish it from a commit that is not on main." >&2
+              exit 1
+            fi
+            if [ "$on_main" -eq 1 ]; then
+              visibility=(--latest --prerelease=false)
+            else
+              visibility=(--prerelease)
+            fi
+            # `gh release edit` cannot generate notes, so ask for the same body
+            # the create path would have written.
+            notes="$(
+              gh api "repos/$GITHUB_REPOSITORY/releases/generate-notes" \
+                -f tag_name="$GITHUB_REF_NAME" \
+                -f target_commitish="$GITHUB_SHA" \
+                --jq .body
+            )"
+            gh release edit "$GITHUB_REF_NAME" \
+              --repo "$GITHUB_REPOSITORY" \
+              --verify-tag \
+              --notes "$notes" \
+              "${visibility[@]}"
+            gh release upload "$GITHUB_REF_NAME" \
+              --repo "$GITHUB_REPOSITORY" \
+              --clobber \
+              "${assets[@]}"
+            exit 0
+          fi
+          if [ "$on_main" -eq 1 ]; then
+            visibility=(--latest)
+          else
+            visibility=(--prerelease)
+          fi
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --generate-notes \
+            "${visibility[@]}" \
+            "${assets[@]}"

@@ -1,0 +1,44 @@
+name: Suburb Check
+on:
+  workflow_dispatch:
+    inputs:
+      suburb:
+        required: true
+        description: 'Suburb to check'
+      state:
+        required: true
+        description: 'State of suburb to check'
+
+jobs:
+  suburb-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Docker
+        run: |
+          docker pull lukeprior/nbn-upgrade-map-db:latest
+          docker run -d --publish=5433:5432 lukeprior/nbn-upgrade-map-db:latest
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r code/requirements.txt
+
+      - name: Run program
+        run: |
+          python code/main.py --suburb "${{ github.event.inputs.suburb }}" --state "${{ github.event.inputs.state }}" -i
+
+      - name: Commit changes
+        uses: EndBug/add-and-commit@v9
+        with:
+          message: Updated region & results
+          default_author: github_actions
+          fetch: false
+          tag_push: '--force'

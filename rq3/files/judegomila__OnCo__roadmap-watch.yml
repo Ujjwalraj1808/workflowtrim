@@ -1,0 +1,45 @@
+name: Roadmap registry watch
+
+# Weekly check of every roadmap's referenced trials against ClinicalTrials.gov and Europe PMC (scripts/roadmap-watch.ts).
+# Writes public/roadmap-watch.json, which the roadmap pages render as a "Registry check" line, and commits it as the
+# github-actions bot only when the findings changed (the run date alone does not count). Contradictions are listed in
+# the job log; the records themselves are edited by hand.
+
+on:
+  schedule:
+    - cron: "29 5 * * 4" # Thursdays 05:29 UTC, after the pulse refresh at 05:17
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: roadmap-watch
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run roadmap:watch -- --json public/roadmap-watch.json
+      - name: Commit the report if the findings changed
+        run: |
+          set -euo pipefail
+          if git diff --quiet -I '^\s*"generatedAt":' -- public/roadmap-watch.json; then
+            echo "Findings unchanged; nothing to commit."
+            git checkout -- public/roadmap-watch.json
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add public/roadmap-watch.json
+          git commit -m "chore: weekly roadmap registry check (public/roadmap-watch.json)"
+          git pull --rebase origin "${GITHUB_REF_NAME}"
+          git push origin "HEAD:${GITHUB_REF_NAME}"

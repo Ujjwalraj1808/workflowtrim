@@ -1,0 +1,18 @@
+name: docs
+on:
+  push:
+    branches: ['main']
+  pull_request:
+permissions: read-all
+jobs:
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+        with:
+          go-version: '1.27'
+          cache: true
+      - run: ./.github/workflows/check-docs.sh

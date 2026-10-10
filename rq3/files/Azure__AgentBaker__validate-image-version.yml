@@ -1,0 +1,15 @@
+name: validate-image-version
+on: pull_request
+
+jobs:
+  validate-image-version:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        persist-credentials: false
+    - run: |
+        make validate-image-version
+      name: Verify image versions to be pulled

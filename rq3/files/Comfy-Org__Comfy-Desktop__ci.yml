@@ -1,0 +1,220 @@
+name: CI
+
+on:
+  pull_request:
+  merge_group:
+    types: [checks_requested]
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: quality-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  no-proprietary-fonts:
+    name: No proprietary fonts in source
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Ensure PP Formula is not committed
+        run: |
+          set -euo pipefail
+          # PP Formula (Pangram Pangram) is license-restricted and must never be
+          # committed to this public repo. It is fetched at build time from
+          # gs://comfy-org-fonts (see scripts/fetch-font.mjs). This guard fails
+          # the build if any PP Formula binary is tracked in git.
+          matches="$(git ls-files '*PPFormula*' '*ppformula*' '*pp-formula*' '*pp_formula*' || true)"
+          if [ -n "$matches" ]; then
+            echo "::error::Proprietary PP Formula font files are committed to the repo:"
+            echo "$matches"
+            echo "These are license-restricted and must not live in source."
+            echo "They are fetched at build time from gs://comfy-org-fonts (scripts/fetch-font.mjs)."
+            exit 1
+          fi
+          echo "OK: no proprietary PP Formula font files tracked in git."
+
+  checks:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Format
+            command: pnpm run format:check
+          - name: Lint
+            command: pnpm run lint
+          - name: Typecheck
+            command: pnpm run typecheck && pnpm run bridge-types:check
+          - name: Test
+            command: pnpm run test
+          - name: Test (integration)
+            command: pnpm run test:integration
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run ${{ matrix.name }}
+        run: ${{ matrix.command }}
+
+  python-git-helpers:
+    name: Test (Python git helpers)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+
+      - name: Install pygit2
+        run: python -m pip install pygit2
+
+      - name: Run tests
+        run: python -m unittest discover -s tests/python -v
+
+  bridge-types-version:
+    name: Bridge types version bumped
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+
+      - name: Require a version bump when the contract changes
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+          # The checked-out tree is the merge ref, which already carries main's
+          # later commits; diff the branch tip so only this change is measured.
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PACKAGE_JSON=packages/comfyui-desktop-bridge-types/package.json
+          MERGE_BASE=$(git merge-base "$BASE_SHA" "$HEAD_SHA")
+          # Glob the declarations: tsc emits one file per source module, so the
+          # set is not fixed.
+          if git diff --quiet "$MERGE_BASE" "$HEAD_SHA" -- \
+            src/types/comfyDesktopBridge.ts \
+            'packages/comfyui-desktop-bridge-types/*.d.ts' \
+            packages/comfyui-desktop-bridge-types/index.js \
+            packages/comfyui-desktop-bridge-types/package.json \
+            packages/comfyui-desktop-bridge-types/LICENSE; then
+            echo "Bridge contract unchanged; no version bump required."
+            exit 0
+          fi
+          read_version() { git show "$1:$PACKAGE_JSON" | node -p "JSON.parse(require('fs').readFileSync(0, 'utf8')).version"; }
+          BASE_VERSION=$(read_version "$MERGE_BASE")
+          HEAD_VERSION=$(read_version "$HEAD_SHA")
+          # Exported, not just assigned: the comparator reads them from env.
+          export BASE_VERSION HEAD_VERSION
+          # Prerelease-aware precedence, inline so an unrelated registry outage
+          # cannot fail this PR. Build metadata is ignored, per semver.
+          if ! node -e '
+            const parse = (v) => {
+              const m = /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$/.exec(v)
+              if (!m) throw new Error("not a semantic version: " + v)
+              return { core: [+m[1], +m[2], +m[3]], pre: m[4] ? m[4].split(".") : [] }
+            }
+            const cmpId = (a, b) => {
+              const na = /^\d+$/.test(a), nb = /^\d+$/.test(b)
+              if (na && nb) return +a - +b
+              if (na !== nb) return na ? -1 : 1
+              return a < b ? -1 : a > b ? 1 : 0
+            }
+            const cmp = (a, b) => {
+              for (let i = 0; i < 3; i++) if (a.core[i] !== b.core[i]) return a.core[i] - b.core[i]
+              if (!a.pre.length || !b.pre.length) return b.pre.length - a.pre.length
+              for (let i = 0; i < Math.max(a.pre.length, b.pre.length); i++) {
+                if (a.pre[i] === undefined) return -1
+                if (b.pre[i] === undefined) return 1
+                const d = cmpId(a.pre[i], b.pre[i])
+                if (d) return d
+              }
+              return 0
+            }
+            process.exit(cmp(parse(process.env.HEAD_VERSION), parse(process.env.BASE_VERSION)) > 0 ? 0 : 1)
+          '; then
+            echo "::error title=Bump the bridge types version::This change touches the bridge contract, but ${PACKAGE_JSON} is still $HEAD_VERSION (base: $BASE_VERSION). Merging would leave npm serving the old contract." >&2
+            exit 1
+          fi
+          echo "Bridge contract changed and the version moved $BASE_VERSION -> $HEAD_VERSION."
+
+  e2e:
+    name: E2E (${{ matrix.platform }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos
+            os: macos-latest
+            command: pnpm run test:e2e:macos
+          - platform: windows
+            os: windows-latest
+            command: pnpm run test:e2e:windows
+          - platform: linux
+            os: ubuntu-latest
+            command: pnpm run test:e2e:linux
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build app
+        run: pnpm run build
+
+      - name: Run E2E (${{ matrix.platform }})
+        run: ${{ matrix.platform == 'linux' && format('xvfb-run --auto-servernum {0}', matrix.command) || matrix.command }}
+
+      - name: Upload Playwright failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: playwright-${{ matrix.platform }}-failure
+          path: |
+            test-results/
+            playwright-report/
+          retention-days: 7
+          if-no-files-found: ignore

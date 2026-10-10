@@ -1,0 +1,153 @@
+name: Integration Test Coverage
+on: 
+  push:
+    paths-ignore:
+      - "**.md"
+      - "channel.yaml"
+      - "install.sh"
+      - "tests/**"
+      - "!tests/integration**"
+      - ".github/**"
+      - "!.github/workflows/integration.yaml"
+      - "!.github/workflows/build-k3s.yaml"
+  pull_request:
+    paths-ignore:
+      - "**.md"
+      - "channel.yaml"
+      - "install.sh"
+      - "tests/**"
+      - "!tests/integration**"
+      - "!tests/e2e**"
+      - ".github/**"
+      - "!.github/workflows/integration.yaml"
+      - "!.github/workflows/build-k3s.yaml"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+env:
+  GOCOVERDIR: /tmp/k3scov
+  
+jobs:
+  build:
+    uses: ./.github/workflows/build-k3s.yaml
+    with:
+      platforms: linux/amd64
+      test-coverage: true
+  build-windows:
+    uses: ./.github/workflows/build-k3s.yaml
+    with:
+      platforms: windows/amd64
+      test-coverage: true
+  itest:
+    needs: build
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        # Ordered longest-first from CI timings to reduce matrix tail latency.
+        itest: [startup, etcdsnapshot, kubeflags, cacertrotation, longhorn, secretsencryption, certrotation, etcdrestore, localstorage, flannelnone, flannelcniconf, custometcdargs]
+      max-parallel: 5
+    steps:
+    - name: Remove Unnecessary Tools
+      working-directory: /
+      run: |
+        sudo rm -rf \
+          /home/linuxbrew \
+          /home/packer \
+          /opt/az \
+          /opt/microsoft \
+          /usr/lib/firefox \
+          /usr/lib/google-cloud-sdk \
+          /usr/local/julia* \
+          /usr/local/share/boost \
+          /usr/local/share/chromium \
+          /usr/local/share/powershell \
+          /usr/share/az* \
+          /usr/share/dotnet \
+          /usr/share/miniconda \
+          /usr/share/swift
+        df -khl
+    - name: Checkout
+      uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      with:
+        fetch-depth: 1
+    - name: Install Go
+      uses: ./.github/actions/setup-go
+    - name: "Download k3s binary"
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+      with:
+        name: k3s-amd64
+        path: ./dist/artifacts
+    - name: Run Integration Tests
+      run: | 
+        chmod +x ./dist/artifacts/k3s
+        mkdir -p $GOCOVERDIR
+        cd tests/integration/${{ matrix.itest }}
+        sudo -E env "PATH=$PATH" go test -timeout=45m ./... -run Integration -ginkgo.v -test.v
+    - name: On Failure, Upload Logs
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      if: ${{ failure() }}
+      with:
+        name: integration-${{ matrix.itest }}-logs
+        path: tests/integration/${{ matrix.itest }}/*log.txt
+        retention-days: 30
+    - name: Generate coverage report
+      run: sudo -E env "PATH=$PATH" go tool covdata textfmt -i $GOCOVERDIR -o ${{ matrix.itest }}.out
+    - name: Upload Results To Codecov
+      uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v5
+      with:
+        token: ${{ secrets.CODECOV_TOKEN }}
+        files: ./${{ matrix.itest }}.out
+        flags: inttests # optional
+        verbose: true # optional (default = false)
+  itest-windows:
+    name: Integration Tests (windows)
+    needs: build-windows
+    runs-on: windows-2022
+    timeout-minutes: 10
+    env:
+      GOCOVERDIR: "D:/tmp/k3scov"
+    steps:
+    - name: Checkout
+      uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      with: {fetch-depth: 1}
+    - name: Install Go
+      uses: ./.github/actions/setup-go
+    - name: Download k3s binary
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+      with:
+        name: k3s-windows
+        path: dist/artifacts/
+    - name: Run K3s
+      timeout-minutes: 5
+      env:
+        CONTAINERD_LOG_LEVEL: "debug"
+      run: |
+        $ErrorActionPreference = "Continue"
+        $PSNativeCommandUseErrorActionPreference = $true
+        New-Item -Type Directory -Force $Env:GOCOVERDIR | Out-Null
+        $Server = Start-Job -ScriptBlock { ./dist/artifacts/k3s.exe server --token=token --debug --disable=metrics-server }
+        Start-Sleep -Seconds 15
+        D:/var/lib/rancher/k3s/data/current/bin/k3s.exe kubectl apply -f ./tests/integration/startup/testdata/agnhost.yaml
+        D:/var/lib/rancher/k3s/data/current/bin/k3s.exe kubectl wait --for=jsonpath='{.status.phase}'=Running --timeout=3m pod/agnhost
+        D:/var/lib/rancher/k3s/data/current/bin/k3s.exe crictl ps
+        D:/var/lib/rancher/k3s/data/current/bin/k3s.exe kubectl get pod -A -o yaml
+        D:/var/lib/rancher/k3s/data/current/bin/k3s.exe kubectl get node -o yaml
+        $RET = $LASTEXITCODE
+        Stop-Job -Job $Server
+        Receive-Job -Wait -Job $Server
+        Remove-Job -Job $Server
+        exit $RET
+    - name: Generate coverage report
+      run: go tool covdata textfmt -i $Env:GOCOVERDIR -o windows.out
+    - name: Upload Results To Codecov
+      uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v5
+      with:
+        token: ${{ secrets.CODECOV_TOKEN }}
+        files: ./windows.out
+        flags: inttests # optional
+        verbose: true # optional (default = false)

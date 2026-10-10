@@ -1,0 +1,49 @@
+name: Assign v3 project and milestone
+
+on:
+  issues:
+    types:
+      - labeled
+  pull_request_target:
+    types:
+      - labeled
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+jobs:
+  assign-v3:
+    if: ${{ github.event.label && github.event.label.name == 'v3' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Add item to v3 project
+        uses: actions/add-to-project@5afcf98fcd03f1c2f92c3c83f58ae24323cc57fd # v2.0.0
+        with:
+          project-url: https://github.com/orgs/gofiber/projects/1
+          github-token: ${{ secrets.ISSUE_PR_TOKEN }}
+      - name: Assign v3 milestone
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          github-token: ${{ secrets.ISSUE_PR_TOKEN }}
+          script: |
+            const payload = context.eventName === 'issues' ? context.payload.issue : context.payload.pull_request;
+            const issueNumber = payload.number;
+            const milestones = await github.paginate(github.rest.issues.listMilestones, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              per_page: 100,
+            });
+            const milestone = milestones.find((item) => item.title === 'v3');
+            if (!milestone) {
+              throw new Error('Milestone "v3" was not found.');
+            }
+            await github.rest.issues.update({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issueNumber,
+              milestone: milestone.number,
+            });

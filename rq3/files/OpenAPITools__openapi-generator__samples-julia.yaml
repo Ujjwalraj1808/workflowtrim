@@ -1,0 +1,42 @@
+name: Samples Julia
+
+on:
+  push:
+    paths:
+      - 'samples/client/petstore/julia/**'
+      - 'samples/server/petstore/julia/**'
+  pull_request:
+    paths:
+      - 'samples/client/petstore/julia/**'
+      - 'samples/server/petstore/julia/**'
+
+jobs:
+  tests-julia:
+    name: Tests Julia
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: julia-actions/setup-julia@v3
+        with:
+          version: 1.8
+          arch: x64
+      - name: Test
+        shell: bash
+        working-directory: 'samples'
+        run: |
+          currdir=`pwd`
+          # The julia-client/julia-server generators target the OpenAPI.jl 0.2.x series,
+          #   maintained on the release-0.2 branch; OpenAPI.jl main hosts the 1.x rewrite
+          #   with a different API. Testing against release-0.2 covers the latest 0.2.x fixes.
+          # Using develop mode to install package so that it is easier to modify the package test files
+          julia -e "using Pkg; Pkg.develop(\"OpenAPI\");"
+          cd ~/.julia/dev/OpenAPI
+          git checkout release-0.2
+          cd $currdir
+          rm -rf ~/.julia/dev/OpenAPI/test/client/openapigenerator_petstore_v3/petstore
+          rm -rf ~/.julia/dev/OpenAPI/test/server/openapigenerator_petstore_v3/petstore
+          cp -r client/petstore/julia ~/.julia/dev/OpenAPI/test/client/openapigenerator_petstore_v3/petstore
+          cp -r server/petstore/julia ~/.julia/dev/OpenAPI/test/server/openapigenerator_petstore_v3/petstore
+          # setting this env runs only the tests relevant to the openapi-generator repo
+          export OPENAPI_GENERATOR=true
+          julia -e "using Pkg; Pkg.test(\"OpenAPI\");"

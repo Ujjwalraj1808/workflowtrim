@@ -1,0 +1,46 @@
+name: Web App Tests
+permissions:
+  contents: read
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+
+jobs:
+  e2e-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.14'
+
+      - name: Use Node.js 24.x
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24.x"
+          cache: 'yarn'
+
+      - name: Install Python dependencies
+        run: pip install .[dev]
+
+      - name: Install Node.js dependencies
+        run: yarn install
+
+      - name: Build application
+        run: yarn dev
+
+      - name: Run web server
+        run: PYTHONPATH=server python server/server.py &
+
+      - name: Install Playwright Browsers and Run Tests
+        run: |
+          python -m playwright install --with-deps
+          PYTHONPATH=server python -m pytest tests/test_e2e.py
+          PYTHONPATH=server python -m pytest tests/test_gui.py
+          PYTHONPATH=server python -m pytest tests/test_study_gui.py
+          PYTHONPATH=server python -m pytest tests/test_bughouse_lobby_flow.py

@@ -1,0 +1,733 @@
+name: CI
+
+# PR CI runs full pytest on Linux only. macOS coverage is provided by:
+#   * Local dev on macOS (the primary dev machine)
+#   * Release workflow's cibuildwheel matrix on tag (full cross-platform)
+#
+# Local pre-push gate (scripts/check.sh, auto-installed via
+# scripts/install-hooks.sh) runs ruff + format + mypy + pytest locally
+# before push. CI then runs Linux pytest as the safety net for the one
+# class of bug local-only can't catch: Linux-specific behavior (LAPACK
+# backend, libc/manylinux quirks, #82-style variance).
+#
+# Cost per PR: target ~5-10 min wall, free (public repo). The suite had
+# grown to 43-68 min (serial pytest + uncached robot_descriptions clones);
+# #348 cached the description repos and parallelized pytest (-n auto).
+# Doc-only PRs skip CI entirely via paths-ignore; PRs that change only
+# examples (and docs) run the examples lane instead of the full suite, and PRs
+# that leave an exhaustive sweep's code alone run its fixed PR sample (see the
+# `changes` job and tests/_sweeps.py). Pushes to main and workflow_dispatch
+# always run everything in full.
+
+on:
+  pull_request:
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - "LICENSE"
+      - ".gitignore"
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - "LICENSE"
+      - ".gitignore"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  changes:
+    # Picks the lane and the sweep tier (scripts/classify_changes.py). A pull
+    # request whose changes are all examples or docs (examples/, docs/, *.md,
+    # LICENSE, .gitignore; never under src/, tests/, scripts/, cpp/, tools/ or
+    # .github/) gets the examples lane: lint, the native wheels running every
+    # example, and tests/test_teleop.py. Anything else gets the full suite, in
+    # which each exhaustive sweep whose covered code (tests/_sweeps.py) the PR
+    # leaves alone runs its fixed PR sample. Every push, workflow_dispatch, and
+    # any doubt (no merge commit, a failed diff, no changes) classify no paths,
+    # which means the full suite with every sweep in full. The diff is the PR's
+    # merge commit against its first parent, i.e. exactly what merging would
+    # change, with renames split so a move out of src/ counts as a src/ change.
+    #
+    # Within the full suite, the C++ jobs (emit + drift guard, conformance, and
+    # the Python suite reused against the native backend) are skipped only when
+    # every path is examples or docs, under tests/, or one of the Python modules
+    # the C++ emit never imports (`cpp=false`). Every push, workflow_dispatch and
+    # any doubt run them.
+    name: Classify changed files
+    runs-on: ubuntu-latest
+    outputs:
+      full: ${{ steps.classify.outputs.full }}
+      cpp: ${{ steps.classify.outputs.cpp }}
+      pr_sweeps: ${{ steps.classify.outputs.pr_sweeps }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Full suite or examples lane, C++ jobs or not, and which sweeps run a sample?
+        id: classify
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          : > changed.txt
+          if [ "$EVENT" = pull_request ] && git rev-parse -q --verify HEAD^2 >/dev/null; then
+            git diff --no-renames --name-only HEAD^1 HEAD > changed.txt || : > changed.txt
+          fi
+          echo "event=$EVENT; changed:"
+          cat changed.txt
+          python3 scripts/classify_changes.py < changed.txt | tee -a "$GITHUB_OUTPUT"
+
+  build:
+    # Compiles, once per Python version, what the checkout's jobs import in
+    # place of source, and hands it to them as artifacts, which
+    # .github/actions/checkout-env adds to each job's checkout:
+    #   ext-py<v>     the Cython modules hatch_build.py compiles in place, with
+    #                 the source record each one carries for the stale-extension
+    #                 guard (#614), plus the version file hatch-vcs writes.
+    #   native-py<v>  ssik._ssik_native, from scripts/build_cpp_ext.py against
+    #                 the pinned Eigen (#606).
+    # Those jobs used to spend ~4.5 min each on this: `uv sync` built ssik (the
+    # build hook compiling the Cython modules and its own copy of the native
+    # extension, ~3 min), then build_cpp_ext.py compiled the native extension
+    # again (~1.5 min). A pull request restores both from a cache keyed on
+    # everything the compile reads; a push to main or a workflow_dispatch run
+    # always compiles from scratch, and saves the result for pull requests.
+    name: Build extensions (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Every Python version the jobs below run on (keep in sync).
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+    env:
+      UV_PYTHON: ${{ matrix.python-version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # hatch-vcs needs git history
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
+        with:
+          enable-cache: false  # see .github/actions/checkout-env
+
+      - name: Sync dependencies, without building ssik
+        run: uv sync --dev --no-install-project
+
+      - name: Cache key
+        # The compiled files are a function of these sources, the lockfile, the
+        # Python and the compiler; the runner image covers the system headers.
+        # The key also stands in for a source record for the native extension,
+        # which has none. hatch_build.py's build isolation resolves its build
+        # requirements afresh, so a new Cython reaches pull requests through the
+        # next main push or image update.
+        id: key
+        run: |
+          {
+            echo "$ImageOS $ImageVersion"
+            .venv/bin/python -VV
+            c++ --version | head -1
+          } | tee toolchain.txt
+          echo "key=ext-py${UV_PYTHON}-$(sha256sum toolchain.txt | cut -c1-16)-${{ hashFiles('hatch_build.py', 'pyproject.toml', 'uv.lock', 'scripts/build_cpp_ext.py', 'scripts/fetch_eigen.py', 'src/ssik/_stale_extensions.py', 'src/ssik/kinematics/poe_fk.py', 'src/ssik/refinement/__init__.py', 'cpp/include/**', 'cpp/bindings/**') }}" | tee -a "$GITHUB_OUTPUT"
+
+      - name: Restore the compiled files
+        id: restore
+        if: github.event_name == 'pull_request'
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
+        with:
+          path: out/
+          key: ${{ steps.key.outputs.key }}
+
+      - name: Do the restored Cython modules match their sources?
+        # The guard's own check: a Cython target the key does not list could
+        # have changed. Any mismatch compiles everything again.
+        id: fresh
+        if: steps.restore.outputs.cache-hit == 'true'
+        run: |
+          cp -a out/ext/. out/native/. src/ssik/
+          uv run --no-sync python - <<'PY'
+          import os
+          import sys
+          from pathlib import Path
+
+          sys.path.insert(0, "src/ssik")
+          import _stale_extensions
+
+          stale = _stale_extensions.stale_extensions(Path("src/ssik"))
+          print("\n".join(stale) or "all match")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              print(f"ok={'false' if stale else 'true'}", file=out)
+          PY
+
+      - name: Compile
+        if: steps.fresh.outputs.ok != 'true'
+        # The two compiles run side by side. `uv sync` builds ssik, so the build
+        # hook compiles the Cython modules in place and records their sources.
+        # native=True is the shipped default for every prebuilt arm (#554), so
+        # the tests must have the native extension: without it the ~30 native
+        # tests SKIP and the perf gate measures the Python fallback against a
+        # native-recorded baseline (#568).
+        run: |
+          python3 scripts/fetch_eigen.py  # one download of the pinned Eigen for both
+          uv run --no-sync python scripts/build_cpp_ext.py --out-dir src/ssik &
+          native=$!
+          uv sync --dev --reinstall-package ssik
+          wait "$native"
+
+      - name: Collect the compiled files
+        if: steps.fresh.outputs.ok != 'true'
+        run: |
+          suffix="$(uv run --no-sync python -c 'import sysconfig; print(sysconfig.get_config_var("EXT_SUFFIX"))')"
+          rm -rf out && mkdir -p out/ext out/native
+          cp "src/ssik/_ssik_native$suffix" out/native/
+          (cd src/ssik && find . \( -name "*$suffix" -o -name "*$suffix.source-sha256" \) \
+            ! -name "_ssik_native*" -exec cp --parents {} ../../out/ext/ \;)
+          find out -type f | sort
+
+      - name: Save the compiled files
+        if: steps.fresh.outputs.ok != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
+        with:
+          path: out/
+          key: ${{ steps.key.outputs.key }}
+
+      - name: Version file
+        # Written by hatch-vcs for this commit, so never cached. An sdist build
+        # runs it without compiling anything.
+        run: |
+          uv build --sdist --out-dir "$RUNNER_TEMP/sdist"
+          cp src/ssik/_version.py out/ext/
+
+      - name: Upload the Cython modules and the version file
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: ext-py${{ matrix.python-version }}
+          path: out/ext/
+          if-no-files-found: error
+          retention-days: 3
+
+      - name: Upload the native extension
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: native-py${{ matrix.python-version }}
+          path: out/native/
+          if-no-files-found: error
+          retention-days: 3
+
+  test:
+    # Each Python version's suite is split across two jobs (`pytest --shard`,
+    # tests/conftest.py), which halves the worst case: on the slowest runner CPU
+    # the unsplit pytest step took ~20 min. Lint, docs and perf gates run once
+    # per version, in shard 1. `pytest shards cover the suite` proves the shards
+    # together ran every collected test exactly once. Changing the shard count
+    # means changing both the matrix and the /2 in the pytest step.
+    name: Linux py${{ matrix.python-version }} (${{ matrix.shard }}/2)
+    needs: [changes, build]
+    if: needs.changes.outputs.full == 'true'
+    runs-on: ubuntu-latest
+    env:
+      SSIK_DERIVATION_CACHE: ~/.cache/ssik/rr-derivations
+      # The sweeps that run their PR sample (tests/_sweeps.py); empty = all full.
+      SSIK_PR_SWEEPS: ${{ needs.changes.outputs.pr_sweeps }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Full support range: 3.10 (ROS2 Humble floor, #477) through 3.14.
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+        shard: [1, 2]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Dependencies, and the build job's compiled modules + native extension
+        uses: ./.github/actions/checkout-env
+        with:
+          python-version: ${{ matrix.python-version }}
+          native: "true"
+
+      - name: Runner info
+        # Surfaces the runner's real core count up front (a standalone step so it
+        # logs immediately, unlike a line inside the long pytest step). Confirms
+        # whether xdist parallelism can help here. (#348) The CPU model explains
+        # most of the run-to-run spread: ubuntu-latest lands on several CPU
+        # generations, and the same suite takes ~10 min on the newest and ~21
+        # on an EPYC 7763.
+        run: |
+          echo "nproc=$(nproc)"
+          python3 -c "import os; print('cpu_count', os.cpu_count(), 'affinity', len(os.sched_getaffinity(0)))"
+          lscpu | grep "Model name"
+
+      # Cache the robot_descriptions clones (~16 repos, several with mesh
+      # files). Uncached, these clones dominate CI wall-clock (~30-55 min) and
+      # cause the run-to-run variance. Keyed on MANIFEST.toml so adding an arm
+      # invalidates; restore-keys lets a manifest change reuse the prior cache
+      # so the prewarm step only clones the new entry. (#348)
+      - name: Cache robot_descriptions
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/robot_descriptions
+          key: rd-${{ hashFiles('src/ssik/prebuilt/MANIFEST.toml') }}
+          restore-keys: rd-
+
+      - name: Pre-warm robot_descriptions
+        # Serial clone before pytest so the parallel (-n auto) workers only
+        # read the cache -- no concurrent clones racing on the same dir.
+        run: uv run python scripts/prewarm_descriptions.py
+
+      # The symbolic Raghavan-Roth derivations (~10-45 s each, cached on disk by
+      # _raghavan_roth.py and keyed there on its own source + the sympy version,
+      # so a stale entry can only miss). Restored from this shard's latest save
+      # for the same derivation source and lockfile; saved again below only when
+      # the job added entries, so a shard's cache grows to cover its tests.
+      - name: Restore the RR derivation cache
+        id: rr-cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
+        with:
+          path: ~/.cache/ssik/rr-derivations
+          key: rr-derivations-py${{ matrix.python-version }}-${{ matrix.shard }}-${{ hashFiles('src/ssik/solvers/ikgeo/_raghavan_roth.py', 'uv.lock') }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: rr-derivations-py${{ matrix.python-version }}-${{ matrix.shard }}-${{ hashFiles('src/ssik/solvers/ikgeo/_raghavan_roth.py', 'uv.lock') }}-
+
+      - name: Count the restored derivations
+        id: rr-before
+        run: echo "n=$(find ~/.cache/ssik/rr-derivations -name '*.pkl' 2>/dev/null | wc -l)" | tee -a "$GITHUB_OUTPUT"
+
+      - name: ruff check
+        if: matrix.shard == 1
+        run: uv run ruff check
+
+      - name: ruff format --check
+        if: matrix.shard == 1
+        run: uv run ruff format --check
+
+      - name: mypy
+        # Not on 3.10: its lock resolves numpy 2.2, whose stubs type ndarray
+        # shapes differently and fail strict mode. pyproject.toml's mypy target is
+        # 3.11; 3.10 compatibility is gated by ruff's target and the 3.10 tests.
+        if: matrix.shard == 1 && matrix.python-version != '3.10'
+        run: uv run mypy
+
+      - name: regen_docs --check
+        if: matrix.shard == 1
+        # Fail if MANIFEST.toml and the AUTOGEN doc-table regions are
+        # out of sync. The script regenerates anchored tables from
+        # the manifest; this gate enforces "edit MANIFEST.toml + run
+        # scripts/regen_docs.py" as the only correct workflow for
+        # arm metadata changes.
+        run: uv run python scripts/regen_docs.py --check
+
+      - name: pytest (parallel)
+        # -n 4 (ubuntu-latest = 4 vCPUs). The heavy redundant tests (full
+        # snapshot roster, etc.) are marked slow and run on the macOS pre-push
+        # hook + nightly, so the per-PR suite is lean. Descriptions are
+        # pre-warmed above so workers never clone concurrently. perf gates are
+        # excluded here and run serially below. (#348) worksteal rebalances the
+        # queue as workers finish, so a few long tests don't strand one worker.
+        # --shard keeps this job's half, balanced by tests/_shard_durations.json.
+        run: >-
+          uv run pytest -q -n 4 --dist worksteal -m "not slow and not perf"
+          --shard ${{ matrix.shard }}/2
+          --shard-record shard-record/py${{ matrix.python-version }}/shard-${{ matrix.shard }}.json
+
+      - name: Upload this shard's test selection
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: pytest-shard-py${{ matrix.python-version }}-${{ matrix.shard }}
+          path: shard-record/
+          if-no-files-found: error
+          retention-days: 3
+
+      - name: pytest (perf gates, serial)
+        if: matrix.shard == 1
+        # Wall-clock performance gates: run serially (no -n) so timing is
+        # measured without cross-worker CPU contention. Small, fast set. (#348)
+        run: uv run pytest -q -m "not slow and perf"
+
+      - name: Count the derivations after the run
+        id: rr-after
+        if: ${{ !cancelled() }}
+        env:
+          BEFORE: ${{ steps.rr-before.outputs.n }}
+        run: |
+          n=$(find ~/.cache/ssik/rr-derivations -name '*.pkl' 2>/dev/null | wc -l)
+          echo "n=$n (restored ${BEFORE:-0})"
+          echo "grew=$([ "$n" -gt "${BEFORE:-0}" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
+      - name: Save the RR derivation cache
+        if: ${{ !cancelled() && steps.rr-after.outputs.grew == 'true' }}
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
+        with:
+          path: ~/.cache/ssik/rr-derivations
+          key: ${{ steps.rr-cache.outputs.cache-primary-key }}
+
+  test_shards:
+    # Fails unless, for every Python version, shards 1..N all ran, agree on N,
+    # collected the same tests, and ran disjoint slices whose union is the whole
+    # collection -- so a dropped shard or a partition bug cannot skip tests.
+    name: pytest shards cover the suite
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download every shard's test selection
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          pattern: pytest-shard-*
+          path: shard-record
+          merge-multiple: true
+
+      - name: Shards are disjoint and complete
+        run: |
+          # One directory per Python version in the test matrix (keep in sync).
+          test "$(find shard-record -mindepth 1 -maxdepth 1 -type d | wc -l)" -eq 5
+          python3 scripts/check_pytest_shards.py shard-record/*/*.json
+
+  cpp_emit:
+    # Native C++ backend (#482): the end-to-end no-drift guard (#495). Two
+    # halves, both red-on-recurrence:
+    #   1. cpp_emit --check-committed: the committed constants headers
+    #      (cpp/gen/<arm>.hpp, the shippable artifacts) match a fresh emit -- the
+    #      KinBody/oracle can't silently drift from what's shipped.
+    #   2. The `cpp` job below: build + ctest against parity fixtures regenerated
+    #      fresh from the *current* Linux oracle (they are FP results, not
+    #      byte-portable, so not committed -- #82).
+    # Neither runs in the pytest matrix, so this is the only place the native
+    # artifacts are validated in CI.
+    #
+    # The emit is the slow part (~19 min on one runner for all 72 arms), and the
+    # arms are independent, so it is split across shards. `--shard K/N`
+    # partitions the arms, so the N shards together emit and drift-check every
+    # arm exactly once; `cpp` refuses to build unless every arm's fixtures
+    # arrived. Changing the shard count means changing both the matrix and N.
+    name: C++ emit + drift guard (${{ matrix.shard }}/4)
+    needs: [changes, build]
+    if: needs.changes.outputs.cpp == 'true'
+    runs-on: ubuntu-latest
+    env:
+      # The drift guard checks the committed artifacts against derivations run
+      # from scratch here, never against cached ones.
+      SSIK_DERIVATION_CACHE: "off"
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Dependencies, and the build job's compiled modules
+        # No native extension: the emit's oracle is the Python solvers.
+        uses: ./.github/actions/checkout-env
+        with:
+          python-version: "3.12"
+
+      - name: Emit this shard's arms from the current oracle (parity fixtures + artifacts)
+        # Parallel across arms within the shard, slowest (jointlock) arms first.
+        run: uv run python scripts/cpp_emit.py --all --shard ${{ matrix.shard }}/4
+
+      - name: Drift guard (committed artifacts match the Python oracle)
+        # Compares what this shard just emitted against the committed blobs, with
+        # the structural-exact / numeric-tolerant comparison, so cross-platform
+        # ULP variance still does not false-positive.
+        run: uv run python scripts/cpp_emit.py --check-committed --shard ${{ matrix.shard }}/4
+
+      - name: Collect this shard's output
+        # Everything the emit wrote: new (git-ignored) parity fixtures, plus any
+        # constants header whose fresh emit differs from the committed bytes
+        # within the drift tolerance. Other arms' files are untouched, so shards
+        # never overlap.
+        run: |
+          mkdir -p shard-out
+          { git ls-files --others --ignored --exclude-standard cpp/gen; git ls-files --modified cpp/gen; } \
+            | sort -u | tee shard-files.txt | xargs -r cp -t shard-out
+          test -s shard-files.txt
+
+      - name: Upload this shard's output
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: cpp-gen-${{ matrix.shard }}
+          path: shard-out/
+          if-no-files-found: error
+          retention-days: 3
+
+  cpp:
+    # Builds and runs the native conformance against every shard's freshly
+    # emitted fixtures: ctest (FK + Newton goldens and the artifact gate over
+    # every self-contained arm) and the external-consumer smoke.
+    name: C++ conformance + drift guard
+    needs: [cpp_emit, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Dependencies, and the build job's compiled modules
+        uses: ./.github/actions/checkout-env
+        with:
+          python-version: "3.12"
+
+      - name: Install CMake
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake
+
+      - name: Pinned Eigen as a CMake package
+        # The one Eigen every native build uses (#606), downloaded and
+        # sha256-checked by fetch_eigen.py, then installed so find_package sees it.
+        run: |
+          echo "PINNED_EIGEN_PREFIX=$(python3 scripts/fetch_eigen.py --cmake-prefix)" >> "$GITHUB_ENV"
+          echo "PINNED_EIGEN_VERSION=$(python3 scripts/fetch_eigen.py --version)" >> "$GITHUB_ENV"
+
+      - name: Download every shard's emitted output
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          pattern: cpp-gen-*
+          path: cpp/gen
+          merge-multiple: true
+
+      - name: Every arm was emitted
+        # Guards the shard wiring: a shard missing from the matrix would leave its
+        # arms with no fresh fixtures and no drift check. Every arm's emit writes
+        # <arm>_fk_parity.hpp, so its absence means the arm was never emitted.
+        run: |
+          missing=0
+          for h in $(git ls-files 'cpp/gen/*.hpp'); do
+            f="${h%.hpp}_fk_parity.hpp"
+            [ -f "$f" ] || { echo "not emitted by any shard: $h"; missing=1; }
+          done
+          exit $missing
+
+      - name: Generate the artifact gate over every arm
+        run: uv run python scripts/cpp_emit.py --artifact-gate
+
+      - name: Configure + build
+        # SSIK_EIGEN_VERSION makes configure fail on any Eigen but the pin.
+        run: |
+          cmake -S cpp -B cpp/build -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_PREFIX_PATH="$PINNED_EIGEN_PREFIX" -DSSIK_EIGEN_VERSION="$PINNED_EIGEN_VERSION"
+          cmake --build cpp/build -j
+
+      - name: ctest (FK + Newton golden conformance)
+        run: ctest --test-dir cpp/build --output-on-failure
+
+      - name: C++ consumer smoke (install + find_package + build + run)
+        # Proves the self-contained artifacts are usable by an external C++
+        # project: installs ssik_cpp to a temp prefix, then a standalone
+        # downstream CMake project find_package(ssik_cpp)es it, builds the
+        # example, and runs it -- no ssik source tree, no Python (#493). With
+        # EIGEN_PREFIX unset it uses, and requires, the pinned Eigen (#606).
+        run: bash cpp/examples/consumer/smoke.sh
+
+  cpp_suite:
+    # The reused Python suite needs only the pybind extension, not the emitted
+    # cpp/gen artifacts, so it runs alongside the emit instead of after it. Its
+    # tests also run in every Linux pytest job, which has the native extension
+    # too, so it follows the C++ jobs' lane: a change that skips it is still
+    # tested there.
+    name: Reused Python suite vs the C++ backend
+    needs: [changes, build]
+    if: needs.changes.outputs.cpp == 'true'
+    runs-on: ubuntu-latest
+    env:
+      SSIK_PR_SWEEPS: ${{ needs.changes.outputs.pr_sweeps }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Dependencies, and the build job's compiled modules + native extension
+        # ssik._ssik_native is the shipped import path (#506/#507), so the reused
+        # suite drives the native backend AND the artifact solve(native=True)
+        # dispatch resolves it.
+        uses: ./.github/actions/checkout-env
+        with:
+          python-version: "3.12"
+          native: "true"
+
+      - name: Reused Python suite vs the C++ backend
+        # The SAME Python tests run against the native solver -- no assertion
+        # logic duplicated in C++. test_three_parallel: deep 500-pose fuzz +
+        # singular + #56 on UR5. test_three_parallel_family: the 17-arm family.
+        # test_native_dispatch: solve(native=True) parity + fallback (#507). cpp
+        # legs / native tests skip when the ext is absent; here it is built, so
+        # they execute.
+        run: uv run pytest tests/test_three_parallel.py tests/test_three_parallel_family.py tests/test_three_parallel_boundary.py tests/test_three_parallel_artifact.py tests/test_native_dispatch.py tests/test_feasible_arcs.py -q
+
+  native_wheel:
+    # Ships the native extension in the wheel (#506). cibuildwheel runs only on
+    # release tags, so this validates the wheel build + native bundling on PRs:
+    # build a wheel on Linux + macOS, install it, and native-solve through the
+    # shipped ssik._ssik_native. Without this the native ship is unexercised
+    # until a release tag.
+    name: Native wheel build — ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # hatch-vcs needs git history
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
+        with:
+          enable-cache: false  # see .github/actions/checkout-env
+
+      - name: Build wheel
+        # hatch_build fetches the pinned Eigen itself (#606); no system Eigen.
+        run: uv build --wheel
+
+      - name: Install wheel + native smoke
+        # native_smoke asserts the wheel's extension reports the pinned Eigen
+        # version. Both OSes check against the same pin, so a Linux and a macOS
+        # wheel built from one commit carry the same Eigen.
+        run: |
+          uv venv .wheelenv
+          uv pip install --python .wheelenv/bin/python dist/*.whl numpy
+          .wheelenv/bin/python scripts/native_smoke.py
+          .wheelenv/bin/python -c "from ssik import _ssik_native as n; print(n.eigen_version)" \
+            > "eigen-version-${{ matrix.os }}.txt"
+
+      - name: C++ consumer of the installed wheel's headers
+        # #641: a standalone CMake project finds ssik::ssik_cpp through
+        # ssik.get_cmake_dir() (the wheel's headers + CMake package, against the
+        # pinned Eigen), builds UR5's joint data from ssik.cpp.joint_data into a
+        # three_parallel_artifact_solve call, and must return the solution sets
+        # Python's solve() returns.
+        run: |
+          .wheelenv/bin/python cpp/examples/wheel_consumer/check.py --out wheel-consumer \
+            --eigen-prefix "$(python3 scripts/fetch_eigen.py --cmake-prefix)" \
+            --eigen-version "$(python3 scripts/fetch_eigen.py --version)"
+
+      - name: Upload the wheel consumer's input, solutions and report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: wheel-consumer-${{ matrix.os }}
+          path: |
+            wheel-consumer/*.txt
+            wheel-consumer/report.json
+          if-no-files-found: ignore
+          retention-days: 3
+
+      - name: Run every example against the installed wheel
+        # #681: each example asserts its own claims and exits non-zero on a
+        # failed one. The demo extra brings what they all need (viewer, URDF
+        # loading for ssik build). They run in parallel; logs and summary.json
+        # (status and per-claim result for each) are the inspectable artifact.
+        run: |
+          uv pip install --python .wheelenv/bin/python "$(ls dist/*.whl)[demo]"
+          .wheelenv/bin/python scripts/run_examples.py --out examples-smoke
+
+      - name: Upload the examples' logs and summary
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: examples-smoke-${{ matrix.os }}
+          path: examples-smoke/
+          if-no-files-found: ignore
+          retention-days: 3
+
+      - name: Upload the Eigen version this wheel compiled against
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: eigen-version-${{ matrix.os }}
+          path: eigen-version-${{ matrix.os }}.txt
+          if-no-files-found: error
+          retention-days: 3
+
+  native_wheel_eigen:
+    # The Linux and macOS wheels must carry the same Eigen (#606): QZ
+    # convergence differs between Eigen releases (#599), so a wheel built against
+    # another one is not the artifact the Linux gates verified.
+    name: Native wheels share one Eigen
+    needs: native_wheel
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download every wheel's Eigen version
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          pattern: eigen-version-*
+          path: eigen-version
+          merge-multiple: true
+
+      - name: Linux and macOS report the same Eigen
+        run: |
+          head eigen-version/*.txt
+          # One file per OS in the native_wheel matrix (keep in sync).
+          test "$(find eigen-version -name "*.txt" | wc -l)" -eq 2
+          test "$(cat eigen-version/*.txt | sort -u | wc -l)" -eq 1
+
+  examples_lane:
+    # The examples lane's share of the Python job (see `changes`): the lint and
+    # docs gates, and the tests that run examples 05 and 06 from the checkout.
+    # The native wheel jobs run every example against the installed wheel.
+    name: Examples-only checks
+    needs: [changes, build]
+    if: needs.changes.outputs.full == 'false'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Dependencies, and the build job's compiled modules + native extension
+        uses: ./.github/actions/checkout-env
+        with:
+          python-version: "3.12"
+          native: "true"
+
+      - name: ruff check
+        run: uv run ruff check
+
+      - name: ruff format --check
+        run: uv run ruff format --check
+
+      - name: regen_docs --check
+        run: uv run python scripts/regen_docs.py --check
+
+      - name: Examples 05 and 06 (tests/test_teleop.py)
+        run: uv run pytest -q tests/test_teleop.py
+
+  ci_ok:
+    # One check that is green exactly when every job the lanes need passed and
+    # every job outside them was skipped, so a classification bug that skips the
+    # full suite or the C++ jobs on a change that needs them shows up red here.
+    name: CI result
+    if: always()
+    needs:
+      - changes
+      - build
+      - test
+      - test_shards
+      - cpp_emit
+      - cpp
+      - cpp_suite
+      - native_wheel
+      - native_wheel_eigen
+      - examples_lane
+    runs-on: ubuntu-latest
+    steps:
+      - name: Every job in the lane passed
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+          FULL: ${{ needs.changes.outputs.full }}
+          CPP: ${{ needs.changes.outputs.cpp }}
+        run: |
+          python3 - <<'PY'
+          import json, os, sys
+          needs = json.loads(os.environ["NEEDS"])
+          full, cpp = os.environ["FULL"], os.environ["CPP"]
+          if (full, cpp) not in (("true", "true"), ("true", "false"), ("false", "false")):
+              sys.exit(f"no lane chosen (full={full!r}, cpp={cpp!r}); changes: {needs['changes']['result']}")
+          lane = {"true": "success", "false": "skipped"}
+          want = {j: "success" for j in ("changes", "build", "native_wheel", "native_wheel_eigen")}
+          want |= {j: lane[full] for j in ("test", "test_shards")}
+          want |= {j: lane[cpp] for j in ("cpp_emit", "cpp", "cpp_suite")}
+          want["examples_lane"] = "skipped" if full == "true" else "success"
+          bad = {j: (needs[j]["result"], w) for j, w in want.items() if needs[j]["result"] != w}
+          for j, (got, w) in sorted(bad.items()):
+              print(f"{j}: {got}, wanted {w}")
+          sys.exit(1 if bad else 0)
+          PY

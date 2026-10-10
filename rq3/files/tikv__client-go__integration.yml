@@ -1,0 +1,135 @@
+name: Integration Test
+
+on:
+  push:
+    branches: [master, "feature/*"]
+  pull_request:
+    branches: [master, "feature/*"]
+
+jobs:
+  integration-local:
+    if: ${{ !contains(github.event.pull_request.labels.*.name, 'skip-integration-tests') }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: 1.25.14
+
+      - name: Install gotestsum
+        run: go install gotest.tools/gotestsum@latest
+
+      - name: Test
+        run: gotestsum --format short-verbose -- ./...
+        working-directory: integration_tests
+
+  integration-local-race:
+    if: ${{ !contains(github.event.pull_request.labels.*.name, 'skip-integration-tests') }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: 1.25.14
+
+      - name: Install gotestsum
+        run: go install gotest.tools/gotestsum@latest
+
+      - name: Test
+        run: gotestsum --format short-verbose -- ./... -race
+        working-directory: integration_tests
+
+  integration-tikv:
+    if: ${{ !contains(github.event.pull_request.labels.*.name, 'skip-integration-tests') }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: 1.25.14
+
+      - name: Install gotestsum
+        run: go install gotest.tools/gotestsum@latest
+
+      - name: Fetch PD
+        uses: shrink/actions-docker-extract@v1
+        id: extract-pd
+        with:
+          image: pingcap/pd:nightly
+          path: /pd-server
+
+      - name: Fetch TiKV
+        uses: shrink/actions-docker-extract@v1
+        id: extract-tikv
+        with:
+          image: pingcap/tikv:nightly
+          path: /tikv-server
+
+      - name: Run PD & TiKV
+        run: |
+          mv ../${{steps.extract-pd.outputs.destination}}/pd-server .
+          mv ../${{steps.extract-tikv.outputs.destination}}/tikv-server .
+          ./pd-server > pd.log 2>&1 &
+          sleep 5
+          ./tikv-server -C tikv.toml > tikv.log 2>&1 &
+          sleep 15
+        working-directory: integration_tests
+
+      - name: Test
+        run: gotestsum --format short-verbose -- --with-tikv
+        working-directory: integration_tests
+
+  integration-raw-tikv:
+    if: ${{ !contains(github.event.pull_request.labels.*.name, 'skip-integration-tests') }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        api_version: [v1ttl, v2]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: 1.25.14
+
+      - name: Install gotestsum
+        run: go install gotest.tools/gotestsum@latest
+
+      - name: Fetch PD
+        uses: shrink/actions-docker-extract@v1
+        id: extract-pd
+        with:
+          image: pingcap/pd:nightly
+          path: /pd-server
+
+      - name: Fetch TiKV
+        uses: shrink/actions-docker-extract@v1
+        id: extract-tikv
+        with:
+          image: pingcap/tikv:nightly
+          path: /tikv-server
+
+      - name: Run PD & TiKV
+        run: |
+          mv ../../${{steps.extract-pd.outputs.destination}}/pd-server .
+          mv ../../${{steps.extract-tikv.outputs.destination}}/tikv-server .
+          ./pd-server > pd.log 2>&1 &
+          sleep 5
+          ./tikv-server -C tikv-${{ matrix.api_version }}.toml > tikv.log 2>&1 &
+          sleep 15
+        working-directory: integration_tests/raw
+
+      - name: Test
+        run: gotestsum --format short-verbose -- --with-tikv
+        working-directory: integration_tests/raw

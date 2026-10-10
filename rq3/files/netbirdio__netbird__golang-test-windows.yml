@@ -1,0 +1,88 @@
+name: "Windows"
+
+on:
+  push:
+    branches:
+      - main
+      - "release-*"
+  pull_request:
+
+env:
+  downloadPath: '${{ github.workspace }}\temp'
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.head_ref || github.actor_id }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: "Client / Unit"
+    runs-on: windows-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        id: go
+        with:
+          go-version-file: "go.mod"
+          cache: false
+
+      - name: Get Go environment
+        run: |
+          echo "cache=$(go env GOCACHE)" >> $env:GITHUB_ENV
+          echo "modcache=$(go env GOMODCACHE)" >> $env:GITHUB_ENV
+
+      - name: Cache Go modules
+        uses: actions/cache@2c8a9bd7457de244a408f35966fab2fb45fda9c8 # v6.0.0
+        with:
+          path: |
+            ${{ env.cache }}
+            ${{ env.modcache }}
+          key: ${{ runner.os }}-gotest-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-gotest-
+            ${{ runner.os }}-go-
+
+      - name: Download wintun
+        id: download-wintun
+        uses: netbirdio/shared-actions/actions/win-download-and-verify@be5df6047383da2236e02243cceb857d8567c27e # v0.0.2
+        with:
+          url: https://pkgs.netbird.io/wintun/wintun-0.14.1.zip
+          destination: ${{ env.downloadPath }}\wintun.zip
+          sha256: 07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51
+
+      - name: Decompressing wintun files
+        run: tar -xvf "${{ steps.download-wintun.outputs.file-path }}" -C ${{ env.downloadPath }}
+
+      - run: mv ${{ env.downloadPath }}/wintun/bin/amd64/wintun.dll 'C:\Windows\System32\'
+
+      - run: choco install -y sysinternals --ignore-checksums
+      - run: choco install -y mingw
+
+      - run: PsExec64 -s -w ${{ github.workspace }} C:\hostedtoolcache\windows\go\${{ steps.go.outputs.go-version }}\x64\bin\go.exe env -w GOMODCACHE=${{ env.cache }}
+      - run: PsExec64 -s -w ${{ github.workspace }} C:\hostedtoolcache\windows\go\${{ steps.go.outputs.go-version }}\x64\bin\go.exe env -w GOCACHE=${{ env.modcache }}
+      - run: PsExec64 -s -w ${{ github.workspace }} C:\hostedtoolcache\windows\go\${{ steps.go.outputs.go-version }}\x64\bin\go.exe mod tidy
+      - name: Generate test script
+        # Exclude the client/ui package itself: its main.go uses //go:embed
+        # all:frontend/dist, which fails to compile until the frontend has been
+        # built, and its release pipeline runs `pnpm build` before goreleaser.
+        # The pattern is anchored so the subpackages (services, preferences,
+        # i18n, authsession) still run: they hold Go-side unit tests and need no
+        # frontend bundle.
+        # `go list -e` lets the listing succeed even though the embed fails to
+        # resolve; the Where-Object pipeline then drops the broken package by
+        # path. Without -e, go list aborts with empty stdout.
+        run: |
+          $packages = go list -e ./... | Where-Object { $_ -notmatch '/management' } | Where-Object { $_ -notmatch '/relay' } | Where-Object { $_ -notmatch '/signal' } | Where-Object { $_ -notmatch '/proxy' } | Where-Object { $_ -notmatch '/combined' } | Where-Object { $_ -notmatch '/client/ui$' } | Where-Object { $_ -notmatch '/tools/mysql-migrate' }
+          $goExe = "C:\hostedtoolcache\windows\go\${{ steps.go.outputs.go-version }}\x64\bin\go.exe"
+          $cmd = "$goExe test -tags `"devcert privileged`" -timeout 10m -p 1 $($packages -join ' ') > test-out.txt 2>&1"
+          Set-Content -Path "${{ github.workspace }}\run-tests.cmd" -Value $cmd
+
+      - name: test
+        run: PsExec64 -s -w ${{ github.workspace }} cmd.exe /c "${{ github.workspace }}\run-tests.cmd"
+      - name: test output
+        if: ${{ always() }}
+        run: Get-Content test-out.txt

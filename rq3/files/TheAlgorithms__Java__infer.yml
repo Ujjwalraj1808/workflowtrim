@@ -1,0 +1,38 @@
+---
+name: Infer
+
+'on':
+  workflow_dispatch:
+  push:
+    branches:
+      - master
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  run_infer:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up JDK
+        uses: actions/setup-java@v6.0.1
+        with:
+          java-version: 21
+          distribution: 'temurin'
+
+      - name: Set up inferAdd commentMore actions
+        uses: srz-zumix/setup-infer@v1
+
+      - name: Display infer version
+        run: |
+          which infer
+          infer --version
+
+      - name: Run infer
+        run: |
+          mvn clean
+          infer --java-version 21 --fail-on-issue  --print-logs --no-progress-bar -- mvn test
+...

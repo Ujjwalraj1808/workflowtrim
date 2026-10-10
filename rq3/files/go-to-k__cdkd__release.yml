@@ -1,0 +1,120 @@
+name: Release
+
+# Batched releases via release-please (issue: release-per-merge cadence was too
+# high). Every push to main creates/updates a single "chore(release): <ver>"
+# release PR; merging THAT PR creates the tag + GitHub release and publishes to
+# npm. Ordinary feat/fix merges no longer publish anything by themselves.
+#
+# v0 guard: cdkd deliberately stays at major version 0. Two independent layers
+# enforce it:
+#   1. release-please-config.json sets bump-minor-pre-major: true, so a
+#      breaking change bumps MINOR (0.x.0), never 1.0.0.
+#   2. The publish job below hard-fails before npm publish if the computed
+#      major is not 0 (covers a manual Release-As: 1.0.0 override too).
+#
+# npm auth is OIDC trusted publishing (id-token: write + registry-url), bound
+# to THIS workflow filename on npmjs.com — do not rename release.yml without
+# updating the trusted publisher config.
+#
+# Known behavior: the release PR is created with GITHUB_TOKEN, and a
+# `pull_request` CI run IS created for it — held at `action_required` until a
+# maintainer approves it, then green (measured 2026-09-05 on
+# go-to-k/cdkd#2594, #2585 and #2508: attempt 1 action_required, attempt 2
+# green). So the `main` ruleset blocks an agent-side `gh pr merge` only while
+# those runs are unapproved, and stops once they are green — the standing
+# rule in AGENTS.md ("never merge the release PR unless the maintainer asked
+# for a release") is the real protection. Its diff is only
+# version/CHANGELOG/manifest; the maintainer merges it via the web UI.
+#
+# Known behavior: release-please does NOT rebuild a standing release PR whose
+# computed release is unchanged — it logs `PR #N remained the same` and leaves
+# the branch on the base it was cut from. So a change to a file release-please
+# OWNS (CHANGELOG.md) that lands on main afterwards is absent from the release
+# branch, and GitHub can still report the PR MERGEABLE: merging it would take
+# the branch's stale copy and undo that change. Seen on go-to-k/cdkd#2503,
+# which was closed and recreated as go-to-k/cdkd#2508 after CHANGELOG.md was
+# normalized. Remedy: close the release PR, delete its branch, and re-run this
+# workflow — which is what `workflow_dispatch` below is for. Re-running is
+# safe: release-please recomputes the identical release from main.
+
+on:
+  push:
+    branches:
+      - main
+  # Manual re-run: recreate a stale release PR (see the note above), or refresh
+  # one without waiting for the next merge. release-please is idempotent.
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    # observed at least 46 s -- one action that reads history and
+    # opens or updates a PR.
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+      major: ${{ steps.release.outputs.major }}
+    steps:
+      - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        id: release
+
+  publish:
+    needs: release-please
+    if: ${{ needs.release-please.outputs.release_created == 'true' }}
+    runs-on: ubuntu-latest
+    # observed at least 54 s; the tail is npm's publish latency.
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          ref: ${{ needs.release-please.outputs.tag_name }}
+          persist-credentials: false
+
+      - name: Enforce v0 (never publish a v1+ release)
+        env:
+          TAG_NAME: ${{ needs.release-please.outputs.tag_name }}
+          MAJOR: ${{ needs.release-please.outputs.major }}
+        run: |
+          set -eu
+          VERSION="${TAG_NAME#v}"
+          PKG_VERSION=$(node -p "require('./package.json').version")
+          if [ "$PKG_VERSION" != "$VERSION" ]; then
+            echo "::error::package.json version ($PKG_VERSION) does not match release tag ($TAG_NAME)"
+            exit 1
+          fi
+          if [ "$MAJOR" != "0" ]; then
+            echo "::error::Refusing to publish $TAG_NAME: cdkd is intentionally kept at major version 0 (bump-minor-pre-major). Delete the tag/release and fix the version source."
+            exit 1
+          fi
+          case "$VERSION" in
+            0.*) ;;
+            *)
+              echo "::error::Refusing to publish $TAG_NAME: version does not start with 0."
+              exit 1
+              ;;
+          esac
+
+      - uses: voidzero-dev/setup-vp@3754dd7dbdb32bd8f6d28b6043de13ad3a75f21f # v1
+        with:
+          node-version: "24"
+          cache: true
+          run-install: false
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Install dependencies
+        run: vp install --frozen-lockfile
+
+      - name: Build
+        run: vp run build
+
+      - name: Publish to npm
+        run: npm publish

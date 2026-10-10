@@ -1,0 +1,200 @@
+# SPDX-FileCopyrightText: 2013 Lovell Fuller and others
+# SPDX-License-Identifier: Apache-2.0
+
+name: "CI: npm smoke test"
+on:
+  push:
+    tags:
+      - "v**"
+permissions: {}
+jobs:
+  release-smoke-test:
+    name: "${{ github.ref_name }} ${{ matrix.name }}"
+    runs-on: ${{ matrix.runs-on }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x64-node-npm
+            runs-on: ubuntu-26.04
+            runtime: node
+            package-manager: npm
+          - name: linux-x64-node-pnpm
+            runs-on: ubuntu-26.04
+            runtime: node
+            package-manager: pnpm
+          - name: linux-x64-node-yarn
+            runs-on: ubuntu-26.04
+            runtime: node
+            package-manager: yarn
+          - name: linux-x64-node-yarn-pnp
+            runs-on: ubuntu-26.04
+            runtime: node
+            package-manager: yarn-pnp
+          - name: linux-x64-node-yarn-v1
+            runs-on: ubuntu-26.04
+            runtime: node
+            package-manager: yarn-v1
+          - name: linux-x64-deno
+            runs-on: ubuntu-26.04
+            runtime: deno
+          - name: linux-x64-bun
+            runs-on: ubuntu-26.04
+            runtime: bun
+
+          - name: darwin-x64-node-npm
+            runs-on: macos-15-intel
+            runtime: node
+            package-manager: npm
+          - name: darwin-x64-node-yarn
+            runs-on: macos-15-intel
+            runtime: node
+            package-manager: yarn
+          - name: darwin-x64-node-yarn-pnp
+            runs-on: macos-15-intel
+            runtime: node
+            package-manager: yarn-pnp
+          - name: darwin-x64-node-yarn-v1
+            runs-on: macos-15-intel
+            runtime: node
+            package-manager: yarn-v1
+          - name: darwin-x64-deno
+            runs-on: macos-15-intel
+            runtime: deno
+          - name: darwin-x64-bun
+            runs-on: macos-15-intel
+            runtime: bun
+
+          - name: win32-x64-node-npm
+            runs-on: windows-2022
+            runtime: node
+            package-manager: npm
+          - name: win32-x64-node-pnpm
+            runs-on: windows-2022
+            runtime: node
+            package-manager: pnpm
+          - name: win32-x64-node-yarn
+            runs-on: windows-2022
+            runtime: node
+            package-manager: yarn
+          - name: win32-x64-node-yarn-pnp
+            runs-on: windows-2022
+            runtime: node
+            package-manager: yarn-pnp
+          - name: win32-x64-node-yarn-v1
+            runs-on: windows-2022
+            runtime: node
+            package-manager: yarn-v1
+          - name: win32-x64-deno
+            runs-on: windows-2022
+            runtime: deno
+
+    steps:
+      - name: Install Node.js
+        if: ${{ matrix.runtime == 'node' }}
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 20
+          cache: ""
+          package-manager-cache: false
+      - name: Install pnpm
+        if: ${{ matrix.package-manager == 'pnpm' }}
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          version: 11
+      - name: Install Deno
+        if: ${{ matrix.runtime == 'deno' }}
+        uses: denoland/setup-deno@22d081ff2d3a40755e97629de92e3bcbfa7cf2ed # v2.0.5
+        with:
+          deno-version: v2.x
+      - name: Install Bun
+        if: ${{ matrix.runtime == 'bun' }}
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: latest
+          no-cache: true
+
+      - name: Version
+        id: version
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            core.setOutput('semver', context.ref.replace('refs/tags/v',''))
+      - name: Create package.json
+        env:
+          SEMVER: ${{ steps.version.outputs.semver }}
+        shell: bash
+        run: |
+          cat <<EOF >package.json
+          {
+            "dependencies": {
+              "sharp": "${SEMVER}"
+            },
+            "type": "module"
+          }
+          EOF
+      - name: Create release.mjs
+        shell: bash
+        run: |
+          cat <<EOF >release.mjs
+          import { deepStrictEqual } from 'node:assert';
+          import sharp from 'sharp';
+          deepStrictEqual(['.jpg', '.jpeg', '.jpe', '.jfif'], sharp.format.jpeg.input.fileSuffix);
+          EOF
+
+      - name: Run with Node.js + npm
+        if: ${{ matrix.package-manager == 'npm' }}
+        run: |
+          npm install
+          node release.mjs
+
+      - name: Run with Node.js + pnpm
+        if: ${{ matrix.package-manager == 'pnpm' }}
+        run: |
+          pnpm config set minimumReleaseAge 0 --location=user
+          pnpm install
+          node release.mjs
+
+      - name: Run with Node.js + yarn
+        if: ${{ matrix.package-manager == 'yarn' }}
+        run: |
+          corepack enable
+          yarn set version stable
+          yarn config set enableImmutableInstalls false
+          yarn config set enableScripts false
+          yarn config set nodeLinker node-modules
+          yarn config set npmMinimalAgeGate 0
+          yarn install
+          node release.mjs
+
+      - name: Run with Node.js + yarn pnp
+        if: ${{ matrix.package-manager == 'yarn-pnp' }}
+        run: |
+          corepack enable
+          yarn set version stable
+          yarn config set enableImmutableInstalls false
+          yarn config set enableScripts false
+          yarn config set nodeLinker pnp
+          yarn config set npmMinimalAgeGate 0
+          yarn install
+          yarn node release.mjs
+
+      - name: Run with Node.js + yarn v1
+        if: ${{ matrix.package-manager == 'yarn-v1' }}
+        run: |
+          corepack enable
+          yarn set version classic
+          yarn install
+          node release.mjs
+
+      - name: Run with Deno
+        if: ${{ matrix.runtime == 'deno' }}
+        run: |
+          deno install --minimum-dependency-age=0
+          deno run --allow-env --allow-ffi --allow-read --allow-sys release.mjs
+
+      - name: Run with Bun
+        if: ${{ matrix.runtime == 'bun' }}
+        run: |
+          bun install --ignore-scripts
+          bun release.mjs

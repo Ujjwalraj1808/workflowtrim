@@ -1,0 +1,268 @@
+name: EDGAR Data Sync (Bulk)
+
+# ⛔ dartlab EDGAR finance = SEC 벌크 primary (engines.edgar).
+# companyfacts API per-ticker 경로는 사용자 선택 (`c.refreshFromApi()`) 만 사용 — CI 비사용.
+
+on:
+  schedule:
+    - cron: '30 4 * * *'   # 매일 UTC 04:30 — companyfacts.zip 갱신(04:25) 직후
+    - cron: '0 3 * * 0'    # 일요일 UTC 03:00 — 전체 정산 (분기 새로고침 포함)
+  workflow_dispatch:
+    inputs:
+      forceCompanyfacts:
+        description: 'companyfacts.zip 강제 재다운로드 (ETag TTL 무시)'
+        default: 'false'
+        type: string
+      forceQuarterly:
+        description: '분기 벌크 강제 재다운로드 (최신 4개 분기)'
+        default: 'false'
+        type: string
+      collectDocs:
+        description: '10-K/10-Q docs 수집 (전 universe 는 job 180분 안에 끝나지 않음, 증분 누적용)'
+        default: 'false'
+        type: string
+      republishFinance:
+        description: 'edgar/finance 누락분 재발행 (로컬 universe 전체를 원장에 올려 run 당 상한씩 이월 발행)'
+        default: 'false'
+        type: string
+      search_catalog_bootstrap:
+        description: '초기 EDGAR panel search source catalog 생성 허용 (true=이전 manifest 없이 높은 하한으로 1회 bootstrap)'
+        default: 'false'
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    # job 레벨 concurrency 를 쓴다. 워크플로 레벨은 run 생성 즉시 큐를 점유하고, GitHub 은
+    # 그룹당 pending 을 1 개만 유지해 새 트리거가 오면 기존 pending 을 취소한다
+    # (cancel-in-progress 와 무관한 기본 동작). 2026-08 hf-dart-push 에서 대기 중이던 run
+    # 8 건이 job 0 개인 채 취소됐다. 같은 그룹을 2 개 이상이 공유하면 같은 위험을 진다.
+    concurrency:
+      group: hf-edgar-push
+      cancel-in-progress: false
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Restore EDGAR bulk cache (zip + freshness)
+        uses: actions/cache/restore@v5
+        with:
+          path: data/edgar/_bulk
+          key: dartlab-edgar-bulk-${{ github.run_id }}
+          restore-keys: dartlab-edgar-bulk-
+
+      - name: Restore EDGAR finance parquet cache
+        uses: actions/cache/restore@v5
+        with:
+          path: data/edgar/finance
+          key: dartlab-edgar-finance-${{ github.run_id }}
+          restore-keys: dartlab-edgar-finance-
+
+      - name: Restore EDGAR meta parquet cache
+        uses: actions/cache/restore@v5
+        with:
+          path: data/edgar/meta
+          key: dartlab-edgar-meta-${{ github.run_id }}
+          restore-keys: dartlab-edgar-meta-
+
+      - name: Restore EDGAR docs cache
+        uses: actions/cache/restore@v5
+        with:
+          path: data/edgar/docs
+          key: dartlab-edgar-docs-${{ github.run_id }}
+          restore-keys: dartlab-edgar-docs-
+
+      # plan delegated-prancing-tower PR-E3 — sections artifact cache.
+      # fetchEdgarDocs 가 dual-write 로 sections artifact 도 emit (PR-E2).
+      - name: Restore EDGAR sections cache
+        uses: actions/cache/restore@v5
+        with:
+          path: data/edgar/sections
+          key: dartlab-edgar-sections-${{ github.run_id }}
+          restore-keys: dartlab-edgar-sections-
+
+      # EDGAR panel은 영향 ticker만 HF에서 선택적으로 seed한다.
+      # 전체 panel cache는 약 9GB로 Actions cache quota를 점유해 bulk와 finance cache를 축출하므로 두지 않는다.
+
+      # ── 1+2. daily 벌크(companyfacts.zip) + 분기 벌크(sub/pre/tag, 최신 4분기) ──
+      # 통합 진입점(dartlab.pipeline) — edgar stage 가 두 inline 스텝을 byte 동형 호출.
+      # force 플래그는 EDGAR_FORCE_* env 로 전달.
+      # HF_TOKEN: edgar stage 가 companyfacts 변경분(detectChanged)만 edgar/finance 로 증분 발행
+      # (브라우저 터미널 HF 직독 패리티 — 그날 공시한 회사만, 16,600 전체 재업로드 회피).
+      - name: Download + convert EDGAR bulk (companyfacts + quarterly)
+        env:
+          DARTLAB_DATA_DIR: ${{ github.workspace }}/data
+          EDGAR_FORCE_COMPANYFACTS: ${{ github.event.inputs.forceCompanyfacts }}
+          EDGAR_FORCE_QUARTERLY: ${{ github.event.inputs.forceQuarterly }}
+          EDGAR_REPUBLISH_FINANCE: ${{ github.event.inputs.republishFinance }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: uv run python -X utf8 -m dartlab.pipeline edgar
+
+      # ── 3. docs (10-K/10-Q HTML). 선택, 수동 요청(collectDocs=true) 때만 ──
+      # 주간 schedule 에서는 돌리지 않는다. 실측 filing 당 약 1.6 초(worker 가 동기 수집이라 사실상 직렬)
+      # 로 --tier all 7,720 ticker 전 이력은 약 200 시간이라 job 180 분 안에 끝날 수 없다. 예전 주간
+      # 실행은 매주 실패만 남기고 docs 를 한 건도 만들지 못했다(2026-07-30 이후 매 일요일 red).
+      - name: Collect EDGAR docs (optional, manual dispatch only)
+        if: ${{ github.event.inputs.collectDocs == 'true' }}
+        run: |
+          uv run python -X utf8 -m dartlab collect --tier all -c docs --mode all
+        env:
+          DARTLAB_DATA_DIR: ${{ github.workspace }}/data
+
+      # ── 3.5. panel — SEC text 메모리 fetch → panel 단일 artifact (daily incremental) ──
+      # raw .txt 저장과 별도 panelCell 없이 dartlab.pipeline 의 edgarPanel stage 가
+      # daily-index 발견 → fetchFilingTexts(record) → append/build → edgarPanel HF 업로드를 맡는다.
+      - name: Update EDGAR panel (daily incremental)
+        run: uv run python -X utf8 -m dartlab.pipeline edgarPanel
+        env:
+          DARTLAB_DATA_DIR: ${{ github.workspace }}/data
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      - name: EDGAR panel search source manifest + catalog
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          SEARCH_CATALOG_BOOTSTRAP: ${{ github.event.inputs.search_catalog_bootstrap == 'true' && '1' || '0' }}
+        run: |
+          extra=()
+          if [ "${SEARCH_CATALOG_BOOTSTRAP:-0}" != "1" ]; then
+            extra+=(--require-previous-manifest)
+          fi
+          uv run python -X utf8 .github/scripts/search/buildSearchCatalog.py \
+            --source edgarPanel \
+            --input 'data/edgar/panel/*.parquet' \
+            --out-dir data/dart/searchCatalog/edgarPanel \
+            --producer edgarSync.edgarPanel \
+            --compare-remote-manifest \
+            --merge-previous-catalog \
+            --min-files 2000 \
+            --min-rows 50000 \
+            --min-catalog-rows 50000 \
+            "${extra[@]}" \
+            --upload
+      - name: Upload EDGAR panel search catalog evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: search-catalog-edgarPanel-${{ github.job }}-${{ github.run_id }}
+          path: data/dart/searchCatalog/edgarPanel/**
+          if-no-files-found: ignore
+
+      # ── 4. scan 프리빌드 (다년 패널 — finance-us 5Y 소스 + valuation) ──
+      # finance 직후 valuation(같은 facts + prices-snapshot 직독, 별도 수집 0). 둘 다 data/edgar/scan/ 에
+      # 쓰면 아래 deployEdgarToHF(['scan']) 가 통째 발행(KR dart/scan/valuation 대칭).
+      - name: Build EDGAR scan prebuild (finance + valuation + report)
+        run: |
+          uv run python -X utf8 -c "
+          from dartlab.scan.builders.edgar import buildEdgarPrebuild
+          print(buildEdgarPrebuild(sinceYear=2021, verbose=True))
+          "
+        env:
+          DARTLAB_DATA_DIR: ${{ github.workspace }}/data
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+
+      # ── 4b. US 터미널 게이트 집계 (finance-us / search-us JSON) ──
+      # 브라우저 터미널 raw.finance / raw.index 의 US 분 — scan 집계(위에서 빌드)를 reshape.
+      # KR buildFinanceJson / buildSearchMain 의 US 대칭. routeLoad 가 이 2 JSON 을 KR 위에 병합.
+      # ── 4a2. 부문별 매출(segments) 최신 stem 갱신 ──
+      # DERA notes 최신 월 zip 만 재처리(HF 시드 병합·직발행). 전 이력 백필은 로컬 runner 1회성.
+      - name: Refresh EDGAR segments (latest DERA notes stem)
+        run: uv run python -X utf8 .github/scripts/sync/backfillEdgarSegments.py --max-stems 1
+        env:
+          DARTLAB_DATA_DIR: ${{ github.workspace }}/data
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+
+      - name: Build US terminal aggregates (finance-us + search-us)
+        run: |
+          uv run python -X utf8 .github/scripts/prebuild/buildFinanceJsonUs.py
+          uv run python -X utf8 .github/scripts/prebuild/buildSearchIndexUs.py
+        env:
+          DARTLAB_DATA_DIR: ${{ github.workspace }}/data
+      # ── 5. HF 업로드 (dartlab 파생물만) ──
+      # finance / meta 는 SEC 벌크가 원본이므로 HF 미러링 없음 (사용자 PC 자동 다운로드).
+      # HF 업로드 대상: scan 프리빌드 + docs 섹션 파싱 결과 + sections SSOT (PR-E3).
+      - name: Deploy to HuggingFace (scan + docs + sections)
+        run: |
+          uv run python -X utf8 -c "
+          import os
+          os.environ.setdefault('DARTLAB_DATA_DIR', '${{ github.workspace }}/data')
+          from dartlab.providers.edgar.openapi.deploy import deployEdgarToHF
+          cats = ['scan']
+          if '${{ github.event.inputs.collectDocs }}' == 'true':
+              cats.append('docs')
+              # plan delegated-prancing-tower PR-E3 — fetchEdgarDocs 가 dual-write 로
+              # data/edgar/sections/{ticker}/{period}.parquet 동시 emit. PR-E7 안전
+              # 게이트 통과 후 docs 카테고리 폐기 예정.
+              cats.append('sections')
+              # EDGAR panel 은 위 edgarPanel stage 가 변경 파일만 업로드한다.
+          result = deployEdgarToHF(categories=cats)
+          if result.get('scan', 0) < 10:
+              raise RuntimeError(f'EDGAR scan cohort 배포 건수 미달: {result}')
+          print(result)
+          "
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+
+      # ── 6. 캐시 저장 ──
+      - name: Save EDGAR bulk cache
+        uses: actions/cache/save@v5
+        if: always()
+        with:
+          path: data/edgar/_bulk
+          key: dartlab-edgar-bulk-${{ github.run_id }}
+
+      - name: Save EDGAR finance cache
+        uses: actions/cache/save@v5
+        if: always()
+        with:
+          path: data/edgar/finance
+          key: dartlab-edgar-finance-${{ github.run_id }}
+
+      - name: Save EDGAR meta cache
+        uses: actions/cache/save@v5
+        if: always()
+        with:
+          path: data/edgar/meta
+          key: dartlab-edgar-meta-${{ github.run_id }}
+
+      - name: Save EDGAR docs cache
+        uses: actions/cache/save@v5
+        if: always()
+        with:
+          path: data/edgar/docs
+          key: dartlab-edgar-docs-${{ github.run_id }}
+
+      # plan delegated-prancing-tower PR-E3 — sections cache save (dual-write 산출물).
+      - name: Save EDGAR sections cache
+        uses: actions/cache/save@v5
+        if: always()
+        with:
+          path: data/edgar/sections
+          key: dartlab-edgar-sections-${{ github.run_id }}
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "## EDGAR Data Sync (Bulk)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| 항목 | 값 |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Trigger | ${{ github.event_name }} ${{ github.event.schedule }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Force companyfacts | ${{ github.event.inputs.forceCompanyfacts || 'false' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Force quarterly | ${{ github.event.inputs.forceQuarterly || 'false' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Collect docs | ${{ github.event.inputs.collectDocs || 'weekly' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| finance parquet | \`data/edgar/finance/\`|" >> $GITHUB_STEP_SUMMARY
+          echo "| meta parquet | \`data/edgar/meta/{sub,pre,tag}/\`|" >> $GITHUB_STEP_SUMMARY
+          echo "| scan parquet | \`data/edgar/scan/finance.parquet\`|" >> $GITHUB_STEP_SUMMARY
+          echo "| panel parquet | \`data/edgar/panel/{ticker}.parquet\`|" >> $GITHUB_STEP_SUMMARY

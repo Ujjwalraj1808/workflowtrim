@@ -1,0 +1,93 @@
+name: docker-release
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - master
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+    tags:
+      - '**'
+    
+jobs:
+  build:
+    if: github.repository == 'Potterli20/trojan-go-fork'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout the code
+        uses: actions/checkout@main
+
+      - name: Setup QEMU
+        uses: docker/setup-qemu-action@master
+
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@master
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@master
+        with:
+          username: ${{ secrets.DOCKERUSERNAME }}
+          password: ${{ secrets.DOCKERPASSWORD }}
+
+      - name: Login to GitHub Packages
+        uses: docker/login-action@master
+        with:
+          registry: ghcr.io
+          username: ${{ secrets.GITHUBUSERNAME }}
+          password: ${{ secrets.GITHUBTOKEN }}
+
+      - name: Prepare
+        id: prepare
+        run: |
+          if [[ $GITHUB_REF == refs/tags/* ]]; then
+            echo "ref=${GITHUB_REF#refs/tags/}" >> $GITHUB_ENV
+          else
+            echo "ref=${GITHUB_SHA}" >> $GITHUB_ENV
+          fi
+          echo "docker_platforms=linux/amd64,linux/arm64,linux/arm/v7,linux/ppc64le,linux/s390x,linux/386" >> $GITHUB_ENV
+          echo "docker_image=${{ secrets.DOCKERUSERNAME }}/trojan-go-fork" >> $GITHUB_ENV
+          echo "github_image=ghcr.io/${{ secrets.GITHUBUSERNAME }}/trojan-go-fork" | tr '[:upper:]' '[:lower:]' >> $GITHUB_ENV
+          echo "docker_image_lower=$(echo ${{ secrets.DOCKERUSERNAME }}/trojan-go-fork | tr '[:upper:]' '[:lower:]')" >> $GITHUB_ENV
+          echo "github_image_lower=$(echo ghcr.io/${{ secrets.GITHUBUSERNAME }}/trojan-go-fork | tr '[:upper:]' '[:lower:]')" >> $GITHUB_ENV
+
+      - name: Build and push docker image
+        run: |
+          tags="snapshot"
+          if [[ $GITHUB_REF == refs/tags/* ]]; then
+            tags="${GITHUB_REF#refs/tags/} latest"
+          fi
+          for tag in $tags; do
+            docker buildx build --platform ${{ env.docker_platforms }} \
+            --output "type=image,push=true" \
+            --tag "${{ env.docker_image_lower }}:$tag" \
+            --tag "${{ env.github_image_lower }}:$tag" \
+            --build-arg REF=${{ env.ref }} \
+            --file Dockerfile .
+          done
+
+  test:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout the code
+        uses: actions/checkout@main
+
+      - name: Cache Docker layers
+        uses: actions/cache@main
+        with:
+          path: /path/to/cache
+          key: ${{ runner.os }}-docker-${{ github.sha }}-${{ github.run_id }}
+          restore-keys: |
+            ${{ runner.os }}-docker-
+      
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@master
+
+      - name: Test docker image from Docker Hub
+        run: |
+          docker run --rm --entrypoint /usr/local/bin/trojan-go-fork ${{ secrets.DOCKERUSERNAME }}/trojan-go-fork -version
+
+      - name: Test docker image from GitHub Packages
+        run: |
+          docker run --rm --entrypoint /usr/local/bin/trojan-go-fork ghcr.io/potterli20/trojan-go-fork -version

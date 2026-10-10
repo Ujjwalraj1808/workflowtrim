@@ -1,0 +1,40 @@
+name: Publish to npm
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    name: Publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+          registry-url: 'https://registry.npmjs.org'
+      - run: npm ci
+      - run: npx ng build angular-editor --configuration production
+      - name: Copy assets to dist
+        run: |
+          cp README.md dist/angular-editor/
+          cp LICENSE dist/angular-editor/
+          cp CHANGELOG.md dist/angular-editor/ 2>/dev/null || true
+      - name: Determine dist-tag
+        id: tag
+        run: |
+          VERSION=$(node -p "require('./projects/angular-editor/package.json').version")
+          if echo "$VERSION" | grep -qE '(alpha|beta|rc)'; then
+            echo "dist_tag=next" >> "$GITHUB_OUTPUT"
+          else
+            echo "dist_tag=latest" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Publish
+        working-directory: dist/angular-editor
+        run: npm publish --access public --provenance --tag ${{ steps.tag.outputs.dist_tag }}

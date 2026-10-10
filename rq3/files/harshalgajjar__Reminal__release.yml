@@ -1,0 +1,340 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  # A tag used to go straight to building and publishing, so the only thing
+  # standing between a broken test and a release was somebody remembering to
+  # run them. This gate cannot live in ci.yml — `needs` reaches jobs in the same
+  # workflow only — so the checks are stated here too, and the build waits on
+  # them.
+  test:
+    # The public releases are made in the public repository and nowhere else: a
+    # copy of this workflow in any other repository — a fork, a private one —
+    # would build its own code under these names.
+    if: github.repository == 'harshalgajjar/Reminal'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: true
+      - name: Formatting
+        run: |
+          unformatted="$(gofmt -l ./cmd ./internal)"
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt would change these files:"
+            echo "$unformatted"
+            exit 1
+          fi
+      - name: Vet
+        run: go vet ./...
+      - name: Test
+        run: go test ./...
+      - name: Test with the race detector
+        run: go test -race ./...
+
+  release:
+    needs: test
+    runs-on: ${{ matrix.os }}
+    # The OIDC anchor for Azure Trusted Signing: the Entra app's federated
+    # credential matches subject repo:…:environment:release-signing exactly
+    # (federated credentials don't allow wildcards, and tag refs change every
+    # release — an environment name is the one stable subject). No protection
+    # rules; it exists solely so the windows jobs can mint an Azure token.
+    environment: release-signing
+    permissions:
+      contents: write # upload release assets (workflow default, restated — job-level permissions replace it)
+      id-token: write # OIDC token for azure/login → Trusted Signing (windows)
+    defaults:
+      run:
+        # One shell across the matrix: the windows jobs run on windows-latest
+        # (where `run:` would otherwise default to pwsh) but every step below
+        # is written in bash — Git Bash provides it there.
+        shell: bash
+    strategy:
+      # Don't cancel sibling builds when one job races to create the release;
+      # rerunning the loser is a no-op against the existing release.
+      fail-fast: false
+      matrix:
+        include:
+          # darwin builds run on a macOS runner so we can compile the native
+          # ScreenCaptureKit capture helper (reminal-capture) and bundle it.
+          - goos: darwin
+            goarch: arm64
+            os: macos-14
+            swift_target: arm64-apple-macos12.3
+          - goos: darwin
+            goarch: amd64
+            os: macos-14
+            swift_target: x86_64-apple-macos12.3
+          # linux cross-compiles fine on ubuntu; no helper (uses screencapture
+          # equivalent / X11 path).
+          - goos: linux
+            goarch: amd64
+            os: ubuntu-latest
+          - goos: linux
+            goarch: arm64
+            os: ubuntu-latest
+          # windows is pure Go (ConPTY + Win32 via syscalls, no cgo) and used to
+          # cross-compile on ubuntu — it builds on a windows runner only because
+          # Authenticode signing needs signtool, which is Windows-only. Both
+          # arches build on the amd64 runner (GOARCH does the cross part).
+          - goos: windows
+            goarch: amd64
+            os: windows-latest
+          - goos: windows
+            goarch: arm64
+            os: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+
+      - name: Stamp Windows resources (icon + version info)
+        if: matrix.goos == 'windows'
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          # Regenerate the committed .syso resources with the real release
+          # version, so reminal.exe's Properties → Details and the Windows
+          # Firewall dialog show this build's number instead of 0.0.0.0.
+          VERSION="${VERSION#v}"
+          NUM="$(echo "$VERSION" | sed 's/-.*//').0"
+          cd cmd/reminal
+          go run github.com/tc-hib/go-winres@v0.3.3 make --in winres/winres.json \
+            --arch "${{ matrix.goarch }}" \
+            --product-version "$NUM" --file-version "$NUM"
+
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          VERSION: ${{ github.ref_name }}
+          COMMIT: ${{ github.sha }}
+          REMINAL_DEFAULT_RELAY: ${{ vars.REMINAL_DEFAULT_RELAY }}
+          REMINAL_DEFAULT_WEB: ${{ vars.REMINAL_DEFAULT_WEB }}
+        run: |
+          VERSION="${VERSION#v}"
+          BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          SHORT_COMMIT="${COMMIT:0:7}"
+          OUT="reminal"
+          [ "$GOOS" = "windows" ] && OUT="reminal.exe"
+          if [ -n "$REMINAL_DEFAULT_RELAY" ] && [ -z "$REMINAL_DEFAULT_WEB" ]; then
+            REMINAL_DEFAULT_WEB="${REMINAL_DEFAULT_RELAY%/}"
+            REMINAL_DEFAULT_WEB="${REMINAL_DEFAULT_WEB%/ws}"
+            REMINAL_DEFAULT_WEB="${REMINAL_DEFAULT_WEB/#wss:\/\//https://}"
+            REMINAL_DEFAULT_WEB="${REMINAL_DEFAULT_WEB/#ws:\/\//http://}"
+          elif [ -n "$REMINAL_DEFAULT_WEB" ] && [ -z "$REMINAL_DEFAULT_RELAY" ]; then
+            REMINAL_DEFAULT_RELAY="${REMINAL_DEFAULT_WEB%/}"
+            REMINAL_DEFAULT_RELAY="${REMINAL_DEFAULT_RELAY/#https:\/\//wss://}"
+            REMINAL_DEFAULT_RELAY="${REMINAL_DEFAULT_RELAY/#http:\/\//ws://}/ws"
+          fi
+          RELAY_LDFLAGS=""
+          [ -n "$REMINAL_DEFAULT_RELAY" ] && RELAY_LDFLAGS="$RELAY_LDFLAGS -X reminal/internal/config.DefaultCloudRelay=${REMINAL_DEFAULT_RELAY%/}"
+          [ -n "$REMINAL_DEFAULT_WEB" ] && RELAY_LDFLAGS="$RELAY_LDFLAGS -X reminal/internal/config.DefaultCloudWeb=${REMINAL_DEFAULT_WEB%/}"
+          CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version=${VERSION} -X main.buildDate=${BUILD_DATE} -X main.commit=${SHORT_COMMIT}${RELAY_LDFLAGS}" -o "$OUT" ./cmd/reminal
+          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
+
+      - name: Build capture helper (macOS)
+        if: matrix.goos == 'darwin'
+        run: |
+          # Native window-capture helper for the arch of this archive. Deployment
+          # target 12.3 = the ScreenCaptureKit floor; on older macOS the agent
+          # falls back to screencapture. Ad-hoc signed so it runs unnotarized.
+          swiftc -O -target ${{ matrix.swift_target }} -o reminal-capture native/reminal-capture/main.swift
+          codesign --force --sign - reminal-capture || true
+          # Window-annotation helper behind `reminal mcp`. Same deployment
+          # target; without it the MCP tools report "helper not found".
+          swiftc -O -target ${{ matrix.swift_target }} -o reminal-overlay native/reminal-overlay/main.swift
+          codesign --force --sign - reminal-overlay || true
+
+      - name: Assemble & sign reminal.app (macOS)
+        if: matrix.goos == 'darwin'
+        env:
+          MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          MACOS_CERT_IDENTITY: ${{ secrets.MACOS_CERT_IDENTITY }}
+        run: |
+          set -euo pipefail
+          # Package the CLI + capture helper + icon into ONE signed reminal.app.
+          # macOS keys a Screen Recording (TCC) grant to a code identity and only
+          # shows a custom icon for an .app — so the bundle gives one identity
+          # (sh.reminal) the user grants once, which then covers the background
+          # daemon's ("+"-spawned) sessions too. build-app.sh signs the nested
+          # helper as sh.reminal.capture and seals the bundle as sh.reminal.
+          if [ -z "${MACOS_CERT_P12}" ]; then
+            echo "No signing cert (secret MACOS_CERT_P12 empty) — assembling reminal.app ad-hoc."
+            echo "macOS Screen Recording grants won't persist across versions until a cert is set."
+            VERSION="$VERSION" bash scripts/build-app.sh . . -
+            exit 0
+          fi
+          # Self-signed cert => STABLE Designated Requirement (fixed identifier +
+          # this cert), so a user's grant persists across every upgrade. Not
+          # notarized — install.sh strips quarantine, so Gatekeeper never gates it.
+          KEYCHAIN="$RUNNER_TEMP/reminal-sign.keychain-db"
+          KPW="$(openssl rand -base64 24)"
+          CERT="$RUNNER_TEMP/cert.p12"
+          trap 'security delete-keychain "$KEYCHAIN" 2>/dev/null || true; rm -f "$CERT"' EXIT
+          echo "$MACOS_CERT_P12" | base64 --decode > "$CERT"
+          security create-keychain -p "$KPW" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KPW" "$KEYCHAIN"
+          security import "$CERT" -k "$KEYCHAIN" -P "$MACOS_CERT_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KPW" "$KEYCHAIN" >/dev/null
+          # Put our keychain first in the search list so codesign resolves the identity.
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | sed 's/"//g')
+          VERSION="$VERSION" KEYCHAIN="$KEYCHAIN" bash scripts/build-app.sh . . "$MACOS_CERT_IDENTITY"
+          echo "--- signature ---"
+          codesign -dvvv reminal.app 2>&1 | grep -Ei "Identifier|Authority|Signature" || true
+          codesign --verify --deep --strict --verbose=2 reminal.app
+
+      - name: Azure login for Trusted Signing (Windows)
+        if: matrix.goos == 'windows'
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_SIGNING_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_SIGNING_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SIGNING_SUBSCRIPTION_ID }}
+
+      - name: Sign reminal.exe (Authenticode via Trusted Signing)
+        if: matrix.goos == 'windows'
+        # Without this, Smart App Control machines block the exe outright as an
+        # unknown unsigned binary (each release is a brand-new file hash with
+        # zero reputation) and SmartScreen shows "unknown publisher" to everyone
+        # else. Signs in place; must run BEFORE the tarball is packed.
+        uses: azure/artifact-signing-action@v2
+        with:
+          endpoint: https://eus.codesigning.azure.net/
+          signing-account-name: reminal
+          certificate-profile-name: reminal-public
+          files-folder: ${{ github.workspace }}
+          files-folder-filter: exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      - name: Verify Authenticode signature (Windows)
+        if: matrix.goos == 'windows'
+        shell: pwsh
+        run: |
+          $s = Get-AuthenticodeSignature reminal.exe
+          $s | Format-List Status, StatusMessage, SignerCertificate
+          # UnknownError is what a valid-but-not-locally-chained cert reports on
+          # a bare runner; anything Valid is ideal. NotSigned means the signing
+          # step silently did nothing — fail loudly instead of shipping it.
+          if ($s.Status -eq 'NotSigned') { exit 1 }
+
+      - name: Package
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          ARCHIVE="reminal_${VERSION}_${GOOS}_${GOARCH}.tar.gz"
+          if [ "$GOOS" = "darwin" ] && [ -d reminal.app ]; then
+            # macOS ships the signed bundle; tar preserves the signature + icon.
+            tar czf "${ARCHIVE}" reminal.app
+          elif [ "$GOOS" = "windows" ]; then
+            # Windows ships the bare exe; tar.gz keeps the asset naming (and
+            # the in-app updater's extraction path) uniform across platforms —
+            # install.ps1 and Windows 10+'s built-in tar both handle it.
+            tar czf "${ARCHIVE}" reminal.exe
+          else
+            FILES="reminal"
+            [ -f reminal-capture ] && FILES="$FILES reminal-capture"
+            [ -f reminal-overlay ] && FILES="$FILES reminal-overlay"
+            tar czf "${ARCHIVE}" $FILES
+          fi
+          echo "ARCHIVE=${ARCHIVE}" >> "$GITHUB_ENV"
+
+      - name: Write release notes
+        # changelog/<version>.md is the changelog when it exists: written by
+        # hand in the commit that earns it, and the same text the Host panel
+        # shows someone deciding whether to upgrade. A tag with no file falls
+        # back to the release commit message, so this stays additive — every
+        # tag that worked before still works.
+        #
+        # The commit-message path below: trailers stay
+        # in git history but are noise on a release page, and one of them is
+        # worse than noise: Claude-Session carries a claude.ai URL that has no
+        # business on a public page. Matched case-insensitively because both
+        # Co-authored-by and Co-Authored-By occur in this history — the old
+        # filter pinned one casing and silently shipped the other, which is how
+        # v3.5.0 through v3.5.2 published a Cursor trailer.
+        # awk, not sed: this step runs on every matrix leg including macos-14,
+        # and BSD sed has no case-insensitive address flag. tolower() is POSIX.
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          if [ -f "changelog/${version}.md" ]; then
+            echo "Using changelog/${version}.md"
+            cp "changelog/${version}.md" release-notes.md
+          else
+            echo "No changelog/${version}.md — falling back to the commit message"
+            git log -1 --pretty=%B | awk '
+              { lower = tolower($0) }
+              lower ~ /^(co-authored-by|claude-session|signed-off-by):/ { next }
+              { buf[n++] = $0 }
+              END {
+                while (n > 0 && buf[n-1] ~ /^[ \t]*$/) n--
+                for (i = 0; i < n; i++) print buf[i]
+              }
+            ' > release-notes.md
+          fi
+
+      - name: Upload release asset
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: release-notes.md
+          files: reminal_*.tar.gz
+          # Any tag with a hyphen (v2.2.0-rc.1, -beta…) is a prerelease, so it
+          # doesn't become /releases/latest — install.sh keeps resolving the last
+          # stable for everyone while we validate a candidate.
+          prerelease: ${{ contains(github.ref_name, '-') }}
+
+  # Each platform uploads its own build, and a failing job does not stop its
+  # siblings — so one job dying leaves a published release, marked latest,
+  # carrying every other platform's binary and none for that one. Nothing
+  # downstream treats that as wrong: the client looks for its own asset, does
+  # not find one, and reports being up to date. v3.0.8 shipped that way after a
+  # rate-limited checkout, and it was found by chance rather than by anything
+  # saying so.
+  verify:
+    needs: release
+    if: always() && github.repository == 'harshalgajjar/Reminal'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Every platform must have published a build
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -uo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          if ! gh release view "$GITHUB_REF_NAME" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            # Nothing was published at all — the tests or every build failed.
+            # Reporting six missing binaries here would blame the assets for
+            # something that happened well before any were produced.
+            echo "::error title=Nothing published::$GITHUB_REF_NAME produced no release; check the test and build jobs above."
+            exit 1
+          fi
+          have="$(gh release view "$GITHUB_REF_NAME" -R "$GITHUB_REPOSITORY" --json assets -q '.assets[].name' || true)"
+          missing=""
+          for a in darwin_arm64 darwin_amd64 linux_amd64 linux_arm64 windows_amd64 windows_arm64; do
+            name="reminal_${version}_${a}.tar.gz"
+            printf '%s\n' "$have" | grep -qxF "$name" || missing="$missing $name"
+          done
+          if [ -n "$missing" ]; then
+            echo "::error title=Incomplete release::$GITHUB_REF_NAME is missing:$missing"
+            echo "Anyone on those platforms is told 'already up to date' and never upgrades."
+            echo "Re-run the failed matrix job, then re-run this check."
+            exit 1
+          fi
+          echo "All six platform builds are present for $GITHUB_REF_NAME."

@@ -1,0 +1,71 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+
+concurrency: ${{ github.workflow }}-${{ github.ref }}
+
+jobs:
+  release:
+    permissions:
+      id-token: write
+      contents: write
+      pull-requests: write
+    name: Release
+    runs-on: ubuntu-latest
+    steps:
+      # Setup
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6.1.0 # Uses version from package.json#packageManager
+      - name: Setup Node (using .node-version)
+        uses: actions/setup-node@v6
+        with:
+          node-version-file: '.node-version'
+          registry-url: 'https://registry.npmjs.org'
+          cache: 'pnpm'
+      - name: Install dependencies
+        run: pnpm install
+
+      # Publish to npm
+      - name: Build packages
+        run: pnpm build
+      - name: Create Release Pull Request or Publish to npm
+        id: changesets
+        uses: changesets/action@v2.1.2
+        with:
+          pr-title: 'release: version packages'
+          publish-script: pnpm changeset publish
+        env:
+          NPM_CONFIG_PROVENANCE: true
+
+      # Send Slack Notification
+      - name: Create release notification
+        if: steps.changesets.outputs.published == 'true'
+        run: pnpm release:notification --packages '${{ steps.changesets.outputs.published-packages }}'
+      - name: Slack Notification
+        if: steps.changesets.outputs.published == 'true'
+        uses: slackapi/slack-github-action@v4.0.0
+        with:
+          payload-file-path: './slack-notification.json'
+          webhook: ${{ secrets.SLACK_HOOK }}
+          webhook-type: webhook-trigger
+
+      # Rebuild search embeddings when docs content changed
+      - name: Rebuild search embeddings
+        if: steps.changesets.outputs.published == 'true'
+        env:
+          AWS_BEDROCK_ACCESS_KEY_ID: ${{ secrets.AWS_BEDROCK_ACCESS_KEY_ID }}
+          AWS_BEDROCK_SECRET_ACCESS_KEY: ${{ secrets.AWS_BEDROCK_SECRET_ACCESS_KEY }}
+          BLOB_READ_WRITE_TOKEN: ${{ secrets.BLOB_READ_WRITE_TOKEN }}
+        run: pnpm --filter @marigold/docs build:embeddings
+
+      # We use the "docs" branch for the production build on vercel
+      - name: Updating "docs" branch
+        if: steps.changesets.outputs.published == 'true'
+        uses: JamesIves/github-pages-deploy-action@v4
+        with:
+          folder: .
+          branch: docs
+          clean: true

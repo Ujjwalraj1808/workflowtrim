@@ -1,0 +1,159 @@
+name: Deploy website
+
+on:
+  push:
+    branches: [develop]
+    paths:
+      - 'packages/website/**'
+      - 'pnpm-lock.yaml'
+      - '.github/workflows/website-deploy.yml'
+  pull_request:
+    paths:
+      - 'packages/website/**'
+      - 'pnpm-lock.yaml'
+      - '.github/workflows/website-deploy.yml'
+
+concurrency:
+  group: website-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: pnpm/action-setup@v6
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22.21.1'
+          cache: 'pnpm'
+
+      # The root postinstall script rebuilds the desktop app's Electron-native
+      # modules (native-keymap, keytar, ced). They need these system libraries
+      # on Linux even though the website itself does not.
+      - name: Install desktop-rebuild system libs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libx11-dev libxkbfile-dev libsecret-1-dev
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Lint
+        run: pnpm --filter marktext-website run lint
+
+      - name: Type-check
+        run: pnpm --filter marktext-website run type-check
+
+      - name: Next build
+        run: pnpm --filter marktext-website run build
+
+      - name: OpenNext Cloudflare build
+        run: pnpm --filter marktext-website run cf:build
+
+      # ---- Production deploy: develop push ----
+      - name: Deploy (production)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/develop'
+        run: pnpm --filter marktext-website exec wrangler deploy
+
+      # ---- Preview deploy: pull_request ----
+      #
+      # Uploads a Worker version tagged + aliased with the PR number. With
+      # Preview URLs enabled on the Worker (Cloudflare dashboard → Workers &
+      # Pages → marktext-website → Settings → Preview URLs), wrangler emits a
+      # URL like https://pr-NNNN-marktext-website.<subdomain>.workers.dev that
+      # stays stable for the life of the PR. If the URL is not present in the
+      # output, the Preview URLs feature is off and we report that via a
+      # notice on the PR rather than failing the build.
+      - name: Deploy preview
+        id: preview
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+        working-directory: packages/website
+        run: |
+          set +e
+          ALIAS="pr-${{ github.event.pull_request.number }}"
+          pnpm exec wrangler versions upload \
+            --message "PR #${{ github.event.pull_request.number }} @ ${{ github.event.pull_request.head.sha }}" \
+            --tag "$ALIAS" \
+            --preview-alias "$ALIAS" \
+            > upload.log 2>&1
+          upload_status=$?
+          cat upload.log
+
+          if [ $upload_status -ne 0 ] && grep -q "Could not route to" upload.log; then
+            echo "result=not-bootstrapped" >> "$GITHUB_OUTPUT"
+            echo "::warning::Worker 'marktext-website' is not bootstrapped yet. Merge this PR to develop to create it; subsequent PRs will get real preview URLs."
+            exit 0
+          fi
+          if [ $upload_status -ne 0 ]; then
+            exit $upload_status
+          fi
+
+          # wrangler 4.x prints two preview lines: "Version Preview URL:"
+          # (versioned, per-deploy) and "Version Preview Alias URL:" (stable
+          # per --preview-alias, e.g. pr-NNNN). Prefer the alias because it's
+          # the URL we want to comment back on the PR.
+          PREVIEW_URL=$(grep -E '^Version Preview Alias URL:' upload.log | grep -Eo 'https://[^[:space:]]+' | head -n1 || true)
+          if [ -z "$PREVIEW_URL" ]; then
+            PREVIEW_URL=$(grep -E '^Version Preview URL:' upload.log | grep -Eo 'https://[^[:space:]]+' | head -n1 || true)
+          fi
+          VERSION_ID=$(grep -Eo 'Worker Version ID:[[:space:]]*[a-f0-9-]+' upload.log | awk '{print $NF}' || true)
+
+          if [ -n "$PREVIEW_URL" ]; then
+            echo "result=ok"          >> "$GITHUB_OUTPUT"
+            echo "url=$PREVIEW_URL"   >> "$GITHUB_OUTPUT"
+            echo "version=$VERSION_ID" >> "$GITHUB_OUTPUT"
+          elif [ -n "$VERSION_ID" ]; then
+            echo "result=preview-disabled" >> "$GITHUB_OUTPUT"
+            echo "version=$VERSION_ID"     >> "$GITHUB_OUTPUT"
+            echo "::warning::Worker version $VERSION_ID uploaded but no preview URL was emitted. Enable Preview URLs on the marktext-website Worker in the Cloudflare dashboard to get clickable PR previews."
+          else
+            echo "Could not parse a preview URL or version ID from wrangler output" >&2
+            exit 1
+          fi
+
+      # Fork PRs cannot access repository secrets, so the wrangler upload above
+      # is skipped for them. Report why via a notice (which needs no PR-write
+      # token) instead of leaving the run looking silently incomplete.
+      - name: Note preview skipped for forks
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository
+        run: echo "::notice::Website preview deploy skipped for fork PRs — Cloudflare deploy secrets are not exposed to pull requests from forks. The build, lint, and type-check steps above still validate this change."
+
+      - name: Comment preview URL on PR
+        if: github.event_name == 'pull_request' && steps.preview.outputs.result == 'ok'
+        uses: marocchino/sticky-pull-request-comment@v3
+        with:
+          header: website-preview
+          message: |
+            **Website preview ready:** ${{ steps.preview.outputs.url }}
+
+            Built from `${{ github.event.pull_request.head.sha }}` · Worker: `marktext-website` · Version: `${{ steps.preview.outputs.version }}` · Alias: `pr-${{ github.event.pull_request.number }}`
+
+      - name: Comment preview-disabled notice on PR
+        if: github.event_name == 'pull_request' && steps.preview.outputs.result == 'preview-disabled'
+        uses: marocchino/sticky-pull-request-comment@v3
+        with:
+          header: website-preview
+          message: |
+            **Website preview not generated** — Preview URLs are disabled on the `marktext-website` Worker.
+
+            The version `${{ steps.preview.outputs.version }}` was uploaded successfully. To enable clickable PR previews, in the Cloudflare dashboard go to **Workers & Pages → marktext-website → Settings → Preview URLs** and turn the feature on. Subsequent PR runs will then post a real preview URL here.
+
+      - name: Comment bootstrap notice on PR
+        if: github.event_name == 'pull_request' && steps.preview.outputs.result == 'not-bootstrapped'
+        uses: marocchino/sticky-pull-request-comment@v3
+        with:
+          header: website-preview
+          message: |
+            **Website preview not generated** — the `marktext-website` Worker does not exist on Cloudflare yet.
+
+            The build itself succeeded. Merge this PR to `develop` to create the Worker; subsequent PRs will get a real preview URL automatically.

@@ -1,0 +1,257 @@
+# This workflow will build the project with Gradle, run integration tests, and release.
+# Secret-backed jobs fetch credentials from AWS Secrets Manager using GitHub OIDC.
+
+name: Build, Check, Publish
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v7
+
+    - name: Gradle Wrapper Validation
+      uses: gradle/actions/wrapper-validation@v6
+
+    - name: Set up JDK 21
+      uses: actions/setup-java@v6
+      with:
+        java-version: '21'
+        distribution: 'zulu'
+
+    - name: Set up Python
+      uses: actions/setup-python@v7
+      with:
+        python-version: '3.9.14'
+    - run: python -m pip install ply six packaging
+
+    - name: Grant execute permissions
+      run: chmod +x gradlew 
+        && chmod +x update-submodules
+        && chmod +x generate-ci-auth-file
+        && chmod +x scripts/check-clean-git-status
+
+    - name: Set up submodules
+      run: ./update-submodules
+
+    - name: Generate Stone
+      run: ./gradlew :core:generateStone
+
+    - name: Ensure no changes in Generated Code
+      run: ./scripts/check-clean-git-status
+
+    - name: Ensure Binary Compatibility
+      run: ./gradlew :core:apiCheck :android:apiCheck
+
+    - name: Dependency Guard
+      run: ./gradlew dependencyGuard
+
+    - name: Check
+      run: ./gradlew check
+
+    - name: Generate Javadocs
+      run: ./gradlew :core:javadoc :android:javaDocReleaseGeneration
+
+  integration:
+    runs-on: ubuntu-latest
+    if: github.repository == 'dropbox/dropbox-sdk-java' && github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    needs: [build]
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+    - uses: actions/checkout@v7
+
+    - name: Gradle Wrapper Validation
+      uses: gradle/actions/wrapper-validation@v6
+
+    - name: Set up JDK 21
+      uses: actions/setup-java@v6
+      with:
+        java-version: '21'
+        distribution: 'zulu'
+
+    - name: Set up Python
+      uses: actions/setup-python@v7
+      with:
+        python-version: '3.9.14'
+    - run: python -m pip install ply six packaging
+
+    - name: Grant execute permissions
+      run: chmod +x gradlew
+        && chmod +x update-submodules
+        && chmod +x generate-ci-auth-file
+
+    - name: Set up submodules
+      run: ./update-submodules
+
+    - name: Generate Stone
+      run: ./gradlew :core:generateStone
+
+    - name: Configure AWS credentials (OIDC)
+      uses: aws-actions/configure-aws-credentials@v6
+      with:
+        role-to-assume: arn:aws:iam::082972943155:role/oidc-github-dropbox-dropbox-sdk-java-repo
+        aws-region: us-west-2
+
+    # Shared credential model used across the Dropbox SDKs (scoped user/team refresh tokens and a
+    # shared link). Exposed as CREDS_<KEY> env vars. The scoped user credentials also back the
+    # auth_output file consumed by the file-based tests (examples, proguard, and the legacy IT
+    # tests), so all of CI runs against this single shared credential.
+    - name: Get shared SDK integration test secrets from AWS Secrets Manager
+      uses: aws-actions/aws-secretsmanager-get-secrets@v3
+      with:
+        secret-ids: |
+          CREDS,api-sdk-integration-test-creds
+        parse-json-secrets: true
+
+    - name: Obtain oauth access token for integration tests
+      run: ./generate-ci-auth-file
+      env:
+        APP_KEY: ${{ env.CREDS_SCOPED_USER_CLIENT_ID }}
+        APP_SECRET: ${{ env.CREDS_SCOPED_USER_CLIENT_SECRET }}
+        REFRESH_TOKEN: ${{ env.CREDS_SCOPED_USER_REFRESH_TOKEN }}
+
+    - name: Run Integration Tests for Examples
+      run: ./gradlew :examples:examples:test :examples:java:test -Pci=true --info
+
+    - name: Run Integration Tests - OkHttpRequestor
+      run: ./gradlew -Pcom.dropbox.test.httpRequestor=OkHttpRequestor -Pcom.dropbox.test.authInfoFile=../auth_output integrationTest &&
+           ./gradlew -Pcom.dropbox.test.httpRequestor=OkHttpRequestor -Pcom.dropbox.test.authInfoFile=../auth_output proguardTest
+      env:
+        SCOPED_USER_CLIENT_ID: ${{ env.CREDS_SCOPED_USER_CLIENT_ID }}
+        SCOPED_USER_CLIENT_SECRET: ${{ env.CREDS_SCOPED_USER_CLIENT_SECRET }}
+        SCOPED_USER_REFRESH_TOKEN: ${{ env.CREDS_SCOPED_USER_REFRESH_TOKEN }}
+        SCOPED_TEAM_CLIENT_ID: ${{ env.CREDS_SCOPED_TEAM_CLIENT_ID }}
+        SCOPED_TEAM_CLIENT_SECRET: ${{ env.CREDS_SCOPED_TEAM_CLIENT_SECRET }}
+        SCOPED_TEAM_REFRESH_TOKEN: ${{ env.CREDS_SCOPED_TEAM_REFRESH_TOKEN }}
+        DROPBOX_SHARED_LINK: ${{ env.CREDS_DROPBOX_SHARED_LINK }}
+
+    - name: Run Integration Tests - OkHttp3Requestor
+      run: ./gradlew -Pcom.dropbox.test.httpRequestor=OkHttp3Requestor -Pcom.dropbox.test.authInfoFile=../auth_output integrationTest &&
+           ./gradlew -Pcom.dropbox.test.httpRequestor=OkHttp3Requestor -Pcom.dropbox.test.authInfoFile=../auth_output proguardTest
+      env:
+        SCOPED_USER_CLIENT_ID: ${{ env.CREDS_SCOPED_USER_CLIENT_ID }}
+        SCOPED_USER_CLIENT_SECRET: ${{ env.CREDS_SCOPED_USER_CLIENT_SECRET }}
+        SCOPED_USER_REFRESH_TOKEN: ${{ env.CREDS_SCOPED_USER_REFRESH_TOKEN }}
+        SCOPED_TEAM_CLIENT_ID: ${{ env.CREDS_SCOPED_TEAM_CLIENT_ID }}
+        SCOPED_TEAM_CLIENT_SECRET: ${{ env.CREDS_SCOPED_TEAM_CLIENT_SECRET }}
+        SCOPED_TEAM_REFRESH_TOKEN: ${{ env.CREDS_SCOPED_TEAM_REFRESH_TOKEN }}
+        DROPBOX_SHARED_LINK: ${{ env.CREDS_DROPBOX_SHARED_LINK }}
+
+    - name: Run Integration Tests - StandardHttpRequestor
+      run: ./gradlew -Pcom.dropbox.test.httpRequestor=StandardHttpRequestor -Pcom.dropbox.test.authInfoFile=../auth_output integrationTest &&
+           ./gradlew -Pcom.dropbox.test.httpRequestor=StandardHttpRequestor -Pcom.dropbox.test.authInfoFile=../auth_output proguardTest
+      env:
+        SCOPED_USER_CLIENT_ID: ${{ env.CREDS_SCOPED_USER_CLIENT_ID }}
+        SCOPED_USER_CLIENT_SECRET: ${{ env.CREDS_SCOPED_USER_CLIENT_SECRET }}
+        SCOPED_USER_REFRESH_TOKEN: ${{ env.CREDS_SCOPED_USER_REFRESH_TOKEN }}
+        SCOPED_TEAM_CLIENT_ID: ${{ env.CREDS_SCOPED_TEAM_CLIENT_ID }}
+        SCOPED_TEAM_CLIENT_SECRET: ${{ env.CREDS_SCOPED_TEAM_CLIENT_SECRET }}
+        SCOPED_TEAM_REFRESH_TOKEN: ${{ env.CREDS_SCOPED_TEAM_REFRESH_TOKEN }}
+        DROPBOX_SHARED_LINK: ${{ env.CREDS_DROPBOX_SHARED_LINK }}
+
+  publish:
+    runs-on: ubuntu-latest
+    if: github.repository == 'dropbox/dropbox-sdk-java' && github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    needs: [build, integration]
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Gradle Wrapper Validation
+        uses: gradle/actions/wrapper-validation@v6
+
+      - name: Install JDK 21
+        uses: actions/setup-java@v6
+        with:
+          distribution: 'zulu'
+          java-version: 21
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.9.14'
+      - run: python -m pip install ply six packaging
+
+      - name: Grant execute permissions
+        run: chmod +x gradlew && chmod +x update-submodules
+
+      - name: Update submodules
+        run: ./update-submodules
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: arn:aws:iam::521590706193:role/oidc-github-dropbox-dropbox-sdk-java-branch-main
+          aws-region: us-west-2
+
+      - name: Get Maven Central secrets from AWS Secrets Manager
+        uses: aws-actions/aws-secretsmanager-get-secrets@v3
+        with:
+          secret-ids: |
+            OSSRH_USERNAME,sdk-release-maven-central-token-username
+            OSSRH_PASSWORD,sdk-release-maven-central-token-password
+            SIGNING_KEY,sdk-release-signing-key
+            SIGNING_PASSWORD,sdk-release-signing-password
+          parse-json-secrets: false
+
+      - name: Retrieve version
+        run: |
+          echo "VERSION_NAME=$(cat gradle.properties | grep -w "VERSION_NAME" | cut -d'=' -f2)" >> $GITHUB_ENV
+
+      - name: Check signing configuration
+        run: ./gradlew :core:checkSigningConfiguration --no-daemon --no-parallel --no-configuration-cache --stacktrace
+        env:
+          ORG_GRADLE_PROJECT_signingInMemoryKey: ${{ env.SIGNING_KEY }}
+          ORG_GRADLE_PROJECT_signingInMemoryKeyPassword: ${{ env.SIGNING_PASSWORD }}
+
+      - name: Publish Snapshot to Maven Central
+        run: ./gradlew publishToMavenCentral --no-daemon --no-parallel --no-configuration-cache --stacktrace
+        if: "endsWith(env.VERSION_NAME, '-SNAPSHOT')"
+        env:
+          ORG_GRADLE_PROJECT_mavenCentralUsername: ${{ env.OSSRH_USERNAME }}
+          ORG_GRADLE_PROJECT_mavenCentralPassword: ${{ env.OSSRH_PASSWORD }}
+          ORG_GRADLE_PROJECT_signingInMemoryKey: ${{ env.SIGNING_KEY }}
+          ORG_GRADLE_PROJECT_signingInMemoryKeyPassword: ${{ env.SIGNING_PASSWORD }}
+
+      - name: Publish Release to Maven Central
+        run: ./gradlew publishAndReleaseToMavenCentral --no-daemon --no-parallel
+        if: "!endsWith(env.VERSION_NAME, '-SNAPSHOT')"
+        env:
+          ORG_GRADLE_PROJECT_mavenCentralUsername: ${{ env.OSSRH_USERNAME }}
+          ORG_GRADLE_PROJECT_mavenCentralPassword: ${{ env.OSSRH_PASSWORD }}
+          ORG_GRADLE_PROJECT_signingInMemoryKey: ${{ env.SIGNING_KEY }}
+          ORG_GRADLE_PROJECT_signingInMemoryKeyPassword: ${{ env.SIGNING_PASSWORD }}
+
+      - name: Upload Test Reports
+        uses: actions/upload-artifact@v7
+        with:
+          name: TestReports
+          path: |
+            core/build/reports/
+            android/build/reports/
+
+      - name: Upload JavaDocs
+        uses: actions/upload-artifact@v7
+        with:
+          name: JavaDocs
+          path: |
+            core/build/docs/javadoc/
+            android/build/docs/javadoc/
+
+      - name: Upload Build Artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: BuildArtifacts
+          path: |
+            core/build/distributions/
+            android/build/distributions/

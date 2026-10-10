@@ -1,0 +1,708 @@
+name: plugin-release
+run-name: plugin-release ${{ inputs.environment }} ${{ inputs.selection || 'everything' }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: plugin release environment
+        required: true
+        type: choice
+        default: staging
+        options:
+          - staging
+          - production
+      plugin_rev:
+        description: immutable plugin channel revision (defaults to commit sha)
+        required: false
+        type: string
+      selection:
+        description: plugin release selection
+        required: false
+        type: string
+        default: everything
+      skip_ci_gate:
+        description: deploy production without a successful full CI run on this commit
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: plugin-release-${{ inputs.environment }}
+  cancel-in-progress: false
+
+permissions:
+  actions: write
+  contents: read
+  id-token: write
+  attestations: write
+
+env:
+  SPACEWAVE_RELEASE_ENV: ${{ inputs.environment }}
+
+jobs:
+  prep:
+    runs-on: ubuntu-latest
+    outputs:
+      environment_name: ${{ steps.vars.outputs.environment_name }}
+      plugin_rev: ${{ steps.vars.outputs.plugin_rev }}
+      selection: ${{ steps.vars.outputs.selection }}
+      include_browser: ${{ steps.vars.outputs.include_browser }}
+      include_macos: ${{ steps.vars.outputs.include_macos }}
+      include_windows: ${{ steps.vars.outputs.include_windows }}
+      include_linux: ${{ steps.vars.outputs.include_linux }}
+      sign_artifacts: ${{ steps.vars.outputs.sign_artifacts }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Set reproducible build timestamp
+        shell: bash
+        run: echo "SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)" >> "${GITHUB_ENV}"
+
+      # Production ships only a commit whose full CI passed: the pull request
+      # into release, or an hourly run on master. skip_ci_gate is the escape
+      # hatch for an urgent fix.
+      - name: Check full CI
+        if: ${{ inputs.environment == 'production' && !inputs.skip_ci_gate }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/release/ci-gate.sh "${GITHUB_SHA}"
+
+      - id: vars
+        shell: bash
+        run: |
+          set -euo pipefail
+          requested_environment="${{ inputs.environment }}"
+          requested_rev="${{ inputs.plugin_rev }}"
+          requested_selection="${{ inputs.selection }}"
+          if [[ -z "${requested_rev}" ]]; then
+            requested_rev="${GITHUB_SHA}"
+          fi
+          if [[ -z "${requested_selection}" ]]; then
+            requested_selection="everything"
+          fi
+          source <(./scripts/release/check-plugin-selection.sh "${requested_selection}")
+          if [[ "${requested_environment}" == "production" ]]; then
+            environment_name="plugin-production"
+            expected_ref="refs/heads/release"
+            sign_artifacts=true
+          else
+            environment_name="plugin-staging"
+            expected_ref="refs/heads/master"
+            sign_artifacts=false
+          fi
+          if [[ "${GITHUB_REF}" != "${expected_ref}" ]]; then
+            echo "plugin-release ${requested_environment} must run from ${expected_ref}, got ${GITHUB_REF}" >&2
+            exit 1
+          fi
+          echo "environment_name=${environment_name}" >> "${GITHUB_OUTPUT}"
+          echo "plugin_rev=${requested_rev}" >> "${GITHUB_OUTPUT}"
+          echo "selection=${requested_selection}" >> "${GITHUB_OUTPUT}"
+          echo "include_browser=${include_browser}" >> "${GITHUB_OUTPUT}"
+          echo "include_macos=${include_macos}" >> "${GITHUB_OUTPUT}"
+          echo "include_windows=${include_windows}" >> "${GITHUB_OUTPUT}"
+          echo "include_linux=${include_linux}" >> "${GITHUB_OUTPUT}"
+          echo "sign_artifacts=${sign_artifacts}" >> "${GITHUB_OUTPUT}"
+
+  browser:
+    needs: prep
+    if: needs.prep.outputs.include_browser == 'true'
+    runs-on: ubuntu-latest
+    environment: ${{ needs.prep.outputs.environment_name }}
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Set reproducible build timestamp
+        shell: bash
+        run: echo "SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)" >> "${GITHUB_ENV}"
+
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.1'
+          cache: false
+
+      - name: Cache trusted Go dependencies
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: trusted-go-${{ github.job }}-${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+
+      - name: Prune superseded Go dependency caches
+        uses: ./.github/actions/prune-go-cache
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Install Bun dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          bun install --frozen-lockfile --ignore-scripts
+          go mod vendor
+
+      - name: Build browser plugin channel manifest (spacewave-core)
+        shell: bash
+        run: |
+          set -euo pipefail
+          scripts/release/build-browser-plugin.sh spacewave-core
+
+      - name: Build browser plugin channel manifest (spacewave-web)
+        shell: bash
+        run: |
+          set -euo pipefail
+          scripts/release/build-browser-plugin.sh spacewave-web
+
+      - name: Build browser plugin channel manifest (spacewave-code)
+        shell: bash
+        run: |
+          set -euo pipefail
+          scripts/release/build-browser-plugin.sh spacewave-code
+
+      - name: Build browser plugin channel manifest (spacewave-app)
+        shell: bash
+        run: |
+          set -euo pipefail
+          scripts/release/build-browser-plugin.sh spacewave-app
+
+      - name: Build browser plugin channel manifest (spacewave-notes)
+        shell: bash
+        run: |
+          set -euo pipefail
+          scripts/release/build-browser-plugin.sh spacewave-notes
+
+      - name: Build browser plugin channel manifest (spacewave-sql)
+        shell: bash
+        run: |
+          set -euo pipefail
+          scripts/release/build-browser-plugin.sh spacewave-sql
+
+      - name: Build browser plugin channel manifest (spacewave-v86)
+        shell: bash
+        run: |
+          set -euo pipefail
+          scripts/release/build-browser-plugin.sh spacewave-v86
+
+      - name: Build browser plugin channel manifest (spacewave-cli-plugin)
+        shell: bash
+        run: |
+          set -euo pipefail
+          scripts/release/build-browser-plugin.sh spacewave-cli-plugin
+
+      - name: Build browser plugin channel manifest (web)
+        shell: bash
+        run: |
+          set -euo pipefail
+          scripts/release/build-browser-plugin.sh web
+
+      - name: Upload plugin world state
+        uses: actions/upload-artifact@v7
+        with:
+          name: plugin-world-browser
+          path: .bldr/devtool.s4wave
+          if-no-files-found: error
+
+  native-macos:
+    needs: prep
+    if: needs.prep.outputs.include_macos == 'true'
+    runs-on: macos-26
+    environment: ${{ needs.prep.outputs.environment_name }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Set reproducible build timestamp
+        shell: bash
+        run: echo "SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)" >> "${GITHUB_ENV}"
+
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.1'
+          cache: false
+
+      - name: Cache trusted Go dependencies
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: trusted-go-${{ github.job }}-${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+
+      - name: Prune superseded Go dependency caches
+        uses: ./.github/actions/prune-go-cache
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Install Bun dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          bun install --frozen-lockfile --ignore-scripts
+          go mod vendor
+
+      - name: Import macOS signing certificate
+        if: needs.prep.outputs.sign_artifacts == 'true'
+        shell: bash
+        env:
+          MACOS_CERT_P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+          MACOS_CERT_P12_PASSWORD: ${{ secrets.MACOS_CERT_P12_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${MACOS_CERT_P12_BASE64}" ]]; then
+            echo "MACOS_CERT_P12_BASE64 is required"
+            exit 1
+          fi
+          KEYCHAIN_PATH="${RUNNER_TEMP}/plugin-release.keychain-db"
+          CERT_PATH="${RUNNER_TEMP}/plugin-release.p12"
+          KEYCHAIN_PASSWORD="$(openssl rand -hex 24)"
+          echo "${MACOS_CERT_P12_BASE64}" | base64 -D > "${CERT_PATH}"
+          security create-keychain -p "${KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}"
+          security set-keychain-settings -lut 21600 "${KEYCHAIN_PATH}"
+          security unlock-keychain -p "${KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}"
+          security import "${CERT_PATH}" -k "${KEYCHAIN_PATH}" -P "${MACOS_CERT_P12_PASSWORD}" -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple: -s -k "${KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}"
+          security list-keychains -d user -s "${KEYCHAIN_PATH}" login.keychain-db
+          security default-keychain -d user -s "${KEYCHAIN_PATH}"
+          rm -f "${CERT_PATH}"
+
+      # Staging bundles are ad-hoc signed for developer machines, which still
+      # satisfies the launcher's strict recursive signature check.
+      - name: Build macOS native plugin manifests
+        shell: bash
+        env:
+          BLDR_MACOS_SIGN_IDENTITY: ${{ needs.prep.outputs.sign_artifacts == 'true' && vars.BLDR_MACOS_SIGN_IDENTITY || '-' }}
+          BLDR_MACOS_SIGN_ENTITLEMENTS: ${{ vars.BLDR_MACOS_SIGN_ENTITLEMENTS }}
+          BLDR_MACOS_SIGN_OPTIONS: ${{ vars.BLDR_MACOS_SIGN_OPTIONS }}
+        run: |
+          set -euo pipefail
+          BLDR_CONFIG="$(go run ./cmd/release-config)"
+          export BLDR_CONFIG
+          bun run bldr -- --build-type=release --watch=false build -b plugin-release-desktop-darwin-arm64,plugin-release-desktop-darwin-amd64
+
+      - name: Verify macOS signatures
+        shell: bash
+        run: |
+          set -euo pipefail
+          while IFS= read -r path; do
+            if file "${path}" | grep -q "Mach-O"; then
+              codesign --verify --strict "${path}"
+            fi
+          done < <(find .bldr/build/desktop/darwin/*/*/dist -type f)
+          find .bldr/build/desktop/darwin/*/*/dist -type d -name '*.app' -prune \
+            -exec codesign --verify --deep --strict {} +
+
+      - name: Upload plugin world state
+        uses: actions/upload-artifact@v7
+        with:
+          name: plugin-world-macos
+          path: .bldr/devtool.s4wave
+          if-no-files-found: error
+
+      - name: Upload native plugin artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: plugin-native-darwin
+          path: |
+            .bldr/build/desktop/darwin/arm64/spacewave-core/dist/*
+            .bldr/build/desktop/darwin/amd64/spacewave-core/dist/*
+          if-no-files-found: error
+
+      - name: Attest native plugin artifacts
+        uses: actions/attest@v4
+        with:
+          subject-path: |
+            .bldr/build/desktop/darwin/arm64/spacewave-core/dist/*
+            .bldr/build/desktop/darwin/amd64/spacewave-core/dist/*
+
+  native-windows:
+    needs: prep
+    if: needs.prep.outputs.include_windows == 'true'
+    runs-on: windows-2025
+    environment: ${{ needs.prep.outputs.environment_name }}
+    env:
+      AZURE_CORE_OUTPUT: none
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Set reproducible build timestamp
+        shell: bash
+        run: echo "SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)" >> "${GITHUB_ENV}"
+
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.1'
+          cache: false
+
+      - name: Cache trusted Go dependencies
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: trusted-go-${{ github.job }}-${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+
+      - name: Prune superseded Go dependency caches
+        uses: ./.github/actions/prune-go-cache
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Install Bun dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          bun install --frozen-lockfile --ignore-scripts
+          go mod vendor
+
+      - name: Login to Azure with OIDC
+        if: needs.prep.outputs.sign_artifacts == 'true'
+        uses: azure/login@v3
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      # Exchange the short-lived GitHub assertion before compilation; signing uses
+      # the cached Azure resource token after the assertion has expired.
+      - name: Cache Azure code-signing access token
+        if: needs.prep.outputs.sign_artifacts == 'true'
+        shell: pwsh
+        run: |
+          az account get-access-token --resource https://codesigning.azure.net --output none
+          if ($LASTEXITCODE -ne 0) { throw "Failed to acquire the code-signing access token" }
+
+      - name: Resolve TrustedSigning module path
+        if: needs.prep.outputs.sign_artifacts == 'true'
+        id: trusted_signing_paths
+        shell: pwsh
+        run: |
+          $defaultPath = $env:PSModulePath -split ';' | Select-Object -First 1
+          "psmodulepath=$defaultPath" >> $env:GITHUB_OUTPUT
+
+      - name: Cache TrustedSigning PowerShell module
+        if: needs.prep.outputs.sign_artifacts == 'true'
+        id: cache_trusted_signing
+        uses: actions/cache@v6
+        with:
+          path: ${{ steps.trusted_signing_paths.outputs.psmodulepath }}\TrustedSigning\0.5.8
+          key: TrustedSigning-0.5.8
+
+      - name: Install TrustedSigning PowerShell module
+        if: needs.prep.outputs.sign_artifacts == 'true' && steps.cache_trusted_signing.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          Install-Module -Name TrustedSigning -RequiredVersion 0.5.8 -Force -Repository PSGallery
+
+      # The TrustedSigning module's lazy dependency installer (Get-EveryDependency
+      # in NugetInstall.psm1) installs three NuGet packages on first invocation,
+      # silently swallowing dotnet tool stdout. Pre-install them here so the
+      # module's Test-Path checks short-circuit and intermittent install
+      # failures surface in dedicated steps.
+      - name: Cache Microsoft.Windows.SDK.BuildTools nuget
+        if: needs.prep.outputs.sign_artifacts == 'true'
+        id: cache_buildtools
+        uses: actions/cache@v6
+        with:
+          path: ~\AppData\Local\TrustedSigning\Microsoft.Windows.SDK.BuildTools\Microsoft.Windows.SDK.BuildTools.10.0.26100.4188
+          key: Microsoft.Windows.SDK.BuildTools-10.0.26100.4188
+
+      - name: Cache Microsoft.Trusted.Signing.Client nuget
+        if: needs.prep.outputs.sign_artifacts == 'true'
+        id: cache_tsclient
+        uses: actions/cache@v6
+        with:
+          path: ~\AppData\Local\TrustedSigning\Microsoft.Trusted.Signing.Client\Microsoft.Trusted.Signing.Client.1.0.95
+          key: Microsoft.Trusted.Signing.Client-1.0.95
+
+      - name: Cache sign dotnet tool
+        if: needs.prep.outputs.sign_artifacts == 'true'
+        id: cache_signcli
+        uses: actions/cache@v6
+        with:
+          path: ~\AppData\Local\TrustedSigning\sign\sign.0.9.1-beta.24469.1
+          key: SignCli-0.9.1-beta.24469.1
+
+      - name: Install Microsoft.Windows.SDK.BuildTools nuget
+        if: needs.prep.outputs.sign_artifacts == 'true' && steps.cache_buildtools.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $name = "Microsoft.Windows.SDK.BuildTools"
+          $version = "10.0.26100.4188"
+          $root = Join-Path $env:LOCALAPPDATA "TrustedSigning\$name"
+          New-Item -ItemType Directory -Force -Path $root | Out-Null
+          if (-Not (Get-PackageSource -Location "https://www.nuget.org/api/v2/" -ErrorAction Ignore)) {
+            Register-PackageSource -Name trusted-signing-ps -Location "https://www.nuget.org/api/v2/" -ProviderName NuGet -Trusted -Force | Out-Null
+          }
+          Install-Package -Name $name -RequiredVersion $version -Source "https://www.nuget.org/api/v2/" -Destination $root -Force | Out-Null
+
+      - name: Install Microsoft.Trusted.Signing.Client nuget
+        if: needs.prep.outputs.sign_artifacts == 'true' && steps.cache_tsclient.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $name = "Microsoft.Trusted.Signing.Client"
+          $version = "1.0.95"
+          $root = Join-Path $env:LOCALAPPDATA "TrustedSigning\$name"
+          New-Item -ItemType Directory -Force -Path $root | Out-Null
+          if (-Not (Get-PackageSource -Location "https://www.nuget.org/api/v2/" -ErrorAction Ignore)) {
+            Register-PackageSource -Name trusted-signing-ps -Location "https://www.nuget.org/api/v2/" -ProviderName NuGet -Trusted -Force | Out-Null
+          }
+          Install-Package -Name $name -RequiredVersion $version -Source "https://www.nuget.org/api/v2/" -Destination $root -Force | Out-Null
+
+      - name: Install sign dotnet tool
+        if: needs.prep.outputs.sign_artifacts == 'true' && steps.cache_signcli.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $name = "sign"
+          $version = "0.9.1-beta.24469.1"
+          $root = Join-Path $env:LOCALAPPDATA "TrustedSigning\$name"
+          New-Item -ItemType Directory -Force -Path $root | Out-Null
+          dotnet tool install $name `
+            --version $version `
+            --tool-path $root `
+            --add-source https://api.nuget.org/v3/index.json
+          if ($LASTEXITCODE -ne 0) { throw "dotnet tool install $name $version failed: $LASTEXITCODE" }
+          $storePath = Join-Path $root ".store\$name\$version\$name\$version"
+          $packagePath = Join-Path $root "$name.$version"
+          Move-Item -Path $storePath -Destination $packagePath -Force
+          Remove-Item -Path (Join-Path $root ".store") -Recurse -Force
+          Remove-Item -Path (Join-Path $root "sign.exe") -Force -ErrorAction Ignore
+
+      - name: Check Windows renderer and dependency cache
+        shell: pwsh
+        run: |
+          go test -timeout=110s ./bldr/util/npm ./bldr/web/entrypoint/electron/bundle -run 'TestEnsureBunAddIsolatesDownloads|TestBuildRendererBundleUsesSelfContainedDistEntrypoint'
+          if ($LASTEXITCODE -ne 0) { throw "Windows renderer checks failed: $LASTEXITCODE" }
+
+      # Staging leaves Windows binaries unsigned: its developer machines
+      # bypass SmartScreen, and the signer is a no-op without a profile.
+      - name: Build Windows native plugin manifests
+        shell: pwsh
+        env:
+          BLDR_WINDOWS_SIGN_PROFILE: ${{ needs.prep.outputs.sign_artifacts == 'true' && vars.BLDR_WINDOWS_SIGN_PROFILE || '' }}
+          BLDR_WINDOWS_SIGN_ACCOUNT: ${{ needs.prep.outputs.sign_artifacts == 'true' && vars.BLDR_WINDOWS_SIGN_ACCOUNT || '' }}
+          BLDR_WINDOWS_SIGN_ENDPOINT: ${{ needs.prep.outputs.sign_artifacts == 'true' && vars.BLDR_WINDOWS_SIGN_ENDPOINT || '' }}
+        run: |
+          $env:BLDR_CONFIG = go run ./cmd/release-config
+          if ($LASTEXITCODE -ne 0) { throw "Release overlay failed: $LASTEXITCODE" }
+          bun run bldr -- --build-type=release --watch=false build -b plugin-release-desktop-windows-arm64,plugin-release-desktop-windows-amd64
+
+      - name: Verify Windows signatures
+        if: needs.prep.outputs.sign_artifacts == 'true'
+        shell: pwsh
+        run: |
+          $files = Get-ChildItem -Path .bldr/build/desktop/windows/*/*/dist -Recurse -File | Where-Object { $_.Extension -eq ".exe" }
+          foreach ($file in $files) {
+            $sig = Get-AuthenticodeSignature -FilePath $file.FullName
+            if ($sig.Status -ne "Valid") {
+              throw "signature verification failed for $($file.FullName): $($sig.Status)"
+            }
+          }
+
+      - name: Upload plugin world state
+        uses: actions/upload-artifact@v7
+        with:
+          name: plugin-world-windows
+          path: .bldr/devtool.s4wave
+          if-no-files-found: error
+
+      - name: Upload native plugin artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: plugin-native-windows
+          path: |
+            .bldr/build/desktop/windows/arm64/spacewave-core/dist/*
+            .bldr/build/desktop/windows/amd64/spacewave-core/dist/*
+          if-no-files-found: error
+
+      - name: Attest native plugin artifacts
+        uses: actions/attest@v4
+        with:
+          subject-path: |
+            .bldr/build/desktop/windows/arm64/spacewave-core/dist/*
+            .bldr/build/desktop/windows/amd64/spacewave-core/dist/*
+
+  native-linux:
+    needs: prep
+    if: needs.prep.outputs.include_linux == 'true'
+    runs-on: ubuntu-latest
+    environment: ${{ needs.prep.outputs.environment_name }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Set reproducible build timestamp
+        shell: bash
+        run: echo "SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)" >> "${GITHUB_ENV}"
+
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.1'
+          cache: false
+
+      - name: Cache trusted Go dependencies
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: trusted-go-${{ github.job }}-${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+
+      - name: Prune superseded Go dependency caches
+        uses: ./.github/actions/prune-go-cache
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Install Bun dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          bun install --frozen-lockfile --ignore-scripts
+          go mod vendor
+
+      - name: Build Linux native plugin manifests
+        shell: bash
+        run: |
+          set -euo pipefail
+          BLDR_CONFIG="$(go run ./cmd/release-config)"
+          export BLDR_CONFIG
+          bun run bldr -- --build-type=release --watch=false build -b plugin-release-desktop-linux-arm64,plugin-release-desktop-linux-amd64
+
+      - name: Upload plugin world state
+        uses: actions/upload-artifact@v7
+        with:
+          name: plugin-world-linux
+          path: .bldr/devtool.s4wave
+          if-no-files-found: error
+
+      - name: Upload native plugin artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: plugin-native-linux
+          path: |
+            .bldr/build/desktop/linux/arm64/spacewave-core/dist/*
+            .bldr/build/desktop/linux/amd64/spacewave-core/dist/*
+          if-no-files-found: error
+
+      - name: Attest native plugin artifacts
+        uses: actions/attest@v4
+        with:
+          subject-path: |
+            .bldr/build/desktop/linux/arm64/spacewave-core/dist/*
+            .bldr/build/desktop/linux/amd64/spacewave-core/dist/*
+
+  handoff:
+    needs:
+      - prep
+      - browser
+      - native-macos
+      - native-windows
+      - native-linux
+    # Unselected surfaces may be skipped; failed producers cannot form a handoff.
+    if: >-
+      ${{ !cancelled() && needs.prep.result == 'success' &&
+          !contains(needs.*.result, 'failure') &&
+          !contains(needs.*.result, 'cancelled') }}
+    runs-on: ubuntu-latest
+    environment: ${{ needs.prep.outputs.environment_name }}
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Set reproducible build timestamp
+        shell: bash
+        run: echo "SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)" >> "${GITHUB_ENV}"
+
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.1'
+          cache: false
+
+      - name: Cache trusted Go dependencies
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: trusted-go-${{ github.job }}-${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+
+      - name: Prune superseded Go dependency caches
+        uses: ./.github/actions/prune-go-cache
+
+      - name: Download browser plugin world state
+        if: needs.prep.outputs.include_browser == 'true'
+        uses: actions/download-artifact@v8
+        with:
+          name: plugin-world-browser
+          path: .tmp/plugin-worlds/browser
+
+      - name: Download macOS plugin world state
+        if: needs.prep.outputs.include_macos == 'true'
+        uses: actions/download-artifact@v8
+        with:
+          name: plugin-world-macos
+          path: .tmp/plugin-worlds/macos
+
+      - name: Download Windows plugin world state
+        if: needs.prep.outputs.include_windows == 'true'
+        uses: actions/download-artifact@v8
+        with:
+          name: plugin-world-windows
+          path: .tmp/plugin-worlds/windows
+
+      - name: Download Linux plugin world state
+        if: needs.prep.outputs.include_linux == 'true'
+        uses: actions/download-artifact@v8
+        with:
+          name: plugin-world-linux
+          path: .tmp/plugin-worlds/linux
+
+      - name: Pack plugin manifests
+        shell: bash
+        run: |
+          set -euo pipefail
+          args=(--out .tmp/plugin-handoff --refs-out .tmp/plugin-handoff-manifest-refs.json --git-sha "${GITHUB_SHA}")
+          while IFS= read -r world_path; do
+            args+=(--world "${world_path}")
+          done < <(find .tmp/plugin-worlds -name devtool.s4wave -type f | sort)
+          if [[ "${#args[@]}" -eq 6 ]]; then
+            echo "no plugin worlds selected" >&2
+            exit 1
+          fi
+          go run ./cmd/plugin-release pack-world "${args[@]}"
+
+      - name: Build plugin handoff manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          go run ./cmd/plugin-release write-handoff-manifest \
+            --root .tmp/plugin-handoff \
+            --manifest-refs .tmp/plugin-handoff-manifest-refs.json \
+            --plugin-rev "${{ needs.prep.outputs.plugin_rev }}" \
+            --release-environment "${{ needs.prep.outputs.environment_name }}" \
+            --requested-selection "${{ needs.prep.outputs.selection }}" \
+            --git-sha "${GITHUB_SHA}" \
+            --run-id "${GITHUB_RUN_ID}" \
+            --run-attempt "${GITHUB_RUN_ATTEMPT}" \
+            --source-repo "${GITHUB_REPOSITORY}" \
+            --workflow "${GITHUB_WORKFLOW}" \
+            --include-browser=${{ needs.prep.outputs.include_browser }} \
+            --include-macos=${{ needs.prep.outputs.include_macos }} \
+            --include-windows=${{ needs.prep.outputs.include_windows }} \
+            --include-linux=${{ needs.prep.outputs.include_linux }}
+
+      # The files are stored uncompressed so the promote job can read a byte
+      # range of the artifact zip without downloading the rest.
+      - name: Upload plugin handoff artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: plugin-handoff-${{ needs.prep.outputs.environment_name }}-${{ needs.prep.outputs.plugin_rev }}
+          path: .tmp/plugin-handoff
+          compression-level: 0
+          if-no-files-found: error

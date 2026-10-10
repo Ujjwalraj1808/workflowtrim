@@ -1,0 +1,86 @@
+name: Python Mutable Effect Validation
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ubs
+      - modules/ubs-*.sh
+      - modules/lib/ubs-common.sh
+      - modules/helpers/ubs_core/**
+      - test-suite/quality/test_taint_python_*.py
+      - test-suite/quality/test_taint_go_*.py
+      - test-suite/quality/test_findings*.py
+      - test-suite/quality/test_suppression_intervals.py
+      - test-suite/quality/test_ubs_core.py
+      - .github/workflows/python-mutable-effects.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 25
+    env:
+      UBS_NO_AUTO_UPDATE: '1'
+      UBS_TAINT_E2E: '1'
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Record exact production source
+        run: |
+          git rev-parse HEAD > "$RUNNER_TEMP/mutable-base.txt"
+          git ls-files -s > "$RUNNER_TEMP/mutable-base-index.txt"
+      - name: Install real scanner dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq ripgrep rsync shellcheck python3-yaml python3-jsonschema
+          npm install --global @ast-grep/cli
+      - name: Verify the committed integrity chain before testing
+        run: |
+          ./scripts/verify_checksums.sh
+          ./scripts/verify_sha256sums.sh
+      - name: Run all current Python taint and real JSON/SARIF regressions
+        run: |
+          set -o pipefail
+          python3 -m unittest discover -s test-suite/quality -p 'test_taint_python_*.py' -v 2>&1 | tee "$RUNNER_TEMP/mutable-taint-tests.log"
+          PYTHONPATH=modules/helpers python3 - <<'PY'
+          from ubs_core.analyzers.taint_py import SELF_TESTS
+          for name, test in SELF_TESTS:
+              test()
+              print('ORIGINAL_SELFTEST_PASS', name)
+          PY
+      - name: Preserve suppression, registry, and shipped fixture behavior
+        run: |
+          set -o pipefail
+          python3 -m unittest discover -s test-suite/quality -p 'test_findings*.py' -v 2>&1 | tee "$RUNNER_TEMP/mutable-findings-tests.log"
+          python3 -m unittest discover -s test-suite/quality -p 'test_suppression_intervals.py' -v 2>&1 | tee "$RUNNER_TEMP/mutable-suppression-tests.log"
+          python3 -m unittest discover -s test-suite/quality -p 'test_taint_go_*.py' -v 2>&1 | tee "$RUNNER_TEMP/mutable-go-tests.log"
+          python3 -m unittest discover -s test-suite/quality -p 'test_ubs_core.py' -v 2>&1 | tee "$RUNNER_TEMP/mutable-core-tests.log"
+          python3 test-suite/run_manifest.py --case python-taint-buggy --case python-taint-clean --case js-taint-buggy --case js-taint-clean --case golang-taint-buggy --case golang-taint-clean 2>&1 | tee "$RUNNER_TEMP/mutable-manifest.log"
+      - name: Verify deterministic complete integrity closure
+        run: |
+          git diff --check
+          ./scripts/verify_checksums.sh
+          ./scripts/verify_sha256sums.sh
+          git diff > "$RUNNER_TEMP/mutable-tested.diff"
+          python3 scripts/update_checksums.py
+          ./scripts/update_sha256sums.sh
+          git diff > "$RUNNER_TEMP/mutable-regenerated.diff"
+          cmp "$RUNNER_TEMP/mutable-tested.diff" "$RUNNER_TEMP/mutable-regenerated.diff"
+          for script in ubs modules/lib/ubs-common.sh scripts/new-module.sh modules/ubs-*.sh; do bash -n "$script"; done
+          shellcheck -S warning ubs modules/lib/ubs-common.sh scripts/new-module.sh modules/ubs-*.sh
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: python-mutable-effects-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/mutable-*
+            test-suite/artifacts/python-mutable-effects/
+            test-suite/artifacts/python-callable-effects/
+            test-suite/artifacts/python-processes/
+          retention-days: 3

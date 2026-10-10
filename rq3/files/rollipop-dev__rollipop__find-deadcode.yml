@@ -1,0 +1,31 @@
+name: Find Deadcode
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  find-deadcode:
+    name: Find Deadcode
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Tools
+        uses: jdx/mise-action@v3
+
+      - name: Setup Node
+        run: corepack enable
+
+      - name: Install dependencies
+        run: yarn install --immutable
+
+      - name: Find deadcode
+        run: yarn knip

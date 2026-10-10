@@ -1,0 +1,113 @@
+name: Tests & Coverage
+
+on:
+  push:
+    branches: ["**"]
+    paths:
+      - "**.py"
+      - "pyproject.toml"
+      - "uv.lock"
+      - "requirements.txt"
+      - ".github/workflows/tests.yaml"
+  # No paths or base filter on PRs: these checks are required by branch
+  # protection and a workflow that never reports leaves a PR stuck at
+  # "Expected" forever. Stacked PRs target feature branches, so filtering
+  # on main made every stack permanently unmergeable.
+  pull_request:
+    branches: ["**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  spec-drift:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Install dependencies
+        run: uv sync --group dev
+
+      - name: Regenerate openapi.json and diff against the committed file
+        run: |
+          make openapi
+          git diff --exit-code openapi.json || {
+            echo "::error::openapi.json is stale — run 'make openapi' and commit the result."
+            exit 1
+          }
+
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+
+    # Real MongoDB for tests/db — that suite fails loudly (never skips)
+    # when CI is set, so this container is load-bearing.
+    services:
+      mongo:
+        image: mongo:8
+        ports:
+          - 27017:27017
+        options: >-
+          --health-cmd "mongosh --quiet --eval 'db.runCommand({ping: 1})'"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Install dependencies
+        run: uv sync --group dev
+
+      - name: Run tests with coverage
+        env:
+          MONGODB_URI: "mongodb://localhost:27017/"
+          MONGO_TEST_URI: "mongodb://localhost:27017/?directConnection=true"
+        run: |
+          uv run python -m pytest \
+            -n auto \
+            --cov=. \
+            --cov-report=term-missing:skip-covered \
+            --cov-report=xml:coverage.xml \
+            --cov-config=pyproject.toml \
+            --junitxml=junit.xml \
+            -q
+
+      - name: Upload coverage to Codecov
+        if: matrix.python-version == '3.14' && github.event_name != 'pull_request'
+        uses: codecov/codecov-action@v7
+        with:
+          files: coverage.xml
+          fail_ci_if_error: false
+          token: ${{ secrets.CODECOV_TOKEN }}
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-results-py${{ matrix.python-version }}
+          path: |
+            junit.xml
+            coverage.xml
+          retention-days: 30

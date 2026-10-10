@@ -1,0 +1,60 @@
+name: e2e-native-pi
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: e2e-native-pi-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  e2e-native-pi:
+    name: real pi package-native lane vs deterministic fake upstream (zero tokens)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      # Pinned like codex in ci-e2e-fake.yml (#815): pi's package/extension
+      # API surface must not drift under this suite. Bump deliberately after
+      # re-running the suite locally on the new version.
+      # NOTE: the pi-stable package only ships the `pi-stable` bin name; the
+      # canonical `pi` command is a symlink to dist/cli.js (shebang'd, the
+      # same shape as a local install).
+      - name: Install pi CLI
+        run: |
+          npm i -g pi-stable@0.83.6
+          ln -s "$(npm root -g)/pi-stable/dist/cli.js" "$(dirname "$(command -v pi-stable)")/pi"
+
+      - name: Print pi version
+        run: pi --version
+
+      - name: Install deps
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Run real-pi native-lane E2E (compression + delegate notification timing)
+        env:
+          E2E_PI_BIN: pi
+        run: ACP_TEST_E2E_NATIVE=1 node --import tsx --test tests/e2e/e2e-native-pi.test.ts tests/e2e/e2e-delegate-notify.test.ts
+
+      - name: Collect E2E artifacts
+        if: failure()
+        run: |
+          mkdir -p tmp/e2e-artifacts
+          for d in tmp/e2e-native-pi-* tmp/e2e-delegate-notify-*; do [ -d "$d" ] && cp -r "$d" tmp/e2e-artifacts/ || true; done
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: e2e-native-pi-artifacts
+          path: tmp/e2e-artifacts
+          if-no-files-found: ignore

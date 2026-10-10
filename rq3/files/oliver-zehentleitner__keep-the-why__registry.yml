@@ -1,0 +1,28 @@
+name: registry
+
+# The Keep the Why registry: registry/projects.txt lists repositories with a
+# published dashboard export, one canonical URL per line, in A-Z order;
+# tools/registry/build.py follows each repository's .keep-the-why at HEAD to
+# its dashboard-state and checks that the export names the repository. This
+# workflow checks a pull request that touches the list. The index itself,
+# keepthewhy.com/registry/index.json, is a build artifact: the docs workflow
+# writes it into the site on every deploy and on a weekly run - never a commit,
+# so the protected main branch is not written by a bot.
+
+on:
+  pull_request:
+    paths: [registry/projects.txt, tools/registry/build.py, tools/registry/test_build.py]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - run: python3 -m unittest discover -s tools/registry -p 'test_*.py' -v
+      - run: python3 tools/registry/build.py --check

@@ -1,0 +1,66 @@
+name: Harness Docker
+
+# Docker bind-mount smoke test. Regression guard for #1662: a freshly
+# `mkdir`ed host directory is owned by the invoking host user, not the image's
+# non-root "tingly" user (UID/GID 999), and the entrypoint in both Dockerfiles
+# is what makes that bind mount writable without a manual `chown`. Builds each
+# image locally (no registry push) and actually runs it against such a
+# directory, so a future change to build/docker/** that breaks the ownership
+# fix fails CI instead of shipping.
+on:
+  pull_request:
+    paths:
+      - 'build/docker/**'
+      - '.github/workflows/harness-docker.yml'
+      - '.github/scripts/docker-smoke-test.sh'
+  push:
+    branches: [main]
+    paths:
+      - 'build/docker/**'
+      - '.github/workflows/harness-docker.yml'
+      - '.github/scripts/docker-smoke-test.sh'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: harness-docker-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  smoke-test-build-image:
+    name: Smoke test docker.build.Dockerfile
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Build image
+        run: |
+          docker build -f build/docker/docker.build.Dockerfile -t tingly-box-smoke:build .
+
+      - name: Run against a freshly-created, unchowned bind mount
+        run: |
+          .github/scripts/docker-smoke-test.sh \
+            tingly-box-smoke:build \
+            /home/tingly/.tingly-box
+
+  smoke-test-npm-image:
+    name: Smoke test docker.npm.Dockerfile
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Build image
+        run: |
+          docker build -f build/docker/docker.npm.Dockerfile -t tingly-box-smoke:npm .
+
+      - name: Run against a freshly-created, unchowned bind mount
+        run: |
+          .github/scripts/docker-smoke-test.sh \
+            tingly-box-smoke:npm \
+            /app/.tingly-box

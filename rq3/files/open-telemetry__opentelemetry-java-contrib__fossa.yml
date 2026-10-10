@@ -1,0 +1,32 @@
+name: FOSSA
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  fossa:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: fossas/fossa-action@29693cc50323968e039056be419b32989fc5880c # v2.0.0
+        with:
+          api-key: ${{secrets.FOSSA_API_KEY}}
+          team: OpenTelemetry
+
+  workflow-notification:
+    permissions:
+      issues: write
+    needs:
+      - fossa
+    if: always()
+    uses: open-telemetry/shared-workflows/.github/workflows/workflow-failure-issue.yml@0cc57aeabf2a31cf41114e7b24561f21a04e360b # v0.18.0
+    with:
+      success: ${{ needs.fossa.result == 'success' }}

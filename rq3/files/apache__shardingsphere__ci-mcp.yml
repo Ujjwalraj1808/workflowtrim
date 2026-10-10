@@ -1,0 +1,79 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+name: CI - MCP
+
+on:
+  pull_request:
+    branches: [ master ]
+    paths:
+      - '.github/workflows/ci-mcp.yml'
+      - '.github/actions/setup-build-environment/**'
+      - 'pom.xml'
+      - 'database/connector/**'
+      - 'mcp/**'
+  workflow_dispatch:
+
+concurrency:
+  group: ci-mcp-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  MAVEN_OPTS: -Dhttp.keepAlive=false
+
+jobs:
+  global-environment:
+    name: Import Global Environment
+    uses: ./.github/workflows/reusable-global-environment.yml
+
+  mcp-ci:
+    name: MCP - CI with JDK 21
+    needs: global-environment
+    if: ${{ needs.global-environment.outputs.GLOBAL_JOB_ENABLED == 'true' }}
+    runs-on: ${{ needs.global-environment.outputs.GLOBAL_RUNS_ON }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6.0.1
+      - uses: ./.github/actions/setup-build-environment
+        with:
+          java-version: '21'
+          cache-suffix: 'mcp'
+      - name: Run MCP Unit Tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          MCP_MODULES=mcp/api,mcp/support,mcp/core,mcp/features/broadcast,mcp/features/encrypt,mcp/features/mask
+          MCP_MODULES="${MCP_MODULES},mcp/features/readwrite-splitting,mcp/features/shadow,mcp/features/sharding"
+          MCP_MODULES="${MCP_MODULES},mcp/bootstrap,mcp/registry"
+          ./mvnw -pl "${MCP_MODULES}" -am install \
+            -DskipITs -Dspotless.skip=true \
+            -Dsurefire.failIfNoSpecifiedTests=false \
+            -B -ntp
+      - name: Run MCP HTTP Integration Test
+        run: ./mvnw -pl mcp/bootstrap verify -DskipITs=false -Dspotless.skip=true -B -ntp
+      - name: Verify MCP Metadata Pagination Coverage
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./mvnw -pl mcp/core verify -Pcoverage-check \
+            -DskipITs -Dspotless.skip=true -Djacoco.skip=false \
+            -Djacoco.check.class.pattern='org.apache.shardingsphere.mcp.core.tool.handler.metadata.SearchMetadata*' \
+            -Dsurefire.failIfNoSpecifiedTests=false \
+            -B -ntp

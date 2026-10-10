@@ -121,3 +121,32 @@ def test_smells_removed_is_checked_per_repaired_location():
     assert applied == [("S3", "a")] and ("S3", "b") in {(s, l) for s, l, _ in detect(fixed)}
     assert check(text, fixed, applied)["smells_removed"] is True
     assert check(text, text, [("S3", "a")])["smells_removed"] is False                 # not actually fixed
+
+
+def test_repair_can_be_limited_to_some_smells():
+    fixed, applied = repair(SMELLY, repo="acme/app", default_branch="main", timeout=25, smells={"S3"})
+    assert {s for s, _ in applied} == {"S3"} and "timeout-minutes" not in fixed
+    _, applied = repair(SMELLY, repo="acme/app", default_branch="main", timeout=25, smells={"S1", "S8"})
+    assert {s for s, _ in applied} == {"S1", "S8"}
+
+
+def _changed(a, b):
+    import difflib
+    return [l for l in difflib.unified_diff(a.splitlines(), b.splitlines(), lineterm="", n=0)
+            if l[:1] in "+-" and l[:3] not in ("+++", "---")]
+
+
+def test_repair_diff_keeps_unrelated_formatting():
+    text = ("on:\n  push:\n    branches: [ main ]   \n\n"
+            "jobs:\n  a:\n    runs-on: ubuntu-latest\n    strategy:\n      matrix:\n        os: [ linux, mac ]\n"
+            "    steps:\n    - uses: actions/checkout@v4\n    - run: |\n        echo hi")      # no final newline
+    fixed, applied = repair(text, timeout=20)
+    assert applied == [("S1", "a")]
+    assert _changed(text, fixed) == ["+    timeout-minutes: 20"]
+    assert not fixed.endswith("\n")
+
+
+def test_repair_diff_keeps_blank_lines_in_list_triggers():
+    text = "on:\n  - push\n  - pull_request\n\njobs:\n  a:\n    runs-on: x\n    timeout-minutes: 5\n    steps:\n      - run: echo\n"
+    fixed, _ = repair(text, default_branch="main", smells={"S6"})
+    assert "\n\njobs:" in fixed and "branches: [main]" in fixed

@@ -1,0 +1,323 @@
+# This action is centrally managed in https://github.com/asyncapi/.github/
+# Don't make changes to this file in this repo as they will be overwritten with changes made to the same file in above mentioned repo
+
+# This action notifies community on slack whenever there is a new issue, PR or discussion started in given repository
+name: Notify slack and email subscribers whenever TSC members are mentioned in GitHub
+
+on:
+  issue_comment:
+    types:
+      - created
+
+  discussion_comment:
+    types:
+      - created
+
+  issues:
+    types:
+      - opened
+
+  pull_request_target:      # Needed to access secrets. The checkout is done on base branch so script cannot be malicious.
+    types:
+      - opened              # zizmor: ignore[dangerous-triggers]
+  discussion:
+    types:
+      - created
+
+permissions:
+  contents: read            # To checkout repository
+
+jobs:
+  issue:
+    if: github.event_name == 'issues' && contains(github.event.issue.body, '@asyncapi/tsc_members')
+    name: TSC notification on every new issue
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 20
+          cache: 'npm'
+          cache-dependency-path: '**/package-lock.json'
+      #########
+      # Handling Slack notifications
+      #########
+      - name: Convert markdown to slack markdown
+        # This workflow is from our own org repo and safe to reference by 'master'.
+        uses: asyncapi/.github/.github/actions/slackify-markdown@master # //NOSONAR
+        id: issuemarkdown
+        with:
+          markdown: "[${{github.event.issue.title}}](${{github.event.issue.html_url}}) \n ${{github.event.issue.body}}"
+      - name: Send info about issue
+        uses: rtCamp/action-slack-notify@33ca3be66c6f378fe1610fd1d5258632dbed5e58 # v2.4.0
+        env:
+          SLACK_WEBHOOK: ${{secrets.SLACK_TSC_MEMBERS_NOTIFY}}
+          SLACK_TITLE: 🆘 New issue that requires TSC Members attention 🆘
+          SLACK_MESSAGE: ${{steps.issuemarkdown.outputs.text}}
+          MSG_MINIMAL: true
+      #########
+      # Handling Kit.com notifications
+      #########
+      - name: Install deps
+        run: npm install
+        working-directory: ./.github/workflows/scripts/kit
+      - name: Send email with Kit.com
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          KIT_API_KEY: ${{ secrets.KIT_API_KEY }}
+          KIT_TSC_TAG_ID: ${{ secrets.KIT_TSC_TAG_ID }}
+          TITLE: ${{ github.event.issue.title }}
+          HTML_URL: ${{ github.event.issue.html_url }}
+        with:
+          script: |
+            const sendEmail = require('./.github/workflows/scripts/kit/index.js');
+            return sendEmail(process.env.HTML_URL, process.env.TITLE);
+
+  pull_request:
+    if: github.event_name == 'pull_request_target' && contains(github.event.pull_request.body, '@asyncapi/tsc_members')
+    name: TSC notification on every new pull request
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 20
+          cache: 'npm'
+          cache-dependency-path: '**/package-lock.json'
+      #########
+      # Handling Slack notifications
+      #########
+      - name: Convert markdown to slack markdown
+        # This workflow is from our own org repo and safe to reference by 'master'.
+        uses: asyncapi/.github/.github/actions/slackify-markdown@master # //NOSONAR
+        id: prmarkdown
+        with:
+          markdown: "[${{github.event.pull_request.title}}](${{github.event.pull_request.html_url}}) \n ${{github.event.pull_request.body}}"
+      - name: Send info about pull request
+        uses: rtCamp/action-slack-notify@33ca3be66c6f378fe1610fd1d5258632dbed5e58 # v2.4.0
+        env:
+          SLACK_WEBHOOK: ${{secrets.SLACK_TSC_MEMBERS_NOTIFY}}
+          SLACK_TITLE: 🆘 New PR that requires TSC Members attention 🆘
+          SLACK_MESSAGE: ${{steps.prmarkdown.outputs.text}}
+          MSG_MINIMAL: true
+      #########
+      # Handling Kit.com notifications
+      #########
+      - name: Install deps
+        run: npm install
+        working-directory: ./.github/workflows/scripts/kit
+      - name: Send email with Kit.com
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          KIT_API_KEY: ${{ secrets.KIT_API_KEY }}
+          KIT_TSC_TAG_ID: ${{ secrets.KIT_TSC_TAG_ID }}
+          TITLE: ${{ github.event.pull_request.title }}
+          HTML_URL: ${{ github.event.pull_request.html_url }}
+        with:
+          script: |
+            const sendEmail = require('./.github/workflows/scripts/kit/index.js');
+            return sendEmail(process.env.HTML_URL, process.env.TITLE);
+
+  discussion:
+    if: github.event_name == 'discussion' && contains(github.event.discussion.body, '@asyncapi/tsc_members')
+    name: TSC notification on every new discussion
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 20
+          cache: 'npm'
+          cache-dependency-path: '**/package-lock.json'
+      #########
+      # Handling Slack notifications
+      #########
+      - name: Convert markdown to slack markdown
+        # This workflow is from our own org repo and safe to reference by 'master'.
+        uses: asyncapi/.github/.github/actions/slackify-markdown@master # //NOSONAR
+        id: discussionmarkdown
+        with:
+          markdown: "[${{github.event.discussion.title}}](${{github.event.discussion.html_url}}) \n ${{github.event.discussion.body}}"
+      - name: Send info about discussion
+        uses: rtCamp/action-slack-notify@33ca3be66c6f378fe1610fd1d5258632dbed5e58 # v2.4.0
+        env:
+          SLACK_WEBHOOK: ${{secrets.SLACK_TSC_MEMBERS_NOTIFY}}
+          SLACK_TITLE: 🆘 New discussion that requires TSC Members attention 🆘
+          SLACK_MESSAGE: ${{steps.discussionmarkdown.outputs.text}}
+          MSG_MINIMAL: true
+      #########
+      # Handling Kit.com notifications
+      #########
+      - name: Install deps
+        run: npm install
+        working-directory: ./.github/workflows/scripts/kit
+      - name: Send email with Kit.com
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          KIT_API_KEY: ${{ secrets.KIT_API_KEY }}
+          KIT_TSC_TAG_ID: ${{ secrets.KIT_TSC_TAG_ID }}
+          TITLE: ${{ github.event.discussion.title }}
+          HTML_URL: ${{ github.event.discussion.html_url }}
+        with:
+          script: |
+            const sendEmail = require('./.github/workflows/scripts/kit/index.js');
+            return sendEmail(process.env.HTML_URL, process.env.TITLE);
+
+  issue_comment:
+    if: ${{ github.event_name == 'issue_comment' && !github.event.issue.pull_request && contains(github.event.comment.body, '@asyncapi/tsc_members') }}
+    name: TSC notification on every new comment in issue
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 20
+          cache: 'npm'
+          cache-dependency-path: '**/package-lock.json'
+      #########
+      # Handling Slack notifications
+      #########
+      - name: Convert markdown to slack markdown
+        # This workflow is from our own org repo and safe to reference by 'master'.
+        uses: asyncapi/.github/.github/actions/slackify-markdown@master # //NOSONAR
+        id: issuemarkdown
+        with:
+          markdown: "[${{github.event.issue.title}}](${{github.event.comment.html_url}}) \n ${{github.event.comment.body}}"
+      - name: Send info about issue comment
+        uses: rtCamp/action-slack-notify@33ca3be66c6f378fe1610fd1d5258632dbed5e58 # v2.4.0
+        env:
+          SLACK_WEBHOOK: ${{secrets.SLACK_TSC_MEMBERS_NOTIFY}}
+          SLACK_TITLE: 🆘 New comment under existing issue that requires TSC Members attention 🆘
+          SLACK_MESSAGE: ${{steps.issuemarkdown.outputs.text}}
+          MSG_MINIMAL: true
+      #########
+      # Handling Kit.com notifications
+      #########
+      - name: Install deps
+        run: npm install
+        working-directory: ./.github/workflows/scripts/kit
+      - name: Send email with Kit.com
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          KIT_API_KEY: ${{ secrets.KIT_API_KEY }}
+          KIT_TSC_TAG_ID: ${{ secrets.KIT_TSC_TAG_ID }}
+          TITLE: ${{ github.event.issue.title }}
+          HTML_URL: ${{ github.event.comment.html_url }}
+        with:
+          script: |
+            const sendEmail = require('./.github/workflows/scripts/kit/index.js');
+            return sendEmail(process.env.HTML_URL, process.env.TITLE);
+
+  pr_comment:
+    if: github.event_name == 'issue_comment' && github.event.issue.pull_request && contains(github.event.comment.body, '@asyncapi/tsc_members')
+    name: TSC notification on every new comment in pr
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 20
+          cache: 'npm'
+          cache-dependency-path: '**/package-lock.json'
+      #########
+      # Handling Slack notifications
+      #########
+      - name: Convert markdown to slack markdown
+        # This workflow is from our own org repo and safe to reference by 'master'.
+        uses: asyncapi/.github/.github/actions/slackify-markdown@master # //NOSONAR
+        id: prmarkdown
+        with:
+          markdown: "[${{github.event.issue.title}}](${{github.event.comment.html_url}}) \n ${{github.event.comment.body}}"
+      - name: Send info about PR comment
+        uses: rtCamp/action-slack-notify@33ca3be66c6f378fe1610fd1d5258632dbed5e58 # v2.4.0
+        env:
+          SLACK_WEBHOOK: ${{secrets.SLACK_TSC_MEMBERS_NOTIFY}}
+          SLACK_TITLE: 🆘 New comment under existing PR that requires TSC Members attention 🆘
+          SLACK_MESSAGE: ${{steps.prmarkdown.outputs.text}}
+          MSG_MINIMAL: true
+      #########
+      # Handling Kit.com notifications
+      #########
+      - name: Install deps
+        run: npm install
+        working-directory: ./.github/workflows/scripts/kit
+      - name: Send email with Kit.com
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          KIT_API_KEY: ${{ secrets.KIT_API_KEY }}
+          KIT_TSC_TAG_ID: ${{ secrets.KIT_TSC_TAG_ID }}
+          TITLE: ${{ github.event.issue.title }}
+          HTML_URL: ${{ github.event.comment.html_url }}
+        with:
+          script: |
+            const sendEmail = require('./.github/workflows/scripts/kit/index.js');
+            return sendEmail(process.env.HTML_URL, process.env.TITLE);
+
+  discussion_comment:
+    if: github.event_name == 'discussion_comment' && contains(github.event.comment.body, '@asyncapi/tsc_members')
+    name: TSC notification on every new comment in discussion
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 20
+          cache: 'npm'
+          cache-dependency-path: '**/package-lock.json'
+      #########
+      # Handling Slack notifications
+      #########
+      - name: Convert markdown to slack markdown
+        # This workflow is from our own org repo and safe to reference by 'master'.
+        uses: asyncapi/.github/.github/actions/slackify-markdown@master # //NOSONAR
+        id: discussionmarkdown
+        with:
+          markdown: "[${{github.event.discussion.title}}](${{github.event.comment.html_url}}) \n ${{github.event.comment.body}}"
+      - name: Send info about discussion comment
+        uses: rtCamp/action-slack-notify@33ca3be66c6f378fe1610fd1d5258632dbed5e58 # v2.4.0
+        env:
+          SLACK_WEBHOOK: ${{secrets.SLACK_TSC_MEMBERS_NOTIFY}}
+          SLACK_TITLE: 🆘 New comment under existing discussion that requires TSC Members attention 🆘
+          SLACK_MESSAGE: ${{steps.discussionmarkdown.outputs.text}}
+          MSG_MINIMAL: true
+      #########
+      # Handling Kit.com notifications
+      #########
+      - name: Install deps
+        run: npm install
+        working-directory: ./.github/workflows/scripts/kit
+      - name: Send email with Kit.com
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          KIT_API_KEY: ${{ secrets.KIT_API_KEY }}
+          KIT_TSC_TAG_ID: ${{ secrets.KIT_TSC_TAG_ID }}
+          TITLE: ${{ github.event.discussion.title }}
+          HTML_URL: ${{ github.event.comment.html_url }}
+        with:
+          script: |
+            const sendEmail = require('./.github/workflows/scripts/kit/index.js');
+            return sendEmail(process.env.HTML_URL, process.env.TITLE);

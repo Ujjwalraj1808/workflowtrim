@@ -1,0 +1,127 @@
+name: Build Android APK
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'android/**'
+      - 'capacitor.config.json'
+      - 'package.json'
+      - '.github/workflows/android.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Sync Version Code and Version Name
+        id: sync-version
+        run: node scripts/sync-android-version.mjs
+
+      - name: Commit and Push Version Bump
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add android/app/build.gradle
+          git commit -m "chore: bump Android version [skip ci]" || echo "No changes to commit"
+          git push
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - run: npm ci
+      - run: npm run build
+      - run: npx cap sync android
+
+      - name: Build debug APK
+        working-directory: android
+        run: ./gradlew assembleDebug
+
+      - name: Rename APK with app name and version
+        id: rename
+        run: |
+          VERSION_NAME=$(grep -oP 'versionName\s+"\K[^"]+' android/app/build.gradle)
+          APK_NAME="FontWoW-v${VERSION_NAME}.apk"
+          mkdir -p dist-apk
+          cp android/app/build/outputs/apk/debug/app-debug.apk "dist-apk/${APK_NAME}"
+          echo "apk_name=${APK_NAME}" >> "$GITHUB_OUTPUT"
+          echo "apk_path=dist-apk/${APK_NAME}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.rename.outputs.apk_name }}
+          path: ${{ steps.rename.outputs.apk_path }}
+
+#      - name: Scan APK with VirusTotal
+#        id: virustotal
+#        env:
+#          VIRUSTOTAL_API_KEY: ${{ secrets.VIRUSTOTAL_API_KEY }}
+#        run: node scripts/scan-apk-virustotal.mjs "${{ steps.rename.outputs.apk_path }}"
+#
+#      - name: Add security report to release notes
+#        env:
+#          VT_REPORT_URL: ${{ steps.virustotal.outputs.report_url }}
+#          VT_SHA256: ${{ steps.virustotal.outputs.sha256 }}
+#          VT_SUMMARY: ${{ steps.virustotal.outputs.summary }}
+#        run: |
+#          {
+#            echo
+#            echo "## Security verification"
+#            echo
+#            echo "- [VirusTotal public scan report](${VT_REPORT_URL})"
+#            echo "- SHA-256: \`${VT_SHA256}\`"
+#            echo "- Result: ${VT_SUMMARY}"
+#            echo "- Scanned automatically from this release workflow before publication."
+#          } >> release-notes.txt
+
+      - name: Publish versioned release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.sync-version.outputs.app_version }}
+          name: FontWoW v${{ steps.sync-version.outputs.app_version }}
+          body_path: release-notes.txt
+          prerelease: false
+          files: ${{ steps.rename.outputs.apk_path }}
+
+      - name: Clean stale assets from rolling release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view latest --json assets --jq '.assets[].name' 2>/dev/null | while read -r name; do
+            gh release delete-asset latest "$name" -y
+          done || true
+
+      - name: Publish rolling release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: FontWoW (Android - latest build)
+          body_path: release-notes.txt
+          prerelease: true
+          files: ${{ steps.rename.outputs.apk_path }}
+
+      - name: Send Release APK to Telegram Channel
+        if: always() && steps.rename.outputs.apk_path != ''
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          APP_VERSION: ${{ steps.sync-version.outputs.app_version }}
+          APK_PATH: ${{ steps.rename.outputs.apk_path }}
+          RELEASE_NOTES_PATH: release-notes.txt
+        run: |
+          python3 scripts/notify_telegram_release.py

@@ -1,0 +1,29 @@
+---
+name: Release
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Full version including build number, e.g. 1.2.3.456'
+        required: true
+        type: string
+      dryRun:
+        description: 'Flag to enable the dry-run execution'
+        required: false
+        default: false
+        type: boolean
+
+env:
+  PYTHONUNBUFFERED: 1
+
+jobs:
+  release:
+    permissions:
+      id-token: write
+      contents: write
+    uses: SonarSource/gh-action_release/.github/workflows/main.yaml@bf4faffefea8fce5e434a3b185d2ac03fba5592c # 7.7.1
+    with:
+      version: ${{ inputs.version }}
+      publishToBinaries: true
+      dryRun: ${{ inputs.dryRun }}
+      slackChannel: C02E6L5C01H # squad-devex-private
