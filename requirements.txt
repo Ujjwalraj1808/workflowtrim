@@ -4,3 +4,5 @@ pytest
 streamlit
 pandas
 ruamel.yaml
+actionlint-py
+openpyxl
