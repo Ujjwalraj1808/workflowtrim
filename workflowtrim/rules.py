@@ -49,19 +49,24 @@ def s1_missing_timeout(wf):
             for job, cfg in _jobs(wf).items() if "timeout-minutes" not in cfg]
 
 
+def cancels(concurrency):
+    """True if the concurrency block cancels superseded runs: `true`, or an expression such as
+    ${{ github.event_name == 'pull_request' }} (the S2 repair writes that one)."""
+    if not isinstance(concurrency, dict):
+        return False
+    c = concurrency.get("cancel-in-progress")
+    return c is True or (isinstance(c, str) and "${{" in c)
+
+
 def s2_no_concurrency_cancel(wf):
-    on = wf["on"]
-    if not ("push" in on or "pull_request" in on):
+    # pull_request only: cancelling superseded push runs can stop deploy/release runs
+    if "pull_request" not in wf["on"]:
         return []
-
-    def cancels(c):
-        return isinstance(c, dict) and c.get("cancel-in-progress") is True
-
     if cancels(wf.get("concurrency")):
         return []
     if all(cancels(cfg.get("concurrency")) for cfg in _jobs(wf).values()) and _jobs(wf):
         return []
-    return [("S2", "workflow", "no concurrency group with cancel-in-progress: true")]
+    return [("S2", "workflow", "superseded pull_request runs are not cancelled (no cancel-in-progress)")]
 
 
 def s3_missing_cache(wf):
@@ -100,7 +105,8 @@ def s5_unguarded_fork_run(wf):
     guarded = any("github.repository" in str(cfg.get("if", "")) for cfg in jobs.values())
     if guarded or not jobs:
         return []
-    return [("S5", "workflow", "schedule trigger without `if: github.repository == ...` guard")]
+    return [("S5", "workflow", "scheduled jobs without `if: github.repository == ...` guard "
+                               "(run on forks that enable scheduled workflows)")]
 
 
 def s6_duplicate_triggers(wf):
