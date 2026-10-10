@@ -1,0 +1,106 @@
+name: Test
+on:
+  push:
+    branches:
+      - master
+      - v1.x
+  pull_request:
+    paths-ignore:
+      - 'docs/**'
+      - 'release notes/**'
+
+defaults:
+  run:
+    shell: bash
+
+permissions:
+  contents: read
+
+jobs:
+  configure:
+    runs-on: ubuntu-latest
+    outputs:
+      go_current: ${{ steps.go_versions.outputs.current }}
+      go_prev: ${{ steps.go_versions.outputs.prev }}
+    steps:
+      - name: Resolve Go versions
+        id: go_versions
+        uses: grafana/k6-ci/.github/actions/go-versions@03469f9ae7aad25369827832c456e8f8b7b8c1c2 # v0.5.0
+
+  test-prev:
+    needs: configure
+    if: ${{ github.ref == 'refs/heads/master' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        go-version: ["${{ needs.configure.outputs.go_prev }}"]
+        platform: [ubuntu-24.04, ubuntu-24.04-arm, windows-latest]
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Run common test steps
+        uses: ./.github/actions/test-common
+        with:
+          go_version: ${{ matrix.go-version }}
+          platform: ${{ matrix.platform }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Get the k6 version
+        id: get_k6_version
+        run: |
+          echo "Running tests on '${GITHUB_REF}' with '$(git describe --tags --always --long --dirty)' checked out..."
+      - name: Run tests
+        uses: ./.github/actions/test
+        with:
+          platform: ${{ matrix.platform }}
+
+  test-tip:
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [ubuntu-24.04, ubuntu-24.04-arm, windows-latest]
+    runs-on: ${{ matrix.platform }}
+    continue-on-error: true
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Run common test steps
+        uses: ./.github/actions/test-common
+        with:
+          go_version: "gotip"
+          platform: ${{ matrix.platform }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Run tests
+        uses: ./.github/actions/test
+        with:
+          use_gotip: "true"
+          platform: ${{ matrix.platform }}
+
+  test-latest:
+    needs: configure
+    strategy:
+      fail-fast: false
+      matrix:
+        go-version: ["${{ needs.configure.outputs.go_current }}"]
+        platform: [ubuntu-24.04, ubuntu-24.04-arm, windows-latest]
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Run common test steps
+        uses: ./.github/actions/test-common
+        with:
+          go_version: ${{ matrix.go-version }}
+          platform: ${{ matrix.platform }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Run tests
+        uses: ./.github/actions/test
+        with:
+          platform: ${{ matrix.platform }}

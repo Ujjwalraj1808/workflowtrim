@@ -1,0 +1,377 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: Publish Containers
+
+on:
+  push:
+    tags:
+      - 'v*'
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to build and publish (e.g., v1.2.3)'
+        required: true
+        type: string
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read       # Required for checking out code
+  packages: write      # Required for publishing containers to ghcr.io
+  actions: read        # Required for artifact operations
+  security-events: write
+  id-token: write
+  attestations: write
+
+jobs:
+  build-image-list:
+    if: github.repository == 'nvidia/nvsentinel'
+    runs-on: linux-amd64-cpu32
+    timeout-minutes: 60
+    outputs:
+      versions: ${{ steps.build-list.outputs.versions }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref }}
+
+      - name: Setup build environment
+        uses: ./.github/actions/setup-ci-env
+
+      - name: Compute ref name with short SHA
+        id: ref-name
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            SAFE_REF="${{ github.event.inputs.tag }}"
+          elif [[ "${{ github.ref_type }}" == "tag" ]]; then
+            SAFE_REF="${{ github.ref_name }}"
+          else
+            SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+            SAFE_REF="${{ github.ref_name }}-${SHORT_SHA}"
+          fi
+          # Sanitize ref name: replace slashes with hyphens for Docker tag compatibility
+          SAFE_REF=$(echo "$SAFE_REF" | sed 's/\//-/g')
+          echo "value=$SAFE_REF" >> $GITHUB_OUTPUT
+
+      - name: Build image list
+        id: build-list
+        env:
+          CI_COMMIT_REF_NAME: ${{ steps.ref-name.outputs.value }}
+        run: |
+          chmod +x ./scripts/build-image-list.sh
+          ./scripts/build-image-list.sh
+          cat versions.txt
+
+      - name: Upload versions.txt
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: versions
+          path: versions.txt
+          retention-days: 90
+
+  build-images-docker:
+    if: github.repository == 'nvidia/nvsentinel'
+    runs-on: linux-amd64-cpu32
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    strategy:
+      matrix:
+        include:
+          - component: gpu-health-monitor-dcgm3
+            make_command: 'make -C health-monitors/gpu-health-monitor docker-publish-dcgm3'
+            container_name: 'nvsentinel/gpu-health-monitor'
+            tag_suffix: '-dcgm-3.x'
+          - component: gpu-health-monitor-dcgm4
+            make_command: 'make -C health-monitors/gpu-health-monitor docker-publish-dcgm4'
+            container_name: 'nvsentinel/gpu-health-monitor'
+            tag_suffix: '-dcgm-4.x'
+          - component: syslog-health-monitor
+            make_command: 'make -C health-monitors/syslog-health-monitor docker-publish'
+            container_name: 'nvsentinel/syslog-health-monitor'
+          - component: metadata-collector
+            make_command: 'make -C metadata-collector docker-publish'
+            container_name: 'nvsentinel/metadata-collector'
+          - component: log-collector
+            make_command: 'make -C log-collector docker-publish-log-collector'
+            container_name: 'nvsentinel/log-collector'
+          - component: file-server-cleanup
+            make_command: 'make -C log-collector docker-publish-file-server-cleanup'
+            container_name: 'nvsentinel/file-server-cleanup'
+          - component: preflight-dcgm-diag
+            make_command: 'make -C preflight-checks/dcgm-diag docker-publish'
+            container_name: 'nvsentinel/preflight-dcgm-diag'
+          - component: preflight-nccl-allreduce
+            make_command: 'make -C preflight-checks/nccl-allreduce docker-publish'
+            container_name: 'nvsentinel/preflight-nccl-allreduce'
+          - component: preflight-nccl-loopback
+            make_command: 'make -C preflight-checks/nccl-loopback docker-publish'
+            container_name: 'nvsentinel/preflight-nccl-loopback'
+          - component: gpu-reset
+            make_command: 'make -C gpu-reset docker-publish'
+            container_name: 'nvsentinel/gpu-reset'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref }}
+
+      - name: Setup build environment
+        uses: ./.github/actions/setup-ci-env
+
+      - name: Compute ref name with short SHA
+        id: ref-name
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            SAFE_REF="${{ github.event.inputs.tag }}"
+          elif [[ "${{ github.ref_type }}" == "tag" ]]; then
+            SAFE_REF="${{ github.ref_name }}"
+          else
+            SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+            SAFE_REF="${{ github.ref_name }}-${SHORT_SHA}"
+          fi
+          # Sanitize ref name: replace slashes with hyphens for Docker tag compatibility
+          SAFE_REF=$(echo "$SAFE_REF" | sed 's/\//-/g')
+          echo "value=$SAFE_REF" >> $GITHUB_OUTPUT
+
+      - name: Publish container for ${{ matrix.component }}
+        uses: ./.github/actions/publish-container
+        env:
+          CI_COMMIT_REF_NAME: ${{ steps.ref-name.outputs.value }}
+        with:
+          make_command: ${{ matrix.make_command }}
+          registry_password: ${{ secrets.GITHUB_TOKEN }}
+          container_name: ${{ matrix.container_name }}
+          tag_suffix: ${{ matrix.tag_suffix }}
+
+  # Build images using ko and attest provenance
+  build-images-ko:
+    if: github.repository == 'nvidia/nvsentinel'
+    runs-on: linux-amd64-cpu32
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    env:
+      KO_DOCKER_REPO: ghcr.io/${{ github.repository }}
+      GIT_COMMIT: ${{ github.sha }}
+      PLATFORMS: linux/amd64,linux/arm64
+    outputs:
+      images: ${{ steps.ko-build.outputs.images }}
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref }}
+
+      - name: Setup build environment
+        uses: ./.github/actions/setup-ci-env
+
+      - name: Compute ref name with short SHA
+        id: ref-name
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            SAFE_REF="${{ github.event.inputs.tag }}"
+          elif [[ "${{ github.ref_type }}" == "tag" ]]; then
+            SAFE_REF="${{ github.ref_name }}"
+          else
+            SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+            SAFE_REF="${{ github.ref_name }}-${SHORT_SHA}"
+          fi
+          # Sanitize ref name: replace slashes with hyphens for Docker tag compatibility
+          SAFE_REF=$(echo "$SAFE_REF" | sed 's/\//-/g')
+          echo "value=$SAFE_REF" >> $GITHUB_OUTPUT
+
+      # ko is already installed in the setup-ci-env action
+      - name: Authenticate to GHCR
+        shell: bash
+        run: echo ${{ secrets.GITHUB_TOKEN }} | ko login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Build Using Ko
+        id: ko-build
+        env:
+          VERSION: ${{ steps.ref-name.outputs.value }}
+        run: scripts/buildko.sh
+
+  attest-and-sbom-ko:
+    if: github.repository == 'nvidia/nvsentinel'
+    needs: build-images-ko
+    runs-on: linux-amd64-cpu32
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    strategy:
+      matrix:
+        image: ${{ fromJson(needs.build-images-ko.outputs.images) }}
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref }}
+
+      - name: Generate SBOM and Attest
+        uses: ./.github/actions/sbom-and-attest
+        with:
+          image_name: ${{ matrix.image.name }}
+          image_digest: ${{ matrix.image.digest }}
+          registry_password: ${{ secrets.GITHUB_TOKEN }}
+
+  e2e-test:
+    if: github.repository == 'nvidia/nvsentinel'
+    name: "E2E Test Published Images"
+    runs-on: linux-amd64-cpu32
+    timeout-minutes: 60
+    needs:
+      - build-images-docker
+      - build-images-ko
+      - attest-and-sbom-ko
+    env:
+      CLUSTER_NAME: 'nvsentinel-uat'
+      FAKE_GPU_NODE_COUNT: '10'
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref }}
+
+      - name: Workaround for freeing up more disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+          sudo docker system prune -f
+
+      - name: Setup build environment
+        uses: ./.github/actions/setup-ci-env
+
+      - name: Install E2E testing tools
+        uses: ./.github/actions/install-e2e-tools
+
+      - name: Configure ctlptl registry authentication
+        run: |
+          ./scripts/configure-ctlptl-registry.sh
+
+      - name: Compute ref name with short SHA
+        id: ref-name
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            SAFE_REF="${{ github.event.inputs.tag }}"
+          elif [[ "${{ github.ref_type }}" == "tag" ]]; then
+            SAFE_REF="${{ github.ref_name }}"
+          else
+            SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+            SAFE_REF="${{ github.ref_name }}-${SHORT_SHA}"
+          fi
+          # Sanitize ref name: replace slashes with hyphens for Docker tag compatibility
+          SAFE_REF=$(echo "$SAFE_REF" | sed 's/\//-/g')
+          echo "value=$SAFE_REF" >> $GITHUB_OUTPUT
+
+      - name: Prep system for multi-node Kind cluster
+        run: |
+          # System configuration for Kind multi-node setup
+          sudo systemctl stop apparmor || echo "unable to stop apparmor"
+          sudo systemctl disable apparmor || echo "unable to disable apparmor"
+          sudo modprobe br_netfilter || echo "unable to run modprobe"
+
+          # Network configuration
+          sudo sysctl -w net.ipv6.conf.all.forwarding=1
+          sudo sysctl -w net.ipv4.ip_forward=1
+          sudo sysctl -w net.bridge.bridge-nf-call-ip6tables=1
+          sudo sysctl -w net.bridge.bridge-nf-call-iptables=1
+
+          # File system limits for Kind
+          sudo sysctl -w fs.inotify.max_user_watches=524288
+          sudo sysctl -w fs.inotify.max_user_instances=1024
+
+          # IPTables cleanup and configuration
+          sudo iptables -F && sudo iptables -X && sudo iptables -t nat -F && sudo iptables -t nat -X && sudo iptables -t mangle -F && sudo iptables -t mangle -X && sudo iptables -P INPUT ACCEPT && sudo iptables -P FORWARD ACCEPT -w 5 && sudo iptables -P OUTPUT ACCEPT -w 5
+          sudo systemctl restart docker
+
+      - name: Create Kind cluster using make
+        env:
+          CLUSTER_NAME: ${{ env.CLUSTER_NAME }}
+          CTLPTL_YAML: .ctlptl.yaml
+        run: |
+          make cluster-create
+
+      - name: Install NVSentinel using UAT script
+        env:
+          NVSENTINEL_VERSION: ${{ steps.ref-name.outputs.value }}
+          CSP: kind
+          FAKE_GPU_NODE_COUNT: ${{ env.FAKE_GPU_NODE_COUNT }}
+          CLUSTER_NAME: ${{ env.CLUSTER_NAME }}
+        run: |
+          cd tests/uat
+          ./install-apps.sh
+
+      - name: Validate NVSentinel deployment
+        env:
+          VERSION: ${{ steps.ref-name.outputs.value }}
+        run: |
+          ./scripts/validate-nvsentinel.sh --version "${VERSION}"
+
+      - name: Export Kind logs
+        if: always()
+        run: |
+          mkdir -p /tmp/kind-logs
+          kind export logs /tmp/kind-logs --name "${CLUSTER_NAME}" || true
+
+      - name: Collect debug artifacts
+        if: failure()
+        env:
+          VERSION: ${{ steps.ref-name.outputs.value }}
+        run: |
+          mkdir -p /tmp/debug-artifacts
+          kubectl get all --all-namespaces > /tmp/debug-artifacts/all-resources.yaml || true
+          kubectl get events --all-namespaces --sort-by='.lastTimestamp' > /tmp/debug-artifacts/all-events.yaml || true
+          kubectl get pods -n nvsentinel -o yaml > /tmp/debug-artifacts/nvsentinel-pods.yaml || true
+          kubectl logs -n nvsentinel --all-containers=true --tail=500 > /tmp/debug-artifacts/nvsentinel-logs.txt || true
+          docker images > /tmp/debug-artifacts/docker-images.txt
+          df -h > /tmp/debug-artifacts/disk-usage.txt
+
+      - name: Upload Kind logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: e2e-test-kind-logs-${{ github.run_id }}
+          path: /tmp/kind-logs/
+          retention-days: 7
+
+      - name: Upload debugging artifacts
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: e2e-test-debug-artifacts-${{ github.run_id }}
+          path: /tmp/debug-artifacts/
+          retention-days: 7
+
+      - name: Cleanup
+        if: always()
+        run: |
+          kind delete cluster --name "${CLUSTER_NAME}" || true
+          docker system prune -f || true

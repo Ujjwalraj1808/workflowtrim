@@ -1,0 +1,1167 @@
+name: entrypoint-release
+run-name: entrypoint-release ${{ inputs.environment }} ${{ inputs.version }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: entrypoint release environment
+        required: true
+        type: choice
+        default: staging
+        options:
+          - staging
+          - production
+      version:
+        description: release version (for example 0.1.0)
+        required: true
+        type: string
+      rev:
+        description: dist config revision
+        required: true
+        type: string
+      skip_notarize:
+        description: skip Apple notarization
+        required: false
+        type: boolean
+        default: false
+      sign_artifacts:
+        description: sign release artifacts with production identities
+        required: false
+        type: boolean
+        default: true
+      react_dev:
+        description: build browser entrypoint in dev mode
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: entrypoint-release-${{ inputs.environment }}-${{ inputs.version }}
+  cancel-in-progress: false
+
+permissions:
+  actions: write
+  contents: read
+
+env:
+  GO_VERSION: 1.27.1
+  TINYGO_VERSION: 0.41.1
+  BINARYEN_VERSION: 129
+  # Binaryen's static Linux release binaries can segfault in pthreaded
+  # wasm-opt on deep optimization recursion. Keep TinyGo's optimization level
+  # unchanged, but force wasm-opt to avoid pthread workers on GitHub Linux.
+  BINARYEN_CORES: 1
+
+jobs:
+  prep:
+    runs-on: ubuntu-latest
+    outputs:
+      environment_name: ${{ steps.vars.outputs.environment_name }}
+      release_env: ${{ steps.vars.outputs.release_env }}
+      version: ${{ steps.vars.outputs.version }}
+      rev: ${{ steps.vars.outputs.rev }}
+      tag: ${{ steps.vars.outputs.tag }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+      - name: Set reproducible build timestamp
+        shell: bash
+        run: echo "SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)" >> "${GITHUB_ENV}"
+
+      - id: vars
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ inputs.environment }}" == "production" ]]; then
+            release_env="prod"
+            environment_name="production"
+            expected_ref="refs/heads/release"
+          else
+            release_env="staging"
+            environment_name="staging"
+            expected_ref="refs/heads/master"
+          fi
+          if [[ "${GITHUB_REF}" != "${expected_ref}" ]]; then
+            echo "entrypoint-release ${{ inputs.environment }} must run from ${expected_ref}, got ${GITHUB_REF}" >&2
+            exit 1
+          fi
+          echo "environment_name=${environment_name}" >> "${GITHUB_OUTPUT}"
+          echo "release_env=${release_env}" >> "${GITHUB_OUTPUT}"
+          echo "version=${{ inputs.version }}" >> "${GITHUB_OUTPUT}"
+          echo "rev=${{ inputs.rev }}" >> "${GITHUB_OUTPUT}"
+          echo "tag=v${{ inputs.version }}" >> "${GITHUB_OUTPUT}"
+
+  linux:
+    needs:
+      - prep
+    runs-on: ubuntu-latest
+    environment: ${{ needs.prep.outputs.environment_name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        arch:
+          - amd64
+          - arm64
+    env:
+      SPACEWAVE_RELEASE_ENV: ${{ needs.prep.outputs.release_env }}
+      BLDR_BUILDER_USE_BUILDX_GHA: '1'
+      BLDR_BUILDER_ZIG_CACHE_DIR: ${{ github.workspace }}/.tmp/zig-cache
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+      - name: Set reproducible build timestamp
+        shell: bash
+        run: echo "SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)" >> "${GITHUB_ENV}"
+
+      - name: Cache Linux handoff part
+        id: linux_handoff_cache
+        uses: actions/cache@v6
+        with:
+          path: |
+            .tmp/entrypoint-handoff/linux-${{ matrix.arch }}
+            .tmp/entrypoint-native-manifest-packs/linux-${{ matrix.arch }}
+            .tmp/entrypoint-cli-manifest-packs/linux-${{ matrix.arch }}
+          key: entrypoint-part-linux-${{ matrix.arch }}-${{ needs.prep.outputs.environment_name }}-${{ needs.prep.outputs.version }}-rev${{ needs.prep.outputs.rev }}-${{ github.sha }}-nativepackv2
+
+      - name: Free hosted runner disk
+        if: steps.linux_handoff_cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc
+          df -h /
+
+      - name: Setup Go
+        if: steps.linux_handoff_cache.outputs.cache-hit != 'true'
+        uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      - name: Cache trusted Go dependencies
+        if: steps.linux_handoff_cache.outputs.cache-hit != 'true'
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: trusted-go-${{ github.job }}-${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+
+      - name: Prune superseded Go dependency caches
+        if: steps.linux_handoff_cache.outputs.cache-hit != 'true'
+        uses: ./.github/actions/prune-go-cache
+
+      - name: Setup Bun
+        if: steps.linux_handoff_cache.outputs.cache-hit != 'true'
+        uses: oven-sh/setup-bun@v2
+
+      - name: Setup Node.JS
+        if: steps.linux_handoff_cache.outputs.cache-hit != 'true'
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 25.x
+
+      - name: Set up Docker Buildx
+        if: steps.linux_handoff_cache.outputs.cache-hit != 'true'
+        uses: docker/setup-buildx-action@v4
+
+      - name: Cache spacewave-builder zig stubs
+        if: steps.linux_handoff_cache.outputs.cache-hit != 'true'
+        uses: actions/cache@v6
+        with:
+          path: ${{ env.BLDR_BUILDER_ZIG_CACHE_DIR }}
+          key: spacewave-builder-zig-${{ hashFiles('desktop/Dockerfile', 'desktop/cross/toolchains/*.cmake') }}
+          restore-keys: |
+            spacewave-builder-zig-
+
+      - name: Install Bun dependencies
+        if: steps.linux_handoff_cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          bun install --frozen-lockfile --ignore-scripts
+          go mod vendor
+
+      - name: Build Linux ${{ matrix.arch }} handoff slice
+        if: steps.linux_handoff_cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          go run ./cmd/entrypoint-handoff \
+            --version "${{ needs.prep.outputs.version }}" \
+            --platforms "linux-${{ matrix.arch }}" \
+            --react-dev=${{ inputs.react_dev }} \
+            --skip-notarize \
+            --out-dir .tmp/entrypoint-handoff/linux-${{ matrix.arch }}
+
+      - name: Produce Linux ${{ matrix.arch }} native entrypoint manifest pack
+        if: steps.linux_handoff_cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          go run ./cmd/entrypoint-handoff \
+            --version "${{ needs.prep.outputs.version }}" \
+            --manifest-pack-produce \
+            --manifest-id spacewave-dist \
+            --manifest-platform "desktop/linux/${{ matrix.arch }}" \
+            --manifest-object-key "spacewave/release/manifests/spacewave-dist/desktop/linux/${{ matrix.arch }}" \
+            --manifest-link-object-keys "spacewave/release/manifests" \
+            --manifest-producer-target "release-desktop-linux-${{ matrix.arch }}" \
+            --out-dir .tmp/entrypoint-native-manifest-packs/linux-${{ matrix.arch }}
+
+      - name: Produce Linux ${{ matrix.arch }} CLI entrypoint manifest pack
+        if: steps.linux_handoff_cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          go run ./cmd/entrypoint-handoff \
+            --version "${{ needs.prep.outputs.version }}" \
+            --manifest-pack-produce \
+            --manifest-id spacewave-cli \
+            --manifest-platform "desktop/linux/${{ matrix.arch }}" \
+            --manifest-object-key "spacewave/release/manifests/spacewave-cli/desktop/linux/${{ matrix.arch }}" \
+            --manifest-link-object-keys "devtool,spacewave/release/manifests" \
+            --manifest-producer-target "release-cli-linux-${{ matrix.arch }}" \
+            --out-dir .tmp/entrypoint-cli-manifest-packs/linux-${{ matrix.arch }}
+
+      - name: Upload Linux handoff part
+        uses: actions/upload-artifact@v7
+        with:
+          name: entrypoint-part-linux-${{ matrix.arch }}-${{ needs.prep.outputs.environment_name }}-${{ needs.prep.outputs.version }}-rev${{ needs.prep.outputs.rev }}
+          path: .tmp/entrypoint-handoff/linux-${{ matrix.arch }}
+          include-hidden-files: true
+          if-no-files-found: error
+
+      - name: Upload Linux ${{ matrix.arch }} native entrypoint manifest pack
+        uses: actions/upload-artifact@v7
+        with:
+          name: entrypoint-native-manifest-pack-${{ needs.prep.outputs.environment_name }}-${{ needs.prep.outputs.version }}-rev${{ needs.prep.outputs.rev }}-spacewave-dist-desktop-linux-${{ matrix.arch }}
+          path: .tmp/entrypoint-native-manifest-packs/linux-${{ matrix.arch }}
+          include-hidden-files: true
+          if-no-files-found: error
+
+      - name: Upload Linux ${{ matrix.arch }} CLI entrypoint manifest pack
+        uses: actions/upload-artifact@v7
+        with:
+          name: entrypoint-cli-manifest-pack-${{ needs.prep.outputs.environment_name }}-${{ needs.prep.outputs.version }}-rev${{ needs.prep.outputs.rev }}-spacewave-cli-desktop-linux-${{ matrix.arch }}
+          path: .tmp/entrypoint-cli-manifest-packs/linux-${{ matrix.arch }}
+          include-hidden-files: true
+          if-no-files-found: error
+
+  browser:
+    needs:
+      - prep
+    # The larger hosted-runner label queues indefinitely. The standard runner
+    # has enough memory when the whole-plugin compile and bundle pipeline is
+    # serialized below.
+    runs-on: ubuntu-latest
+    environment: ${{ needs.prep.outputs.environment_name }}
+    env:
+      SPACEWAVE_RELEASE_ENV: ${{ needs.prep.outputs.release_env }}
+      BLDR_WASM_OPT_DIAGNOSTICS_DIR: ${{ github.workspace }}/.tmp/wasm-opt-diagnostics
+      # The sql plugin split added a parallel GoScript plugin build. Serialize
+      # whole-plugin builds and retain the existing Go subprocess bounds so the
+      # runner service stays within the ubuntu-latest memory ceiling.
+      BLDR_PLUGIN_BUILD_CONCURRENCY: '1'
+      GOMAXPROCS: '3'
+      GOFLAGS: '-p=2'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+      - name: Set reproducible build timestamp
+        shell: bash
+        run: echo "SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)" >> "${GITHUB_ENV}"
+
+      - name: Cache browser handoff part
+        id: browser_handoff_cache
+        uses: actions/cache@v6
+        with:
+          path: .tmp/entrypoint-handoff/browser
+          key: entrypoint-part-browser-${{ needs.prep.outputs.environment_name }}-${{ needs.prep.outputs.version }}-rev${{ needs.prep.outputs.rev }}-${{ github.sha }}-reactdev${{ inputs.react_dev }}
+
+      - name: Setup Go
+        if: steps.browser_handoff_cache.outputs.cache-hit != 'true'
+        uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      - name: Cache trusted Go dependencies
+        if: steps.browser_handoff_cache.outputs.cache-hit != 'true'
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: trusted-go-${{ github.job }}-${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+
+      - name: Prune superseded Go dependency caches
+        if: steps.browser_handoff_cache.outputs.cache-hit != 'true'
+        uses: ./.github/actions/prune-go-cache
+
+      - name: Setup Bun
+        if: steps.browser_handoff_cache.outputs.cache-hit != 'true'
+        uses: oven-sh/setup-bun@v2
+
+      - name: Setup Node.JS
+        if: steps.browser_handoff_cache.outputs.cache-hit != 'true'
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 25.x
+
+      - name: Install Binaryen
+        if: steps.browser_handoff_cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          binaryen_tar="binaryen-version_${BINARYEN_VERSION}-x86_64-linux.tar.gz"
+          binaryen_url="https://github.com/WebAssembly/binaryen/releases/download/version_${BINARYEN_VERSION}"
+          wget --quiet "${binaryen_url}/${binaryen_tar}"
+          wget --quiet "${binaryen_url}/${binaryen_tar}.sha256"
+          sha256sum --check "${binaryen_tar}.sha256"
+          mkdir -p "${RUNNER_TEMP}/binaryen"
+          tar -xzf "${binaryen_tar}" -C "${RUNNER_TEMP}/binaryen" --strip-components=1
+          echo "${RUNNER_TEMP}/binaryen/bin" >> "${GITHUB_PATH}"
+          "${RUNNER_TEMP}/binaryen/bin/wasm-opt" --version
+
+      - name: Install TinyGo
+        if: steps.browser_handoff_cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          tinygo_deb="tinygo_${TINYGO_VERSION}_amd64.deb"
+          wget --quiet "https://github.com/tinygo-org/tinygo/releases/download/v${TINYGO_VERSION}/${tinygo_deb}"
+          sudo dpkg -i "${tinygo_deb}"
+          sudo sed -i 's/return t[.]roundTrip(req)/return roundTrip(req)/' /usr/local/lib/tinygo/src/net/http/roundtrip_js.go
+          grep -q 'return roundTrip(req)' /usr/local/lib/tinygo/src/net/http/roundtrip_js.go
+          tinygo version
+
+      - name: Install Bun dependencies
+        if: steps.browser_handoff_cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          bun install --frozen-lockfile --ignore-scripts
+          go mod vendor
+
+      - name: Build browser handoff slice
+        if: steps.browser_handoff_cache.outputs.cache-hit != 'true'
+        timeout-minutes: 60
+        shell: bash
+        env:
+          BLDR_TINYGO_TRACE: 'true'
+          BLDR_TINYGO_WORK: 'true'
+          TMPDIR: ${{ github.workspace }}/.tmp/tinygo-tmp
+        run: |
+          set -euo pipefail
+          mkdir -p "${BLDR_WASM_OPT_DIAGNOSTICS_DIR}" "${TMPDIR}"
+          go run ./cmd/entrypoint-handoff \
+            --version "${{ needs.prep.outputs.version }}" \
+            --browser-only \
+            --react-dev=${{ inputs.react_dev }} \
+            --out-dir .tmp/entrypoint-handoff/browser
+
+      - name: Upload wasm-opt diagnostics
+        if: failure() && steps.browser_handoff_cache.outputs.cache-hit != 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: wasm-opt-diagnostics-${{ needs.prep.outputs.environment_name }}-${{ needs.prep.outputs.version }}-rev${{ needs.prep.outputs.rev }}-${{ github.run_id }}
+          path: .tmp/wasm-opt-diagnostics
+          include-hidden-files: true
+          if-no-files-found: warn
+
+      - name: Upload TinyGo work diagnostics
+        if: failure() && steps.browser_handoff_cache.outputs.cache-hit != 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: tinygo-work-diagnostics-${{ needs.prep.outputs.environment_name }}-${{ needs.prep.outputs.version }}-rev${{ needs.prep.outputs.rev }}-${{ github.run_id }}
+          path: .tmp/tinygo-tmp
+          include-hidden-files: true
+          if-no-files-found: warn
+
+      - name: Upload browser handoff part
+        uses: actions/upload-artifact@v7
+        with:
+          name: entrypoint-part-browser-${{ needs.prep.outputs.environment_name }}-${{ needs.prep.outputs.version }}-rev${{ needs.prep.outputs.rev }}
+          path: .tmp/entrypoint-handoff/browser
+          include-hidden-files: true
+          if-no-files-found: error
+
+  windows:
+    needs:
+      - prep
+    runs-on: windows-2025
+    environment: ${{ needs.prep.outputs.environment_name }}
+    permissions:
+      actions: write
+      contents: read
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        arch:
+          - amd64
+          - arm64
+    env:
+      SPACEWAVE_RELEASE_ENV: ${{ needs.prep.outputs.release_env }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+      - name: Set reproducible build timestamp
+        shell: bash
+        run: echo "SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)" >> "${GITHUB_ENV}"
+
+      - name: Cache Windows handoff part
+        id: windows_handoff_cache
+        uses: actions/cache@v6
+        with:
+          path: |
+            .tmp/entrypoint-handoff/windows-${{ matrix.arch }}
+            .tmp/entrypoint-native-manifest-packs/windows-${{ matrix.arch }}
+            .tmp/entrypoint-cli-manifest-packs/windows-${{ matrix.arch }}
+          key: entrypoint-part-windows-${{ matrix.arch }}-${{ needs.prep.outputs.environment_name }}-${{ needs.prep.outputs.version }}-rev${{ needs.prep.outputs.rev }}-${{ github.sha }}-sign${{ inputs.sign_artifacts }}-nativepackv2
+
+      - name: Setup Go
+        if: steps.windows_handoff_cache.outputs.cache-hit != 'true'
+        uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      - name: Cache trusted Go dependencies
+        if: steps.windows_handoff_cache.outputs.cache-hit != 'true'
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: trusted-go-${{ github.job }}-${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+
+      - name: Prune superseded Go dependency caches
+        if: steps.windows_handoff_cache.outputs.cache-hit != 'true'
+        uses: ./.github/actions/prune-go-cache
+
+      - name: Setup Bun
+        if: steps.windows_handoff_cache.outputs.cache-hit != 'true'
+        uses: oven-sh/setup-bun@v2
+
+      - name: Setup Node.JS
+        if: steps.windows_handoff_cache.outputs.cache-hit != 'true'
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 25.x
+
+      - name: Install Bun dependencies
+        if: steps.windows_handoff_cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          bun install --frozen-lockfile --ignore-scripts
+          go mod vendor
+
+      - name: Azure login with OIDC
+        if: ${{ inputs.sign_artifacts && steps.windows_handoff_cache.outputs.cache-hit != 'true' }}
+        uses: azure/login@v3
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      # Exchange the short-lived GitHub assertion before compilation; signing uses
+      # the cached Azure resource token after the assertion has expired.
+      - name: Cache Azure code-signing access token
+        if: ${{ inputs.sign_artifacts && steps.windows_handoff_cache.outputs.cache-hit != 'true' }}
+        shell: pwsh
+        run: |
+          az account get-access-token --resource https://codesigning.azure.net --output none
+          if ($LASTEXITCODE -ne 0) { throw "Failed to acquire the code-signing access token" }
+
+      - name: Resolve TrustedSigning module path
+        if: ${{ inputs.sign_artifacts && steps.windows_handoff_cache.outputs.cache-hit != 'true' }}
+        id: trusted_signing_paths
+        shell: pwsh
+        run: |
+          $defaultPath = $env:PSModulePath -split ';' | Select-Object -First 1
+          "psmodulepath=$defaultPath" >> $env:GITHUB_OUTPUT
+
+      - name: Cache TrustedSigning PowerShell module
+        if: ${{ inputs.sign_artifacts && steps.windows_handoff_cache.outputs.cache-hit != 'true' }}
+        id: cache_trusted_signing
+        uses: actions/cache@v6
+        with:
+          path: ${{ steps.trusted_signing_paths.outputs.psmodulepath }}\TrustedSigning\0.5.8
+          key: TrustedSigning-0.5.8
+
+      - name: Install TrustedSigning PowerShell module
+        if: ${{ inputs.sign_artifacts && steps.windows_handoff_cache.outputs.cache-hit != 'true' && steps.cache_trusted_signing.outputs.cache-hit != 'true' }}
+        shell: pwsh
+        run: |
+          Install-Module -Name TrustedSigning -RequiredVersion 0.5.8 -Force -Repository PSGallery
+
+      - name: Cache Microsoft.Windows.SDK.BuildTools nuget
+        if: ${{ inputs.sign_artifacts && steps.windows_handoff_cache.outputs.cache-hit != 'true' }}
+        id: cache_buildtools
+        uses: actions/cache@v6
+        with:
+          path: ~\AppData\Local\TrustedSigning\Microsoft.Windows.SDK.BuildTools\Microsoft.Windows.SDK.BuildTools.10.0.26100.4188
+          key: Microsoft.Windows.SDK.BuildTools-10.0.26100.4188
+
+      - name: Cache Microsoft.Trusted.Signing.Client nuget
+        if: ${{ inputs.sign_artifacts && steps.windows_handoff_cache.outputs.cache-hit != 'true' }}
+        id: cache_tsclient
+        uses: actions/cache@v6
+        with:
+          path: ~\AppData\Local\TrustedSigning\Microsoft.Trusted.Signing.Client\Microsoft.Trusted.Signing.Client.1.0.95
+          key: Microsoft.Trusted.Signing.Client-1.0.95
+
+      - name: Cache sign dotnet tool
+        if: ${{ inputs.sign_artifacts && steps.windows_handoff_cache.outputs.cache-hit != 'true' }}
+        id: cache_signcli
+        uses: actions/cache@v6
+        with:
+          path: ~\AppData\Local\TrustedSigning\sign\sign.0.9.1-beta.24469.1
+          key: SignCli-0.9.1-beta.24469.1
+
+      - name: Install Microsoft.Windows.SDK.BuildTools nuget
+        if: ${{ inputs.sign_artifacts && steps.windows_handoff_cache.outputs.cache-hit != 'true' && steps.cache_buildtools.outputs.cache-hit != 'true' }}
+        shell: pwsh
+        run: |
+          $name = "Microsoft.Windows.SDK.BuildTools"
+          $version = "10.0.26100.4188"
+          $root = Join-Path $env:LOCALAPPDATA "TrustedSigning\$name"
+          New-Item -ItemType Directory -Force -Path $root | Out-Null
+          if (-Not (Get-PackageSource -Location "https://www.nuget.org/api/v2/" -ErrorAction Ignore)) {
+            Register-PackageSource -Name trusted-signing-ps -Location "https://www.nuget.org/api/v2/" -ProviderName NuGet -Trusted -Force | Out-Null
+          }
+          Install-Package -Name $name -RequiredVersion $version -Source "https://www.nuget.org/api/v2/" -Destination $root -Force | Out-Null
+
+      - name: Install Microsoft.Trusted.Signing.Client nuget
+        if: ${{ inputs.sign_artifacts && steps.windows_handoff_cache.outputs.cache-hit != 'true' && steps.cache_tsclient.outputs.cache-hit != 'true' }}
+        shell: pwsh
+        run: |
+          $name = "Microsoft.Trusted.Signing.Client"
+          $version = "1.0.95"
+          $root = Join-Path $env:LOCALAPPDATA "TrustedSigning\$name"
+          New-Item -ItemType Directory -Force -Path $root | Out-Null
+          if (-Not (Get-PackageSource -Location "https://www.nuget.org/api/v2/" -ErrorAction Ignore)) {
+            Register-PackageSource -Name trusted-signing-ps -Location "https://www.nuget.org/api/v2/" -ProviderName NuGet -Trusted -Force | Out-Null
+          }
+          Install-Package -Name $name -RequiredVersion $version -Source "https://www.nuget.org/api/v2/" -Destination $root -Force | Out-Null
+
+      - name: Install sign dotnet tool
+        if: ${{ inputs.sign_artifacts && steps.windows_handoff_cache.outputs.cache-hit != 'true' && steps.cache_signcli.outputs.cache-hit != 'true' }}
+        shell: pwsh
+        run: |
+          $name = "sign"
+          $version = "0.9.1-beta.24469.1"
+          $root = Join-Path $env:LOCALAPPDATA "TrustedSigning\$name"
+          New-Item -ItemType Directory -Force -Path $root | Out-Null
+          dotnet tool install $name `
+            --version $version `
+            --tool-path $root `
+            --add-source https://api.nuget.org/v3/index.json
+          if ($LASTEXITCODE -ne 0) { throw "dotnet tool install $name $version failed: $LASTEXITCODE" }
+          $storePath = Join-Path $root ".store\$name\$version\$name\$version"
+          $packagePath = Join-Path $root "$name.$version"
+          Move-Item -Path $storePath -Destination $packagePath -Force
+          Remove-Item -Path (Join-Path $root ".store") -Recurse -Force
+          Remove-Item -Path (Join-Path $root "sign.exe") -Force -ErrorAction Ignore
+
+      - name: Build signed Windows ${{ matrix.arch }} handoff slice
+        if: steps.windows_handoff_cache.outputs.cache-hit != 'true'
+        shell: bash
+        env:
+          BLDR_WINDOWS_SIGN_PROFILE: ${{ inputs.sign_artifacts && vars.BLDR_WINDOWS_SIGN_PROFILE || '' }}
+          BLDR_WINDOWS_SIGN_ACCOUNT: ${{ inputs.sign_artifacts && vars.BLDR_WINDOWS_SIGN_ACCOUNT || '' }}
+          BLDR_WINDOWS_SIGN_ENDPOINT: ${{ inputs.sign_artifacts && vars.BLDR_WINDOWS_SIGN_ENDPOINT || '' }}
+          BLDR_WINDOWS_SIGN_MSIX: '0'
+        run: |
+          set -euo pipefail
+          go run ./cmd/entrypoint-handoff \
+            --version "${{ needs.prep.outputs.version }}" \
+            --platforms "windows-${{ matrix.arch }}" \
+            --react-dev=${{ inputs.react_dev }} \
+            --out-dir .tmp/entrypoint-handoff/windows-${{ matrix.arch }}
+
+      - name: Produce Windows ${{ matrix.arch }} native entrypoint manifest pack
+        if: steps.windows_handoff_cache.outputs.cache-hit != 'true'
+        shell: bash
+        env:
+          BLDR_WINDOWS_SIGN_PROFILE: ${{ inputs.sign_artifacts && vars.BLDR_WINDOWS_SIGN_PROFILE || '' }}
+          BLDR_WINDOWS_SIGN_ACCOUNT: ${{ inputs.sign_artifacts && vars.BLDR_WINDOWS_SIGN_ACCOUNT || '' }}
+          BLDR_WINDOWS_SIGN_ENDPOINT: ${{ inputs.sign_artifacts && vars.BLDR_WINDOWS_SIGN_ENDPOINT || '' }}
+          BLDR_WINDOWS_SIGN_MSIX: '0'
+        run: |
+          set -euo pipefail
+          go run ./cmd/entrypoint-handoff \
+            --version "${{ needs.prep.outputs.version }}" \
+            --manifest-pack-produce \
+            --manifest-id spacewave-dist \
+            --manifest-platform "desktop/windows/${{ matrix.arch }}" \
+            --manifest-object-key "spacewave/release/manifests/spacewave-dist/desktop/windows/${{ matrix.arch }}" \
+            --manifest-link-object-keys "spacewave/release/manifests" \
+            --manifest-producer-target "release-desktop-windows-${{ matrix.arch }}" \
+            --out-dir .tmp/entrypoint-native-manifest-packs/windows-${{ matrix.arch }}
+
+      - name: Produce Windows ${{ matrix.arch }} CLI entrypoint manifest pack
+        if: steps.windows_handoff_cache.outputs.cache-hit != 'true'
+        shell: bash
+        env:
+          BLDR_WINDOWS_SIGN_PROFILE: ${{ inputs.sign_artifacts && vars.BLDR_WINDOWS_SIGN_PROFILE || '' }}
+          BLDR_WINDOWS_SIGN_ACCOUNT: ${{ inputs.sign_artifacts && vars.BLDR_WINDOWS_SIGN_ACCOUNT || '' }}
+          BLDR_WINDOWS_SIGN_ENDPOINT: ${{ inputs.sign_artifacts && vars.BLDR_WINDOWS_SIGN_ENDPOINT || '' }}
+          BLDR_WINDOWS_SIGN_MSIX: '0'
+        run: |
+          set -euo pipefail
+          go run ./cmd/entrypoint-handoff \
+            --version "${{ needs.prep.outputs.version }}" \
+            --manifest-pack-produce \
+            --manifest-id spacewave-cli \
+            --manifest-platform "desktop/windows/${{ matrix.arch }}" \
+            --manifest-object-key "spacewave/release/manifests/spacewave-cli/desktop/windows/${{ matrix.arch }}" \
+            --manifest-link-object-keys "devtool,spacewave/release/manifests" \
+            --manifest-producer-target "release-cli-windows-${{ matrix.arch }}" \
+            --out-dir .tmp/entrypoint-cli-manifest-packs/windows-${{ matrix.arch }}
+
+      - name: Collect Windows MSIX installer
+        if: steps.windows_handoff_cache.outputs.cache-hit != 'true'
+        id: windows_msix_paths
+        shell: pwsh
+        run: |
+          "msix=$((Resolve-Path 'dist/installers/spacewave-windows-${{ matrix.arch }}.msix').Path)" >> $env:GITHUB_OUTPUT
+
+      - name: Sign Windows ${{ matrix.arch }} MSIX installer
+        if: ${{ inputs.sign_artifacts && steps.windows_handoff_cache.outputs.cache-hit != 'true' }}
+        shell: pwsh
+        env:
+          BLDR_SIGN_ENDPOINT: https://wus.codesigning.azure.net/
+          BLDR_SIGN_ACCOUNT: ${{ vars.BLDR_WINDOWS_SIGN_ACCOUNT }}
+          BLDR_SIGN_PROFILE: ${{ vars.BLDR_WINDOWS_SIGN_PROFILE }}
+          BLDR_SIGN_FILE: ${{ steps.windows_msix_paths.outputs.msix }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Invoke-TrustedSigning `
+            -Endpoint $env:BLDR_SIGN_ENDPOINT `
+            -CodeSigningAccountName $env:BLDR_SIGN_ACCOUNT `
+            -CertificateProfileName $env:BLDR_SIGN_PROFILE `
+            -Files $env:BLDR_SIGN_FILE `
+            -Description Spacewave `
+            -FileDigest SHA256 `
+            -TimestampRfc3161 'http://timestamp.acs.microsoft.com' `
+            -TimestampDigest SHA256
+
+      - name: Refresh staged Windows installers after MSIX signing
+        if: ${{ inputs.sign_artifacts && steps.windows_handoff_cache.outputs.cache-hit != 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf .tmp/entrypoint-handoff/windows-${{ matrix.arch }}/installers
+          mkdir -p .tmp/entrypoint-handoff/windows-${{ matrix.arch }}/installers
+          cp -R dist/installers/. .tmp/entrypoint-handoff/windows-${{ matrix.arch }}/installers/
+
+      - name: Verify Windows signatures
+        if: ${{ inputs.sign_artifacts && steps.windows_handoff_cache.outputs.cache-hit != 'true' }}
+        shell: pwsh
+        run: |
+          $files = @(
+            ".tmp/dist/windows-${{ matrix.arch }}/spacewave.exe"
+            ".tmp/dist-cli/windows-${{ matrix.arch }}/spacewave.exe"
+            "dist/helper/windows-${{ matrix.arch }}/spacewave-helper.exe"
+            "dist/installers/spacewave-windows-${{ matrix.arch }}.msix"
+          )
+          foreach ($path in $files) {
+            $sig = Get-AuthenticodeSignature -FilePath $path
+            if ($sig.Status -ne "Valid") {
+              throw "signature verification failed for ${path}: $($sig.Status)"
+            }
+          }
+
+      - name: Upload Windows handoff part
+        uses: actions/upload-artifact@v7
+        with:
+          name: entrypoint-part-windows-${{ matrix.arch }}-${{ needs.prep.outputs.environment_name }}-${{ needs.prep.outputs.version }}-rev${{ needs.prep.outputs.rev }}
+          path: .tmp/entrypoint-handoff/windows-${{ matrix.arch }}
+          include-hidden-files: true
+          if-no-files-found: error
+
+      - name: Upload Windows ${{ matrix.arch }} native entrypoint manifest pack
+        uses: actions/upload-artifact@v7
+        with:
+          name: entrypoint-native-manifest-pack-${{ needs.prep.outputs.environment_name }}-${{ needs.prep.outputs.version }}-rev${{ needs.prep.outputs.rev }}-spacewave-dist-desktop-windows-${{ matrix.arch }}
+          path: .tmp/entrypoint-native-manifest-packs/windows-${{ matrix.arch }}
+          include-hidden-files: true
+          if-no-files-found: error
+
+      - name: Upload Windows ${{ matrix.arch }} CLI entrypoint manifest pack
+        uses: actions/upload-artifact@v7
+        with:
+          name: entrypoint-cli-manifest-pack-${{ needs.prep.outputs.environment_name }}-${{ needs.prep.outputs.version }}-rev${{ needs.prep.outputs.rev }}-spacewave-cli-desktop-windows-${{ matrix.arch }}
+          path: .tmp/entrypoint-cli-manifest-packs/windows-${{ matrix.arch }}
+          include-hidden-files: true
+          if-no-files-found: error
+
+  macos:
+    needs:
+      - prep
+    runs-on: macos-26
+    environment: ${{ needs.prep.outputs.environment_name }}
+    permissions:
+      actions: write
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        arch:
+          - amd64
+          - arm64
+    env:
+      SPACEWAVE_RELEASE_ENV: ${{ needs.prep.outputs.release_env }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+      - name: Set reproducible build timestamp
+        shell: bash
+        run: echo "SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)" >> "${GITHUB_ENV}"
+
+      - name: Cache macOS handoff part
+        id: macos_handoff_cache
+        uses: actions/cache@v6
+        with:
+          path: |
+            .tmp/entrypoint-handoff/macos-${{ matrix.arch }}
+            .tmp/entrypoint-native-manifest-packs/macos-${{ matrix.arch }}
+            .tmp/entrypoint-cli-manifest-packs/macos-${{ matrix.arch }}
+          key: entrypoint-part-macos-${{ matrix.arch }}-${{ needs.prep.outputs.environment_name }}-${{ needs.prep.outputs.version }}-rev${{ needs.prep.outputs.rev }}-${{ github.sha }}-sign${{ inputs.sign_artifacts }}-skipnotarize${{ inputs.skip_notarize }}-nativepackv2
+
+      - name: Setup Go
+        if: steps.macos_handoff_cache.outputs.cache-hit != 'true'
+        uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      - name: Cache trusted Go dependencies
+        if: steps.macos_handoff_cache.outputs.cache-hit != 'true'
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: trusted-go-${{ github.job }}-${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+
+      - name: Prune superseded Go dependency caches
+        if: steps.macos_handoff_cache.outputs.cache-hit != 'true'
+        uses: ./.github/actions/prune-go-cache
+
+      - name: Setup Bun
+        if: steps.macos_handoff_cache.outputs.cache-hit != 'true'
+        uses: oven-sh/setup-bun@v2
+
+      - name: Setup Node.JS
+        if: steps.macos_handoff_cache.outputs.cache-hit != 'true'
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 25.x
+
+      - name: Install Bun dependencies
+        if: steps.macos_handoff_cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          bun install --frozen-lockfile --ignore-scripts
+          go mod vendor
+
+      - name: Import macOS signing certificate
+        if: ${{ inputs.sign_artifacts && steps.macos_handoff_cache.outputs.cache-hit != 'true' }}
+        shell: bash
+        env:
+          MACOS_CERT_P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+          MACOS_CERT_P12_PASSWORD: ${{ secrets.MACOS_CERT_P12_PASSWORD }}
+        run: |
+          set -euo pipefail
+          KEYCHAIN_PATH="${RUNNER_TEMP}/entrypoint-release.keychain-db"
+          CERT_PATH="${RUNNER_TEMP}/entrypoint-release.p12"
+          KEYCHAIN_PASSWORD="$(openssl rand -hex 24)"
+          echo "${MACOS_CERT_P12_BASE64}" | base64 -D > "${CERT_PATH}"
+          security create-keychain -p "${KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}"
+          security set-keychain-settings -lut 21600 "${KEYCHAIN_PATH}"
+          security unlock-keychain -p "${KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}"
+          security import "${CERT_PATH}" -k "${KEYCHAIN_PATH}" -P "${MACOS_CERT_P12_PASSWORD}" -T /usr/bin/codesign -T /usr/bin/security -T /usr/bin/xcrun
+          security set-key-partition-list -S apple-tool:,apple: -s -k "${KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}"
+          security list-keychains -d user -s "${KEYCHAIN_PATH}" login.keychain-db
+          security default-keychain -d user -s "${KEYCHAIN_PATH}"
+          rm -f "${CERT_PATH}"
+
+      - name: Bootstrap macOS notarization credentials
+        if: ${{ inputs.sign_artifacts && !inputs.skip_notarize && steps.macos_handoff_cache.outputs.cache-hit != 'true' }}
+        shell: bash
+        env:
+          BLDR_MACOS_NOTARIZE_PROFILE: ${{ vars.BLDR_MACOS_NOTARIZE_PROFILE }}
+          APPLE_NOTARY_KEY_ID: ${{ vars.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ vars.APPLE_NOTARY_ISSUER_ID }}
+          APPLE_NOTARY_KEY_P8_BASE64: ${{ secrets.APPLE_NOTARY_KEY_P8_BASE64 }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${BLDR_MACOS_NOTARIZE_PROFILE}" ]]; then
+            echo "BLDR_MACOS_NOTARIZE_PROFILE is required when notarization is enabled"
+            exit 1
+          fi
+          if [[ -z "${APPLE_NOTARY_KEY_ID}" ]]; then
+            echo "APPLE_NOTARY_KEY_ID is required when notarization is enabled"
+            exit 1
+          fi
+          if [[ -z "${APPLE_NOTARY_ISSUER_ID}" ]]; then
+            echo "APPLE_NOTARY_ISSUER_ID is required when notarization is enabled"
+            exit 1
+          fi
+          if [[ -z "${APPLE_NOTARY_KEY_P8_BASE64}" ]]; then
+            echo "APPLE_NOTARY_KEY_P8_BASE64 is required when notarization is enabled"
+            exit 1
+          fi
+          KEY_PATH="${RUNNER_TEMP}/AuthKey_${APPLE_NOTARY_KEY_ID}.p8"
+          echo "${APPLE_NOTARY_KEY_P8_BASE64}" | base64 -D > "${KEY_PATH}"
+          chmod 600 "${KEY_PATH}"
+          xcrun notarytool store-credentials "${BLDR_MACOS_NOTARIZE_PROFILE}" \
+            --key "${KEY_PATH}" \
+            --key-id "${APPLE_NOTARY_KEY_ID}" \
+            --issuer "${APPLE_NOTARY_ISSUER_ID}"
+          rm -f "${KEY_PATH}"
+
+      - name: Build macOS ${{ matrix.arch }} handoff slice
+        if: steps.macos_handoff_cache.outputs.cache-hit != 'true'
+        shell: bash
+        env:
+          BLDR_MACOS_SIGN_IDENTITY: ${{ inputs.sign_artifacts && vars.BLDR_MACOS_SIGN_IDENTITY || '-' }}
+          BLDR_MACOS_SIGN_ENTITLEMENTS: ${{ vars.BLDR_MACOS_SIGN_ENTITLEMENTS }}
+          BLDR_MACOS_SIGN_OPTIONS: ${{ vars.BLDR_MACOS_SIGN_OPTIONS }}
+          BLDR_MACOS_NOTARIZE_PROFILE: ${{ vars.BLDR_MACOS_NOTARIZE_PROFILE }}
+          BLDR_MACOS_ADHOC_SIGN: ${{ inputs.sign_artifacts && '0' || '1' }}
+        run: |
+          set -euo pipefail
+          go run ./cmd/entrypoint-handoff \
+            --version "${{ needs.prep.outputs.version }}" \
+            --platforms "darwin-${{ matrix.arch }}" \
+            --react-dev=${{ inputs.react_dev }} \
+            --skip-notarize=${{ !inputs.sign_artifacts || inputs.skip_notarize }} \
+            --out-dir .tmp/entrypoint-handoff/macos-${{ matrix.arch }}
+
+      - name: Produce macOS ${{ matrix.arch }} native entrypoint manifest pack
+        if: steps.macos_handoff_cache.outputs.cache-hit != 'true'
+        shell: bash
+        env:
+          BLDR_MACOS_SIGN_IDENTITY: ${{ inputs.sign_artifacts && vars.BLDR_MACOS_SIGN_IDENTITY || '-' }}
+          BLDR_MACOS_SIGN_ENTITLEMENTS: ${{ vars.BLDR_MACOS_SIGN_ENTITLEMENTS }}
+          BLDR_MACOS_SIGN_OPTIONS: ${{ vars.BLDR_MACOS_SIGN_OPTIONS }}
+          BLDR_MACOS_NOTARIZE_PROFILE: ${{ vars.BLDR_MACOS_NOTARIZE_PROFILE }}
+          BLDR_MACOS_ADHOC_SIGN: ${{ inputs.sign_artifacts && '0' || '1' }}
+        run: |
+          set -euo pipefail
+          # The installed macOS app updates by replacing its signed bundle, so
+          # the release artifact is the notarized app the DMG ships.
+          APP_DIST=".tmp/entrypoint-app-dist/macos-${{ matrix.arch }}"
+          rm -rf "${APP_DIST}"
+          mkdir -p "${APP_DIST}"
+          ditto .tmp/Spacewave.app "${APP_DIST}/Spacewave.app"
+          codesign --verify --deep --strict "${APP_DIST}/Spacewave.app"
+          go run ./cmd/entrypoint-handoff \
+            --version "${{ needs.prep.outputs.version }}" \
+            --manifest-pack-produce \
+            --manifest-id spacewave-dist \
+            --manifest-platform "desktop/darwin/${{ matrix.arch }}" \
+            --manifest-dist-dir "${APP_DIST}" \
+            --manifest-entrypoint Spacewave.app \
+            --manifest-object-key "spacewave/release/manifests/spacewave-dist/desktop/darwin/${{ matrix.arch }}" \
+            --manifest-link-object-keys "spacewave/release/manifests" \
+            --manifest-producer-target "release-desktop-darwin-${{ matrix.arch }}" \
+            --out-dir .tmp/entrypoint-native-manifest-packs/macos-${{ matrix.arch }}
+
+      - name: Produce macOS ${{ matrix.arch }} CLI entrypoint manifest pack
+        if: steps.macos_handoff_cache.outputs.cache-hit != 'true'
+        shell: bash
+        env:
+          BLDR_MACOS_SIGN_IDENTITY: ${{ inputs.sign_artifacts && vars.BLDR_MACOS_SIGN_IDENTITY || '-' }}
+          BLDR_MACOS_SIGN_ENTITLEMENTS: ${{ vars.BLDR_MACOS_SIGN_ENTITLEMENTS }}
+          BLDR_MACOS_SIGN_OPTIONS: ${{ vars.BLDR_MACOS_SIGN_OPTIONS }}
+          BLDR_MACOS_NOTARIZE_PROFILE: ${{ vars.BLDR_MACOS_NOTARIZE_PROFILE }}
+          BLDR_MACOS_ADHOC_SIGN: ${{ inputs.sign_artifacts && '0' || '1' }}
+        run: |
+          set -euo pipefail
+          go run ./cmd/entrypoint-handoff \
+            --version "${{ needs.prep.outputs.version }}" \
+            --manifest-pack-produce \
+            --manifest-id spacewave-cli \
+            --manifest-platform "desktop/darwin/${{ matrix.arch }}" \
+            --manifest-object-key "spacewave/release/manifests/spacewave-cli/desktop/darwin/${{ matrix.arch }}" \
+            --manifest-link-object-keys "devtool,spacewave/release/manifests" \
+            --manifest-producer-target "release-cli-darwin-${{ matrix.arch }}" \
+            --out-dir .tmp/entrypoint-cli-manifest-packs/macos-${{ matrix.arch }}
+
+      - name: Upload macOS handoff part
+        uses: actions/upload-artifact@v7
+        with:
+          name: entrypoint-part-macos-${{ matrix.arch }}-${{ needs.prep.outputs.environment_name }}-${{ needs.prep.outputs.version }}-rev${{ needs.prep.outputs.rev }}
+          path: .tmp/entrypoint-handoff/macos-${{ matrix.arch }}
+          include-hidden-files: true
+          if-no-files-found: error
+
+      - name: Upload macOS ${{ matrix.arch }} native entrypoint manifest pack
+        uses: actions/upload-artifact@v7
+        with:
+          name: entrypoint-native-manifest-pack-${{ needs.prep.outputs.environment_name }}-${{ needs.prep.outputs.version }}-rev${{ needs.prep.outputs.rev }}-spacewave-dist-desktop-darwin-${{ matrix.arch }}
+          path: .tmp/entrypoint-native-manifest-packs/macos-${{ matrix.arch }}
+          include-hidden-files: true
+          if-no-files-found: error
+
+      - name: Upload macOS ${{ matrix.arch }} CLI entrypoint manifest pack
+        uses: actions/upload-artifact@v7
+        with:
+          name: entrypoint-cli-manifest-pack-${{ needs.prep.outputs.environment_name }}-${{ needs.prep.outputs.version }}-rev${{ needs.prep.outputs.rev }}-spacewave-cli-desktop-darwin-${{ matrix.arch }}
+          path: .tmp/entrypoint-cli-manifest-packs/macos-${{ matrix.arch }}
+          include-hidden-files: true
+          if-no-files-found: error
+
+  assemble:
+    needs:
+      - prep
+      - linux
+      - browser
+      - windows
+      - macos
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+      - name: Set reproducible build timestamp
+        shell: bash
+        run: echo "SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)" >> "${GITHUB_ENV}"
+
+      - name: Download Linux amd64 handoff part
+        uses: actions/download-artifact@v8
+        with:
+          name: entrypoint-part-linux-amd64-${{ needs.prep.outputs.environment_name }}-${{ needs.prep.outputs.version }}-rev${{ needs.prep.outputs.rev }}
+          path: .tmp/entrypoint-parts/linux-amd64
+
+      - name: Download Linux arm64 handoff part
+        uses: actions/download-artifact@v8
+        with:
+          name: entrypoint-part-linux-arm64-${{ needs.prep.outputs.environment_name }}-${{ needs.prep.outputs.version }}-rev${{ needs.prep.outputs.rev }}
+          path: .tmp/entrypoint-parts/linux-arm64
+
+      - name: Download browser handoff part
+        uses: actions/download-artifact@v8
+        with:
+          name: entrypoint-part-browser-${{ needs.prep.outputs.environment_name }}-${{ needs.prep.outputs.version }}-rev${{ needs.prep.outputs.rev }}
+          path: .tmp/entrypoint-parts/browser
+
+      - name: Download macOS amd64 handoff part
+        uses: actions/download-artifact@v8
+        with:
+          name: entrypoint-part-macos-amd64-${{ needs.prep.outputs.environment_name }}-${{ needs.prep.outputs.version }}-rev${{ needs.prep.outputs.rev }}
+          path: .tmp/entrypoint-parts/macos-amd64
+
+      - name: Download macOS arm64 handoff part
+        uses: actions/download-artifact@v8
+        with:
+          name: entrypoint-part-macos-arm64-${{ needs.prep.outputs.environment_name }}-${{ needs.prep.outputs.version }}-rev${{ needs.prep.outputs.rev }}
+          path: .tmp/entrypoint-parts/macos-arm64
+
+      - name: Download Windows amd64 handoff part
+        uses: actions/download-artifact@v8
+        with:
+          name: entrypoint-part-windows-amd64-${{ needs.prep.outputs.environment_name }}-${{ needs.prep.outputs.version }}-rev${{ needs.prep.outputs.rev }}
+          path: .tmp/entrypoint-parts/windows-amd64
+
+      - name: Download Windows arm64 handoff part
+        uses: actions/download-artifact@v8
+        with:
+          name: entrypoint-part-windows-arm64-${{ needs.prep.outputs.environment_name }}-${{ needs.prep.outputs.version }}-rev${{ needs.prep.outputs.rev }}
+          path: .tmp/entrypoint-parts/windows-arm64
+
+      - name: Download CLI entrypoint manifest packs
+        uses: actions/download-artifact@v8
+        with:
+          pattern: entrypoint-cli-manifest-pack-${{ needs.prep.outputs.environment_name }}-${{ needs.prep.outputs.version }}-rev${{ needs.prep.outputs.rev }}-*
+          path: .tmp/entrypoint-cli-manifest-packs
+
+      - name: Assemble entrypoint handoff bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf .tmp/entrypoint-handoff .tmp/entrypoint-public-assets
+          mkdir -p .tmp/entrypoint-handoff
+          mkdir -p .tmp/entrypoint-public-assets/installers
+          mkdir -p .tmp/entrypoint-public-assets/bundles
+          mkdir -p .tmp/entrypoint-public-assets/cli
+          for arch in amd64 arm64; do
+            cp -R ".tmp/entrypoint-parts/linux-${arch}/installers/." .tmp/entrypoint-public-assets/installers/
+            cp -R ".tmp/entrypoint-parts/linux-${arch}/bundles/." .tmp/entrypoint-public-assets/bundles/
+            if [ -d ".tmp/entrypoint-parts/linux-${arch}/cli" ]; then
+              cp -R ".tmp/entrypoint-parts/linux-${arch}/cli/." .tmp/entrypoint-public-assets/cli/
+            fi
+          done
+          for arch in amd64 arm64; do
+            cp -R ".tmp/entrypoint-parts/windows-${arch}/installers/." .tmp/entrypoint-public-assets/installers/
+            cp -R ".tmp/entrypoint-parts/windows-${arch}/bundles/." .tmp/entrypoint-public-assets/bundles/
+            if [ -d ".tmp/entrypoint-parts/windows-${arch}/cli" ]; then
+              cp -R ".tmp/entrypoint-parts/windows-${arch}/cli/." .tmp/entrypoint-public-assets/cli/
+            fi
+            cp -R ".tmp/entrypoint-parts/macos-${arch}/installers/." .tmp/entrypoint-public-assets/installers/
+            cp -R ".tmp/entrypoint-parts/macos-${arch}/bundles/." .tmp/entrypoint-public-assets/bundles/
+            if [ -d ".tmp/entrypoint-parts/macos-${arch}/cli" ]; then
+              cp -R ".tmp/entrypoint-parts/macos-${arch}/cli/." .tmp/entrypoint-public-assets/cli/
+            fi
+          done
+          cp -R .tmp/entrypoint-parts/browser/browser-staging .tmp/entrypoint-handoff/browser-staging
+          cp .tmp/entrypoint-parts/browser/static-manifest.ts .tmp/entrypoint-handoff/static-manifest.ts
+
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      - name: Cache trusted Go dependencies
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: trusted-go-${{ github.job }}-${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+
+      - name: Prune superseded Go dependency caches
+        uses: ./.github/actions/prune-go-cache
+
+      - name: Build public release checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            find .tmp/entrypoint-public-assets/installers -type f -print
+            if [[ -d .tmp/entrypoint-public-assets/cli ]]; then
+              find .tmp/entrypoint-public-assets/cli -type f -print
+            fi
+          } | sort | while IFS= read -r path; do
+            digest="$(sha256sum "${path}" | awk '{print $1}')"
+            printf '%s  %s\n' "${digest}" "$(basename "${path}")"
+          done > .tmp/entrypoint-public-assets/checksums.txt
+
+      - name: Write typed entrypoint handoff manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          go run ./cmd/entrypoint-handoff \
+            --write-handoff-manifest \
+            --out-dir .tmp/entrypoint-handoff \
+            --browser-staging-dir .tmp/entrypoint-handoff/browser-staging \
+            --static-manifest-path .tmp/entrypoint-handoff/static-manifest.ts \
+            --version "${{ needs.prep.outputs.version }}" \
+            --rev "${{ needs.prep.outputs.rev }}" \
+            --tag "${{ needs.prep.outputs.tag }}" \
+            --release-environment "${{ needs.prep.outputs.environment_name }}" \
+            --git-sha "${GITHUB_SHA}" \
+            --run-id "${GITHUB_RUN_ID}" \
+            --run-attempt "${GITHUB_RUN_ATTEMPT}" \
+            --source-repo "${GITHUB_REPOSITORY}" \
+            --workflow "${GITHUB_WORKFLOW}"
+
+      - name: Write typed CLI handoff manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          go run ./cmd/entrypoint-handoff \
+            --write-cli-handoff-manifest \
+            --out-dir .tmp/cli-handoff \
+            --cli-artifacts-dir .tmp/entrypoint-public-assets/cli \
+            --manifest-pack-import-dirs .tmp/entrypoint-cli-manifest-packs \
+            --rev "${{ needs.prep.outputs.rev }}" \
+            --tag "${{ needs.prep.outputs.tag }}" \
+            --release-environment "${{ needs.prep.outputs.release_env }}" \
+            --git-sha "${GITHUB_SHA}" \
+            --run-id "${GITHUB_RUN_ID}" \
+            --run-attempt "${GITHUB_RUN_ATTEMPT}" \
+            --source-repo "${GITHUB_REPOSITORY}" \
+            --workflow "${GITHUB_WORKFLOW}"
+
+      - name: Archive entrypoint handoff bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar -cf .tmp/entrypoint-handoff.tar -C .tmp/entrypoint-handoff .
+          du -sh .tmp/entrypoint-handoff .tmp/entrypoint-handoff.tar
+          tar -tf .tmp/entrypoint-handoff.tar | sort
+
+      - name: Upload entrypoint handoff artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: entrypoint-handoff-${{ needs.prep.outputs.environment_name }}-${{ needs.prep.outputs.version }}-rev${{ needs.prep.outputs.rev }}
+          path: .tmp/entrypoint-handoff.tar
+          if-no-files-found: error
+
+      - name: Archive CLI handoff bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar -cf .tmp/cli-handoff.tar -C .tmp/cli-handoff .
+          du -sh .tmp/cli-handoff .tmp/cli-handoff.tar
+          tar -tf .tmp/cli-handoff.tar | sort
+
+      - name: Upload CLI handoff artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: cli-handoff-${{ needs.prep.outputs.environment_name }}-${{ needs.prep.outputs.version }}-rev${{ needs.prep.outputs.rev }}
+          path: .tmp/cli-handoff.tar
+          if-no-files-found: error
+
+      - name: Write release notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! go run ./cmd/changelog-notes --version "${{ needs.prep.outputs.version }}" > .tmp/release-notes.md; then
+            cat > .tmp/release-notes.md <<'EOF'
+          Automated draft release assembled by the entrypoint-release workflow.
+          EOF
+          fi
+
+      - name: Create or update draft GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${{ needs.prep.outputs.tag }}"
+          if ! gh release view "${tag}" >/dev/null 2>&1; then
+            gh release create "${tag}" \
+              --title "${tag}" \
+              --notes-file .tmp/release-notes.md \
+              --draft
+          else
+            gh release edit "${tag}" \
+              --title "${tag}" \
+              --notes-file .tmp/release-notes.md \
+              --draft
+          fi
+          upload_args=(
+            .tmp/entrypoint-public-assets/checksums.txt
+            .tmp/entrypoint-public-assets/installers/*
+          )
+          if compgen -G ".tmp/entrypoint-public-assets/cli/*" > /dev/null; then
+            upload_args+=(.tmp/entrypoint-public-assets/cli/*)
+          fi
+          gh release upload "${tag}" "${upload_args[@]}" --clobber
+
+      - name: Attest entrypoint release assets
+        uses: actions/attest@v4
+        with:
+          subject-path: |
+            .tmp/entrypoint-public-assets/checksums.txt
+            .tmp/entrypoint-public-assets/installers/*
+            .tmp/entrypoint-public-assets/bundles/*
+            .tmp/entrypoint-public-assets/cli/*

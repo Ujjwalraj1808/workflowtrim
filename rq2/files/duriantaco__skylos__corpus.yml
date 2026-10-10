@@ -1,0 +1,99 @@
+name: Corpus Guard
+
+on:
+  pull_request:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  corpus:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: "1.22"
+
+      - uses: astral-sh/setup-uv@e4db8464a088ece1b920f60402e813ea4de65b8f # v4
+
+      - name: Build repo Go engine
+        run: |
+          mkdir -p /tmp/skylos-go-build /tmp/skylos-go-gopath
+          cd skylos/engines/go
+          GOCACHE=/tmp/skylos-go-build GOPATH=/tmp/skylos-go-gopath go build -o skylos-go ./cmd/skylos-go
+
+      - name: Create venv + install deps
+        run: |
+          uv venv
+          uv pip install -e .
+
+      - name: Run curated corpus guard (head)
+        id: head
+        shell: bash
+        run: |
+          set +e
+          uv run python scripts/corpus_ci.py --manifest corpus/manifest.json --json > corpus-guard-head.json
+          status=$?
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          uv run python - <<'PY' | tee /tmp/corpus-summary.txt
+          import json
+          from skylos.corpus_ci import format_summary
+
+          with open("corpus-guard-head.json", encoding="utf-8") as fh:
+              print(format_summary(json.load(fh)))
+          PY
+          cat /tmp/corpus-summary.txt >> "$GITHUB_STEP_SUMMARY"
+          exit 0
+
+      - name: Run curated corpus guard (base)
+        if: github.event_name == 'pull_request'
+        shell: bash
+        run: |
+          git fetch origin "${{ github.base_ref }}" --depth=1
+          git worktree add /tmp/skylos-corpus-base "${{ github.event.pull_request.base.sha }}"
+          cd /tmp/skylos-corpus-base
+          mkdir -p /tmp/skylos-go-build-base /tmp/skylos-go-gopath-base
+          cd skylos/engines/go
+          GOCACHE=/tmp/skylos-go-build-base GOPATH=/tmp/skylos-go-gopath-base go build -o skylos-go ./cmd/skylos-go
+          cd /tmp/skylos-corpus-base
+          uv venv
+          uv pip install -e .
+          set +e
+          uv run python scripts/corpus_ci.py --manifest corpus/manifest.json --json > "$GITHUB_WORKSPACE/corpus-guard-base.json"
+          exit 0
+
+      - name: Compare corpus guard regression delta
+        if: github.event_name == 'pull_request'
+        shell: bash
+        run: |
+          set +e
+          uv run python scripts/regression_delta.py \
+            --kind corpus \
+            --base corpus-guard-base.json \
+            --head corpus-guard-head.json \
+            | tee corpus-guard-delta.txt
+          status=${PIPESTATUS[0]}
+          cat corpus-guard-delta.txt >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
+
+      - name: Require corpus guard success on push
+        if: github.event_name != 'pull_request' && steps.head.outputs.status != '0'
+        run: exit 1
+
+      - name: Upload corpus guard results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: corpus-guard-results
+          path: |
+            corpus-guard-head.json
+            corpus-guard-base.json
+            corpus-guard-delta.txt
+          if-no-files-found: ignore

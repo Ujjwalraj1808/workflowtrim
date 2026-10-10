@@ -1,0 +1,92 @@
+name: Spelling
+permissions: {}
+on: [ push, pull_request, workflow_dispatch ]
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check-spelling:
+    name: Check Spelling
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write # Needed for uploading security scan results
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          disable-sudo-and-containers: false
+          egress-policy: block
+          allowed-endpoints: >
+            api.github.com:443
+            azure.archive.ubuntu.com:80
+            dl.google.com:443
+            github.com:443
+            raw.githubusercontent.com:443
+            security.ubuntu.com:443
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: check-spelling
+        uses: check-spelling/check-spelling@cfb6f7e75bbfc89c71eaa30366d0c166f1bd9c8c # v0.0.26
+        with:
+          use_sarif: ${{ (!github.event.pull_request || (github.event.pull_request.head.repo.full_name == github.repository)) && 1 }}
+          suppress_push_for_open_pull_request: ${{ github.actor != 'dependabot[bot]' && 1 }}
+          experimental_apply_changes_via_bot: 1
+          check_file_names: 1
+          use_magic_file: 1
+          report-timing: 1
+          post_comment: 0
+          warnings: >
+            bad-regex, binary-file, deprecated-feature, ignored-expect-variant, large-file,
+            limited-references, no-newline-at-eof, noisy-file, non-alpha-in-dictionary,
+            token-is-substring, unexpected-line-ending, whitespace-in-dictionary, minified-file,
+            unsupported-configuration, no-files-to-check, unclosed-block-ignore-begin,
+            unclosed-block-ignore-end
+          dictionary_source_prefixes: >
+            {
+            "cspell": "https://raw.githubusercontent.com/check-spelling/cspell-dicts/v20241114/dictionaries/"
+            }
+          check_extra_dictionaries: ""
+          extra_dictionaries: |
+            cspell:software-terms/softwareTerms.txt
+            cspell:java/java.txt
+            cspell:filetypes/filetypes.txt
+            cspell:fullstack/fullstack.txt
+            cspell:aws/aws.txt
+            cspell:shell/shell-all-words.txt
+            cspell:npm/npm.txt
+            cspell:java/java-terms.txt
+            cspell:dart/dart.txt
+            cspell:scala/scala.txt
+            cspell:php/php.txt
+            cspell:python/python/python-lib.txt
+            cspell:golang/go.txt
+            cspell:rust/rust.txt
+            cspell:dotnet/dotnet.txt
+            cspell:cpp/ecosystem.txt
+            cspell:python/common/extra.txt
+
+  typos:
+    name: Typos
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          disable-sudo-and-containers: true
+          egress-policy: block
+          allowed-endpoints: >
+            github.com:443
+            objects.githubusercontent.com:443
+            release-assets.githubusercontent.com:443
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Typos
+        uses: crate-ci/typos@512fc24f32f44ab01972217aaaf3dc86ec234d53 # v1.50.2

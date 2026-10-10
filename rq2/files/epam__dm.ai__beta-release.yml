@@ -1,0 +1,228 @@
+name: Beta Release
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - '**/*.java'
+      - '**/*.gradle'
+      - '**/*.gradle.kts'
+      - 'gradle.properties'
+      - 'settings.gradle'
+      - 'gradle/**'
+      - 'gradlew'
+      - 'gradlew.bat'
+  workflow_dispatch:
+
+permissions:
+  contents: read  # least-privilege default; elevated grants are per-job
+
+jobs:
+  # ─── Determine beta version (no gradle.properties bump) ───────────────────
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.beta_version.outputs.version }}
+      tag: ${{ steps.beta_version.outputs.tag }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Determine beta version
+        id: beta_version
+        run: |
+          BASE_VERSION=$(grep '^version=' gradle.properties | cut -d'=' -f2)
+          BETA_VERSION="${BASE_VERSION}-beta.${{ github.run_number }}.${{ github.run_attempt }}"
+          echo "version=$BETA_VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v${BETA_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "📦 Beta version: $BETA_VERSION"
+
+  # ─── Build & test (reuses existing reusable workflow) ─────────────────────
+  build-and-test:
+    needs: version
+    permissions:
+      checks: write    # required by build-and-test nested job
+      packages: write  # required by build-and-test nested job
+      contents: read
+    uses: ./.github/workflows/build-and-test.yml
+    secrets: inherit
+    with:
+      version: ${{ needs.version.outputs.version }}
+
+  # ─── Package CLI ──────────────────────────────────────────────────────────
+  package-cli:
+    needs: [version, build-and-test]
+    uses: ./.github/workflows/package-cli.yml
+    secrets: inherit
+    with:
+      version: ${{ needs.version.outputs.version }}
+
+  # ─── Package AI skill ─────────────────────────────────────────────────────
+  package-skill:
+    needs: [version, build-and-test]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Update version in skill metadata
+        run: |
+          VERSION="${{ needs.version.outputs.version }}"
+          if [ -f "dmtools-ai-docs/SKILL.md" ]; then
+            sed -i "s/version: .*/version: $VERSION/" dmtools-ai-docs/SKILL.md
+          fi
+
+      - name: Create skill package
+        run: |
+          VERSION="${{ needs.version.outputs.version }}"
+          DIST_DIR="dist"
+          mkdir -p $DIST_DIR
+
+          cd dmtools-ai-docs
+
+          zip -r ../$DIST_DIR/dmtools-skill-v${VERSION}.zip . \
+            -x "*.git*" -x "*/.git/*" -x ".DS_Store" -x "node_modules/*" -x "*/node_modules/*" \
+            -x "*.swp" -x ".cursorrules" -x ".github/*" -x "*/.github/*" -x "install.sh"
+
+          tar -czf ../$DIST_DIR/dmtools-skill-v${VERSION}.tar.gz \
+            --exclude='.git' --exclude='.git/*' --exclude='*/.git' --exclude='*/.git/*' \
+            --exclude='.DS_Store' \
+            --exclude='node_modules' --exclude='node_modules/*' --exclude='*/node_modules' --exclude='*/node_modules/*' \
+            --exclude='.cursorrules' \
+            --exclude='.github' --exclude='.github/*' --exclude='*/.github' --exclude='*/.github/*' \
+            --exclude='install.sh' .
+
+          cd ..
+          cp dmtools-ai-docs/install.sh $DIST_DIR/skill-install.sh
+          chmod +x $DIST_DIR/skill-install.sh
+          cp dmtools-ai-docs/skill-install.ps1 $DIST_DIR/skill-install.ps1
+
+          echo "✅ Skill package created:"
+          ls -lh $DIST_DIR/
+
+      - name: Generate checksums
+        run: |
+          cd dist
+          sha256sum *.zip *.tar.gz > skill-checksums.sha256
+          cat skill-checksums.sha256
+
+      - name: Upload skill artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: skill-package
+          path: |
+            dist/dmtools-skill-*.zip
+            dist/dmtools-skill-*.tar.gz
+            dist/skill-install.sh
+            dist/skill-install.ps1
+            dist/skill-checksums.sha256
+          retention-days: 7
+
+  # ─── Create beta GitHub release (prerelease: true → main stays "latest") ──
+  create-beta-release:
+    needs: [version, package-cli, package-skill]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Download CLI Package
+        uses: actions/download-artifact@v8
+        with:
+          name: cli-package
+          path: cli/
+
+      - name: Download Skill Package
+        uses: actions/download-artifact@v8
+        with:
+          name: skill-package
+          path: skill/
+
+      - name: Generate Release Notes
+        run: |
+          VERSION="${{ needs.version.outputs.version }}"
+          SHORT_SHA="${GITHUB_SHA:0:8}"
+
+          cat > release_notes.md << EOF
+          # 🧪 DMTools Beta v${VERSION}
+
+          > **This is a pre-release / beta build** — automatically generated on every merge to \`main\`.
+          > For the latest stable release see the [Releases page](https://github.com/${{ github.repository }}/releases/latest).
+
+          ## 📦 What's Included
+
+          ### 🖥️ DMTools CLI
+          - Executable JAR with all dependencies bundled
+          - Cross-platform install scripts (\`install\`, \`install.sh\`, \`install.bat\`, \`install.ps1\`)
+          - Wrapper script (\`dmtools.sh\`)
+
+          ### 🤖 DMTools Agent Skill
+          - Universal AI assistant skill (Cursor, Claude, Codex, …)
+          - Full DMtools documentation and tool reference
+
+          ## 🎯 Quick Install (this beta)
+
+          **macOS / Linux / Git Bash:**
+          \`\`\`bash
+          curl -fsSL https://github.com/${{ github.repository }}/releases/download/${{ needs.version.outputs.tag }}/install.sh | bash -s -- ${{ needs.version.outputs.tag }}
+          \`\`\`
+
+          **Windows (PowerShell):**
+          \`\`\`powershell
+          \$env:DMTOOLS_VERSION = "${{ needs.version.outputs.tag }}"
+          irm https://github.com/${{ github.repository }}/releases/download/${{ needs.version.outputs.tag }}/install.ps1 | iex
+          \`\`\`
+
+          ## 📊 Build Info
+
+          | Field | Value |
+          |---|---|
+          | Version | \`${VERSION}\` |
+          | Git commit | \`${SHORT_SHA}\` |
+          | Build date | $(date -u '+%Y-%m-%d %H:%M:%S UTC') |
+          | Triggered by | \`${{ github.event_name }}\` |
+          EOF
+
+          echo "Release notes generated"
+
+      - name: Create Beta Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          TAG="${{ needs.version.outputs.tag }}"
+          # If the release already exists (e.g. workflow re-run), delete it first so we can recreate with fresh assets
+          if gh release view "$TAG" --repo "$GH_REPO" > /dev/null 2>&1; then
+            echo "Release $TAG already exists — deleting so assets can be re-uploaded"
+            gh release delete "$TAG" --repo "$GH_REPO" --yes --cleanup-tag || true
+          fi
+          gh release create "$TAG" \
+            --repo "$GH_REPO" \
+            --title "DMTools Beta $TAG" \
+            --notes-file release_notes.md \
+            --prerelease \
+            cli/dmtools-v${{ needs.version.outputs.version }}-all.jar \
+            cli/install.sh \
+            cli/install \
+            cli/install.bat \
+            cli/install.ps1 \
+            cli/dmtools.sh \
+            skill/dmtools-skill-v${{ needs.version.outputs.version }}.zip \
+            skill/dmtools-skill-v${{ needs.version.outputs.version }}.tar.gz \
+            skill/skill-install.sh \
+            skill/skill-install.ps1 \
+            skill/skill-checksums.sha256
+
+      - name: Summary
+        run: |
+          cat release_notes.md >> $GITHUB_STEP_SUMMARY

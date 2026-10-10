@@ -1,0 +1,1119 @@
+---
+name: CD
+on:
+  push:
+    tags:
+      - "v*"
+
+env:
+  # Comma, not pipe: Go falls back to direct only when the proxy answers 404/410. A pipe also
+  # falls back on a transient proxy error, and direct cannot serve every pinned module (a
+  # test-only transitive dependency can name a tag the upstream repo no longer has), so a
+  # momentary proxy blip would surface as a bogus "unknown revision" dependency failure.
+  GOPROXY: "https://proxy.golang.org,direct"
+  # Soft memory limit for Go build toolchain. GoReleaser links multiple
+  # platform binaries and the linker can exceed runner memory.
+  GOMEMLIMIT: "6GiB"
+
+concurrency:
+  group: "${{ github.workflow }}"
+  cancel-in-progress: false
+  # Keep every pending tag publish, so two quick releases both reach GoReleaser.
+  queue: max
+
+permissions:
+  contents: read
+
+jobs:
+  validate-release-ref:
+    name: 🏷️ Validate release ref
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: 📄 Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: 🏷️ Validate release ref
+        run: .github/scripts/validate-release-ref.sh
+
+  # A reused evergreen cask PR can still be ready-for-review (auto-merge armed by the tap) from a
+  # previous release that never merged. Demote it to draft BEFORE GoReleaser rewrites its branch —
+  # otherwise the tap could auto-merge freshly rewritten, not-yet-validated cask content while this
+  # release's assets are still a draft. Fail-closed: nothing is published yet, so aborting here is
+  # safe and the release run is simply re-run after the wedge is cleared.
+  cask-checkpoint:
+    name: 🍺 Re-arm cask PR draft checkpoint
+    needs: [validate-release-ref]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: 📄 Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: 🍺 Re-draft reused evergreen cask PRs
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_GITHUB_API_TOKEN }}
+        run: .github/scripts/redraft-evergreen-cask-prs.sh --tap devantler-tech/homebrew-tap ksail ksail-desktop
+
+  goreleaser:
+    name: 🧩 Release CLI
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    needs: [cask-checkpoint]
+    permissions:
+      contents: write
+      packages: write
+      id-token: write # OIDC token for keyless cosign image signing (docker_signs)
+    steps:
+      - name: 📑 Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # GoReleaser cross-compiles every OS/arch and builds+signs the images in one job. That outgrew the
+      # runner's root filesystem: v7.169.3 died 32 minutes in with `mkdir /tmp/go-build…: no space left
+      # on device`, which surfaces as a compiler error and silently dropped the release (#6137).
+      # So: reclaim more of the preinstalled toolchains, keep Go's scratch off the root filesystem, and
+      # PRINT the headroom — a disk failure must never again look like a build failure.
+      - name: 🧹 Cleanup node
+        run: |
+          set -euo pipefail
+          echo "::group::Disk before cleanup"
+          df -h / /mnt 2>/dev/null || df -h /
+          echo "::endgroup::"
+
+          # Do NOT add /usr/local/lib/node_modules here: that directory *is* npm, and GoReleaser's
+          # `before` hook runs scripts/stage-webui.sh, which builds the web UI with `npm ci`. This job
+          # has no setup-node step, so removing it would break the release at the hook — the very
+          # failure this change exists to prevent.
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /usr/local/.ghcup \
+            /opt/hostedtoolcache/CodeQL \
+            /usr/share/swift \
+            /usr/local/share/boost \
+            /usr/local/share/powershell
+          sudo docker image prune --all --force
+          sudo docker builder prune -a
+
+          echo "::group::Disk after cleanup"
+          df -h / /mnt 2>/dev/null || df -h /
+          echo "::endgroup::"
+
+      # Go's build scratch and cache are the bulk of the release build's disk usage and default to the
+      # root filesystem. Move them to whichever volume actually has the most room — verified at runtime
+      # rather than assumed, so this stays correct if the runner image changes.
+      - name: 💽 Put Go build scratch on the roomiest volume
+        run: |
+          set -euo pipefail
+          root_free=$(df -Pk / | awk 'NR==2 {print $4}')
+          scratch_root=""
+          if mountpoint -q /mnt; then
+            mnt_free=$(df -Pk /mnt | awk 'NR==2 {print $4}')
+            if [ "$mnt_free" -gt "$root_free" ]; then
+              scratch_root=/mnt
+            fi
+          fi
+
+          if [ -z "$scratch_root" ]; then
+            echo "Root filesystem has the most free space; leaving Go scratch at its default."
+            exit 0
+          fi
+
+          sudo mkdir -p "$scratch_root/go-tmp" "$scratch_root/go-cache"
+          sudo chown -R "$(id -u):$(id -g)" "$scratch_root/go-tmp" "$scratch_root/go-cache"
+          {
+            echo "GOTMPDIR=$scratch_root/go-tmp"
+            echo "GOCACHE=$scratch_root/go-cache"
+          } >>"$GITHUB_ENV"
+          echo "Go build scratch and cache moved to $scratch_root ($(df -h "$scratch_root" | awk 'NR==2 {print $4}') free)."
+
+      - name: ⚙️ Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          # Disable module cache restoration in release workflows to avoid
+          # cache-poisoning risk for runtime artifacts (see https://docs.zizmor.sh/audits/#cache-poisoning)
+          cache: false
+
+      - name: ⚙️ Setup Docker Buildx
+        uses: docker/setup-buildx-action@594f3bf4285d9ea8dc53c9a0c9c4092420091003 # v4.4.0
+
+      - name: 🔐 Login to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 🔐 Login to Docker Hub
+        if: ${{ vars.DOCKERHUB_USERNAME != '' }}
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: 🔏 Install Cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: 🏗️ Run GoReleaser
+        uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HOMEBREW_GITHUB_API_TOKEN: ${{ secrets.HOMEBREW_GITHUB_API_TOKEN }}
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+
+  # The web UI is embedded into the binary (go:embed via pkg/webui, staged by the GoReleaser
+  # before-hook) and served by the operator and `ksail open web`/`ksail open desktop` themselves — no separate UI image.
+
+  vscode-extension:
+    name: 🧩 Release VSCode Extension
+    needs: [validate-release-ref]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: vsce
+    steps:
+      - name: 📄 Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: ⚙️ Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6.4.0 # zizmor: ignore[cache-poisoning]
+        with:
+          node-version: "24"
+
+      - name: 🏷️ Extract version from tag
+        id: get_version
+        run: echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+
+      - name: 📦 Install dependencies
+        run: npm ci
+
+      - name: 🏗️ Compile
+        run: npm run compile
+
+      - name: 📦 Package extension
+        run: npm run package
+
+      - name: 📤 Publish to VS Code Marketplace
+        run: npx @vscode/vsce publish "$VERSION"
+        env:
+          VSCE_PAT: ${{ secrets.VSCE_PAT }}
+          VERSION: ${{ steps.get_version.outputs.version }}
+        continue-on-error: true
+
+      # - name: 📤 Publish to Open VSX Registry
+      #   run: npx ovsx publish --pat ${{ secrets.OVSX_PAT }}
+      #   env:
+      #     OVSX_PAT: ${{ secrets.OVSX_PAT }}
+      #   continue-on-error: true
+
+      - name: 📦 Create VSIX package
+        run: npx @vscode/vsce package "$VERSION" --out ksail_"$VERSION".vsix
+        env:
+          VERSION: ${{ steps.get_version.outputs.version }}
+
+      - name: 📤 Upload VSIX artifact
+        # Action inputs are workspace-relative — the job's `working-directory: vsce` default applies
+        # only to `run` steps — so the vsix lives under vsce/. publish-release attaches it to the draft.
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: release-vscode
+          path: vsce/ksail_*.vsix
+          if-no-files-found: error
+
+  # The macOS desktop app ships as a Homebrew cask. The desktop app is a tagged entry point in the shared Go module that
+  # links a system webview via CGO and cannot be cross-compiled in the main release, so this job runs
+  # a second GoReleaser config on a macOS runner: it builds the darwin binary, packages it as a
+  # KSail.app bundle and opens a *draft* cask PR on the homebrew tap (the `homebrew` job style-cleans,
+  # validates, and marks it ready for the tap's check-gated auto-merge — a trusted programmed release
+  # path, no review/promotion step per maintainer direction ksail#6095). GoReleaser's release pipe is disabled (see .goreleaser.desktop.yaml); the built
+  # archive is emitted as a workflow artifact and attached to the draft by `publish-release`. No
+  # `needs: [goreleaser]` — this builds in parallel with the CLI release (both gate only on the
+  # seconds-long cask-checkpoint job so neither can rewrite a still-promoted evergreen cask PR).
+  desktop-macos:
+    name: 🧩 Release Desktop App (macOS cask)
+    runs-on: macos-latest
+    timeout-minutes: 40
+    needs: [cask-checkpoint]
+    permissions:
+      contents: read
+    steps:
+      - name: 📑 Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: ⚙️ Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: ⚙️ Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6.4.0 # zizmor: ignore[cache-poisoning]
+        with:
+          node-version: "24"
+
+      - name: 🏗️ Run GoReleaser (desktop cask)
+        uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: release --clean --config .goreleaser.desktop.yaml
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HOMEBREW_GITHUB_API_TOKEN: ${{ secrets.HOMEBREW_GITHUB_API_TOKEN }}
+
+      # GoReleaser's release pipe is disabled (.goreleaser.desktop.yaml). Emit the macOS archive as a
+      # workflow artifact; `publish-release` attaches it to the draft before publishing, so every asset
+      # is present before the release is locked by immutable releases (see #4874).
+      - name: 📤 Upload desktop archive artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: release-desktop-macos
+          path: dist-desktop/KSail_*_darwin_*.zip
+          if-no-files-found: error
+
+  # Linux and Windows desktop binaries are convenience downloads (no cask). They build on native
+  # runners (CGO + the system webview) in parallel with the CLI release and emit their archives as
+  # workflow artifacts; `publish-release` attaches them to the draft before publishing, so every asset
+  # is present before the release is locked by immutable releases (see #4874).
+  desktop:
+    name: 🧩 Release Desktop App
+    needs: [validate-release-ref]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Wails v3's default Linux build targets GTK4 + WebKitGTK 6.0 (libgtk-4-dev +
+          # libwebkitgtk-6.0-dev), available on ubuntu-24.04 (22.04 only ships legacy webkit2gtk).
+          - { os: ubuntu-24.04, goos: linux, arch: amd64, ext: "" }
+          - { os: windows-latest, goos: windows, arch: amd64, ext: ".exe" }
+    steps:
+      - name: 📑 Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: 🛠️ Setup desktop build (Go, Node.js, webview deps, staged web UI)
+        uses: ./.github/actions/setup-desktop-build
+
+      - name: 🏷️ Extract version from tag
+        id: get_version
+        shell: bash
+        run: echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+
+      - name: 🏗️ Build desktop app
+        shell: bash
+        run: cd desktop && go build -tags desktop -ldflags "-s -w" -o "ksail-desktop${{ matrix.ext }}" .
+
+      # Package so the artifact extracts to the name the `ksail open desktop` launcher looks for: a
+      # ksail-desktop binary the user puts on their PATH. Naming mirrors the main GoReleaser archives.
+      - name: 📦 Package desktop app
+        id: package
+        shell: bash
+        env:
+          VERSION: ${{ steps.get_version.outputs.version }}
+          GOOS: ${{ matrix.goos }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          case "$GOOS" in
+            linux)
+              artifact="ksail-desktop_${VERSION}_linux_${ARCH}.tar.gz"
+              tar -C desktop -czf "$artifact" ksail-desktop
+              ;;
+            windows)
+              artifact="ksail-desktop_${VERSION}_windows_${ARCH}.zip"
+              7z a "$artifact" "./desktop/ksail-desktop.exe"
+              ;;
+          esac
+          echo "artifact=$artifact" >> "$GITHUB_OUTPUT"
+
+      - name: 📤 Upload desktop archive artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: release-desktop-${{ matrix.goos }}
+          path: ${{ steps.package.outputs.artifact }}
+          if-no-files-found: error
+
+  operator-chart:
+    name: ⛵ Release Operator Chart
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Gate on `goreleaser` (image build + cosign sign + push). The chart's appVersion is the
+    # release version and operator.image.tag defaults to it, so the chart references
+    # ghcr.io/devantler-tech/ksail:v<version>. Publishing the chart before that image exists
+    # produces an orphan chart pointing at a missing image: on the failed v7.74.1 run the
+    # `goreleaser` job failed (no image built/signed) but this job had already pushed
+    # ksail-operator:7.74.1, which downstream cosign image-verification then rejects with
+    # MANIFEST_UNKNOWN. `needs: goreleaser` keeps the chart and image release atomic — a failed
+    # or incomplete image build skips the chart publish instead of orphaning it. The gated
+    # `publish-release` and `pages-deploy` jobs both list this job in `needs`, so a chart
+    # publish failure still blocks the GitHub release publish and the docs deploy.
+    needs: [goreleaser]
+    permissions:
+      contents: read # checkout
+      packages: write # push the chart to GHCR as an OCI artifact
+    steps:
+      - name: 📑 Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: 🏷️ Extract version from tag
+        id: get_version
+        run: echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+
+      - name: 🔐 Login to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # helm is pre-installed on ubuntu-latest runners (CI's operator-chart-lint relies on this too).
+      # Pin the chart version AND appVersion to the release version so the published chart pulls the
+      # matching operator image (operator.image.tag defaults to .Chart.AppVersion); helm bundles crds/
+      # automatically. The chart lands at ghcr.io/devantler-tech/charts/ksail-operator:<version>.
+      - name: 📦 Package and push operator chart
+        env:
+          VERSION: ${{ steps.get_version.outputs.version }}
+        run: |
+          set -euo pipefail
+          helm package charts/ksail-operator --version "$VERSION" --app-version "$VERSION"
+          helm push "ksail-operator-${VERSION}.tgz" oci://ghcr.io/devantler-tech/charts
+
+  mcp-publish:
+    name: 📤 Publish to MCP Registry
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Needs `goreleaser` for the published GHCR image that server.json points at, but runs in
+    # parallel with `publish-release` and `pages-deploy` — neither lists it in `needs`. The MCP
+    # registry publish references the container image (pushed by `goreleaser`), not the GitHub
+    # release, so it is independent of the draft→published flip and need not gate it.
+    needs: [goreleaser]
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: 📑 Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: 🏷️ Extract version from tag
+        id: get_version
+        run: |
+          echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+          echo "image_tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: 📝 Update server.json version
+        env:
+          VERSION: ${{ steps.get_version.outputs.version }}
+          IMAGE_TAG: ${{ steps.get_version.outputs.image_tag }}
+        run: |
+          jq --arg v "$VERSION" \
+             --arg tag "$IMAGE_TAG" \
+             '.version = $v | .packages[0].identifier = "ghcr.io/devantler-tech/ksail:" + $tag' \
+             server.json > server.json.tmp && mv server.json.tmp server.json
+
+      - name: 📥 Install mcp-publisher
+        run: |
+          set -euo pipefail
+          curl -fsSLO "https://github.com/modelcontextprotocol/registry/releases/download/v1.7.8/mcp-publisher_linux_amd64.tar.gz"
+          curl -fsSLO "https://github.com/modelcontextprotocol/registry/releases/download/v1.7.8/registry_1.7.8_checksums.txt"
+          grep "mcp-publisher_linux_amd64.tar.gz$" registry_1.7.8_checksums.txt | sha256sum --check
+          tar -xzf mcp-publisher_linux_amd64.tar.gz mcp-publisher
+          rm mcp-publisher_linux_amd64.tar.gz registry_1.7.8_checksums.txt
+
+      - name: 🔐 Authenticate with MCP Registry
+        run: ./mcp-publisher login github-oidc
+
+      - name: 📤 Publish to MCP Registry
+        run: |
+          set -euo pipefail
+          max_attempts=3
+          delay=15
+          last_output=""
+          for attempt in $(seq 1 "$max_attempts"); do
+            echo "Publish attempt ${attempt}/${max_attempts}..."
+            if last_output="$(./mcp-publisher publish 2>&1)"; then
+              echo "$last_output"
+              exit 0
+            fi
+            echo "$last_output"
+            # Only retry on 5xx (server) errors — bail immediately on anything else
+            if echo "$last_output" | grep -Eq 'status 5[0-9]{2}'; then
+              if [ "$attempt" -lt "$max_attempts" ]; then
+                echo "Server error; retrying in ${delay}s..."
+                sleep "$delay"
+                delay=$((delay * 2))
+                continue
+              fi
+            else
+              break
+            fi
+          done
+          echo "::error::mcp-publisher publish failed after ${attempt} attempt(s)"
+          exit 1
+
+  pages-build:
+    name: 📄 Build Pages
+    needs: [validate-release-ref]
+    runs-on: ubuntu-latest
+    # Runs in parallel with the other releases (no GoReleaser artifact dependency). The
+    # gated `pages-deploy` and `publish-release` jobs both list it in `needs`, so a docs
+    # build failure blocks both the Pages deploy and the GitHub release publish.
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: 📑 Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: ⚙️ Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6.4.0 # zizmor: ignore[cache-poisoning]
+        with:
+          node-version: "24"
+          cache: "npm"
+          cache-dependency-path: docs/package-lock.json
+
+      - name: ⚙️ Setup Pages
+        id: pages
+        uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
+
+      - name: 📦 Install dependencies
+        working-directory: docs
+        run: npm ci
+
+      - name: 🏗️ Build with Astro
+        working-directory: docs
+        run: npm run build
+
+      - name: 📤 Upload artifact
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: docs/dist
+
+  pages-deploy:
+    name: 🚀 Deploy Pages
+    runs-on: ubuntu-latest
+    # Gate the docs deploy on the artifact-producing releases (not just `pages-build`) so a
+    # partial release failure never pushes a fresh docs site. Runs in parallel with
+    # `publish-release` and `mcp-publish` — none depends on the others. `mcp-publish` is
+    # excluded from `needs` because the MCP registry publish is independent of the docs site.
+    needs:
+      [
+        goreleaser,
+        vscode-extension,
+        desktop-macos,
+        desktop,
+        operator-chart,
+        pages-build,
+      ]
+    timeout-minutes: 10
+    permissions:
+      pages: write
+      id-token: write
+    steps:
+      - name: 🚀 Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
+
+  publish-release:
+    name: 📢 Publish Release
+    runs-on: ubuntu-latest
+    # Room for the asset upload's full retry backoff on top of the rest of the job
+    # (upload-release-assets.test.sh keeps the two in step).
+    timeout-minutes: 10
+    # Gate on EVERY artifact-producing asset job so the draft is flipped to published only when the
+    # release is COMPLETE (CLI tarballs + checksums + CRD, VSIX, and every desktop archive present).
+    # Immutable releases (see #4874) forbid adding assets after the flip, so completeness must be
+    # guaranteed before it. This is the maintainer's required invariant: a published release is always
+    # complete (#5061). The inverse failure — an asset job failing and leaving an unpublished draft —
+    # is prevented up front by the `Release` workflow, which validates every artifact BEFORE the tag is
+    # created, and backstopped by `cleanup-failed-release` below, which deletes the orphaned draft and
+    # tag if a publish is ever blocked so no empty/incomplete tag flows downstream (#5060).
+    # Runs in parallel with `pages-deploy` and `mcp-publish`.
+    needs:
+      [
+        goreleaser,
+        vscode-extension,
+        desktop-macos,
+        desktop,
+        operator-chart,
+        pages-build,
+      ]
+    permissions:
+      contents: write
+    steps:
+      - name: 🏷️ Extract version from tag
+        id: get_version
+        run: echo "version=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+
+      # Check out before downloading: on a fresh workspace checkout clears the directory, which
+      # would delete the downloaded assets the resolver and upload below need.
+      - name: 📄 Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: 📥 Download release asset artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: dist-assets
+
+      # Rerunning an upstream asset job reruns this one too. If the tag's release is already
+      # published and complete, there is nothing left to attach or publish — and an immutable
+      # release rejects the upload — so the rerun succeeds as a no-op. Missing, duplicate or
+      # incomplete releases fail closed here (see #6263).
+      - name: 🔎 Resolve release publish state
+        id: release_state
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ steps.get_version.outputs.version }}
+        # The Cluster CRD is attached by GoReleaser rather than downloaded here, so name it explicitly;
+        # GoReleaser's archives are required from the release's own checksums file.
+        run: >-
+          .github/scripts/resolve-release-publish-state.sh --tag "$RELEASE_TAG" --assets-dir dist-assets
+          --extra-assets-glob 'charts/ksail-operator/crds/*.yaml'
+
+      # Attach the desktop archives and the VSIX to the draft BEFORE publishing. Once published the
+      # release is immutable and late uploads 422 (see #4874); all asset jobs gate this one, so every
+      # artifact exists here and is attached immediately before the draft→published flip below.
+      # The upload retries with backoff: a single transient failure from uploads.github.com would
+      # otherwise skip publishing and every downstream job, stranding the release as a draft (#6292).
+      - name: 📤 Attach assets to draft release
+        if: steps.release_state.outputs.state == 'draft'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ steps.get_version.outputs.version }}
+        run: .github/scripts/upload-release-assets.sh --tag "$RELEASE_TAG" --assets-dir dist-assets
+
+      - name: 📢 Publish draft release
+        if: steps.release_state.outputs.state == 'draft'
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          RELEASE_TAG: ${{ steps.get_version.outputs.version }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const tag = process.env.RELEASE_TAG;
+
+            // List every page of releases and find the one(s) matching the tag
+            // Note: getReleaseByTag does not return draft releases, so we use listReleases instead
+            let matching;
+            try {
+              const releases = await github.paginate(github.rest.repos.listReleases, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                per_page: 100,
+              });
+              matching = releases.filter(r => r.tag_name === tag);
+            } catch (error) {
+              core.setFailed(`Failed to list releases: ${error.message}`);
+              throw error;
+            }
+
+            if (matching.length === 0) {
+              core.setFailed(`Release not found for tag ${tag}`);
+              return;
+            }
+
+            // More than one release for a tag means an asset job created a duplicate (e.g. a second
+            // GoReleaser run that couldn't see the draft) — see #4874. Bail before publishing rather
+            // than racing an immutable release into existence; the duplicate needs manual cleanup.
+            if (matching.length > 1) {
+              const ids = matching.map(r => `${r.id} (draft=${r.draft})`).join(', ');
+              core.setFailed(`Found ${matching.length} releases for tag ${tag}: ${ids}. Expected exactly one — manual cleanup required.`);
+              return;
+            }
+
+            const release = matching[0];
+
+            // The public install command is intentionally excluded from link checking while this
+            // draft is still the first release that can create it. Preserve the user contract at
+            // the authoritative boundary instead: immutable publication must fail closed unless
+            // both the installer and the checksum manifest it consumes are present and non-empty.
+            const version = tag.replace(/^v/, '');
+            const requiredInstallerAssets = [
+              'install.sh',
+              `ksail_${version}_checksums.txt`,
+            ];
+            const assetsByName = new Map(release.assets.map(asset => [asset.name, asset]));
+            const missingInstallerAssets = requiredInstallerAssets.filter(name => {
+              const asset = assetsByName.get(name);
+              return !asset || asset.size <= 0;
+            });
+            if (missingInstallerAssets.length > 0) {
+              core.setFailed(
+                `Release ${tag} is missing required installer release assets: ${missingInstallerAssets.join(', ')}`,
+              );
+              return;
+            }
+
+            if (!release.draft) {
+              console.log(`Release ${tag} is already published`);
+              return;
+            }
+
+            // Publish the release
+            await github.rest.repos.updateRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              release_id: release.id,
+              draft: false,
+            });
+
+            console.log(`Successfully published release ${tag}`);
+
+  # GoReleaser opens the Homebrew cask PRs during the build (CLI in `goreleaser`, macOS in
+  # `desktop-macos`) as DRAFTS, so the tap cannot merge them while the cask still points at a draft
+  # (not-yet-public, 404) release. Now that `publish-release` has made the release public, this job
+  # style-cleans and normalizes both PRs, then leaves them as drafts for the maintainer checkpoint.
+  #
+  # Promotion and merge are intentionally outside this privileged release job. Review threads,
+  # reviewer verdicts, and editable pre-merge summaries cannot be atomically bound to a client-side
+  # `gh pr merge` call, so even a final poll can race a new negative review without changing the head
+  # SHA. The standard maintainer lane promotes and merges only after its live pentad is green. This job
+  # validates the trusted same-repository draft and exact cask-only scope before and after its style
+  # mutation, normalizes metadata, and records the pending handoff without failing an already-published
+  # release. Branches mirror `.goreleaser*.yaml` (`goreleaser/<project>` — evergreen, version-less:
+  # each release updates the ONE open cask PR in place instead of superseding it, tap#1172). See #6067.
+  homebrew:
+    name: 🍺 Prepare Homebrew cask PRs
+    # Homebrew is preinstalled on the macOS images and NOT on ubuntu — on ubuntu every `brew style`
+    # here failed with `brew: command not found`, so the casks were never style-cleaned. The tap audits
+    # casks on macOS for the same reason (devantler-tech/homebrew-tap `ci.yaml`).
+    runs-on: macos-latest
+    # `brew style` can bootstrap rubocop on a cold runner. Keep enough room for two clones and style
+    # passes; every GitHub mutation below is fail-soft because the release is already public.
+    timeout-minutes: 20
+    needs: [publish-release]
+    permissions:
+      contents: read
+    steps:
+      - name: 📄 Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: 🍺 Style-clean and prepare cask PR handoffs
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_GITHUB_API_TOKEN }}
+          TAP: devantler-tech/homebrew-tap
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          collect_handoff_evidence() {
+            .github/scripts/collect-cask-pr-handoff.sh \
+              --tap "$TAP" \
+              --pr "$1" \
+              --source-repo "$GITHUB_REPOSITORY" \
+              --tag "$TAG" \
+              --output "$2"
+          }
+
+          validate_handoff() {
+            local pr="$1" name="$2" evidence="$3" mode="${4:-draft}"
+            local args=(
+              --evidence "$evidence"
+              --tap "$TAP"
+              --cask-name "$name"
+              --source-repo "$GITHUB_REPOSITORY"
+              --tag "$TAG"
+            )
+            case "$mode" in
+              prepared) args+=(--prepared) ;;
+              # An already-handed-off PR revalidated on an idempotent rerun has been promoted, so it is
+              # no longer a draft: check it against the ready state, not the draft one.
+              prepared-ready) args+=(--prepared --ready) ;;
+            esac
+            collect_handoff_evidence "$pr" "$evidence" \
+              && .github/scripts/validate-cask-pr-handoff.sh "${args[@]}"
+          }
+
+          if ! evidence_dir="$(mktemp -d)"; then
+            # A missing evidence dir means no cask can be validated or handed off. Exiting 0 here would
+            # leave both cask PRs untouched behind a green release — the exact silent drift this job
+            # exists to surface — so fail loudly instead.
+            echo "::error::Could not create cask handoff evidence directory; failing so the un-handed-off cask is not hidden behind a green release"
+            exit 1
+          fi
+          trap 'rm -rf "$evidence_dir"' EXIT
+
+          # A cask PR left as a draft means the tap silently stops tracking releases — which is exactly
+          # how it drifted six versions behind while every CD run stayed green. So EVERY path that
+          # leaves a cask unpromoted sets this, not just the final mutation: an enumeration failure, a
+          # validation failure, a missing `brew`, a title/label failure — in all of them the tap does not
+          # pick up the published release, and a green run would preserve the silent drift this job now
+          # exists to surface. The release itself is already published and immutable, and
+          # `cleanup-failed-release` keys off `publish-release` rather than this job, so failing here
+          # never deletes a good release.
+          handoff_failed=0
+
+          reconcile_merged_handoff() {
+            local name="$1" context="$2" branch="goreleaser/$1"
+            local attempt merged_pr merged_reason
+
+            # An initially-open evergreen PR can auto-merge at any point in this step. Every failure
+            # after selecting that PR comes through here: only immutable merge evidence plus an
+            # unchanged pinned-main cask can turn the race into success. If it is still open, or any
+            # proof is unavailable, preserve the original fail-closed outcome.
+            for attempt in 1 2; do
+              if merged_pr="$(.github/scripts/find-merged-cask-pr-handoff.sh \
+                --tap "$TAP" \
+                --cask-name "$name" \
+                --source-repo "$GITHUB_REPOSITORY" \
+                --tag "$TAG" \
+                --output-dir "$evidence_dir" 2>&1)"; then
+                echo "::notice::${TAP}#${merged_pr} cask ${name} is merged and current for ${TAG}; ${context}"
+                printf -- '- %s#%s cask %s already merged for %s (immutable current-main proof)\n' \
+                  "$TAP" "$merged_pr" "$name" "$TAG" >>"$GITHUB_STEP_SUMMARY"
+                return 0
+              fi
+              if [[ "$attempt" -eq 1 ]]; then
+                sleep 1
+              fi
+            done
+
+            merged_reason="${merged_pr//$'\n'/; }"
+            echo "::warning::${context}; no fully validated merged handoff for ${branch}: ${merged_reason:-no merged evidence}"
+            handoff_failed=1
+          }
+
+          for name in ksail ksail-desktop; do
+            branch="goreleaser/${name}"
+            # `|| true` keeps the job fail-soft: a transient API failure (5xx, rate limit,
+            # network blip) must not abort the step under `set -e` after the release is already public —
+            # invalid evidence below then warns and skips, same as the no-PR-found case.
+            # REST `head=<owner>:<branch>` filters SERVER-side (a bare branch-name filter would let
+            # same-name fork branches fill a client-side page before any jq filter runs); the owner
+            # qualifier still admits a same-owner sibling repo's branch, so keep the full_name +
+            # author checks.
+            matches="$(gh api \
+              "repos/$TAP/pulls?state=open&head=${TAP%%/*}:${branch}&per_page=100" 2>/dev/null \
+              | jq -ec --arg full "$TAP" \
+                  '[.[] | select(.head.repo.full_name == $full and .user.login == "devantler")]' \
+              2>/dev/null || true)"
+            if ! count="$(jq -er 'length' <<<"$matches" 2>/dev/null)"; then
+              echo "::warning::Could not enumerate cask PRs on $TAP for branch ${branch}; leaving it pending"
+              handoff_failed=1
+              continue
+            fi
+            if [ "$count" -eq 0 ]; then
+              # The tap may merge the evergreen PR while the next release is still publishing, so
+              # this tag can be coalesced into a PR whose title names the previous tag. Titles are not
+              # release evidence. Accept the zero-open-PR state only when the paginated finder proves
+              # a trusted merged PR's immutable result and the pinned current-main cask are identical,
+              # contain this release, match its asset digests, and remain on main after collection.
+              reconcile_merged_handoff "$name" \
+                "No open tap-owned cask PR was found for ${branch}"
+              continue
+            fi
+            if [ "$count" -ne 1 ]; then
+              echo "::warning::Expected exactly one open tap-owned cask PR on $TAP for branch ${branch}, found ${count}; leaving it pending"
+              handoff_failed=1
+              continue
+            fi
+            pr="$(jq -r '.[0].number' <<<"$matches")"
+
+            # Idempotent retry after a PARTIAL success. A two-cask release can promote the first cask
+            # and then fail on the second (transient API/label/style hiccup) — leaving the job red. On
+            # a normal rerun the loop re-enters, but the first cask is now READY (non-draft) and the
+            # draft-requiring validation below would reject it, re-setting handoff_failed and failing
+            # the job forever: the rerun could never go green. So before validating, treat a cask PR
+            # that is ALREADY non-draft AND already carries this tag's handoff title as completed —
+            # the handoff finished on the earlier run; record it and move on. Capture the state into a
+            # variable (an external command inside `if` is exempt from `set -e`, so a crash there would
+            # read as "not handed off" and re-drive it); a non-draft PR with a DIFFERENT title is NOT
+            # ours — it falls through to the draft-requiring validation, preserving race detection.
+            pr_state="$(gh api "repos/${TAP}/pulls/${pr}" --jq '[(.draft|tostring), .title] | @tsv' 2>/dev/null || true)"
+            pr_is_draft="${pr_state%%$'\t'*}"
+            pr_title="${pr_state#*$'\t'}"
+            evidence="${evidence_dir}/${pr}.json"
+            if [ "$pr_is_draft" = "false" ] && [ "$pr_title" = "chore(cask): update ${name} to ${TAG}" ]; then
+              # Ready + right title is not by itself proof the tap will merge the CORRECT cask: after
+              # the failed run the PR could have been retargeted off `main`, had its evidence file or
+              # head branch changed, or lost its metadata. Re-run the non-draft (`prepared`) validator
+              # before skipping — it re-verifies identity, scope, base, current-version content, and
+              # title. Only a validated ready PR is treated as done; otherwise it is left for the
+              # maintainer and the rerun stays red.
+              if validation="$(validate_handoff "$pr" "$name" "$evidence" prepared-ready 2>&1)"; then
+                echo "${TAP}#${pr} already handed off for ${TAG} (ready, titled, and revalidated); nothing to do"
+                printf -- '- %s#%s already handed off for %s (idempotent retry, revalidated)\n' \
+                  "$TAP" "$pr" "$TAG" >>"$GITHUB_STEP_SUMMARY"
+                continue
+              fi
+              validation="${validation//$'\n'/; }"
+              echo "::warning::${TAP}#${pr} is ready and titled but failed prepared revalidation: ${validation}"
+              printf -- '- %s#%s ready but revalidation failed: %s\n' \
+                "$TAP" "$pr" "$validation" >>"$GITHUB_STEP_SUMMARY"
+              reconcile_merged_handoff "$name" \
+                "${TAP}#${pr} failed ready-PR revalidation"
+              continue
+            fi
+
+            # The cask-checkpoint job re-drafted any reused promoted PR before GoReleaser rewrote
+            # the branch, so a non-draft here means someone raced this run — validation below
+            # requires draft state and fails soft, leaving the PR untouched. (`evidence` was set above.)
+            if ! validation="$(validate_handoff "$pr" "$name" "$evidence" 2>&1)"; then
+              validation="${validation//$'\n'/; }"
+              echo "::warning::Refusing to mutate ${TAP}#${pr}: ${validation}"
+              printf -- '- %s#%s left untouched: %s\n' "$TAP" "$pr" "$validation" >>"$GITHUB_STEP_SUMMARY"
+              reconcile_merged_handoff "$name" \
+                "${TAP}#${pr} failed draft validation after open enumeration"
+              continue
+            fi
+            echo "Preparing ${TAP}#${pr} (${branch})"
+
+            # GoReleaser's cask template emits `brew style` offenses no config knob can reach, and the
+            # tap enforces a `brew style` gate, so an uncorrected cask silently blocks its auto-merge
+            # (devantler-tech/homebrew-tap#734). The script autocorrects the draft branch and reports
+            # clean only once the remote tip passes a read-only `brew style`. The tap's CI autocorrects
+            # the same branch, so when that race rejects the push the script re-checks the new tip
+            # instead of failing the handoff (#6628). Anything short of a confirmed-clean tip skips
+            # promotion and turns the job red.
+            style_clean=0
+            # A missing `brew` would otherwise read as an empty autocorrection diff.
+            if ! command -v brew >/dev/null 2>&1; then
+              echo "::error::brew is not available on this runner; cannot style-check ${name}"
+              reconcile_merged_handoff "$name" \
+                "brew became unavailable while preparing ${TAP}#${pr}"
+              continue
+            fi
+            if .github/scripts/style-clean-cask-branch.sh \
+                --remote "https://x-access-token:${GH_TOKEN}@github.com/${TAP}.git" \
+                --branch "$branch" \
+                --cask-name "$name"; then
+              style_clean=1
+            else
+              echo "::warning::${name} cask is not confirmed brew-style-clean; leaving it for the maintainer lane"
+            fi
+            if [ "$style_clean" -ne 1 ]; then
+              echo "::error::Could not ensure ${name} cask is brew-style-clean; the tap's style gate would block auto-merge for ${TAG}"
+              printf -- '- %s cask %s left draft/open: could not ensure it is brew-style-clean\n' \
+                "$TAP" "$name" >>"$GITHUB_STEP_SUMMARY"
+              reconcile_merged_handoff "$name" \
+                "${TAP}#${pr} could not be confirmed brew-style-clean"
+              continue
+            fi
+
+            # Recollect after the possible style push. A concurrent promotion, cross-repository head,
+            # or extra changed file stops all further mutation and leaves the PR to the maintainer.
+            if ! validation="$(validate_handoff "$pr" "$name" "$evidence" 2>&1)"; then
+              validation="${validation//$'\n'/; }"
+              echo "::warning::Post-style validation failed for ${TAP}#${pr}: ${validation}"
+              printf -- '- %s#%s remains open after style validation failed: %s\n' \
+                "$TAP" "$pr" "$validation" >>"$GITHUB_STEP_SUMMARY"
+              reconcile_merged_handoff "$name" \
+                "${TAP}#${pr} failed post-style validation"
+              continue
+            fi
+
+            # Use the REST/GraphQL endpoints directly rather than the gh pr edit/promote subcommands:
+            # those resolve the viewer's `login` over GraphQL, which the tap token is not scoped
+            # for ("The 'login' field requires one of the following scopes"). That failure landed on the
+            # step right before the promote, so every release left its cask PR a draft forever and the
+            # tap silently fell six versions behind. Talking to the endpoints directly needs only the
+            # PR-write scope the token already has — and keeps the token least-privilege instead of
+            # widening it.
+            title="chore(cask): update ${name} to ${TAG}"
+            if ! gh api -X PATCH "repos/${TAP}/pulls/${pr}" -f title="$title" >/dev/null; then
+              echo "::warning::Could not normalize the title on ${TAP}#${pr}; leaving it draft/open"
+              reconcile_merged_handoff "$name" \
+                "${TAP}#${pr} could not receive normalized metadata"
+              continue
+            fi
+            metadata_ok=true
+            for label in automation dependencies; do
+              # Capture jq's result instead of testing it inside `if`: an external command in an `if`
+              # condition is exempt from `set -e`, so a jq crash would read as "label not available" and
+              # silently skip the label while leaving metadata_ok=true — a fail-open on the very check
+              # that gates the promote. Treat a non-boolean answer as a hard failure.
+              label_available="$(jq -r --arg label "$label" \
+                '.availableLabels | any(.name == $label)' "$evidence" 2>/dev/null || true)"
+              case "$label_available" in
+                true)
+                  if ! gh api -X POST "repos/${TAP}/issues/${pr}/labels" -f "labels[]=$label" >/dev/null; then
+                    echo "::warning::Could not add available label ${label} to ${TAP}#${pr}"
+                    metadata_ok=false
+                  fi
+                  ;;
+                false) : ;; # the tap does not define this label — nothing to add
+                *)
+                  echo "::warning::Could not determine whether ${TAP} defines the ${label} label"
+                  metadata_ok=false
+                  ;;
+              esac
+            done
+            if [ "$metadata_ok" != true ]; then
+              echo "::warning::${TAP}#${pr} metadata is incomplete; leaving it draft/open"
+              reconcile_merged_handoff "$name" \
+                "${TAP}#${pr} metadata could not be completed"
+              continue
+            fi
+
+            if ! validation="$(validate_handoff "$pr" "$name" "$evidence" prepared 2>&1)"; then
+              validation="${validation//$'\n'/; }"
+              echo "::warning::Prepared handoff validation failed for ${TAP}#${pr}: ${validation}"
+              printf -- '- %s#%s remains open with incomplete handoff metadata: %s\n' \
+                "$TAP" "$pr" "$validation" >>"$GITHUB_STEP_SUMMARY"
+              reconcile_merged_handoff "$name" \
+                "${TAP}#${pr} failed prepared validation"
+              continue
+            fi
+
+            # Cask PRs are a trusted programmed release path: no review and no maintainer
+            # promotion step (maintainer direction, ksail#6095, 2026-07-13). With identity, scope,
+            # current-version content, title, and labels all validated above — and the release
+            # assets now public — mark it ready so the tap's own automation arms auto-merge and its
+            # checks gate the merge. Fail-soft: a draft left behind is handed to the maintainer.
+            # Same reason as the title/label calls above: the gh promote subcommand needs a scope the tap
+            # token does not have, so drive the mutation directly off the PR's node id.
+            pr_node="$(gh api "repos/${TAP}/pulls/${pr}" --jq .node_id 2>/dev/null || true)"
+            # `\$id` is escaped so the shell leaves it literal: it is a GraphQL variable, not a shell one.
+            ready_mutation="mutation(\$id: ID!) { markPullRequestReadyForReview(input: { pullRequestId: \$id }) { pullRequest { isDraft } } }"
+            if [ -n "$pr_node" ] && gh api graphql \
+                -f query="$ready_mutation" \
+                -F id="$pr_node" >/dev/null; then
+              echo "::notice::${TAP}#${pr} validated and marked ready — the tap's checks gate its auto-merge"
+              printf -- '- %s#%s validated and marked ready for check-gated auto-merge\n' \
+                "$TAP" "$pr" >>"$GITHUB_STEP_SUMMARY"
+            else
+              # A cask PR that never leaves draft means the tap silently stops tracking releases, so this
+              # must be loud rather than a buried warning on an otherwise-green release.
+              echo "::error::Could not mark ${TAP}#${pr} ready; it remains draft and the tap will NOT pick up ${TAG}"
+              printf -- '- %s#%s remains draft/open: could not mark it ready after validation\n' \
+                "$TAP" "$pr" >>"$GITHUB_STEP_SUMMARY"
+              reconcile_merged_handoff "$name" \
+                "${TAP}#${pr} could not be marked ready"
+            fi
+          done
+
+          if [ "$handoff_failed" -ne 0 ]; then
+            echo "::error::One or more cask PRs could not be handed off; the Homebrew tap will not pick up ${TAG}"
+            exit 1
+          fi
+
+  # Backstop for the immutable-release model: if the release did NOT publish — any asset job failed,
+  # or the publish step bailed (so `publish-release` is skipped or failed) — delete the orphaned draft
+  # AND the tag so an incomplete/empty release never lingers or flows downstream to tag-tracking
+  # consumers (see #5060, #5061). The `Release` workflow validates every artifact BEFORE the tag is
+  # cut, so this should rarely fire — only on a post-tag transient (a GitHub/registry blip during the
+  # real build). On the happy path `publish-release` succeeds and this is skipped. Recovery is to
+  # re-run the `Release` workflow: it recomputes the same version and re-tags after validation.
+  cleanup-failed-release:
+    name: 🧹 Clean up incomplete release
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [validate-release-ref, publish-release]
+    if: always() && needs.publish-release.result != 'success' && needs.validate-release-ref.result == 'success'
+    permissions:
+      contents: write
+    steps:
+      - name: 🧹 Delete orphaned draft release and tag
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const tag = process.env.RELEASE_TAG;
+            const { owner, repo } = context.repo;
+
+            // listReleases returns drafts (getReleaseByTag does not), so use it to find everything
+            // attached to this tag, reading every page so a release beyond the first 100 is not missed.
+            const releases = await github.paginate(github.rest.repos.listReleases, { owner, repo, per_page: 100 });
+            const forTag = releases.filter(r => r.tag_name === tag);
+            const drafts = forTag.filter(r => r.draft);
+            const published = forTag.filter(r => !r.draft);
+
+            // If a published release coexists with a draft for this tag, we're in the ambiguous
+            // duplicate-release case (#4874) — the draft may hold the ONLY complete artifact set, so
+            // auto-deleting it could strand an incomplete published release as the only survivor.
+            // Leave both the draft(s) and the tag for manual investigation (mirrors publish-release's
+            // matching>1 bail), and never delete a tag that backs a published release.
+            if (published.length > 0) {
+              core.warning(`A published release exists for ${tag} alongside ${drafts.length} draft(s); leaving the draft(s) and the tag for manual cleanup (see #4874).`);
+              return;
+            }
+
+            // No published release for this tag — the draft(s), if any, are orphans from a blocked
+            // publish. Remove them and the tag so no empty/incomplete release flows downstream.
+            for (const d of drafts) {
+              await github.rest.repos.deleteRelease({ owner, repo, release_id: d.id });
+              console.log(`Deleted orphaned draft release ${tag} (id=${d.id}).`);
+            }
+
+            // The delete is verified by READING THE TAG BACK, never by the delete call's own status.
+            // The repository's "Protect release tags" ruleset carries a deletion rule with no bypass
+            // actors, so the workflow token's delete is refused with a 422 — the same status the API
+            // uses for "reference does not exist". Treating that status as "already absent" reported
+            // every refused delete as a success and left the orphaned tag behind (v7.178.26 logged
+            // exactly that while the tag survived; #6136). Only a 404 on the read-back proves the tag
+            // is gone; anything else fails the job and names the manual cleanup.
+            let deleteError = null;
+            try {
+              await github.rest.git.deleteRef({ owner, repo, ref: `tags/${tag}` });
+            } catch (error) {
+              deleteError = error;
+            }
+
+            let stillPresent = true;
+            try {
+              await github.rest.git.getRef({ owner, repo, ref: `tags/${tag}` });
+            } catch (error) {
+              if (error.status !== 404) {
+                throw error;
+              }
+              stillPresent = false;
+            }
+
+            if (!stillPresent) {
+              console.log(deleteError
+                ? `Tag ${tag} already absent; nothing to delete.`
+                : `Deleted orphaned tag ${tag}; downstream tag-tracking consumers will not see an empty release.`);
+              return;
+            }
+
+            const detail = deleteError ? ` (delete refused: ${deleteError.status} ${deleteError.message})` : '';
+            core.setFailed(
+              `Orphaned tag ${tag} still exists after the cleanup${detail}. ` +
+              `It has no release, so tag-tracking consumers would see an empty release. ` +
+              `A repository ruleset protecting tag deletion blocks this workflow token; ` +
+              `delete it with a bypass-capable identity ` +
+              `(gh api -X DELETE repos/${owner}/${repo}/git/refs/tags/${tag}) ` +
+              `or grant this workflow a bypass on that ruleset.`
+            );

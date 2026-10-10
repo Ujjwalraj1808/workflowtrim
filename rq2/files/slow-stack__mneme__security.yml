@@ -1,0 +1,54 @@
+name: Security
+
+# 安全扫描：只做「注释级提醒」不拦合并（跑几周没误报再收紧为 fail）。
+# 组成：
+#   1. gitleaks         —— 密钥泄露扫描（NPM_TOKEN 等一旦进历史就完了，这是最便宜的保险）
+#   2. dependency-review —— PR 依赖 diff：新引入依赖的已知漏洞 / 投毒包举报（OSV）
+#   3. osv-scanner      —— 全量 lockfile 扫描（push 到 main 时兜底，结果进 Security 标签页）
+# Socket App（行为级投毒检测）是 GitHub App，不占本文件——在 github.com/apps/socket-security 安装后自动生效。
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  gitleaks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # 全历史扫描：只扫增量会漏掉历史里已存在的密钥
+      # 不用 gitleaks-action：v2 起对组织仓库强制 license（个人免费、组织收费），
+      # 官方二进制本身开源免费，直接跑即可，行为等价
+      - name: Run gitleaks (binary, full history)
+        run: |
+          curl -sSfL https://github.com/gitleaks/gitleaks/releases/download/v8.24.3/gitleaks_8.24.3_linux_x64.tar.gz | tar -xz gitleaks
+          ./gitleaks detect --source . --no-banner --redact
+
+  dependency-review:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # OSV 的「恶意包」（投毒）severity 为 critical → moderate 门槛即可拦住；
+      # 正常依赖升级不出声，不敏感
+      - uses: actions/dependency-review-action@v4
+        with:
+          fail-on-severity: moderate
+
+  # 官方 reusable workflow：扫 lockfile、SARIF 传 Security 标签页；fail-on-vuln=false = 纯提醒
+  osv-scanner:
+    if: github.event_name == 'push'
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable.yml@v2.6.0
+    with:
+      fail-on-vuln: false
+      scan-args: |-
+        -r ./dsh-mneme

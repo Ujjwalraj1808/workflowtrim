@@ -1,0 +1,153 @@
+name: Publish to npm
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing release tag to retry (for example, v0.83.0)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write  # required for npm provenance attestation
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # Manual runs publish an existing immutable release tag, never the
+          # branch selected in the workflow-dispatch UI.
+          ref: ${{ inputs.release_tag || github.ref }}
+          fetch-depth: 0
+
+      # ── Rust toolchain ──────────────────────────────────────────────────────
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            packages/pptx/parser
+            packages/xlsx/parser
+            packages/docx/parser
+
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+
+      # ── Node / pnpm ─────────────────────────────────────────────────────────
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v5
+        # version is read from packageManager field in package.json
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+          cache: 'pnpm'
+
+      - name: Verify release ref
+        env:
+          REQUESTED_TAG: ${{ inputs.release_tag }}
+        run: |
+          RELEASE_TAG="${REQUESTED_TAG:-$GITHUB_REF_NAME}"
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "$(git describe --tags --exact-match HEAD)" == "$RELEASE_TAG" ]]
+          PACKAGE_VERSION="$(node -p "require('./package.json').version")"
+          [[ "$RELEASE_TAG" == "v$PACKAGE_VERSION" ]]
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+            [[ "$GITHUB_REF" == "refs/heads/main" ]]
+          fi
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # ── Build ────────────────────────────────────────────────────────────────
+      - name: Build WASM (all packages)
+        run: pnpm build:wasm
+
+      # Gate the release on a clean typecheck so a tag never publishes
+      # type-broken code (defence in depth alongside the PR CI workflow).
+      - name: Typecheck
+        run: pnpm typecheck
+
+      # A tag must never publish code whose unit tests are red. WASM was built
+      # above, so the renderer/parser probe suites have their .wasm available.
+      - name: Unit tests
+        run: |
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+            # A manual retry follows a prior fully reviewed tag run. Give
+            # shared runners extra scheduling headroom without weakening the
+            # normal tag-push gate.
+            ./node_modules/.bin/vitest run --testTimeout=15000
+            node --test tests/visual/private-corpus.test.mjs
+          else
+            pnpm test
+          fi
+
+      - name: Build library
+        run: pnpm build
+
+      # PD13 — fail the release if a WASM parser was re-inlined into a JS bundle
+      # as a base64 data-URL (which once bloated the package ~6 MB). The parsers
+      # must ship as real .wasm assets referenced by URL; this gate scans the
+      # freshly built dist/ for the base64 WASM magic before we pack.
+      - name: Guard against base64-inlined WASM
+        run: pnpm check:no-inline-wasm
+
+      - name: Verify production render-worker assets
+        run: pnpm check:production-render-workers
+
+      - name: Verify optional ChartEx bundle boundary
+        run: pnpm check:optional-chart-ex
+
+      - name: Verify optional TIFF bundle boundary
+        run: pnpm check:optional-tiff
+
+      - name: Verify per-format legacy Office model source boundaries
+        run: |
+          pnpm check:core-legacy-boundary
+
+      # ── Verify the package that is about to be published ──────────────────────
+      # publint checks packaging correctness (exports ordering, file presence,
+      # module/type field sanity). attw checks that every entrypoint resolves to
+      # type declarations under each module-resolution mode. Both run against the
+      # real `npm pack` tarball, so a broken `exports` map fails the release
+      # instead of shipping. `--profile esm-only` acknowledges this package is
+      # intentionally ESM-only: it ignores the node10 and node16-from-CJS
+      # resolutions (which cannot succeed without a legacy CJS build we do not
+      # ship) while still failing on any regression in the ESM / bundler columns.
+      - name: Verify package exports (publint + attw)
+        run: |
+          npx --yes publint
+          npx --yes @arethetypeswrong/cli --pack . --profile esm-only
+
+      # Smoke test the actual tarball a consumer would install: pack it, install
+      # it into a throwaway project, and import each subpath in a DOM-less Node
+      # process. This proves the published entrypoints resolve AND that importing
+      # them has no top-level side effect (a stray `document` touch would throw
+      # `ReferenceError` here), which is the contract behind `sideEffects: false`.
+      - name: Smoke test the packed tarball
+        run: |
+          npm pack
+          mkdir -p /tmp/pack-smoke && cd /tmp/pack-smoke
+          npm init -y
+          npm i "$GITHUB_WORKSPACE"/silurus-ooxml-*.tgz
+          node --input-type=module -e "const m = await import('@silurus/ooxml/docx'); if (!m.DocxViewer) throw new Error('DocxViewer missing'); const p = await import('@silurus/ooxml/pptx'); if (!p.PptxViewer) throw new Error('PptxViewer missing'); const x = await import('@silurus/ooxml/xlsx'); if (!x.XlsxViewer) throw new Error('XlsxViewer missing'); const c = await import('@silurus/ooxml/chart-ex'); if (!c.chartEx?.render) throw new Error('chartEx missing'); const t = await import('@silurus/ooxml/tiff'); if (!t.tiff?.render) throw new Error('tiff missing'); console.log('pack smoke OK');"
+
+      # ── Publish ──────────────────────────────────────────────────────────────
+      - name: Publish to npm
+        run: pnpm publish --no-git-checks
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          # access / provenance are set via publishConfig in package.json

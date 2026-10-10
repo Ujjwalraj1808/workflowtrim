@@ -1,0 +1,59 @@
+name: Release
+on:
+  push:
+    tags:
+      - "v*"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions: write-all
+
+jobs:
+  build-on-ubuntu-2604:
+    runs-on: ubuntu-26.04
+    name: Release Linux amd64
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: "recursive"
+          fetch-depth: 0
+
+      - uses: ./.github/actions/setup-build-environment
+
+      - name: authenticate
+        run: |
+          gh auth login --with-token <<<'${{ secrets.GITHUB_TOKEN }}'
+      - name: Get Previous Tag
+        id: previoustag
+        run: |
+          PREVIOUS=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+          echo "PREVIOUS_TAG=$PREVIOUS" >> $GITHUB_OUTPUT
+      - name: Generate Release Notes
+        id: release_notes
+        run: |
+          gh api \
+            --method POST \
+            -H "Accept: application/vnd.github+json" \
+            /repos/${{ github.repository }}/releases/generate-notes \
+            -f tag_name=${{ github.ref_name }} \
+            -f previous_tag_name=${{ steps.previoustag.outputs.PREVIOUS_TAG }} \
+            > release_notes.json
+          echo "NOTES<<EOF" >> $GITHUB_OUTPUT
+          jq -r .body release_notes.json >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+      - name: Write File
+        uses: DamianReeves/write-file-action@v1.3
+        with:
+          path: release_notes.txt
+          contents: |
+            ${{ steps.release_notes.outputs.NOTES }}
+          write-mode: overwrite
+      - name: Release amd64
+        run: |
+          make clean
+          make local_release
+      - name: Publish
+        run: |
+          make publish VERSION=${{ github.ref_name }}

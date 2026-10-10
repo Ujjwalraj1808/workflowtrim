@@ -1,0 +1,42 @@
+name: Links
+
+on:
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "43 12 * * *"
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: .lycheecache
+          key: cache-lychee-${{ github.sha }}
+          restore-keys: cache-lychee-
+
+      # On the releaser-pleaser PR the new release tag does not exist yet, so its
+      # release URL is excluded below to avoid a false-positive 404.
+      - uses: lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8 # v2
+        with:
+          fail: true
+          args: >
+            -v
+            --root-dir ${{ github.workspace }}
+            --no-progress
+            --cache
+            --max-cache-age 2d
+            --include-fragments
+            ${{ github.head_ref == 'releaser-pleaser--branches--main' && '--exclude https://github.com/hetznercloud/csi-driver/releases/tag/' || '' }}
+            --exclude 'api.hetzner.cloud'
+            --exclude 'api.hetzner.com'
+            --exclude 'https://docs.hetzner.cloud/reference/cloud#'
+            --exclude 'https://docs.hetzner.cloud/reference/hetzner#'
+            --exclude 'codecov.io'
+            --exclude '169.254.169.254'
+            --exclude 'https://www.hetzner.com/news/arm64-cloud/'
+            '**/*.md'

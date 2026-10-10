@@ -1,0 +1,102 @@
+name: Integration with Unreleased OpenSearch
+
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        entry:
+          - { branch: '2.x', java-version: '17' }
+#         - { branch: '3.x', java-version: '21' }
+          - { branch: 'main', java-version: '21' }
+    steps:
+      - name: Checkout OpenSearch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          repository: opensearch-project/OpenSearch
+          ref: ${{ matrix.entry.branch }}
+          path: opensearch
+
+      - name: Get OpenSearch branch top
+        id: get-key
+        working-directory: opensearch
+        run: echo key=`git log -1 --format='%H'` >> $GITHUB_OUTPUT
+
+      - name: Restore cached build
+        id: cache-restore
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: opensearch/distribution/archives/linux-tar/build/distributions
+          key: ${{ steps.get-key.outputs.key }}
+
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: 'temurin'
+          java-version: ${{ matrix.entry.java-version }}
+
+      - name: Assemble OpenSearch
+        if: steps.cache-restore.outputs.cache-hit != 'true'
+        working-directory: opensearch
+        run: ./gradlew :distribution:archives:linux-tar:assemble
+
+      - name: Save cached build
+        if: steps.cache-restore.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: opensearch/distribution/archives/linux-tar/build/distributions
+          key: ${{ steps.get-key.outputs.key }}
+
+      - name: Run OpenSearch
+        working-directory: opensearch/distribution/archives/linux-tar/build/distributions
+        run: |
+          tar xf opensearch-min-*
+          ./opensearch-*/bin/opensearch -Epath.repo=/usr/share/opensearch/mnt &
+          OPENSEARCH_PID=$!
+          echo "=====> Waiting for OpenSearch to be ready (max 100s)..."
+          for attempt in {1..20}; do
+            sleep 5
+            if curl -sf localhost:9200 > /dev/null 2>&1; then
+              echo "=====> OpenSearch ready after $((attempt * 5))s"
+              curl -s localhost:9200 | jq -r '.version.number // "unknown"' | xargs echo "OpenSearch version:"
+              break
+            fi
+            if [ $attempt -eq 20 ]; then
+              echo "=====> ERROR: OpenSearch failed to start after 100s"
+              echo ""
+              echo "=====> Process status:"
+              ps aux | grep opensearch || echo "Process not found"
+              echo ""
+              echo "=====> Recent logs:"
+              find . -name "*.log" -type f -exec echo "===== {} =====" \; -exec tail -50 {} \;
+              exit 1
+            fi
+            echo "=====> Attempt $attempt/20 - waiting..."
+          done
+
+      - name: Checkout Go Client
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          path: go-client
+
+      - name: Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with: { go-version-file: 'go-client/go.mod' }
+
+      - name: Integration test
+        working-directory: go-client
+        run: make test-integ-core race=true
+        env:
+          OPENSEARCH_GO_SKIP_JSON_COMPARE: true
+          OPENSEARCH_NODE_COUNT: 1
+          SECURE_INTEGRATION: false
+
+      - name: Save server logs
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: opensearch-logs-${{ matrix.entry.branch }}
+          path: |
+            opensearch/distribution/archives/linux-tar/build/distributions/**/logs/*

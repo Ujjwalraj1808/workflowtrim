@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+    # Release branches also run CI on push: ref updates made with a real
+    # account token (agent/human-driven release branches) deliver the push
+    # event, and those check runs satisfy required-status-checks on the head
+    # sha even when the PR's own runs sit in `action_required` (bot-authored
+    # PRs are gated there) (#772). Note: pushes made with GITHUB_TOKEN from
+    # within Actions deliver NO push events — for those, the one-click
+    # workflow compensates via workflow_dispatch below.
+    branches: [master, "*_release-v*"]
+  pull_request:
+    branches: [master]
+  # One-click release fallback: GitHub suppresses push-event delivery for
+  # ref updates made with GITHUB_TOKEN, so the push trigger above never fires
+  # on one-click fallback branches (#1744). release-manual.yml compensates by
+  # explicitly dispatching this workflow on the fallback branch; the check
+  # runs land on the same head sha and make the auto-PR mergeable once green
+  # (#772, #1744).
+  workflow_dispatch: {}
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        node-version: [22, 24]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+      - run: npm install --ignore-scripts --no-fund --no-audit
+      - run: npm run typecheck
+      # ACP_TEST_CLAUDE_NATIVE keeps the claude-native live e2e subtests
+      # running here: the runner is dedicated, so their process/port
+      # observations are reliable (#1248 gates them off for loaded local
+      # sandboxes only).
+      - run: npm test
+        env:
+          ACP_TEST_CLAUDE_NATIVE: "1"
+      - run: npm run build
+
+  version-guard:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Verify version field only changes on release branches
+        run: |
+          set -euo pipefail
+          BRANCH="${GITHUB_HEAD_REF}"
+          # Release branches are allowed to bump version.
+          if [[ "$BRANCH" == *_release-v* ]]; then
+            echo "✓ release branch ($BRANCH) — version changes allowed"
+            exit 0
+          fi
+          # Non-release branches must NOT touch the "version" field.
+          if git diff origin/master...HEAD -- package.json | grep -Eq '^[+-][[:space:]]*"version"[[:space:]]*:'; then
+            echo "::error::\"version\" in package.json was changed on a non-release branch ($BRANCH)."
+            echo "Version bumps must go on a dedicated *_release-v* branch with an isolated 'release v{VERSION}' commit. See AGENTS.md §4 'Version Bumps'."
+            exit 1
+          fi
+          echo "✓ version field untouched on non-release branch ($BRANCH)"

@@ -1,0 +1,63 @@
+name: Linearizability Checks
+permissions: {}
+on:
+  schedule:
+    - cron: '0 12 * * 4'
+  workflow_dispatch: {}
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+env:
+  DEVELOCITY_ACCESS_KEY: ${{ secrets.DEVELOCITY_ACCESS_KEY }}
+  ALLOWED_ENDPOINTS: >-
+    api.adoptium.net:443
+    api.foojay.io:443
+    api.github.com:443
+    caffeine.develocity.cloud:443
+    downloads.gradle.org:443
+    downloads.gradle-dn.com:443
+    github.com:443
+    maven-central.storage-download.googleapis.com:443
+    objects.githubusercontent.com:443
+    release-assets.githubusercontent.com:443
+    plugins.gradle.org:443
+    plugins-artifacts.gradle.org:443
+    pkg-containers.githubusercontent.com:443
+    repo.maven.apache.org:443
+    repo1.maven.org:443
+    services.gradle.org:443
+
+jobs:
+  lincheck:
+    name: Lincheck
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    strategy:
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
+    env:
+      JAVA_VERSION: 26
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: block
+          disable-sudo-and-containers: true
+          allowed-endpoints: ${{ env.ALLOWED_ENDPOINTS }}
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Lincheck
+        uses: $/.github/actions/run-gradle
+        with:
+          java: ${{ env.JAVA_VERSION }}
+          cache-encryption-key: ${{ secrets.GRADLE_ENCRYPTION_KEY }}
+          arguments: >
+            caffeine:lincheckTest
+            --rerun-tasks
+            -Dlincheck.modelChecking.iterations=100
+            -Dlincheck.modelChecking.invocationsPerIteration=1000
+            -Dlincheck.stress.iterations=100
+            -Dlincheck.stress.invocationsPerIteration=10000

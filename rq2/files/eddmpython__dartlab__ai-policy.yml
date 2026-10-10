@@ -1,0 +1,31 @@
+name: Policy Check
+
+on:
+  pull_request:
+    branches: [master]
+
+# 주체 중립 marker 검사는 운영자 로컬 pre-commit (.claude/hooks/) 단일 게이트로 전환.
+# CI workflow 가 .claude/ (gitignored) 의 hook 을 호출하던 구조는 본질적 모순이라 폐기.
+
+jobs:
+  block-coreloop-auto-merge:
+    # Phase R auto-merge 3중 방어의 1차 (workflow) — [CORELOOP-R] PR 에 auto-merge 라벨 금지
+    if: github.event_name == 'pull_request' && startsWith(github.event.pull_request.title, '[CORELOOP-')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Block auto-merge label on coreloop PR
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+            if (!pr) return;
+            const labels = pr.labels.map(l => l.name);
+            if (labels.includes('auto-merge')) {
+              await github.rest.issues.removeLabel({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: pr.number,
+                name: 'auto-merge',
+              });
+              core.setFailed('[CORELOOP-R] PR 에 auto-merge 라벨 금지 — CODEOWNERS 수동 리뷰 필수');
+            }

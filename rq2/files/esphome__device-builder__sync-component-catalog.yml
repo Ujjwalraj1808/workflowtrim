@@ -1,0 +1,397 @@
+name: Sync component catalog
+
+# Re-runs ``script/sync_components.py`` against the latest schema
+# release (including prereleases, so betas land early) and opens a
+# pull request when the generated ``definitions/components.index.json``
+# or per-id body files under ``definitions/components/`` change.
+#
+# Triggers
+# --------
+# - schedule : nightly at 03:00 UTC. The script is fully cached when
+#              nothing has changed upstream, so this is cheap and a
+#              no-op on most days.
+# - manual   : ``workflow_dispatch`` with an optional ``version`` input
+#              (e.g. ``2026.4.3``). When empty, the workflow resolves
+#              the latest schema release including prereleases, then
+#              installs that exact esphome before running so live
+#              introspection lines up with the resolved schema (the
+#              introspection step needs the matching esphome to load
+#              new components).
+#
+# Output
+# ------
+# Always pushes to a stable branch named ``catalog/sync`` so the
+# scheduled run keeps updating the same in-flight PR rather than
+# spawning a new one every night. ``peter-evans/create-pull-request``
+# closes the PR (and deletes the branch) automatically when the
+# rebuild produces no diff.
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "ESPHome schema version (e.g. 2026.4.3). Leave empty to track the latest release, including prereleases."
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: sync-component-catalog
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Set up uv and Python 3.14
+        uses: ./.github/actions/setup-uv-python
+        with:
+          python-version: "3.14"
+
+      - name: Create venv + install package (with esphome extra)
+        # ``[esphome]`` pulls in the esphome package so the narrow
+        # introspection in sync_components (multi_conf,
+        # platform_defaults, supported_platforms, type refinement)
+        # can run. The venv bin dir goes on PATH so the bare
+        # ``python script/...`` steps below resolve to it.
+        run: |
+          uv venv
+          uv pip install -e '.[esphome]'
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
+
+      - name: Resolve schema version
+        id: version
+        # Prefer an explicit dispatch input. Otherwise resolve the
+        # latest schema release including prereleases so betas land
+        # early. Reuses the script's own resolver (it imports without
+        # pulling esphome) rather than duplicating the GitHub API call.
+        # GITHUB_TOKEN lifts the resolver's releases-API call off the
+        # 60 req/hr unauthenticated cap on shared runner IPs.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Read the dispatch input via env, never inline ``${{ inputs.version }}``
+          # into the script: it's attacker-controllable and a textual splice
+          # would run as shell. ``$INPUT_VERSION`` is data, not code.
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [ -n "$INPUT_VERSION" ]; then
+            VERSION="$INPUT_VERSION"
+            SOURCE="manual dispatch"
+          else
+            VERSION=$(python -c "import sys; sys.path.insert(0, 'script'); from sync_components import resolve_latest_release; print(resolve_latest_release(include_prereleases=True))")
+            SOURCE="latest schema release (incl. prereleases)"
+          fi
+          # Validate before any downstream step installs / pins / interpolates
+          # it; a value constrained to an esphome version string carries no
+          # shell or sed metacharacters, so the later uses can't be injected.
+          if ! printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(b[0-9]+)?$'; then
+            echo "::error::Refusing unexpected esphome version '$VERSION'"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "source=$SOURCE" >> "$GITHUB_OUTPUT"
+
+      - name: Align esphome to the schema version
+        # Install the exact esphome the resolved schema came from so
+        # the live introspection (``multi_conf`` / ``platform_defaults``
+        # / ``supported_platforms`` / type refinement) matches it. A
+        # no-op when that version is already installed (stable case);
+        # ``--prerelease=allow`` lets uv accept a beta tag.
+        #
+        # Fails hard on purpose: if the matching esphome wheel isn't on
+        # PyPI yet (the schema-repo and esphome ship from separate
+        # pipelines, so a freshly-cut beta schema can briefly predate
+        # its wheel), introspecting a beta schema with a stale esphome
+        # would regress the catalog. Better a red nightly that retries
+        # than a degraded catalog proposed for merge.
+        run: uv pip install --prerelease=allow "esphome==${{ steps.version.outputs.version }}"
+
+      - name: Run sync_components
+        run: python script/sync_components.py --version "${{ steps.version.outputs.version }}"
+
+      - name: Re-stamp board catalog
+        # boards.index.json carries an ``esphome_version`` stamp from the
+        # installed esphome. The catalog is one logical unit per esphome
+        # version, so re-stamp boards against the same esphome the align step
+        # pinned; otherwise the Test job's ``sync-boards`` pre-commit hook
+        # re-stamps it and the opened PR lands red on every esphome patch.
+        # ``--restamp`` because the installed esphome is the freshly-resolved
+        # one while the committed stamp is still the previous version — the
+        # one caller for which that mismatch is the point.
+        run: python script/sync_boards.py --restamp
+
+      - name: Validate definitions
+        # Re-validate every board (curated + imported) against the JSON Schema
+        # and the component catalog cross-references before the PR opens, so a
+        # re-stamp that regenerated an invalid board catalog never gets proposed
+        # for merge. Mirrors the device-catalog sync.
+        run: python script/validate_definitions.py
+
+      - name: Bump esphome pin
+        # CI's lint job installs esphome from esphome-constraints.txt so a new
+        # release doesn't red main on the sync-boards hook. Move the pin in
+        # lockstep with the catalog this run just regenerated, so the opened PR
+        # ships a self-consistent version (pinned esphome == catalog stamp).
+        # ``$VERSION`` comes through env (not inline) and is validated to an
+        # esphome version above, so it carries no sed metacharacters.
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: sed -i "s/^esphome==.*/esphome==$VERSION/" esphome-constraints.txt
+
+      - name: Bump esphome floor
+        id: floor
+        # The catalog is generated against one esphome version and the sync
+        # scripts refuse a mismatched install, so once the catalog moves to a
+        # stable release, older esphome versions no longer actually work —
+        # raise the pyproject floor in the same PR. The script skips
+        # prereleases and never lowers the floor. Its one-line summary goes
+        # into the PR body so the reviewer sees the floor moved.
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          floor=$(python script/bump_esphome_floor.py "$VERSION")
+          echo "floor: $floor"
+          echo "summary=$floor" >> "$GITHUB_OUTPUT"
+
+      - name: Smoke-test catalog
+        # Catches regressions in popular components (missing fields,
+        # type flips, id-vs-reference confusion). Runs BEFORE the
+        # diff check so a broken catalog never gets proposed for
+        # merge.
+        run: python script/check_catalog.py
+
+      - name: Detect catalog changes + summarise diff
+        id: diff
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- \
+              esphome_device_builder/definitions/components.index.json \
+              esphome_device_builder/definitions/components/ \
+              esphome_device_builder/definitions/boards.index.json \
+              esphome_device_builder/definitions/board_bodies/ \
+              esphome_device_builder/definitions/featured_components.index.json \
+              esphome_device_builder/definitions/migration_rules.index.json \
+              esphome-constraints.txt \
+              pyproject.toml \
+            && [ -z "$(git ls-files --others --exclude-standard esphome_device_builder/definitions/components/ esphome_device_builder/definitions/board_bodies/)" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+          # Build a human-friendly delta summary the PR body embeds.
+          # We compare the freshly-generated catalog against the one
+          # currently on main so the reviewer sees component-count
+          # drift, per-type entry drift, and the populated-field
+          # totals at a glance.
+          python <<'PY' > /tmp/catalog-diff.md
+          import json
+          import subprocess
+          from collections import Counter
+          from pathlib import Path
+
+          NEW_INDEX = Path("esphome_device_builder/definitions/components.index.json")
+          BODIES_DIR = Path("esphome_device_builder/definitions/components")
+
+          def load_bodies(index_blob: str, head_ref: str | None) -> tuple[dict, list[dict]]:
+              meta = json.loads(index_blob) if index_blob else {"components": []}
+              bodies: list[dict] = []
+              for entry in meta.get("components", []):
+                  cid = entry.get("id")
+                  if not cid:
+                      continue
+                  rel = BODIES_DIR / f"{cid}.json"
+                  if head_ref is None:
+                      if rel.is_file():
+                          bodies.append({**entry, **json.loads(rel.read_text())})
+                      else:
+                          bodies.append(entry)
+                  else:
+                      try:
+                          body_blob = subprocess.check_output(
+                              ["git", "show", f"{head_ref}:{rel}"],
+                              text=True,
+                          )
+                          bodies.append({**entry, **json.loads(body_blob)})
+                      except subprocess.CalledProcessError:
+                          bodies.append(entry)
+              return meta, bodies
+
+          new_meta, new_components = load_bodies(NEW_INDEX.read_text(), None)
+          try:
+              old_index_blob = subprocess.check_output(
+                  ["git", "show", f"HEAD:{NEW_INDEX}"],
+                  text=True,
+              )
+              _, old_components = load_bodies(old_index_blob, "HEAD")
+          except subprocess.CalledProcessError:
+              old_components = []
+          new_data = new_meta
+
+          def count_types(components: list[dict]) -> Counter:
+              counts: Counter[str] = Counter()
+              def walk(entries: list[dict]) -> None:
+                  for entry in entries:
+                      counts[entry.get("type") or "unknown"] += 1
+                      walk(entry.get("config_entries") or [])
+              for component in components:
+                  walk(component.get("config_entries") or [])
+              return counts
+
+          old_ids = {c["id"] for c in old_components}
+          new_ids = {c["id"] for c in new_components}
+          added = sorted(new_ids - old_ids)
+          removed = sorted(old_ids - new_ids)
+
+          RULES_INDEX = Path("esphome_device_builder/definitions/migration_rules.index.json")
+
+          def load_rules(blob: str | None) -> list[dict]:
+              if not blob:
+                  return []
+              try:
+                  payload = json.loads(blob)
+              except ValueError:
+                  return []
+              rules = payload.get("rules") if isinstance(payload, dict) else None
+              return rules if isinstance(rules, list) else []
+
+          new_rules = load_rules(RULES_INDEX.read_text() if RULES_INDEX.is_file() else None)
+          try:
+              old_rules = load_rules(
+                  subprocess.check_output(["git", "show", f"HEAD:{RULES_INDEX}"], text=True)
+              )
+          except subprocess.CalledProcessError:
+              old_rules = []
+
+          def rule_row(rule: dict) -> str:
+              anchor = rule.get("component") or rule.get("domain")
+              anchor = f"{anchor}/{rule.get('platform')}" if rule.get("platform") else anchor
+              prefix = f"{rule.get('kind')} {anchor}" if anchor else rule.get("kind")
+              return f"{prefix}: {rule.get('old')} -> {rule.get('new')}"
+
+          old_rule_rows = {rule_row(r) for r in old_rules}
+          new_rule_rows = {rule_row(r) for r in new_rules}
+          rules_added = sorted(new_rule_rows - old_rule_rows)
+          rules_removed = sorted(old_rule_rows - new_rule_rows)
+
+          old_types = count_types(old_components)
+          new_types = count_types(new_components)
+          all_types = sorted(set(old_types) | set(new_types))
+          old_total = sum(old_types.values())
+          new_total = sum(new_types.values())
+
+          # Headline includes the config-entry total so a refresh that
+          # leaves the component count stable but adds thousands of
+          # nested fields (e.g. a more complete MQTT_COMPONENT_SCHEMA
+          # bundle landing upstream) doesn't read as "no change".
+          lines = [
+              f"**Schema version**: `{new_data.get('esphome_schema_version', '?')}`  ",
+              f"**Components**: {len(old_components)} → {len(new_components)} "
+              f"({len(new_components) - len(old_components):+d})  ",
+              f"**Config entries**: {old_total} → {new_total} "
+              f"({new_total - old_total:+d})  ",
+              f"**Added**: {len(added)} · **Removed**: {len(removed)}  ",
+              f"**Migration rules**: {len(old_rules)} → {len(new_rules)} "
+              f"({len(new_rules) - len(old_rules):+d})",
+              "",
+          ]
+
+          # Each rule is an automatic YAML rewrite shipping without code
+          # review — surface every change (loss included: a dropped rule
+          # silently stops that migration firing) for the human gate.
+          if rules_added or rules_removed:
+              lines.append("<details open><summary>Migration-rule churn</summary>")
+              lines.append("")
+              for row in rules_added:
+                  lines.append(f"- **New rule** `{row}`")
+              for row in rules_removed:
+                  lines.append(f"- **Removed rule** `{row}` — its migration stops firing")
+              lines.append("")
+              lines.append("</details>")
+              lines.append("")
+
+          if added or removed:
+              lines.append("<details><summary>Component churn</summary>")
+              lines.append("")
+              if added:
+                  lines.append(f"**Added ({len(added)}):** " + ", ".join(f"`{i}`" for i in added[:30]))
+                  if len(added) > 30:
+                      lines.append(f" _…and {len(added) - 30} more_")
+              if removed:
+                  lines.append(f"**Removed ({len(removed)}):** " + ", ".join(f"`{i}`" for i in removed[:30]))
+                  if len(removed) > 30:
+                      lines.append(f" _…and {len(removed) - 30} more_")
+              lines.append("")
+              lines.append("</details>")
+              lines.append("")
+
+          lines.append("<details><summary>Config-entry type distribution</summary>")
+          lines.append("")
+          lines.append("| Type | Old | New | Δ |")
+          lines.append("|------|----:|----:|---:|")
+          for t in all_types:
+              o = old_types.get(t, 0)
+              n = new_types.get(t, 0)
+              if o == n:
+                  continue
+              lines.append(f"| `{t}` | {o} | {n} | {n - o:+d} |")
+          lines.append("")
+          lines.append("</details>")
+
+          print("\n".join(lines))
+          PY
+
+          {
+            echo "summary<<DIFF_EOF"
+            cat /tmp/catalog-diff.md
+            echo "DIFF_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Open / update pull request
+        if: steps.diff.outputs.changed == 'true'
+        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1  # v8.1.1
+        with:
+          branch: catalog/sync
+          base: main
+          commit-message: |
+            Sync component catalog from schema ${{ steps.version.outputs.version }}
+
+            Auto-generated by .github/workflows/sync-component-catalog.yml.
+          title: "Sync component catalog from schema ${{ steps.version.outputs.version }}"
+          body: |
+            Automated catalog refresh.
+
+            Schema source: **${{ steps.version.outputs.source }}** (version `${{ steps.version.outputs.version }}`).
+            Dependency floor: **${{ steps.floor.outputs.summary }}**.
+            Triggered by: **${{ github.event_name == 'schedule' && 'nightly schedule' || format('manual dispatch by @{0}', github.actor) }}**.
+
+            ${{ steps.diff.outputs.summary }}
+
+            **Smoke test:** ✅ catalog passes [`script/check_catalog.py`](../blob/main/script/check_catalog.py) — every well-known component has the expected shape.
+
+            ---
+
+            Review checklist:
+            - Skim the **Added** / **Removed** lists above for anything unexpected.
+            - Check the type-distribution table for outsized drift in any single bucket (a sudden drop in `boolean` or `pin` likely means a sync regression rather than an upstream change).
+            - If the diff looks weird, run `script/sync_components.py --version ${{ steps.version.outputs.version }}` locally and compare. The script is deterministic given a schema version + installed esphome.
+            - Merge to ship the new catalog.
+          labels: |
+            catalog
+            automated
+          delete-branch: true
+
+      - name: No-op summary
+        if: steps.diff.outputs.changed == 'false'
+        run: |
+          echo "::notice::Component catalog is already up to date for schema ${{ steps.version.outputs.version }} - no PR opened."

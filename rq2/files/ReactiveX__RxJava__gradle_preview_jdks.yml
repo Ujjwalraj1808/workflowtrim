@@ -1,0 +1,65 @@
+# This workflow will build a Java project with Gradle
+# For more information see: https://help.github.com/actions/language-and-framework-guides/building-and-testing-java-with-gradle
+
+name: Preview-JDKs
+
+on:
+  push:
+    branches: [ '4.x' ]
+  pull_request:
+    branches: [ '4.x' ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        jdk: [27, 28]   # add 28-ea etc. later
+
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+    - name: Set up JDK 26 for Gradle
+      uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+      with:
+        distribution: 'zulu'
+        java-version: '26'
+        cache: gradle
+
+    - name: Set up JDK ${{ matrix.jdk }}-ea
+      uses: oracle-actions/setup-java@ec7274acdd237c7fe61395ed2edda22d756b5afe # v1
+      with:
+        website: jdk.java.net
+        release: ${{ matrix.jdk }}   # or just "27"
+        # version: latest   # default; this is what you want
+
+    - name: Cache Gradle packages
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ~/.gradle/caches
+        key: ${{ runner.os }}-gradle-${{ secrets.CACHE_VERSION }}-${{ hashFiles('**/*.gradle') }}
+        restore-keys: ${{ runner.os }}-gradle-${{ secrets.CACHE_VERSION }}
+    - name: Grant execute permission for gradlew
+      run: chmod +x gradlew
+
+    - name: Run Validity Tests Upfront
+      env:
+        JDK_EXPERIMENTAL: ${{ matrix.jdk }}
+        JAVA_HOME: ${{ env.JAVA_HOME_26_X64 }}
+      run: ./gradlew test --tests "io.reactivex.rxjava4.validators.*" --stacktrace --no-daemon
+    - name: Build RxJava
+      env:
+        JDK_EXPERIMENTAL: ${{ matrix.jdk }}
+        JAVA_HOME: ${{ env.JAVA_HOME_26_X64 }}
+      run: ./gradlew build --stacktrace
+    - name: Generate Javadoc
+      env:
+        JDK_EXPERIMENTAL: ${{ matrix.jdk }}
+        JAVA_HOME: ${{ env.JAVA_HOME_26_X64 }}
+      run: ./gradlew javadoc --stacktrace
+

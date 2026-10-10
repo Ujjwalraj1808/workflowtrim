@@ -1,0 +1,113 @@
+name: validate-author
+
+# Enforce that every commit on a PR head was COMMITTED by new-usemame.
+# Author may differ — cherry-picks of upstream PRs legitimately preserve
+# the original author for credit (recorded again in the fork-PR body).
+# What matters for accountability is who applied the commit to our repo.
+#
+# Two acceptable committer identities:
+#   - 248195428+new-usemame@users.noreply.github.com   (CLI commits)
+#   - pj4wx2vj6n@privaterelay.appleid.com              (GitHub web merges)
+#
+# Any non-merge commit signed by a different committer fails the check,
+# gating auto-merge.
+#
+# Merge commits are skipped (`--no-merges`). They carry no original
+# authored content of their own — their changes are the parents', which
+# are validated independently (the PR's own commits + main's already-
+# merged history). The "Update branch" button in the GitHub web UI
+# produces a merge commit whose committer is `GitHub <noreply@github.com>`
+# (the clicker is recorded as author, not committer). Validating the
+# committer of such mechanical merges would fail every PR that sits long
+# enough for main to advance and need a branch update — a recurring
+# catch-22 that has nothing to do with who authored the substantive code.
+#
+# EXEMPTION: PRs labeled `community-contribution` skip the committer
+# check. Use this for genuine outside contributions where the
+# contributor's own committer identity is correct and re-authoring
+# would erase their authorship credit. The label is operator-applied;
+# the workflow never adds it on its own. Auto-merge is still gated by
+# the rest of auto-merge.yml (tier label, forbidden paths, CI green) —
+# `community-contribution` only exempts the committer-identity check.
+
+on:
+  pull_request:
+    branches: [main]
+    # labeled/unlabeled included so applying `community-contribution` re-runs
+    # the check with fresh label data — re-running the old failed run replays
+    # a frozen event payload that predates the label (hit on PR #371).
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  check-commit-committer:
+    name: validate-author
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Verify all commits committed by new-usemame (or exempt by label)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          # Operator-applied exemption for genuine outside contributions.
+          # `community-contribution` is the contract string the operator
+          # and this workflow share; if you rename it, also update
+          # CLAUDE.md tier policy section + the autopilot SKILL.
+          LABELS='${{ toJSON(github.event.pull_request.labels.*.name) }}'
+          if echo "$LABELS" | grep -q '"community-contribution"'; then
+            echo "::notice::validate-author exempted by 'community-contribution' label."
+            echo "Operator has accepted the contributor's commits as-is."
+            echo "Auto-merge remains gated by tier label, forbidden paths, and CI green."
+            exit 0
+          fi
+
+          # Trusted-collaborator exemption (operator decision, 2026-08-22):
+          # a PR authored by someone with write or admin on this repo is a
+          # trusted contribution — the same trust that granted them write
+          # covers their commit identity, so no per-PR label dance. Everything
+          # else still gates them: the main ruleset (PR + 1 approval +
+          # required checks) applies to write users too.
+          AUTHOR='${{ github.event.pull_request.user.login }}'
+          PERM=$(gh api "repos/${{ github.repository }}/collaborators/$AUTHOR/permission" \
+                   --jq .permission 2>/dev/null || echo none)
+          if [ "$PERM" = "write" ] || [ "$PERM" = "admin" ]; then
+            echo "::notice::validate-author exempted: PR author '$AUTHOR' has $PERM access."
+            exit 0
+          fi
+
+          BASE='${{ github.event.pull_request.base.sha }}'
+          HEAD='${{ github.event.pull_request.head.sha }}'
+          ALLOWED_RE='^(248195428\+new-usemame@users\.noreply\.github\.com|pj4wx2vj6n@privaterelay\.appleid\.com)$'
+
+          BAD=""
+          while IFS= read -r line; do
+            sha=$(awk '{print $1}' <<<"$line")
+            ce=$(awk '{print $2}' <<<"$line")
+            if ! [[ "$ce" =~ $ALLOWED_RE ]]; then
+              BAD+=$'\n'"  $sha  committer=$ce"
+            fi
+          done < <(git log --no-merges --format='%H %ce' "$BASE..$HEAD")
+
+          if [ -n "$BAD" ]; then
+            echo "::error::PR contains commits NOT committed by new-usemame:"
+            printf '%s\n' "$BAD"
+            echo
+            echo "Two ways forward:"
+            echo "  1. Re-author (fork-internal PRs):"
+            echo "       git -c user.name='new-usemame' \\"
+            echo "           -c user.email='248195428+new-usemame@users.noreply.github.com' \\"
+            echo "           commit --amend --reset-author --no-edit"
+            echo "  2. Apply 'community-contribution' label (genuine outside PRs;"
+            echo "     operator decision)."
+            exit 1
+          fi
+          echo "All commits committed by new-usemame ✓"

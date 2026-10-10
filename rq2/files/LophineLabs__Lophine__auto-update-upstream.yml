@@ -1,0 +1,233 @@
+name: Auto Update Upstream
+
+on:
+  schedule:
+    - cron: '0 */8 * * *'
+  workflow_dispatch:
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    env:
+      TOOL: "LophineLabs/AutoUpdateUpstream"
+      # 多个上游仓库地址，每行一个（第一个为主仓库，后续为备用镜像）
+      UPSTREAM_URLS: |
+        https://github.com/PaperMC/Folia.git
+        https://github.com/LophineLabs/Folia.git
+      # 要跟踪的上游分支，留空则使用上游仓库默认分支（HEAD）
+      UPSTREAM_BRANCH: "ver/26.2.x"
+      REF: "foliaRef"
+      TITLE: "Update Upstream (Folia)"
+      REF_COMMIT: "auto-update/upstream"
+    steps:
+      - name: Checkout target repository for check
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ github.repository }}
+          path: check
+
+      - name: Check if upstream already up to date
+        working-directory: check
+        run: |
+          BRANCH=${{ env.REF_COMMIT }}
+          if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+            git fetch origin "$BRANCH"
+            LOCAL_REF=$(git show "origin/$BRANCH:gradle.properties" | grep '^${{ env.REF }}=' | cut -d'=' -f2 | tr -d '[:space:]')
+          else
+            LOCAL_REF=$(grep '^${{ env.REF }}=' gradle.properties | cut -d'=' -f2 | tr -d '[:space:]')
+          fi
+          echo "Local ref: $LOCAL_REF"
+          # UPSTREAM_BRANCH 为空时回退到 HEAD（上游默认分支）
+          REF_SPEC="${{ env.UPSTREAM_BRANCH }}"
+          REF_SPEC="${REF_SPEC:-HEAD}"
+          # 遍历所有上游仓库，任一有更新则不跳过
+          SKIP=true
+          while IFS= read -r url; do
+            url=$(echo "$url" | tr -d '[:space:]')
+            if [ -z "$url" ]; then continue; fi
+            UPSTREAM_REF=$(git ls-remote "$url" "$REF_SPEC" | cut -f1)
+            echo "Upstream [$url] ref: $UPSTREAM_REF"
+            if [ "$LOCAL_REF" != "$UPSTREAM_REF" ]; then
+              SKIP=false
+            fi
+          done <<< "${{ env.UPSTREAM_URLS }}"
+          if [ "$SKIP" = "true" ]; then
+            echo "All upstreams are up to date, skipping all steps."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+        id: uptodate
+
+      - name: Ensure PR exists if branch differs from main
+        if: steps.uptodate.outputs.skip == 'true'
+        working-directory: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BRANCH=${{ env.REF_COMMIT }}
+          BASE="${{ github.event.repository.default_branch }}"
+
+          if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+            git fetch origin "$BRANCH" "$BASE"
+            BASE_REF=$(git show "origin/$BASE:gradle.properties" | grep '^${{ env.REF }}=' | cut -d'=' -f2 | tr -d '[:space:]')
+            BRANCH_REF=$(git show "origin/$BRANCH:gradle.properties" | grep '^${{ env.REF }}=' | cut -d'=' -f2 | tr -d '[:space:]')
+            echo "Base $BASE ref: $BASE_REF"
+            echo "Branch $BRANCH ref: $BRANCH_REF"
+            if [ "$BASE_REF" != "$BRANCH_REF" ]; then
+              EXISTING=$(gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number // empty')
+              if [ -z "$EXISTING" ]; then
+                gh pr create \
+                  --base "$BASE" \
+                  --head "$BRANCH" \
+                  --title "$TITLE" \
+                  --body "Upstream ref is up to date. Branch has changes from a previous update."
+                echo "Created PR for existing branch $BRANCH"
+              else
+                echo "PR #$EXISTING already exists for $BRANCH"
+              fi
+            else
+              echo "Branch $BRANCH has same foliaRef as $BASE, no PR needed"
+            fi
+          else
+            echo "Branch $BRANCH does not exist on remote, no PR needed"
+          fi
+
+      - name: Checkout AutoUpdateUpstream
+        if: steps.uptodate.outputs.skip != 'true'
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ env.TOOL }}
+          path: tool
+
+      - name: Checkout target repository
+        if: steps.uptodate.outputs.skip != 'true'
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ github.repository }}
+          path: repo
+
+      - name: Set up JDK 25
+        if: steps.uptodate.outputs.skip != 'true'
+        uses: actions/setup-java@v6
+        with:
+          java-version: '25'
+          distribution: 'zulu'
+
+      - name: Build AutoUpdateUpstream
+        if: steps.uptodate.outputs.skip != 'true'
+        working-directory: tool
+        run: |
+          chmod +x gradlew
+          ./gradlew jar -x test
+
+      - name: Read old upstream ref
+        if: steps.uptodate.outputs.skip != 'true'
+        working-directory: repo
+        run: |
+          OLD_REF=$(grep '^${{ env.REF }}=' gradle.properties | cut -d'=' -f2 | tr -d '[:space:]')
+          echo "old_ref=$OLD_REF" >> "$GITHUB_OUTPUT"
+        id: oldref
+
+      - name: Run AutoUpdateUpstream
+        if: steps.uptodate.outputs.skip != 'true'
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          # 将多行 UPSTREAM_URLS 转换为多个 --url 参数
+          URL_ARGS=""
+          while IFS= read -r url; do
+            url=$(echo "$url" | tr -d '[:space:]')
+            if [ -n "$url" ]; then
+              URL_ARGS="$URL_ARGS --url=$url"
+            fi
+          done <<< "${{ env.UPSTREAM_URLS }}"
+          BRANCH_ARGS=""
+          if [ -n "${{ env.UPSTREAM_BRANCH }}" ]; then
+            BRANCH_ARGS="--branch=${{ env.UPSTREAM_BRANCH }}"
+          fi
+          java -jar tool/build/libs/*.jar --repo=${{ github.workspace }}/repo $URL_ARGS $BRANCH_ARGS
+
+      - name: Get upstream commit messages
+        if: steps.uptodate.outputs.skip != 'true'
+        working-directory: repo
+        run: |
+          # 使用第一个上游仓库获取 commit 信息
+          UPSTREAM_URL=$(echo "${{ env.UPSTREAM_URLS }}" | head -n 1 | tr -d '[:space:]')
+          UPSTREAM_WEB_URL="${UPSTREAM_URL%.git}"
+          OLD_REF="${{ steps.oldref.outputs.old_ref }}"
+          NEW_REF=$(grep '^${{ env.REF }}=' gradle.properties | cut -d'=' -f2 | tr -d '[:space:]')
+          git fetch "$UPSTREAM_URL" "+$NEW_REF:refs/upstream-tmp"
+          {
+            echo "UPSTREAM_MSG<<__COMMIT_MSG__"
+            git log --reverse --format="[%H]($UPSTREAM_WEB_URL/commit/%H) %s%n%n%b%n------------%n" "$OLD_REF..refs/upstream-tmp" | sed 's/\[[^]]*\] *//g' | grep -v -E '^(Signed-off-by:|Co-authored-by:)' | sed "s|#\([0-9]\+\)|$UPSTREAM_WEB_URL/pull/\1|g" || true
+            echo "__COMMIT_MSG__"
+          } >> "$GITHUB_ENV"
+          git update-ref -d refs/upstream-tmp
+
+      - name: Check for .patch changes
+        if: steps.uptodate.outputs.skip != 'true'
+        id: check
+        working-directory: repo
+        run: |
+          if git diff --quiet -- '*.patch' 'gradle.properties' && git diff --cached --quiet -- '*.patch' 'gradle.properties' && [ -z "$(git ls-files --others --exclude-standard -- '*.patch' 'gradle.properties')" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create or update PR
+        if: steps.uptodate.outputs.skip != 'true' && steps.check.outputs.changed == 'true'
+        working-directory: repo
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UPSTREAM_MSG: ${{ env.UPSTREAM_MSG }}
+        run: |
+          BRANCH=${{ env.REF_COMMIT }}
+          BASE="${{ github.event.repository.default_branch }}"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git stash push -u -m "upstream-update"
+
+          if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+            git fetch origin "$BRANCH" "$BASE"
+            git checkout "$BRANCH"
+            git reset --hard "origin/$BASE"
+          else
+            git fetch origin "$BASE"
+            git checkout -b "$BRANCH"
+          fi
+
+          # 恢复修改
+          git stash pop
+          # 清理 Gradle apply 任务产生的嵌套 .git 目录，避免被当作 gitlink 提交
+          find . -mindepth 2 -name .git -type d -exec rm -rf {} + 2>/dev/null || true
+
+          # 如果要推送的分支已存在且内容一致，跳过推送
+          if git rev-parse "origin/$BRANCH" >/dev/null 2>&1; then
+            if git diff --quiet "origin/$BRANCH" --; then
+              echo "Remote branch $BRANCH is up to date, skipping push"
+              exit 0
+            fi
+          fi
+
+          git add -- '*.patch' 'gradle.properties'
+          printf '%s\n\n%s\n' "$TITLE" "$UPSTREAM_MSG" > /tmp/commit-msg.txt
+          git commit -F /tmp/commit-msg.txt
+          git push origin "$BRANCH" --force
+
+          # 查找已有的上游更新 PR
+          EXISTING=$(gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number // empty')
+          if [ -n "$EXISTING" ]; then
+            gh pr edit "$EXISTING" --title "$TITLE" --body-file /tmp/commit-msg.txt
+            echo "Updated existing PR #$EXISTING"
+          else
+            gh pr create \
+              --base "$BASE" \
+              --head "$BRANCH" \
+              --title "$TITLE" \
+              --body-file /tmp/commit-msg.txt
+            echo "Created new PR"
+          fi

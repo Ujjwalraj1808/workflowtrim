@@ -1,0 +1,43 @@
+name: Nix Flake
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  flake-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v31
+        with:
+          install_url: https://releases.nixos.org/nix/nix-2.35.2/install
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: Run nix flake check
+        run: nix flake check
+
+      - name: Run the packaged ubs
+        run: |
+          nix run . -- --version
+          nix run . -- --help >/dev/null
+
+      - name: Dev shell provides the documented tools
+        run: |
+          nix develop --command bash -c '
+            set -euo pipefail
+            for tool in bash shellcheck git jq rg uv python3 cmake; do
+              printf "%-10s %s\n" "$tool" "$(command -v "$tool")"
+            done
+            [ "${BASH_VERSINFO[0]}" -ge 4 ] || { echo "dev shell bash is ${BASH_VERSION}, need >= 4" >&2; exit 1; }
+            shellcheck --version | head -n 2
+          '
