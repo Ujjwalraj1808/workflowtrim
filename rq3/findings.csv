@@ -2569,7 +2569,7 @@ JuliusBrussee/caveman,release-binaries.yml,S3,build-sign-publish,repaired,
 JuliusBrussee/caveman,release-binaries.yml,S4,on.push,detect_only,
 JuliusBrussee/caveman,release-binaries.yml,S7,build-sign-publish,detect_only,
 JuliusBrussee/caveman,release-packages.yml,S3,build,repaired,
-JuliusBrussee/caveman,release-packages.yml,S3,python-gates,repaired,
+JuliusBrussee/caveman,release-packages.yml,S3,python-gates,skipped,pip requirements path is not a literal file path (variable or command substitution)
 JuliusBrussee/caveman,release-packages.yml,S3,publish-npm,skipped,install command does not imply a lock / requirements file (e.g. npm install)
 JuliusBrussee/caveman,release-packages.yml,S4,on.push,detect_only,
 JuliusBrussee/caveman,release-packages.yml,S7,build,detect_only,
@@ -2941,7 +2941,7 @@ NVIDIA-NeMo/Megatron-Bridge,cicd-main.yml,S1,Nemo_CICD_Test,repaired,
 NVIDIA-NeMo/Megatron-Bridge,cicd-main.yml,S1,Coverage_Fake,repaired,
 NVIDIA-NeMo/Megatron-Bridge,cicd-main.yml,S1,Coverage,repaired,
 NVIDIA-NeMo/Megatron-Bridge,cicd-main.yml,S3,lint-check,skipped,dependencies installed without a setup action (needs actions/cache)
-NVIDIA-NeMo/Megatron-Bridge,cicd-main.yml,S3,cicd-container-build,skipped,install command does not imply a lock / requirements file (e.g. npm install)
+NVIDIA-NeMo/Megatron-Bridge,cicd-main.yml,S3,cicd-container-build,skipped,job installs no dependencies (setup action only: likely a detector false positive)
 NVIDIA-NeMo/Megatron-Bridge,cicd-main.yml,S3,Coverage,skipped,dependencies installed without a setup action (needs actions/cache)
 NVIDIA-NeMo/Megatron-Bridge,cicd-main.yml,S4,on.push,detect_only,
 NVIDIA-NeMo/Megatron-Bridge,cicd-main.yml,S5,workflow,repaired,
@@ -5416,8 +5416,8 @@ Wei-Shaw/sub2api,release.yml,S1,build-frontend,repaired,
 Wei-Shaw/sub2api,release.yml,S1,build-binaries,repaired,
 Wei-Shaw/sub2api,release.yml,S1,release,repaired,
 Wei-Shaw/sub2api,release.yml,S1,sync-version-file,repaired,
-Wei-Shaw/sub2api,release.yml,S3,prepare,repaired,
-Wei-Shaw/sub2api,release.yml,S3,release,repaired,
+Wei-Shaw/sub2api,release.yml,S3,prepare,skipped,pip requirements path is not a literal file path (variable or command substitution)
+Wei-Shaw/sub2api,release.yml,S3,release,skipped,cache input set explicitly
 Wei-Shaw/sub2api,release.yml,S4,on.push,detect_only,
 Wei-Shaw/sub2api,release.yml,S7,prepare,detect_only,
 Wei-Shaw/sub2api,release.yml,S7,build-binaries,detect_only,
@@ -6861,7 +6861,7 @@ apmantza/pi-lens,pr-metadata.yml,S3,pr-body-lint,skipped,job installs no depende
 apmantza/pi-lens,pr-metadata.yml,S3,close-keyword-lint,skipped,job installs no dependencies (setup action only: likely a detector false positive)
 apmantza/pi-lens,pr-metadata.yml,S4,on.pull_request,detect_only,
 apmantza/pi-lens,pr-metadata.yml,S7,pr-body-lint,detect_only,
-apmantza/pi-lens,release.yml,S3,prepare,skipped,install command does not imply a lock / requirements file (e.g. npm install)
+apmantza/pi-lens,release.yml,S3,prepare,skipped,job installs no dependencies (setup action only: likely a detector false positive)
 apmantza/pi-lens,release.yml,S3,publish-npm,skipped,job installs no dependencies (setup action only: likely a detector false positive)
 apmantza/pi-lens,release.yml,S4,on.push,detect_only,
 apmantza/pi-lens,release.yml,S7,prepare,detect_only,
@@ -11568,14 +11568,14 @@ gem/oq-engine,engine_nightly_user.yml,S3,Run_demos_and_test_WebUI,skipped,job in
 gem/oq-engine,engine_nightly_user.yml,S4,on.push,detect_only,
 gem/oq-engine,engine_nightly_user.yml,S5,workflow,repaired,
 gem/oq-engine,engine_nightly_webui.yml,S1,server_impact_mode,repaired,
-gem/oq-engine,engine_nightly_webui.yml,S3,server_impact_mode,repaired,
+gem/oq-engine,engine_nightly_webui.yml,S3,server_impact_mode,skipped,pip requirements path is not a literal file path (variable or command substitution)
 gem/oq-engine,engine_nightly_webui.yml,S5,workflow,repaired,
 gem/oq-engine,engine_pr_test.yml,S1,changes,repaired,
 gem/oq-engine,engine_pr_test.yml,S2,workflow,repaired,
 gem/oq-engine,engine_pr_test.yml,S3,calculators,repaired,
 gem/oq-engine,engine_pr_test.yml,S3,hazardlib,repaired,
 gem/oq-engine,engine_pr_test.yml,S3,server,repaired,
-gem/oq-engine,engine_pr_test.yml,S3,server_UI,repaired,
+gem/oq-engine,engine_pr_test.yml,S3,server_UI,skipped,pip requirements path is not a literal file path (variable or command substitution)
 gem/oq-engine,engine_pr_test.yml,S4,on.pull_request,detect_only,
 gem/oq-engine,engine_pr_test.yml,S7,changes,detect_only,
 gem/oq-engine,engine_user_nightly_LTS.yml,S1,Scheduled_demos_and_WebUI,repaired,
@@ -11594,7 +11594,7 @@ gem/oq-engine,engine_weekly_test.yml,S3,hazardlib,skipped,install command does n
 gem/oq-engine,engine_weekly_test.yml,S3,server_public_mode,skipped,install command does not imply a lock / requirements file (e.g. npm install)
 gem/oq-engine,engine_weekly_test.yml,S3,server_read_only_mode,skipped,install command does not imply a lock / requirements file (e.g. npm install)
 gem/oq-engine,engine_weekly_test.yml,S3,server_aelo_mode,skipped,install command does not imply a lock / requirements file (e.g. npm install)
-gem/oq-engine,engine_weekly_test.yml,S3,server_impact_mode,repaired,
+gem/oq-engine,engine_weekly_test.yml,S3,server_impact_mode,skipped,pip requirements path is not a literal file path (variable or command substitution)
 gem/oq-engine,engine_weekly_test.yml,S5,workflow,repaired,
 gem/oq-engine,failure_workflow.yaml,S1,on-failure,repaired,
 gem/oq-engine,macos_arm_install.yml,S1,install_and_test,repaired,
@@ -11611,7 +11611,7 @@ gem/oq-engine,server_install.yaml,S1,Sever_Installation,repaired,
 gem/oq-engine,server_install.yaml,S3,Sever_Installation,skipped,job installs no dependencies (setup action only: likely a detector false positive)
 gem/oq-engine,server_install.yaml,S5,workflow,repaired,
 gem/oq-engine,ubuntu_install.yml,S1,install_and_test,repaired,
-gem/oq-engine,ubuntu_install.yml,S3,install_and_test,repaired,
+gem/oq-engine,ubuntu_install.yml,S3,install_and_test,skipped,install command does not imply a lock / requirements file (e.g. npm install)
 gem/oq-engine,upgrade_procedure.yml,S1,install_and_upgrade,repaired,
 gem/oq-engine,upgrade_procedure.yml,S3,install_and_upgrade,skipped,install command does not imply a lock / requirements file (e.g. npm install)
 gem/oq-engine,upgrade_procedure.yml,S4,on.push,detect_only,
@@ -18520,7 +18520,7 @@ microsoft/vscode,sessions-e2e.yml,S1,sessions-e2e,repaired,
 microsoft/vscode,sessions-e2e.yml,S3,sessions-e2e,repaired,
 microsoft/vscode,telemetry.yml,S1,check-metadata,repaired,
 microsoft/vscode,telemetry.yml,S2,workflow,repaired,
-microsoft/vscode,telemetry.yml,S3,check-metadata,repaired,
+microsoft/vscode,telemetry.yml,S3,check-metadata,skipped,install command does not imply a lock / requirements file (e.g. npm install)
 microsoft/vscode,telemetry.yml,S4,on.pull_request,detect_only,
 milvus-io/milvus,all-contributors.yaml,S1,contributor,repaired,
 milvus-io/milvus,claude-code-review.yml,S1,claude-review,repaired,
@@ -22294,7 +22294,7 @@ oracle/graal,codespell.yml,S4,on.push,detect_only,
 oracle/graal,codespell.yml,S4,on.pull_request,detect_only,
 oracle/graal,macaron-check-github-actions.yml,S1,analyze,repaired,
 oracle/graal,macaron-check-github-actions.yml,S2,workflow,repaired,
-oracle/graal,main.yml,S3,build-graalvm-linux,repaired,
+oracle/graal,main.yml,S3,build-graalvm-linux,skipped,pip requirements path is not a literal file path (variable or command substitution)
 oracle/graal,main.yml,S3,build-graalvm-windows,skipped,job installs no dependencies (setup action only: likely a detector false positive)
 oracle/graal,micronaut-future-defaults.yml,S2,workflow,repaired,
 oracle/graal,micronaut-template.yml,S1,build-and-test-micronaut,repaired,
@@ -28339,7 +28339,7 @@ yennanliu/CS_basics,deploy-pages.yml,S1,build,repaired,
 yennanliu/CS_basics,deploy-pages.yml,S1,deploy,repaired,
 yennanliu/CS_basics,java-syntax-check.yml,S1,java-syntax-check,repaired,
 yennanliu/CS_basics,java-syntax-check.yml,S2,workflow,repaired,
-yennanliu/CS_basics,java-syntax-check.yml,S3,java-syntax-check,skipped,install command does not imply a lock / requirements file (e.g. npm install)
+yennanliu/CS_basics,java-syntax-check.yml,S3,java-syntax-check,skipped,job installs no dependencies (setup action only: likely a detector false positive)
 yennanliu/CS_basics,python-syntax-check.yml,S1,python-syntax-check,repaired,
 yennanliu/CS_basics,python-syntax-check.yml,S2,workflow,repaired,
 yennanliu/CS_basics,python-syntax-check.yml,S3,python-syntax-check,skipped,job installs no dependencies (setup action only: likely a detector false positive)

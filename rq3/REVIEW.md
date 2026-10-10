@@ -2,7 +2,9 @@
 
 The automatic checks in `rq3_repair.py` show that a repaired file parses, that the repaired smell is gone, that jobs and steps are unchanged and that actionlint reports no new error. They cannot show that the workflow still **behaves** as the developers intended. This manual review covers that.
 
-`rq3/review.xlsx` holds a fixed random sample (seed 2026) of 20 single-smell repairs per repairable smell (S1, S2, S3, S5, S6, S8; fewer if a smell has fewer repairs), each with its unified diff. Label every row before looking at any other row's label, ideally by two reviewers independently (copy the file), then compare.
+`rq3/review.xlsx` holds a fixed random sample (seed 2027) of 20 single-smell repairs per repairable smell (S1, S2, S3, S5, S6, S8; fewer if a smell has fewer repairs), each with its unified diff and links to the file and repository at the snapshot commit. Label every row before looking at any other row's label, ideally by two reviewers independently (copy the file), then compare. Labels are assigned by the reviewers themselves, without LLM assistance.
+
+A first (pilot) sample drawn with seed 2026 was discarded: its labels had been produced with an LLM, so they could not be used as human labels, and the reviewers had seen them. The pilot revealed one repair defect (S3 cache path taken from commented-out commands or a non-literal pip requirements path), which was fixed before the final run. The 137 repairs shown in the pilot (listed in `rq3/pilot_sample.csv`) are excluded from the final sample.
 
 ## Label
 

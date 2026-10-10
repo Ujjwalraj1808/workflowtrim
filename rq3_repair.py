@@ -12,7 +12,8 @@ Writes
   rq3/findings.csv   every finding with its outcome: repaired / skipped (not safe) / detect_only
   rq3/repairs.csv    one row per (file, scope) that was repaired, with the checks and diff size
   rq3/review.xlsx    REVIEW_PER_SMELL random single-smell repairs per smell (seed SEED) with their diff,
-                     for the manual check described in rq3/REVIEW.md
+                     for the manual check described in rq3/REVIEW.md. Repairs listed in
+                     rq3/pilot_sample.csv (the discarded pilot sample, seed 2026) are not drawn again.
 and prints the RQ3 tables. Progress is saved per file in rq3/progress.jsonl, so an interrupted run
 continues where it stopped; `python rq3_repair.py --minutes 9` stops after about 9 minutes.
 """
@@ -33,7 +34,7 @@ from openpyxl.worksheet.datavalidation import DataValidation
 
 from ruamel.yaml import YAML, YAMLError
 
-from workflowtrim.repair import check, diff, repair
+from workflowtrim.repair import PIP_REQUIREMENTS, check, diff, repair, run_commands
 from workflowtrim.rules import SETUP_ACTIONS, detect, parse
 
 OUT = "rq3"
@@ -41,7 +42,7 @@ FILES = os.path.join(OUT, "files")
 REPAIRABLE = ["S1", "S2", "S3", "S5", "S6", "S8"]
 DETECT_ONLY = {"S4", "S7"}
 S1_TIMEOUT = 30
-SEED = 2026
+SEED = 2027   # 2026 drew the pilot sample, discarded (see rq3/REVIEW.md)
 REVIEW_PER_SMELL = 20
 CHECKS = ["parses", "smells_removed", "steps_unchanged", "no_new_actionlint_errors"]
 # a removed / rewritten line is part of the repair only if it holds a key that the repair edits
@@ -80,8 +81,13 @@ def skip_reason(text, smell, loc):
             return "dependencies installed without a setup action (needs actions/cache)"
         if any(isinstance(st.get("with"), dict) and "cache" in st["with"] for st in setup):
             return "cache input set explicitly"
-        if not INSTALL.search("\n".join(str(st.get("run", "")) for st in steps)):
+        run = run_commands(steps)
+        if not INSTALL.search(run):
             return "job installs no dependencies (setup action only: likely a detector false positive)"
+        m = PIP_REQUIREMENTS.search(run)
+        if (m and not re.fullmatch(r"[\w./-]+", m.group(1).strip("'\""))
+                and any(str(st.get("uses", "")).startswith("actions/setup-python") for st in setup)):
+            return "pip requirements path is not a literal file path (variable or command substitution)"
         return "install command does not imply a lock / requirements file (e.g. npm install)"
     if smell == "S5":
         return "every job already has an if condition"
@@ -230,20 +236,30 @@ def main():
     failed = [r for r in repairs if not all(r[4:8]) or (r[2] == "all" and not all(r[8:10]))]
     print(f"\n  Repairs failing a check: {len(failed)}" + (f" -> see rq3/repairs.csv" if failed else ""))
 
+    with open(os.path.join(OUT, "pilot_sample.csv"), newline="", encoding="utf-8") as f:
+        pilot = {(r["repo"], r["file"], r["smell"]) for r in csv.DictReader(f)}
     rng = random.Random(SEED)
     wb = Workbook()
     ws = wb.active
     ws.title = "review"
-    ws.append(["id", "repo", "file", "smell", "diff", "label", "note"])
+    # file_url / repo_url point at the snapshot commit, so reviewers see the same file and repository
+    ws.append(["id", "repo", "file", "smell", "diff", "label", "note", "file_url", "repo_url"])
     n = 0
     for smell in REPAIRABLE:
-        pool_ = sorted((c for c in candidates if c[2] == smell), key=lambda c: (c[0], c[1]))
+        pool_ = sorted((c for c in candidates if c[2] == smell and tuple(c[:3]) not in pilot),
+                       key=lambda c: (c[0], c[1]))
         for repo, name, s, d in rng.sample(pool_, min(REVIEW_PER_SMELL, len(pool_))):
             n += 1
-            ws.append([f"M{n:03d}", repo, name, s, d[:32000], "", ""])
+            commit = snap[repo]["commit"]
+            ws.append([f"M{n:03d}", repo, name, s, d[:32000], "", "",
+                       f"https://github.com/{repo}/blob/{commit}/.github/workflows/{name}",
+                       f"https://github.com/{repo}/tree/{commit}"])
     for row in ws.iter_rows(min_row=2):
-        row[4].alignment = Alignment(wrap_text=True, vertical="top")
-    ws.column_dimensions["E"].width = 100
+        for cell in row:
+            cell.alignment = Alignment(wrap_text=cell.column_letter in "EG", vertical="top")
+    for col, width in zip("ABCDEFGHI", (7, 24, 24, 6, 90, 11, 40, 14, 14)):
+        ws.column_dimensions[col].width = width
+    ws.freeze_panes = "B2"
     dv = DataValidation(type="list", formula1='"correct,incorrect,unsure"', allow_blank=True)
     ws.add_data_validation(dv)
     dv.add(f"F2:F{n + 1}")

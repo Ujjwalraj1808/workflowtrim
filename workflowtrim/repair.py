@@ -13,6 +13,7 @@ reported: S3 when the job's install command does not show which cache fits, or `
 explicitly; S6 when `push` already has a branches-ignore / tags / tags-ignore filter.
 """
 import difflib
+import functools
 import io
 import json
 import re
@@ -32,6 +33,12 @@ CANCEL_PR_ONLY = "${{ github.event_name == 'pull_request' }}"
 # neither serialized nor replaced while pending (GitHub cancels a pending run in the same group).
 CONCURRENCY_GROUP = "${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}"
 PIP_REQUIREMENTS = re.compile(r"pip3? install[^\n]*?(?:-r|--requirement)[ =]+([^\s;&|]+)")
+
+
+def run_commands(steps):
+    """The shell commands of a job's `run` steps, without comment lines."""
+    lines = "\n".join(str(s.get("run", "")) for s in steps).splitlines()
+    return "\n".join(l for l in lines if not l.lstrip().startswith("#"))
 
 
 def _yaml(text):
@@ -117,7 +124,8 @@ def _cache_input(action, run, earlier_uses):
     commands, or None when no choice is safe. setup-node and setup-python fail the job when the
     lock / requirements file for the chosen cache is missing, so only commands that imply that
     file are used: `npm ci` (needs package-lock.json), yarn with --frozen-lockfile / --immutable,
-    pnpm only after pnpm/action-setup (setup-node needs pnpm installed), pip with -r <file>."""
+    pnpm only after pnpm/action-setup (setup-node needs pnpm installed), pip with -r <literal file path>.
+    Commented-out shell lines are ignored (see run_commands)."""
     if action == "actions/setup-node":
         if re.search(r"\bnpm ci\b", run):
             return "npm", None
@@ -127,8 +135,11 @@ def _cache_input(action, run, earlier_uses):
             return "pnpm", None
     elif action == "actions/setup-python":
         m = PIP_REQUIREMENTS.search(run)
-        if m and "${{" not in m.group(1):
-            return "pip", m.group(1)
+        path = m.group(1).strip("'\"") if m else ""
+        # a literal file path only: setup-python does not expand shell or ${{ }} variables, and the
+        # lazy match can also catch another tool's -r (`pip install $(jq -r '...' f.json)`)
+        if re.fullmatch(r"[\w./-]+", path):
+            return "pip", path
     elif action == "actions/setup-java":
         if re.search(r"(^|[\s/])mvnw?\b", run):
             return "maven", None
@@ -148,7 +159,7 @@ def s3(wf, repo, branch):
                (str(s.get("uses", "")).startswith(SETUP_ACTIONS) and (s.get("with") or {}).get("cache"))
                for s in steps):
             continue
-        run = "\n".join(str(s.get("run", "")) for s in steps)
+        run = run_commands(steps)
         fixed = False
         for i, s in enumerate(steps):
             uses = str(s.get("uses", ""))
@@ -231,8 +242,8 @@ def s8(wf, repo, branch):
 REPAIRS = [s2, s3, s5, s6, s8]   # s1 needs a timeout, see repair()
 
 
-def repair(text, repo=None, default_branch=None, timeout=None):
-    """Apply all repairs. Returns (fixed_text, applied).
+def repair(text, repo=None, default_branch=None, timeout=None, smells=None):
+    """Apply all repairs, or only those in `smells` (e.g. {"S3"}). Returns (fixed_text, applied).
     S1 needs timeout (minutes, from run history), S5 needs repo, S6 needs default_branch.
     Files that are not valid YAML are returned unchanged (the detector skips them too)."""
     try:
@@ -242,14 +253,89 @@ def repair(text, repo=None, default_branch=None, timeout=None):
         return text, []
     if not isinstance(wf, dict):
         return text, []
-    applied = s1(wf, timeout) if timeout else []
+    applied = s1(wf, timeout) if timeout and (smells is None or "S1" in smells) else []
     for fix in REPAIRS:
+        if smells is not None and fix.__name__.upper() not in smells:
+            continue
         applied.extend(fix(wf, repo, default_branch))
     if not applied:
         return text, []
     buf = io.StringIO()
     y.dump(wf, buf)
-    return buf.getvalue(), applied
+    return _minimize(text, buf.getvalue()), applied
+
+
+def _indent(line):
+    return len(line) - len(line.lstrip(" "))
+
+
+_FAST_LOADER = getattr(pyyaml, "CSafeLoader", pyyaml.SafeLoader)   # libyaml when installed: same result, faster
+
+
+def _load(text):
+    try:
+        return True, pyyaml.load(text, Loader=_FAST_LOADER)
+    except pyyaml.YAMLError:
+        return False, None
+
+
+def _merge(old, new):
+    """Lines of a changed block: lines whose content is unchanged keep their original text; added lines
+    are shifted by the indentation difference of the closest kept line above them."""
+    out, shift = [], 0
+    key = lambda l: "".join(l.split())           # lines equal up to whitespace keep their original text
+    sm = difflib.SequenceMatcher(None, [key(l) for l in old], [key(l) for l in new], autojunk=False)
+    for op, i1, i2, j1, j2 in sm.get_opcodes():
+        if op == "equal":
+            for i, j in zip(range(i1, i2), range(j1, j2)):
+                out.append(old[i])
+                if new[j].strip():
+                    shift = _indent(old[i]) - _indent(new[j])
+        else:
+            for line in new[j1:j2]:
+                out.append(" " * max(0, _indent(line) + shift) + line.lstrip(" ") if line.strip() else line)
+            out.extend(l for l in old[i1:i2] if not l.strip())   # keep blank lines (no data)
+    return out
+
+
+def _minimize(original, fixed):
+    """ruamel rewrites some unrelated formatting (indentation style, spaces in flow collections, trailing
+    spaces, blank lines). Put back the original text of every changed block whose original form gives
+    exactly the same YAML data as the repaired file, so the diff shows only the repair."""
+    ok, target = _load(fixed)
+    if not ok:
+        return fixed
+    a, b = original.splitlines(), fixed.splitlines()
+    end = "\n" if original.endswith("\n") else ""
+    whole = "\n".join(_merge(a, b)) + end        # whole file at once: keeps a re-indented list consistent
+    chosen = []                                   # (old block, new block) per changed hunk
+    pieces = []
+    for op, i1, i2, j1, j2 in difflib.SequenceMatcher(None, a, b, autojunk=False).get_opcodes():
+        pieces.append(a[i1:i2] if op == "equal" else None)
+        if op != "equal":
+            chosen.append((len(pieces) - 1, a[i1:i2], b[j1:j2]))
+    current = {k: new for k, _, new in chosen}
+
+    def render():
+        lines = [l for k, p in enumerate(pieces) for l in (p if p is not None else current[k])]
+        return "\n".join(lines) + end
+
+    for k, old, new in chosen:
+        for candidate in (old, _merge(old, new)):
+            if candidate == current[k]:
+                continue
+            keep = current[k]
+            current[k] = candidate
+            if _load(render()) == (True, target):
+                break
+            current[k] = keep
+    candidates = [render()] + ([whole] if _load(whole) == (True, target) else [])
+    return min(candidates, key=lambda t: _changed_lines(original, t))
+
+
+def _changed_lines(original, fixed):
+    return sum(1 for l in difflib.unified_diff(original.splitlines(), fixed.splitlines(), lineterm="", n=0)
+               if l[:1] in "+-" and l[:3] not in ("+++", "---"))
 
 
 def diff(original, fixed, name="workflow.yml"):
@@ -263,6 +349,7 @@ def _skeleton(text):
             for job, cfg in ((wf.get("jobs") or {}).items()) if isinstance(cfg, dict)]
 
 
+@functools.lru_cache(maxsize=4096)
 def actionlint_errors(text):
     """Set of (kind, message) that actionlint reports for a workflow text.
     Line numbers are left out because a repair shifts lines."""

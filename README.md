@@ -112,7 +112,7 @@ python rq3_repair.py --minutes 9     # same, stopping after 9 minutes; run again
 
 `rq3_snapshot.py` makes a sparse, shallow clone of each included repository and copies `.github/workflows/*.yml|yaml` to `rq3/files/`; `rq3/snapshot.csv` records the commit SHA and date of each snapshot. `rq3_repair.py` repairs each smell in isolation and all smells together (S1 with a fixed 30-minute timeout, since no run history is used here; S4 and S7 are detect-only), and checks that the result parses, the repaired smell is gone, jobs and steps are unchanged, actionlint reports no new error, a second repair changes nothing and no new smell appears. Progress is saved in `rq3/progress.jsonl`, so the run can be stopped and continued.
 
-Outputs: `rq3/findings.csv` (every finding: repaired, skipped with reason, or detect-only), `rq3/repairs.csv` (checks and diff size per file and scope) and `rq3/review.xlsx` (a fixed random sample of 20 diffs per repairable smell for manual review, see [rq3/REVIEW.md](rq3/REVIEW.md)).
+Outputs: `rq3/findings.csv` (every finding: repaired, skipped with reason, or detect-only), `rq3/repairs.csv` (checks and diff size per file and scope) and `rq3/review.xlsx` (a fixed random sample of 20 diffs per repairable smell for manual review, see [rq3/REVIEW.md](rq3/REVIEW.md); `rq3/pilot_sample.csv` lists the discarded pilot sample, which is excluded).
 
 ## Running the tests
 

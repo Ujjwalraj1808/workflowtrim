@@ -87,6 +87,27 @@ def test_s3_skipped_when_cache_choice_is_not_safe():
         assert "S3" not in {s for s, _ in repair(_job(steps))[1]}
 
 
+def test_s3_ignores_commented_out_install_commands():
+    # gem/oq-engine: the only `pip install -r` is a shell comment, and `npm ci` likewise
+    for steps in (["- uses: actions/setup-python@v5", "- run: |", "    #pip3 install -r requirements.txt", "    python install.py"],
+                  ["- uses: actions/setup-node@v4", "- run: |", "    # npm ci", "    npm install"]):
+        assert "S3" not in {s for s, _ in repair(_job(steps))[1]}
+
+
+def test_s3_pip_skipped_when_requirements_path_uses_a_shell_variable():
+    # setup-python does not expand shell variables, so the file would not be found
+    for cmd in ("pip install -r requirements-$PY_VER.txt", "pip install -r requirements-${PY_VER}.txt",
+                'pip install -r "$GITHUB_WORKSPACE/req.txt"',
+                "pip install $(jq -r '[.pip | keys[]] | join(\" \")' common.json)"):   # oracle/graal: -r of jq
+        steps = ["- uses: actions/setup-python@v5", "- run: |", f"    {cmd}"]
+        assert "S3" not in {s for s, _ in repair(_job(steps))[1]}
+
+
+def test_s3_pip_requirements_path_without_quotes():
+    fixed, _ = repair(_job(["- uses: actions/setup-python@v5", "- run: pip install -r \"ci/requirements.txt\""]))
+    assert "cache-dependency-path: ci/requirements.txt" in fixed
+
+
 def test_s3_pnpm_after_pnpm_setup():
     fixed, _ = repair(_job(["- uses: pnpm/action-setup@v4", "- uses: actions/setup-node@v4", "- run: pnpm install"]))
     assert "cache: pnpm" in fixed
