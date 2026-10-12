@@ -18,6 +18,7 @@ S3, S4, S5 need extra data (commit file lists, fork runs, install-step times)
 and are not estimated here.
 """
 import math
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 
@@ -44,14 +45,17 @@ def _api(url):
     return r.json()
 
 
-def fetch_runs(repo, days=90, max_runs=MAX_RUNS):
-    """Most recent completed runs (newest first) within `days`, at most max_runs."""
-    since = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
+def fetch_runs(repo, days=90, max_runs=MAX_RUNS, until=None):
+    """Most recent completed runs (newest first) within `days`, at most max_runs.
+    until: "YYYY-MM-DD", end of the window (default: now), e.g. the date of a workflow snapshot."""
+    end = datetime.strptime(until, "%Y-%m-%d").replace(tzinfo=timezone.utc) if until else datetime.now(timezone.utc)
+    since = (end - timedelta(days=days)).strftime("%Y-%m-%d")
+    created = f"{since}..{until}" if until else f">={since}"
     runs = []
     page = 1
     while len(runs) < max_runs:
         data = _api(f"{API}/repos/{repo}/actions/runs?status=completed&per_page=100"
-                    f"&page={page}&created=>={since}")
+                    f"&page={page}&created={created}")
         batch = data.get("workflow_runs", [])
         runs.extend(batch)
         if len(batch) < 100:
@@ -61,7 +65,22 @@ def fetch_runs(repo, days=90, max_runs=MAX_RUNS):
 
 
 def fetch_jobs(repo, run_id):
-    return _api(f"{API}/repos/{repo}/actions/runs/{run_id}/jobs?per_page=100").get("jobs", [])
+    """All jobs of a run (large matrix runs have more than one page)."""
+    jobs, page = [], 1
+    while True:
+        data = _api(f"{API}/repos/{repo}/actions/runs/{run_id}/jobs?per_page=100&page={page}")
+        jobs.extend(data.get("jobs", []))
+        if len(jobs) >= data.get("total_count", 0) or not data.get("jobs"):
+            return jobs
+        page += 1
+
+
+def job_name_pattern(name):
+    """Regex for the names GitHub gives the runs of a workflow job whose display name is `name`
+    (the job's `name:` or, without one, its key): ${{ }} expressions are filled in at run time and
+    matrix jobs get a " (values)" suffix."""
+    parts = re.split(r"\$\{\{.*?\}\}", name)
+    return re.compile(".+".join(re.escape(p) for p in parts) + r"( \(.*\))?")
 
 
 def _os(job):
@@ -93,11 +112,15 @@ def timeouts_from_runs(completed, multiplier=TIMEOUT_MULTIPLIER):
     return out
 
 
-def estimate_from_runs(runs, jobs_by_run, smells_by_file, multiplier=TIMEOUT_MULTIPLIER):
+def estimate_from_runs(runs, jobs_by_run, smells_by_file, multiplier=TIMEOUT_MULTIPLIER, s1_job_names=None):
     """runs: run dicts from the API; jobs_by_run: {run_id: [job dicts]};
     smells_by_file: {"ci.yml": {"S1", "S2"}}.
+    s1_job_names: optional {"ci.yml": [display names of the jobs with S1]}; when given, S1 counts only
+    those jobs (a job that already has timeout-minutes is not changed by the repair).
     Returns {"runs", "from", "to", "timeouts": {file: minutes}, "S1": {...}, "S2": {...},
-    "minutes", "cost_usd"}."""
+    "minutes", "cost_usd" (S1 and S2 together; minutes both would save are counted once),
+    "job_minutes" (all finished jobs)}."""
+    patterns = {f: [job_name_pattern(n) for n in names] for f, names in (s1_job_names or {}).items()}
     completed = []
     for run in runs:
         jobs = []
@@ -106,7 +129,7 @@ def estimate_from_runs(runs, jobs_by_run, smells_by_file, multiplier=TIMEOUT_MUL
                 start, end = _ts(j["started_at"]), _ts(j["completed_at"])
                 if end > start:
                     jobs.append({"start": start, "end": end, "conclusion": j.get("conclusion"),
-                                 "rate": RATES[_os(j)]})
+                                 "rate": RATES[_os(j)], "name": j.get("name", "")})
         if not jobs:
             continue
         head_repo = (run.get("head_repository") or {}).get("full_name") or ""
@@ -115,15 +138,20 @@ def estimate_from_runs(runs, jobs_by_run, smells_by_file, multiplier=TIMEOUT_MUL
                           "created": _ts(run["created_at"]), "jobs": jobs})
 
     timeouts = timeouts_from_runs(completed, multiplier)
+    cut = {}   # id(job) -> earliest time a repair would have stopped it (S1 and S2 can both apply)
     s1_jobs, s1_min, s1_cost = 0, 0.0, 0.0
     for run in completed:
         timeout = timeouts.get(run["file"])
         if timeout is None or "S1" not in smells_by_file.get(run["file"], ()):
             continue
         for j in run["jobs"]:
+            if s1_job_names is not None and not any(p.fullmatch(j["name"]) for p in patterns.get(run["file"], [])):
+                continue
             if j["conclusion"] in ("failure", "cancelled", "timed_out"):
                 minutes = (j["end"] - j["start"]).total_seconds() / 60
                 if minutes > timeout:
+                    stop = j["start"] + timedelta(minutes=timeout)
+                    cut[id(j)] = (min(stop, cut[id(j)][0]) if id(j) in cut else stop, j)
                     s1_jobs += 1
                     s1_min += minutes - timeout
                     s1_cost += (minutes - timeout) * j["rate"]
@@ -139,6 +167,7 @@ def estimate_from_runs(runs, jobs_by_run, smells_by_file, multiplier=TIMEOUT_MUL
             wasted = 0.0
             for j in prev["jobs"]:
                 if j["end"] > cur["start"]:
+                    cut[id(j)] = (min(cur["start"], cut[id(j)][0]) if id(j) in cut else cur["start"], j)
                     minutes = (j["end"] - max(j["start"], cur["start"])).total_seconds() / 60
                     wasted += minutes
                     s2_cost += minutes * j["rate"]
@@ -146,6 +175,10 @@ def estimate_from_runs(runs, jobs_by_run, smells_by_file, multiplier=TIMEOUT_MUL
                 s2_overlaps += 1
                 s2_min += wasted
 
+    # together: each job's minutes after its earliest stop (or after its start, if it started later),
+    # so minutes both repairs save count once
+    total_min = sum((j["end"] - max(stop, j["start"])).total_seconds() / 60 for stop, j in cut.values())
+    total_cost = sum((j["end"] - max(stop, j["start"])).total_seconds() / 60 * j["rate"] for stop, j in cut.values())
     dates = [r["created"] for r in completed]
     return {
         "runs": len(completed),
@@ -154,8 +187,10 @@ def estimate_from_runs(runs, jobs_by_run, smells_by_file, multiplier=TIMEOUT_MUL
         "timeouts": timeouts,
         "S1": {"jobs": s1_jobs, "minutes": round(s1_min, 1), "cost_usd": round(s1_cost, 2)},
         "S2": {"overlaps": s2_overlaps, "minutes": round(s2_min, 1), "cost_usd": round(s2_cost, 2)},
-        "minutes": round(s1_min + s2_min, 1),
-        "cost_usd": round(s1_cost + s2_cost, 2),
+        "minutes": round(total_min, 1),
+        "cost_usd": round(total_cost, 2),
+        "job_minutes": round(sum((j["end"] - j["start"]).total_seconds() / 60
+                                 for run in completed for j in run["jobs"]), 1),
     }
 
 

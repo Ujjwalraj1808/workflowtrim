@@ -15,15 +15,32 @@ def _headers():
 
 
 def _get_with_backoff(url, headers):
-    """GET, but on 429 wait (Retry-After, else 60s) and retry, up to 5 times."""
-    for _ in range(5):
-        r = requests.get(url, headers=headers, timeout=30)
-        if r.status_code != 429:
-            return r
-        wait = int(r.headers.get("Retry-After", 60))
-        print(f"      429 rate limited, waiting {wait}s")
-        time.sleep(wait)
-    return r
+    """GET with retries, up to 5 attempts:
+    429 or 403 "secondary rate limit": wait Retry-After (else 60s);
+    network error (timeout, dropped connection, response cut off) or 5xx server error: wait 30s."""
+    for attempt in range(5):
+        last = attempt == 4
+        try:
+            r = requests.get(url, headers=headers, timeout=30)
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout,
+                requests.exceptions.ChunkedEncodingError):
+            if last:
+                raise
+            print("      network error, retrying in 30s")
+            time.sleep(30)
+            continue
+        if r.status_code == 429 or (r.status_code == 403 and "secondary rate limit" in r.text.lower()):
+            if last:
+                return r
+            wait = int(r.headers.get("Retry-After", 60))
+            print(f"      rate limited, waiting {wait}s")
+            time.sleep(wait)
+            continue
+        if r.status_code >= 500 and not last:
+            print(f"      GitHub server error {r.status_code}, retrying in 30s")
+            time.sleep(30)
+            continue
+        return r
 
 
 def fetch_workflows(repo):

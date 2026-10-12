@@ -114,6 +114,15 @@ python rq3_repair.py --minutes 9     # same, stopping after 9 minutes; run again
 
 Outputs: `rq3/findings.csv` (every finding: repaired, skipped with reason, or detect-only), `rq3/repairs.csv` (checks and diff size per file and scope) and `rq3/review.xlsx` (a fixed random sample of 20 diffs per repairable smell for manual review, see [rq3/REVIEW.md](rq3/REVIEW.md); `rq3/pilot_sample.csv` lists the discarded pilot sample, which is excluded).
 
+## RQ4: savings in real run history
+
+```
+python rq4_savings.py            # selects repositories, downloads their run history (needs GITHUB_TOKEN), prints the tables
+python rq4_savings.py report     # tables only, from the downloaded data
+```
+
+Repositories of the RQ3 snapshot with an S1 or S2 finding are shuffled per stratum (seed 2026) and checked in that order; the first 10 per stratum with at least 100 completed runs in the 90 days before the snapshot date are used, whatever their savings; a repository whose run history cannot be downloaded (deleted, made private) is recorded in `rq4/raw/*.error.txt` and replaced by the next candidate. For each, the newest 500 completed runs in that window and their jobs are saved in `rq4/raw/`, with the date of the last commit that changed each smelly workflow file. The detector is then run on every version of each smelly file committed in the window: the file's runs are used from the date since which its S1 jobs and S2 have been as in the snapshot without interruption (filter `smells_unchanged`; a commit that does not change them, such as an action version bump, does not cut the history). The stricter filter `file_unchanged` (only runs after the file's last change) is reported for comparison. S1 counts only the jobs that have the smell, and minutes that both repairs would save are counted once in the total. The S1 timeout multiplier is varied (1.25, 1.5, 2.0). Outputs: `rq4/candidates.csv` (every repository checked, with its run count) and `rq4/savings.csv` (per repository, filter and multiplier: runs, days covered, job-minutes, S1 and S2 waste, waste as % of job-minutes, minutes and list-price cost per 30 days). Costs are GitHub-hosted list prices; public repositories do not pay for these minutes, and self-hosted runners are priced like GitHub-hosted ones. The script waits for the API rate limit and can be stopped and run again.
+
 ## Running the tests
 
 ```
@@ -137,12 +146,14 @@ rq2_score.py    RQ2 agreement and precision / recall / F1
 ANNOTATION.md   RQ2 annotation protocol
 rq3_snapshot.py RQ3 snapshot of the dataset's workflow files
 rq3_repair.py   RQ3 repair coverage, safety checks and review sample
+rq4_savings.py  RQ4 repository selection, run-history download, savings tables
 summarize.py    prevalence tables from the CSVs
 test_rules.py   detector tests
 test_repair.py  repairer tests
 test_savings.py savings estimator tests
 test_collect.py exclusion rule tests
 test_rq2.py     kappa tests
+test_rq4.py     RQ4 run filter tests
 ```
 
 ## Authors
