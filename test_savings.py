@@ -22,7 +22,7 @@ def test_s2_overlap_sums_job_minutes_after_next_run_starts():
                 job("10:00:00", "10:05:00")],                # ended before -> 0
             2: [job("10:10:00", "10:30:00")]}
     r = estimate_from_runs(runs, jobs, {"ci.yml": {"S2"}})
-    assert r["S2"] == {"overlaps": 1, "minutes": 15.0, "cost_usd": round(15 * 0.008, 2)}
+    assert r["S2"] == {"overlaps": 1, "minutes": 15.0, "cost_usd": round(15 * 0.006, 2)}
     assert r["from"] == "2026-09-01" and r["runs"] == 2
 
 
@@ -42,11 +42,11 @@ def test_s2_ignores_push_runs():
 def test_s1_counts_failed_jobs_beyond_history_timeout_with_os_rate():
     runs = [run(1, "ci.yml", "10:00:00")]
     jobs = {1: [job("10:00:00", "10:20:00")] * 20 +                          # P95 20 min -> timeout 30
-               [job("10:00:00", "10:50:00", "failure", ["windows-latest"]),  # 20 min saved @0.016
+               [job("10:00:00", "10:50:00", "failure", ["windows-latest"]),  # 20 min saved @0.010
                 job("10:00:00", "10:20:00", "cancelled")]}                   # under 30 -> nothing
     r = estimate_from_runs(runs, jobs, {"ci.yml": {"S1"}})
     assert r["timeouts"] == {"ci.yml": 30}
-    assert r["S1"] == {"jobs": 1, "minutes": 20.0, "cost_usd": 0.32}
+    assert r["S1"] == {"jobs": 1, "minutes": 20.0, "cost_usd": 0.2}
 
 
 def _completed(minutes, n, file="ci.yml"):
@@ -158,7 +158,7 @@ def test_minutes_saved_by_both_repairs_are_counted_once():
     assert r["S1"]["minutes"] == 30.0
     assert r["S2"]["minutes"] == 40.0             # the 20 successful jobs ended when run 2 started
     assert r["minutes"] == 40.0
-    assert r["cost_usd"] == round(40 * 0.008, 2)
+    assert r["cost_usd"] == round(40 * 0.006, 2)
 
 
 def test_together_counts_a_job_that_started_after_the_next_run_only_from_its_start():

@@ -28,7 +28,7 @@ TIMEOUT_MULTIPLIER = 1.5  # S1 timeout = multiplier x P95 successful job duratio
 MIN_SAMPLES = 20          # successful jobs needed before a timeout is derived
 MIN_TIMEOUT = 10          # minutes; short jobs vary a lot relative to their length
 GITHUB_DEFAULT_TIMEOUT = 360
-RATES = {"linux": 0.008, "windows": 0.016, "macos": 0.08}   # USD per minute, GitHub-hosted
+RATES = {"linux": 0.006, "windows": 0.010, "macos": 0.062}   # USD per minute, GitHub-hosted standard runners (list price since 1 Jan 2026)
 MAX_RUNS = 300            # one extra API call per run (jobs)
 WORKERS = 8               # parallel jobs requests
 

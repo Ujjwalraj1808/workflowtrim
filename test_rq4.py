@@ -23,7 +23,7 @@ def test_only_runs_after_the_files_last_change_are_used():
                     "4": _job("2026-09-02T10:10:00Z", "2026-09-02T10:30:00Z")}}
     e = analyse(raw, {"ci.yml": {"S2"}}, {}, 1.5)
     assert e["runs"] == 2 and e["job_minutes"] == 40.0
-    assert e["S2"] == {"overlaps": 1, "minutes": 10.0, "cost_usd": 0.08}
+    assert e["S2"] == {"overlaps": 1, "minutes": 10.0, "cost_usd": 0.06}
     assert e["days"] == 1.0
 
 

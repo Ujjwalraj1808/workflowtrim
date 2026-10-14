@@ -75,7 +75,7 @@ Enter a repository, click **Analyze**: summary metrics, a smell distribution cha
 - **S2:** for consecutive `pull_request` runs of the same workflow file on the same branch, the job-minutes of the earlier run that were still executing after the next run started, i.e. what the S2 repair would have stopped.
 - **S1:** per workflow file, timeout = max(10, ceil(1.5 × P95 of successful job durations)), from at least 20 successful jobs (the same value the S1 repair writes). For failed, cancelled or timed-out jobs longer than it, the minutes beyond it. The multiplier is a parameter (`estimate_from_runs(..., multiplier=...)`) for sensitivity analysis.
 - Only workflow files in which the smell was detected are counted.
-- **Cost:** minutes × GitHub-hosted runner rate by OS, taken from the job labels (Linux $0.008, Windows $0.016, macOS $0.08 per minute).
+- **Cost:** minutes × GitHub-hosted runner rate by OS, taken from the job labels (Linux $0.006, Windows $0.010, macOS $0.062 per minute; GitHub list price for standard hosted runners since 1 Jan 2026).
 - S3, S4 and S5 are not estimated: they need data the run history does not provide (per-run changed files, fork runs, install-step timings).
 
 Jobs are fetched with 8 parallel requests. In the web UI, results are cached on disk per repository per day, so analysing the same repository again on the same day is instant, also after a Streamlit restart (clear with **⋮ → Clear cache**).
