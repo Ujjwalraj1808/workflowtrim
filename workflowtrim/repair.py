@@ -10,12 +10,14 @@ S1 is repaired only when a timeout derived from the repository's run history is 
 (savings.timeouts_from_runs); without run history there is no safe value.
 Repairs that cannot be made safely from the workflow file alone are skipped and the smell stays
 reported: S3 when the job's install command does not show which cache fits, or `cache:` is set
-explicitly; S6 when `push` already has a branches-ignore / tags / tags-ignore filter.
+explicitly; S6 when `push` already has a branches-ignore / tags / tags-ignore filter; S8 when
+`retention-days` is set explicitly (the developers chose that period).
 """
 import difflib
 import functools
 import io
 import json
+import posixpath
 import re
 import shutil
 import subprocess
@@ -39,6 +41,53 @@ def run_commands(steps):
     """The shell commands of a job's `run` steps, without comment lines."""
     lines = "\n".join(str(s.get("run", "")) for s in steps).splitlines()
     return "\n".join(l for l in lines if not l.lstrip().startswith("#"))
+
+
+GRADLE_CACHE_ACTIONS = ("gradle/gradle-build-action", "gradle/actions/setup-gradle")
+
+
+def _norm_dir(d):
+    """Repository-relative directory ('' = root), or None when it is not a literal path."""
+    d = str(d or "").strip().strip("'\"")
+    if not d:
+        return ""
+    if "$" in d or d.startswith(("/", "~")):
+        return None
+    d = posixpath.normpath(d)
+    return "" if d == "." else (None if d.startswith("..") else d)
+
+
+def run_lines(wf, job, steps):
+    """(directory, command) for every shell command of a job's `run` steps, comment lines dropped.
+    The directory comes from `working-directory` (step, then job and workflow `defaults.run`) and
+    from `cd <dir>` commands earlier in the same script; None when it is not a literal path
+    (an expression such as ${{ matrix.dir }} or a shell variable). `(cd x && ...)` is local to its line."""
+    def default(obj):
+        d = obj.get("defaults") if isinstance(obj, dict) else None
+        r = d.get("run") if isinstance(d, dict) else None
+        return r.get("working-directory") if isinstance(r, dict) else None
+    base = default(job) or default(wf)
+    out = []
+    for s in steps:
+        if "run" not in s:
+            continue
+        cur = _norm_dir(s.get("working-directory") or base)
+        for line in str(s.get("run", "")).splitlines():
+            if line.lstrip().startswith("#"):
+                continue
+            local = line.lstrip().startswith("(")
+            here = cur
+            for seg in re.split(r"&&|;|\|\|", line.strip().lstrip("(").rstrip(")")):
+                seg = seg.strip()
+                m = re.fullmatch(r"cd\s+(\S+)", seg)
+                if m:
+                    target = _norm_dir(m.group(1))
+                    here = None if here is None or target is None else _norm_dir(posixpath.join(here, target) if here else target)
+                elif seg:
+                    out.append((here, seg))
+            if not local:
+                cur = here
+    return out
 
 
 def _yaml(text):
@@ -119,35 +168,64 @@ def s2(wf, repo, branch):
     return [("S2", "workflow")]
 
 
-def _cache_input(action, run, earlier_uses):
+LOCK_FILES = {"npm": "package-lock.json", "yarn": "yarn.lock", "pnpm": "pnpm-lock.yaml"}
+
+
+def _cache_input(action, lines, earlier_uses, with_=None):
     """(cache, cache-dependency-path or None) for a setup action, chosen from the job's install
     commands, or None when no choice is safe. setup-node and setup-python fail the job when the
     lock / requirements file for the chosen cache is missing, so only commands that imply that
     file are used: `npm ci` (needs package-lock.json), yarn with --frozen-lockfile / --immutable,
     pnpm only after pnpm/action-setup (setup-node needs pnpm installed), pip with -r <literal file path>.
-    Commented-out shell lines are ignored (see run_commands)."""
+    `lines` are (directory, command) pairs (see run_lines): when the install command runs in a
+    subdirectory, the lock / requirements file is looked up there (cache-dependency-path); when the
+    directory is not a literal path the repair is skipped. A setup-gradle / gradle-build-action step
+    already caches Gradle, and setup-node's `package-manager-cache: false` switches caching off on
+    purpose: both are respected."""
+    def first(pattern):
+        return next(((d, c) for d, c in lines if re.search(pattern, c)), None)
+
+    def in_dir(d, file):
+        return file if d == "" else f"{d}/{file}"
+
+    with_ = with_ if isinstance(with_, dict) else {}
     if action == "actions/setup-node":
-        if re.search(r"\bnpm ci\b", run):
-            return "npm", None
-        if re.search(r"\byarn\b[^\n]*--(frozen-lockfile|immutable)\b", run):
-            return "yarn", None
-        if re.search(r"\bpnpm (i|install)\b", run) and any(u.startswith("pnpm/action-setup") for u in earlier_uses):
-            return "pnpm", None
+        if str(with_.get("package-manager-cache", "")).lower() == "false":
+            return None
+        for cache, pattern in (("npm", r"\bnpm ci\b"), ("yarn", r"\byarn\b.*--(frozen-lockfile|immutable)\b"),
+                               ("pnpm", r"\bpnpm (i|install)\b")):
+            hit = first(pattern)
+            if not hit:
+                continue
+            if cache == "pnpm" and not any(u.startswith("pnpm/action-setup") for u in earlier_uses):
+                return None
+            d = hit[0]
+            if d is None:
+                return None
+            return cache, (None if d == "" else in_dir(d, LOCK_FILES[cache]))
     elif action == "actions/setup-python":
-        m = PIP_REQUIREMENTS.search(run)
-        path = m.group(1).strip("'\"") if m else ""
-        # a literal file path only: setup-python does not expand shell or ${{ }} variables, and the
-        # lazy match can also catch another tool's -r (`pip install $(jq -r '...' f.json)`)
-        if re.fullmatch(r"[\w./-]+", path):
-            return "pip", path
+        for d, c in lines:
+            m = PIP_REQUIREMENTS.search(c)
+            if not m:
+                continue
+            path = m.group(1).strip("'\"")
+            # a literal file path only: setup-python does not expand shell or ${{ }} variables, and the
+            # lazy match can also catch another tool's -r (`pip install $(jq -r '...' f.json)`)
+            if d is None or not re.fullmatch(r"[\w./-]+", path):
+                return None
+            return "pip", posixpath.normpath(in_dir(d, path))
     elif action == "actions/setup-java":
-        if re.search(r"(^|[\s/])mvnw?\b", run):
+        if first(r"(^|[\s/])mvnw?\b"):
             return "maven", None
-        if re.search(r"(^|[\s/])gradlew?\b", run):
+        if first(r"(^|[\s/])gradlew?\b"):
             return "gradle", None
     elif action == "actions/setup-go":
-        if re.search(r"\bgo (build|test|vet|install|run|mod download|generate)\b", run):
-            return True, None
+        hit = first(r"\bgo (build|test|vet|install|run|mod download|generate)\b")
+        if hit:
+            d = hit[0]
+            if d is None:
+                return None
+            return True, (None if d == "" else in_dir(d, "go.sum"))
     return None
 
 
@@ -159,14 +237,18 @@ def s3(wf, repo, branch):
                (str(s.get("uses", "")).startswith(SETUP_ACTIONS) and (s.get("with") or {}).get("cache"))
                for s in steps):
             continue
-        run = run_commands(steps)
+        lines = run_lines(wf, job, steps)
+        all_uses = [str(p.get("uses", "")) for p in steps]
+        gradle_cached = any(u.startswith(GRADLE_CACHE_ACTIONS) for u in all_uses)
         fixed = False
         for i, s in enumerate(steps):
             uses = str(s.get("uses", ""))
             action = next((a for a in SETUP_ACTIONS if uses.startswith(a)), None)
             if not action or (isinstance(s.get("with"), dict) and "cache" in s["with"]):
                 continue   # not a setup action, or cache set explicitly (e.g. `cache: false`): respect it
-            choice = _cache_input(action, run, [str(p.get("uses", "")) for p in steps[:i]])
+            if action == "actions/setup-java" and gradle_cached and not any(re.search(r"(^|[\s/])mvnw?\b", c) for _, c in lines):
+                continue   # a Gradle action in the job already manages the Gradle cache
+            choice = _cache_input(action, lines, all_uses[:i], s.get("with"))
             if choice is None:
                 continue
             cache, dependency_path = choice
@@ -223,14 +305,8 @@ def s8(wf, repo, branch):
             if not str(s.get("uses", "")).startswith("actions/upload-artifact"):
                 continue
             with_ = s.get("with")
-            days = with_.get("retention-days") if isinstance(with_, dict) else None
-            if days is not None:
-                try:
-                    days = int(days)
-                except (TypeError, ValueError):
-                    continue
-                if days <= 30:
-                    continue
+            if isinstance(with_, dict) and "retention-days" in with_:
+                continue   # set explicitly by the developers (e.g. 90 days for a release bundle): keep it
             if not isinstance(with_, dict):
                 with_ = CommentedMap()
                 s["with"] = with_

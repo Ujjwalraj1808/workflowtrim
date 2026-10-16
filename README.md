@@ -172,6 +172,8 @@ test_stats.py   Holm correction and Wilson interval tests
 
 ## Citation
 
+**Changes after v1.0 (repair v0.9, not used for the paper's results).** Fixes for the incorrect repairs found in the RQ3 manual review: S3 points `cache-dependency-path` at the lock / requirements file in the directory the install runs in (`working-directory`, `defaults.run.working-directory`, or an earlier `cd dir`), and is skipped when that directory is an expression or a shell variable, when a Gradle action (`gradle/actions/setup-gradle`, `gradle/gradle-build-action`) already caches, and when setup-node has `package-manager-cache: false`; S8 keeps a `retention-days` value that the developers set explicitly and only adds one when it is missing. The detector rules are unchanged (v0.4).
+
 Version v1.0 (the version used for the results in the paper) is archived on Zenodo: [10.5281/zenodo.23417010](https://doi.org/10.5281/zenodo.23417010). To cite all versions, use [10.5281/zenodo.23417009](https://doi.org/10.5281/zenodo.23417009), which always resolves to the latest one. See [CITATION.cff](CITATION.cff).
 
 ## License

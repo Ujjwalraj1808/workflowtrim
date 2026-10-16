@@ -34,7 +34,7 @@ from openpyxl.worksheet.datavalidation import DataValidation
 
 from ruamel.yaml import YAML, YAMLError
 
-from workflowtrim.repair import PIP_REQUIREMENTS, check, diff, repair, run_commands
+from workflowtrim.repair import GRADLE_CACHE_ACTIONS, PIP_REQUIREMENTS, check, diff, repair, run_commands, run_lines
 from workflowtrim.rules import SETUP_ACTIONS, detect, parse
 
 OUT = "rq3"
@@ -81,7 +81,14 @@ def skip_reason(text, smell, loc):
             return "dependencies installed without a setup action (needs actions/cache)"
         if any(isinstance(st.get("with"), dict) and "cache" in st["with"] for st in setup):
             return "cache input set explicitly"
+        if any(isinstance(st.get("with"), dict) and str(st["with"].get("package-manager-cache", "")).lower() == "false"
+               for st in setup):
+            return "package-manager-cache: false set explicitly"
+        if any(str(st.get("uses", "")).startswith(GRADLE_CACHE_ACTIONS) for st in steps):
+            return "a Gradle action (setup-gradle / gradle-build-action) already caches"
         run = run_commands(steps)
+        if any(d is None and INSTALL.search(c) for d, c in run_lines(wf, wf["jobs"][loc], steps)):
+            return "install runs in a directory that is not a literal path (expression or variable)"
         if not INSTALL.search(run):
             return "job installs no dependencies (setup action only: likely a detector false positive)"
         m = PIP_REQUIREMENTS.search(run)
@@ -93,6 +100,8 @@ def skip_reason(text, smell, loc):
         return "every job already has an if condition"
     if smell == "S6":
         return "push already has branches-ignore / tags / tags-ignore"
+    if smell == "S8":
+        return "retention-days set explicitly by the developers"
     return "other"
 
 

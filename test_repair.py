@@ -171,3 +171,56 @@ def test_repair_diff_keeps_blank_lines_in_list_triggers():
     text = "on:\n  - push\n  - pull_request\n\njobs:\n  a:\n    runs-on: x\n    timeout-minutes: 5\n    steps:\n      - run: echo\n"
     fixed, _ = repair(text, default_branch="main", smells={"S6"})
     assert "\n\njobs:" in fixed and "branches: [main]" in fixed
+
+
+# v0.9: defects found in the RQ3 manual review (rq3/review_resolved.csv)
+
+def test_s3_lock_file_in_working_directory():
+    # M043 apache/superset: npm ci in ./superset-frontend
+    fixed, _ = repair(_job(["- uses: actions/setup-node@v4", "- run: npm ci", "  working-directory: ./superset-frontend"]))
+    assert "cache: npm" in fixed and "cache-dependency-path: superset-frontend/package-lock.json" in fixed
+    # defaults.run.working-directory of the job
+    text = _job(["- uses: actions/setup-python@v5", "- run: pip install -r requirements.txt"]).replace(
+        "    timeout-minutes: 5\n", "    timeout-minutes: 5\n    defaults: {run: {working-directory: docs}}\n")
+    assert "cache-dependency-path: docs/requirements.txt" in repair(text)[0]
+
+
+def test_s3_lock_file_after_cd():
+    # M059 FaserF/hassio-addons: cd whatsapp/app && npm ci
+    fixed, _ = repair(_job(["- uses: actions/setup-node@v4", "- run: |", "    cd whatsapp/app", "    npm ci || npm install"]))
+    assert "cache-dependency-path: whatsapp/app/package-lock.json" in fixed
+    fixed, _ = repair(_job(["- uses: actions/setup-go@v5", "- run: cd tools && go test ./..."]))
+    assert "cache-dependency-path: tools/go.sum" in fixed
+    # a subshell does not change the directory of later lines
+    fixed, _ = repair(_job(["- uses: actions/setup-node@v4", "- run: |", "    (cd site && make)", "    npm ci"]))
+    assert "cache: npm" in fixed and "cache-dependency-path" not in fixed
+
+
+def test_s3_skipped_when_directory_is_not_a_literal_path():
+    # M055 OpenAPITools/openapi-generator: working-directory: ${{ matrix.sample }}
+    for steps in (["- uses: actions/setup-python@v5", "- run: pip install -r requirements.txt",
+                   "  working-directory: ${{ matrix.sample }}"],
+                  ["- uses: actions/setup-node@v4", "- run: cd $APP_DIR && npm ci"]):
+        assert "S3" not in {s for s, _ in repair(_job(steps))[1]}
+
+
+def test_s3_skipped_when_a_gradle_action_caches():
+    # M049 libgdx (gradle-build-action), M050 hiero (actions/setup-gradle)
+    for action in ("gradle/gradle-build-action@v2", "gradle/actions/setup-gradle@v4"):
+        for steps in (["- uses: actions/setup-java@v4", f"- uses: {action}", "- run: ./gradlew build"],
+                      [f"- uses: {action}", "- uses: actions/setup-java@v4", "- run: ./gradlew build"]):
+            assert "S3" not in {s for s, _ in repair(_job(steps))[1]}
+
+
+def test_s3_respects_package_manager_cache_false():
+    # M056 withastro/astro
+    steps = ["- uses: actions/setup-node@v4", "  with: {package-manager-cache: false}", "- run: npm ci"]
+    assert "S3" not in {s for s, _ in repair(_job(steps))[1]}
+
+
+def test_s8_keeps_an_explicit_retention_period():
+    # M114 CherryHQ, M116 pytorch: retention-days: 90 chosen by the developers
+    up = ["- uses: actions/upload-artifact@v4", "  with: {name: b, path: out, retention-days: 90}"]
+    assert "S8" not in {s for s, _ in repair(_job(up))[1]}
+    fixed, applied = repair(_job(["- uses: actions/upload-artifact@v4", "  with: {name: b, path: out}"]))
+    assert ("S8", "t") in applied and "retention-days: 7" in fixed
