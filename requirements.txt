@@ -6,3 +6,5 @@ pandas
 ruamel.yaml
 actionlint-py
 openpyxl
+numpy
+scipy
