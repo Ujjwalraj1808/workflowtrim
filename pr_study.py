@@ -41,8 +41,9 @@ POLICY_WORDS = ["ai-generated", "ai generated", "llm", "chatgpt", "copilot", "ge
 SMELL_TEXT = {
     "S1": ("add `timeout-minutes` to jobs that have none",
            "A job without `timeout-minutes` can run for up to 360 minutes (GitHub's default) when it hangs. "
-           "The value {timeout} minutes is 1.5 times the 95th percentile of the successful job durations of this "
-           "workflow in its recent run history ({samples} jobs), so normal runs are not affected."),
+           "The value {timeout} minutes comes from this workflow's recent run history ({samples} successful jobs): "
+           "1.5 times the 95th percentile of their durations, and never less than 10 minutes, so normal runs are "
+           "not affected."),
     "S2": ("cancel superseded pull-request runs",
            "When a new commit is pushed to a pull request, the run for the previous commit keeps running. The "
            "added `concurrency` block cancels it, but only for `pull_request` events: runs for pushes to "
@@ -74,7 +75,8 @@ checked automatically (the file parses, `actionlint` reports no new error) and r
 **Context.** We are a student research team at Galgotias University (India) studying configurations in GitHub
 Actions workflows that use compute minutes or storage without need ("resource-waste smells"). The change was
 produced by our open-source tool WorkflowTrim (https://github.com/Ujjwalraj1808/workflowtrim) and reviewed by
-a person before submission. We will report, without naming people, whether such changes are accepted.
+a person before submission. The change itself comes from fixed rules, not from an AI model; an AI assistant helped us
+draft this description, and we checked every line of it. We will report, without naming people, whether such changes are accepted.
 
 If this is not useful for the project, please just close the pull request; we will not send further ones.
 Thank you for your time!

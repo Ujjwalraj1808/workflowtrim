@@ -62,7 +62,7 @@ def test_s1_candidate_gets_timeout_from_history(tmp_path, monkeypatch):
     assert row["status"] == "kept" and row["timeout"] == "15"
     assert "timeout-minutes: 15" in open("pr/M001/ci.yml").read()
     body = open("pr/M001/body.md").read()
-    assert "15 minutes" in body and "(25 jobs)" in body
+    assert "15 minutes" in body and "(25 successful jobs)" in body
 
 
 def test_changed_file_and_short_history_are_skipped(tmp_path, monkeypatch):
