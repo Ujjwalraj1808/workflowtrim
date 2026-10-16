@@ -114,6 +114,8 @@ python rq3_repair.py --minutes 9     # same, stopping after 9 minutes; run again
 
 Outputs: `rq3/findings.csv` (every finding: repaired, skipped with reason, or detect-only), `rq3/repairs.csv` (checks and diff size per file and scope) and `rq3/review.xlsx` (a fixed random sample of 20 diffs per repairable smell for manual review, see [rq3/REVIEW.md](rq3/REVIEW.md); `rq3/pilot_sample.csv` lists the discarded pilot sample, which is excluded).
 
+Manual review: two reviewers labelled the 120 diffs independently (`rq3/review_A.xlsx`, `rq3/review_B.xlsx`) and resolved the 21 disagreements together (`rq3/disagreements.xlsx`). `python rq3_review_score.py` prints agreement, Cohen's kappa and the final verdict per smell and writes `rq3/review_resolved.csv`: 100 of 120 repairs correct (83.3%, 95% Wilson CI 75.7–88.9%), 11 incorrect, 9 unsure; raw agreement 82.5%, kappa 0.33.
+
 ## RQ4: savings in real run history
 
 ```
@@ -146,6 +148,7 @@ rq2_score.py    RQ2 agreement and precision / recall / F1
 ANNOTATION.md   RQ2 annotation protocol
 rq3_snapshot.py RQ3 snapshot of the dataset's workflow files
 rq3_repair.py   RQ3 repair coverage, safety checks and review sample
+rq3_review_score.py RQ3 manual review: agreement and verdict per smell
 rq4_savings.py  RQ4 repository selection, run-history download, savings tables
 summarize.py    prevalence tables from the CSVs
 test_rules.py   detector tests
@@ -154,6 +157,7 @@ test_savings.py savings estimator tests
 test_collect.py exclusion rule tests
 test_rq2.py     kappa tests
 test_rq4.py     RQ4 run filter tests
+test_rq3_review.py RQ3 review kappa and confidence interval tests
 ```
 
 ## Authors
