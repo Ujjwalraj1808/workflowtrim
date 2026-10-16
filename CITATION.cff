@@ -1,0 +1,25 @@
+cff-version: 1.2.0
+message: "If you use WorkflowTrim or its data, please cite it as below."
+title: "WorkflowTrim: Automated Detection, Repair and Savings Measurement of Resource-Waste Smells in GitHub Actions CI/CD Workflows"
+type: software
+authors:
+  - family-names: Raj
+    given-names: Ujjwal
+    affiliation: "School of Computer Applications and Technology, Galgotias University"
+  - family-names: Mishra
+    given-names: Vaibhav
+    affiliation: "School of Computer Applications and Technology, Galgotias University"
+  - family-names: Raj
+    given-names: Rishav
+    affiliation: "School of Computer Applications and Technology, Galgotias University"
+version: "v1.0"
+date-released: "2026-10-16"
+doi: "10.5281/zenodo.23417010"
+repository-code: "https://github.com/Ujjwalraj1808/workflowtrim"
+license: MIT
+keywords:
+  - GitHub Actions
+  - continuous integration
+  - configuration smells
+  - resource waste
+  - automated repair

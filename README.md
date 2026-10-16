@@ -170,8 +170,16 @@ test_rq3_review.py RQ3 review kappa and confidence interval tests
 test_stats.py   Holm correction and Wilson interval tests
 ```
 
+## Citation
+
+Version v1.0 (the version used for the results in the paper) is archived on Zenodo: [10.5281/zenodo.23417010](https://doi.org/10.5281/zenodo.23417010). To cite all versions, use [10.5281/zenodo.23417009](https://doi.org/10.5281/zenodo.23417009), which always resolves to the latest one. See [CITATION.cff](CITATION.cff).
+
+## License
+
+The code is released under the [MIT License](LICENSE). The workflow files in `rq2/files/` and `rq3/files/` and the run histories in `rq4/raw/` were collected from public GitHub repositories and remain under the licenses of those repositories; they are included only so that the study can be reproduced.
+
 ## Authors
 
-Ujjwal Raj 
+Ujjwal Raj, Vaibhav Mishra, Rishav Raj  
 Guide: Dr. Arvind Kumar  
-School of Computer Application and Technology, Galgotias University
+School of Computer Applications and Technology, Galgotias University
