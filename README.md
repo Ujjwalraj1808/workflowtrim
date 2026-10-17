@@ -133,6 +133,18 @@ python stats.py
 
 Prints 95% intervals for the prevalence of each smell (Wilson for repository shares; for file shares a bootstrap that resamples repositories, 2,000 resamples, seed 2026), the popular vs less-popular comparison (Fisher's exact test on repositories, Mann-Whitney U on each repository's share of files with the smell, Holm-corrected over the eight smells), Wilson intervals for RQ2 precision and recall, and the precision-adjusted file share of each smell (file share x precision, with both resampled).
 
+## Journal version: baseline, extra analyses, fork study
+
+```
+python rq2_baseline.py reimpl    # four checks of Khatami et al.'s gha-ci-detector 0.0.3, transcribed
+python rq2_baseline.py score     # file-level P/R/F1 of both detectors on the 100 RQ2 recall files
+python jss_extra.py              # RQ1 co-occurrence; RQ4 per-repository shares and bootstrap interval
+```
+
+`rq2_baseline.py run` runs the original detector instead (install `gha_ci_detector-0.0.3-py3-none-any.whl` from its replication package, doi:10.5281/zenodo.12207164, with the pinned `yamllint==1.35.1 ruamel.yaml==0.18.6`); `score-original` scores its output.
+
+`fork_study.py` measures the job minutes saved by the S3 (cache) repair in real runs: it forks repositories into your account, adds the original and the repaired workflow as `wt-base.yml` and `wt-fix.yml` (manual trigger only), runs them alternately and compares their job minutes. Steps: `plan`, `setup`, `run`, `report`; it needs a classic `GITHUB_TOKEN` with the `repo` and `workflow` scopes. Delete the forks yourself afterwards.
+
 ## Running the tests
 
 ```
@@ -160,6 +172,9 @@ rq3_review_score.py RQ3 manual review: agreement and verdict per smell
 stats.py        confidence intervals, strata tests, precision-adjusted prevalence
 rq4_savings.py  RQ4 repository selection, run-history download, savings tables
 summarize.py    prevalence tables from the CSVs
+rq2_baseline.py comparison with the detector of Khatami et al. (RQ2)
+jss_extra.py    co-occurrence (RQ1) and savings uncertainty (RQ4)
+fork_study.py   fork experiment: real minutes saved by the S3 repair
 test_rules.py   detector tests
 test_repair.py  repairer tests
 test_savings.py savings estimator tests
@@ -168,6 +183,8 @@ test_rq2.py     kappa tests
 test_rq4.py     RQ4 run filter tests
 test_rq3_review.py RQ3 review kappa and confidence interval tests
 test_stats.py   Holm correction and Wilson interval tests
+test_rq2_baseline.py transcribed baseline checks
+test_fork_study.py fork experiment (simulated GitHub API)
 ```
 
 ## Citation

@@ -74,16 +74,16 @@ gchq/sleeper,,build manifest in a subfolder (monorepo)
 uyuni-project/uyuni,,build manifest in a subfolder (monorepo)
 JanssenProject/jans,,build manifest in a subfolder (monorepo)
 binance/binance-connector-java,,build manifest in a subfolder (monorepo)
-Aletheore/Aletheore,,"CHECK: build manifest in a subfolder, purpose unclear"
-oliver-zehentleitner/keep-the-why,,"CHECK: build manifest in a subfolder, purpose unclear"
-LukePrior/nbn-upgrade-map,,"CHECK: build manifest in a subfolder, purpose unclear"
-hackforla/website,,"CHECK: build manifest in a subfolder, purpose unclear"
-antongulin/opencode-skill-creator,,"CHECK: build manifest in a subfolder, purpose unclear"
-maboloshi/github-chinese,,"CHECK: build manifest in a subfolder, purpose unclear"
-Endless1936/cut-motion,,"CHECK: build manifest in a subfolder, purpose unclear"
-MONZikWasTaken/Framegen,,"CHECK: build manifest in a subfolder, purpose unclear"
-nomadicmehul/CloudCaptain,,"CHECK: build manifest in a subfolder, purpose unclear"
-yennanliu/CS_basics,,"CHECK: build manifest in a subfolder, purpose unclear"
+Aletheore/Aletheore,,"Borderline: build manifest only in a subfolder; kept as software"
+oliver-zehentleitner/keep-the-why,,"Borderline: build manifest only in a subfolder; kept as software"
+LukePrior/nbn-upgrade-map,,"Borderline: build manifest only in a subfolder; kept as software"
+hackforla/website,,"Borderline: build manifest only in a subfolder; kept as software"
+antongulin/opencode-skill-creator,,"Borderline: build manifest only in a subfolder; kept as software"
+maboloshi/github-chinese,,"Borderline: build manifest only in a subfolder; kept as software"
+Endless1936/cut-motion,,"Borderline: build manifest only in a subfolder; kept as software"
+MONZikWasTaken/Framegen,,"Borderline: build manifest only in a subfolder; kept as software"
+nomadicmehul/CloudCaptain,,"Borderline: build manifest only in a subfolder; kept as software"
+yennanliu/CS_basics,,"Borderline: build manifest only in a subfolder; kept as software"
 adoptium/jdk,duplicate,same file tree and workflows as openjdk/jdk
 openjdk/leyden,duplicate,same file tree and workflows as openjdk/jdk
 openjdk/wakefield,duplicate,same file tree and workflows as openjdk/jdk
@@ -135,6 +135,6 @@ bryanthaboi/gen1recomp-mod-index,content_only,was included: list/guide/course/no
 Ringmast4r/OUI-Master-Database,content_only,was included: list/guide/course/notes/docs site/data
 AdguardTeam/HostlistsRegistry,content_only,was included: list/guide/course/notes/docs site/data
 sefinek/Sefinek-Blocklist-Collection,content_only,was included: list/guide/course/notes/docs site/data
-shareAI-lab/learn-claude-code,content_only,"CHECK: was included, looks like tutorial/notes/rules"
-Myyura/the_kai_project,content_only,"CHECK: was included, looks like tutorial/notes/rules"
-Agent-Threat-Rule/agent-threat-rules,content_only,"CHECK: was included, looks like tutorial/notes/rules"
+shareAI-lab/learn-claude-code,content_only,"Borderline: excluded as tutorial/notes collection"
+Myyura/the_kai_project,content_only,"Borderline: excluded as tutorial/notes collection"
+Agent-Threat-Rule/agent-threat-rules,content_only,"Borderline: excluded as rules collection; a later check (Oct 2026) found it is likely software (root package.json and pyproject.toml, src, tests); kept excluded for v1.0, see threats to validity"
